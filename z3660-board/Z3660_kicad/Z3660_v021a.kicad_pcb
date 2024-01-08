@@ -8,7 +8,8 @@
   (title_block
     (title "Z3660 by sHaNsHe (Double H Tech)")
     (date "2023-08-06")
-    (rev "v0.21")
+    (rev "v0.21a")
+    (comment 1 "v0.21a Changed Array Networks")
   )
 
   (layers
@@ -4540,7 +4541,7 @@
         (effects (font (size 1 1) (thickness 0.15)))
       (tstamp 44468707-eebf-453a-affa-0a778ba2f6c0)
     )
-    (fp_text value "LED_Small" (at 0 1.82 180) (layer "F.Fab")
+    (fp_text value "LED_Small_Green" (at 0 1.82 180) (layer "F.Fab")
         (effects (font (size 1 1) (thickness 0.15)))
       (tstamp 6e057403-3033-4cbc-b363-ed4f525cb724)
     )
@@ -4652,7 +4653,7 @@
         (effects (font (size 1 1) (thickness 0.15)))
       (tstamp 27a75600-5605-4720-a916-b3384331b25b)
     )
-    (fp_text value "LED_Small" (at 0 1.82 180) (layer "F.Fab")
+    (fp_text value "LED_Small_Red" (at 0 1.82 180) (layer "F.Fab")
         (effects (font (size 1 1) (thickness 0.15)))
       (tstamp a73d9aab-9322-4626-bbef-ecd8335e268c)
     )
