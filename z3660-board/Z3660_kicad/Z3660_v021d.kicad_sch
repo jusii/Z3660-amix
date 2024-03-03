@@ -2,14 +2,16 @@
 
   (uuid 72366acb-6c86-4134-89df-01ed6e4dc8e0)
 
-  (paper "A4")
+  (paper "A3")
 
   (title_block
     (title "Z3660 by sHaNsHe (Double H Tech)")
-    (date "2024-02-09")
-    (rev "v0.21b")
+    (date "2024-03-03")
+    (rev "v0.21d")
     (comment 1 "v0.21a Changed Array Networks")
     (comment 2 "v0.21b Changed the 060 socket")
+    (comment 3 "v0.21c version wrongly named")
+    (comment 4 "v0.21d Changed fan header to right angle and three pins")
   )
 
   (lib_symbols
@@ -27,7 +29,7 @@
       (effects (font (size 2 2)) (justify left top))
     )
     (instances
-      (project "Z3660_v021b"
+      (project "Z3660_v021d"
         (path "/72366acb-6c86-4134-89df-01ed6e4dc8e0" (page "4"))
       )
     )
@@ -44,7 +46,7 @@
       (effects (font (size 2 2)) (justify left top))
     )
     (instances
-      (project "Z3660_v021b"
+      (project "Z3660_v021d"
         (path "/72366acb-6c86-4134-89df-01ed6e4dc8e0" (page "2"))
       )
     )
@@ -61,7 +63,7 @@
       (effects (font (size 2 2)) (justify left top))
     )
     (instances
-      (project "Z3660_v021b"
+      (project "Z3660_v021d"
         (path "/72366acb-6c86-4134-89df-01ed6e4dc8e0" (page "1"))
       )
     )
@@ -78,7 +80,7 @@
       (effects (font (size 2 2)) (justify left top))
     )
     (instances
-      (project "Z3660_v021b"
+      (project "Z3660_v021d"
         (path "/72366acb-6c86-4134-89df-01ed6e4dc8e0" (page "3"))
       )
     )
@@ -95,7 +97,7 @@
       (effects (font (size 2 2)) (justify left top))
     )
     (instances
-      (project "Z3660_v021b"
+      (project "Z3660_v021d"
         (path "/72366acb-6c86-4134-89df-01ed6e4dc8e0" (page "5"))
       )
     )
