@@ -135,6 +135,94 @@ static void test_memory_roundtrip_endianness(void)
 	CHECK_EQ32(m68k_dreg(regs, 1) & 0xffff, 0xAABB, "move.w (a0),d1 big-endian");
 }
 
+/* ==================================================================
+ * Adversarial-instruction baseline (decision #3 spike candidates).
+ * These run on the current NON-MMU engine to capture known-good register/memory
+ * results. When the MMU engine lands, the spike re-runs the same instructions
+ * faulting mid-access and must restart to these exact results.
+ * ================================================================== */
+static void test_tas_rmw(void)
+{
+	printf("[test] TAS.B (An) read-modify-write\n");
+	cpu_set_context(0x2000);
+	m68k_areg(regs, 0) = 0x00050000;
+	hram_poke8(0x00050000, 0x00);        /* byte starts 0 */
+	hram_poke16(0x2000, 0x4AD0);         /* TAS (a0) */
+	step();
+	CHECK_EQ32(hram_peek8(0x00050000), 0x80, "TAS set bit7");
+	MakeSR();   /* WinUAE keeps CC decomposed; compose regs.sr before reading */
+	CHECK((regs.sr & 4) != 0, "TAS Z flag set (operand was 0)\n");
+}
+
+static void test_cas_rmw(void)
+{
+	printf("[test] CAS.L Dc,Du,(An) match + no-match\n");
+	/* match: (a0)==d1 -> store d2, Z=1 */
+	cpu_set_context(0x2000);
+	m68k_areg(regs, 0) = 0x00060000;
+	m68k_dreg(regs, 1) = 0x11111111;     /* Dc */
+	m68k_dreg(regs, 2) = 0x22222222;     /* Du */
+	hram_poke32(0x00060000, 0x11111111);
+	hram_poke16(0x2000, 0x0ED0);         /* CAS.L ...,(a0) */
+	hram_poke16(0x2002, (2 << 6) | 1);   /* ext: Du=d2, Dc=d1 */
+	step();
+	CHECK_EQ32(hram_peek32(0x00060000), 0x22222222, "CAS match -> stored Du");
+	MakeSR();
+	CHECK((regs.sr & 4) != 0, "CAS match -> Z set\n");
+	/* no-match: (a0)!=d1 -> load (a0) into d1, Z=0, mem unchanged */
+	cpu_set_context(0x2000);
+	m68k_areg(regs, 0) = 0x00060000;
+	m68k_dreg(regs, 1) = 0x11111111;
+	m68k_dreg(regs, 2) = 0x33333333;
+	hram_poke32(0x00060000, 0xAAAAAAAA);
+	hram_poke16(0x2000, 0x0ED0);
+	hram_poke16(0x2002, (2 << 6) | 1);
+	step();
+	CHECK_EQ32(hram_peek32(0x00060000), 0xAAAAAAAA, "CAS no-match -> mem unchanged");
+	CHECK_EQ32(m68k_dreg(regs, 1), 0xAAAAAAAA, "CAS no-match -> Dc loaded from mem");
+	MakeSR();
+	CHECK((regs.sr & 4) == 0, "CAS no-match -> Z clear\n");
+}
+
+static void test_movem(void)
+{
+	printf("[test] MOVEM.L reg<->mem (multi-word access)\n");
+	cpu_set_context(0x2000);
+	m68k_dreg(regs, 0) = 0xDEAD0000;
+	m68k_dreg(regs, 1) = 0xBEEF0001;
+	m68k_areg(regs, 0) = 0x00070000;
+	hram_poke16(0x2000, 0x48D0);         /* MOVEM.L d0/d1,(a0) */
+	hram_poke16(0x2002, 0x0003);         /* mask d0,d1 */
+	step();
+	CHECK_EQ32(hram_peek32(0x00070000), 0xDEAD0000, "MOVEM store d0");
+	CHECK_EQ32(hram_peek32(0x00070004), 0xBEEF0001, "MOVEM store d1");
+	/* load back into d2/d3 */
+	m68k_setpc(0x2004);
+	m68k_areg(regs, 0) = 0x00070000;
+	hram_poke16(0x2004, 0x4CD0);         /* MOVEM.L (a0),d2/d3 */
+	hram_poke16(0x2006, 0x000C);         /* mask d2,d3 */
+	step();
+	CHECK_EQ32(m68k_dreg(regs, 2), 0xDEAD0000, "MOVEM load d2");
+	CHECK_EQ32(m68k_dreg(regs, 3), 0xBEEF0001, "MOVEM load d3");
+}
+
+static void test_misaligned_long(void)
+{
+	printf("[test] misaligned long access (68030 allows)\n");
+	cpu_set_context(0x2000);
+	m68k_dreg(regs, 0) = 0x12345678;
+	m68k_areg(regs, 0) = 0x00040001;     /* odd address */
+	hram_poke16(0x2000, 0x2080);         /* move.l d0,(a0) */
+	step();
+	CHECK_EQ32(hram_peek32(0x00040001), 0x12345678, "misaligned long stored big-endian");
+	/* read back */
+	m68k_setpc(0x2002);
+	m68k_areg(regs, 0) = 0x00040001;
+	hram_poke16(0x2002, 0x2210);         /* move.l (a0),d1 */
+	step();
+	CHECK_EQ32(m68k_dreg(regs, 1), 0x12345678, "misaligned long read back");
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -150,6 +238,10 @@ int main(int argc, char **argv)
 	test_add_sequence();
 	test_immediate_and_memory();
 	test_memory_roundtrip_endianness();
+	test_tas_rmw();
+	test_cas_rmw();
+	test_movem();
+	test_misaligned_long();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
