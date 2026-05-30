@@ -15,7 +15,14 @@
 #include "options.h"
 #include "memory.h"
 #include "newcpu.h"
+#include "cpummu030.h"
 #include "harness.h"
+
+/* 68030 TT-register bits (#defined privately in cpummu030.cpp). */
+#define Z_TT_FC_MASK   0x00000007u
+#define Z_TT_RWM       0x00000100u
+#define Z_TT_ENABLE    0x00008000u
+#define Z_TC_ENABLE    0x80000000u
 
 #include <cstdio>
 #include <cstring>
@@ -223,6 +230,59 @@ static void test_misaligned_long(void)
 	CHECK_EQ32(m68k_dreg(regs, 1), 0x12345678, "misaligned long read back");
 }
 
+/* ==================================================================
+ * MMU030 engine — decision #6 test 1: transparent translation (TTR).
+ * Drives the real engine through the PMOVE path (mmu_op30_pmove), exactly as
+ * AMIX would, then checks mmu030_translate(). Validates that the imported
+ * WinUAE 4.4.0 MMU engine is live, accepts register loads, enables, and
+ * transparently translates a TTR-covered region.
+ * ================================================================== */
+static uae_u16 pmove_next(int preg) { return (uae_u16)((preg & 31) << 10); } /* write, fd=0 */
+
+static void test_mmu030_ttr(void)
+{
+	printf("[test] MMU030 PMOVE + transparent translation (decision #6 test 1)\n");
+	currprefs.mmu_model = 68030;
+	currprefs.mmu_ec = 0;
+	currprefs.cpu_memory_cycle_exact = false;
+	mmu030_reset(1);                 /* hard reset: clear state + wire x_phys_* */
+	m68k_setpc(0x2000);              /* PMOVE uses m68k_getpc() for logging */
+
+	/* MMU disabled -> translate is identity */
+	CHECK_EQ32(mmu030_translate(0x00012340, true, true, false), 0x00012340,
+	           "MMU disabled -> identity passthrough");
+
+	/* PMOVE write TT0: transparent-translate the 0x40xxxxxx region (match-all FC,
+	 * r/w-disabled so both reads and writes are transparent). */
+	uae_u32 ttr = Z_TT_ENABLE | Z_TT_RWM | 0x40000000u | Z_TT_FC_MASK; /* 0x40008107 */
+	hram_poke32(0x100, ttr);
+	bool err = mmu_op30_pmove(0x2000, 0xF010, pmove_next(0x02), 0x100);
+	CHECK(!err, "PMOVE TT0 accepted\n");
+	CHECK_EQ32(tt0_030, ttr, "tt0_030 loaded via PMOVE");
+
+	/* PMOVE write TC: enable translation. Valid 030 TC: E | PS=12 (4KB) |
+	 * TIA=10 | TIB=10  (IS 0 + PS 12 + TIA 10 + TIB 10 = 32). */
+	uae_u32 tc = Z_TC_ENABLE | (12u << 20) | (10u << 12) | (10u << 8); /* 0x80C0AA00 */
+	hram_poke32(0x104, tc);
+	err = mmu_op30_pmove(0x2000, 0xF010, pmove_next(0x10), 0x104);
+	CHECK(!err, "PMOVE TC accepted\n");
+	CHECK((tc_030 & Z_TC_ENABLE) != 0, "tc_030 enable bit set\n");
+
+	/* MMU now enabled: a TTR-covered address is transparently translated (returns
+	 * the same physical address) -- proving the engine ran the TTR path, not the
+	 * disabled shortcut. */
+	CHECK_EQ32(mmu030_translate(0x40001234, true, true, false), 0x40001234,
+	           "TTR transparent translation, supervisor read");
+	CHECK_EQ32(mmu030_translate(0x40000000, false, true, true), 0x40000000,
+	           "TTR transparent translation, user write");
+	CHECK_EQ32(mmu030_translate(0x4000FFFC, false, false, false), 0x4000FFFC,
+	           "TTR transparent translation, user instr fetch");
+
+	/* Leave the MMU disabled for any later tests. */
+	currprefs.mmu_model = 0;
+	mmu030_reset(1);
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -242,6 +302,7 @@ int main(int argc, char **argv)
 	test_cas_rmw();
 	test_movem();
 	test_misaligned_long();
+	test_mmu030_ttr();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
