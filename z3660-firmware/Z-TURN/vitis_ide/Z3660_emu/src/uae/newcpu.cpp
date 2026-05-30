@@ -733,6 +733,13 @@ static void set_x_funcs (void)
    set_x_cp_funcs();
 }
 
+#ifdef HOST_TEST_HARNESS
+/* Exposes the static set_x_funcs() to the Layer-1 host MMU test harness so it can
+ * wire the x_* memory accessors after build_cpufunctbl(). Never compiled into the
+ * firmware (HOST_TEST_HARNESS is only defined by test/host/Makefile). */
+extern "C" void harness_set_x_funcs(void) { set_x_funcs(); }
+#endif
+
 bool can_cpu_tracer (void)
 {
    return currprefs.cpu_model == 68000 && currprefs.cpu_memory_cycle_exact;
