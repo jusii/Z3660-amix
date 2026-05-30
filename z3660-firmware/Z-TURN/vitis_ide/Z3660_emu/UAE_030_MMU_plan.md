@@ -103,12 +103,18 @@ for context but read these first.
    tripwire (`static_assert(BOOTMODE_NUM == N)` / cross-ref comment). Full shared
    header stays out of scope (3 build systems).
 
-9. **`gencpu` diff-gate needs a baseline first.** The Phase 0 gate is "regenerated
-   non-MMU `cpuemu_*` matches checked-in modulo **known local edits**" — but those
-   edits aren't enumerated. Before the gate is meaningful, diff the **checked-in**
-   `cpuemu_{0,4,11,13,40,44}`/`cpustbl.cpp` against pristine **Amiberry-v5.6.0**
-   `gencpu` output to produce the known-edit set, so the gate becomes "diff ==
-   known-edit set," not "diff == empty."
+9. **`gencpu` diff-gate baseline — DONE (better than expected).** Amiberry v5.6.0
+   *ships its `cpuemu_*` pre-generated*, so the baseline is a direct file diff (no
+   gencpu run needed): `cpuemu_4/11/13/44` are **byte-identical** to Amiberry
+   v5.6.0 (the 68030 interpreter `cpuemu_13` is **pristine**); the only edits are
+   `cpuemu_0` (14 lines, debug prints + a signedness tweak), `cpuemu_40` (104
+   lines), and `cpustbl` (1712 lines, a *cosmetic* `(uae_s16)` cast — gencpu-format
+   only). The gate now lives in [test/gencpu/](test/gencpu/) (`baseline_diff.sh`,
+   green). **gencpu caveat:** Amiberry v5.6.0's *repo* `gencpu.cpp` aborts on 68060
+   `HALT`/`PULSE`/`LPSTOP` and lacks the `cpustbl` cast — so the MMU table
+   `cpuemu_31.cpp` must be sourced from the **WinUAE-lineage gencpu that matches
+   this tree** (the one that produced Amiberry v5.6.0's pre-generated tables),
+   pairing cleanly with the pristine `cpuemu_13`.
 
 10. **Provenance corrected: core is Amiberry `v5.6.0` (`88f30af9`), not WinUAE
     5.6.0** (which never existed). Pin all imported sources (MMU engine, `gencpu`)
