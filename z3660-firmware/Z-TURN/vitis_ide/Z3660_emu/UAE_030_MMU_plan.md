@@ -129,19 +129,44 @@ for context but read these first.
     **`cpu_compatible = false`** ("More Compatible" OFF; ON panics AMIX), JIT off,
     A3000-class only.
 
-### Progress log (host harness)
-- **Layer-1 host harness is built and green** ([test/host/](test/host/)): the
-  portable UAE core subset (`newcpu`, all six `cpuemu_*`, `cpustbl`, `cpudefs`,
-  `readcpu`, `memory`, `events`, `fpp`) compiles+links on x86-64 g++ with board
-  seams stubbed to a big-endian flat-RAM buffer (decision #6: `lget`/`wget` path,
-  no `baseaddr_direct`, no `-m32`). The 68030 direct interpreter (mode 0, JIT off)
-  executes real instructions; 10/10 foundation assertions pass (moveq, add.l,
-  move.l #imm32, memory store/load, byte/word/long big-endian round-trips). Two
-  arch-safe core fixes were required to build off-ARM: `regs.pissoff` moved out of
-  `#ifdef JIT` (newcpu.h); ARM `vmrs/vmsr` asm in `fesetround` guarded with a host
-  no-op (fpp_native.cpp). A `HOST_TEST_HARNESS`-guarded `harness_set_x_funcs()`
-  wrapper exposes the static `set_x_funcs()`. **This is the substrate for the MMU
-  translation tests, pending the engine import.**
+### Progress log (implementation, 2026-05-30 branch `uae-030-mmu`)
+
+**Phase 0 — DONE.** gencpu host toolchain builds; the non-MMU baseline is green
+([test/gencpu/](test/gencpu/)): this tree's `cpuemu_4/11/13/44` are byte-identical
+to Amiberry v5.6.0's pre-generated files (030 interpreter `cpuemu_13` pristine);
+known edits are `cpuemu_0` (14), `cpuemu_40` (104), `cpustbl` (cosmetic 1712).
+
+**Layer-1 host harness — built and green ([test/host/](test/host/)).** The
+portable UAE core subset (`newcpu`, all six `cpuemu_*`, `cpustbl`, `cpudefs`,
+`readcpu`, `memory`, `events`, `fpp`) compiles+links on x86-64 g++ with board
+seams stubbed to a big-endian flat-RAM buffer (decision #6: `lget`/`wget` path,
+no `baseaddr_direct`, no `-m32`). Two arch-safe core fixes were needed off-ARM:
+`regs.pissoff` moved out of `#ifdef JIT` (newcpu.h); ARM `vmrs/vmsr` asm in
+`fesetround` guarded (fpp_native.cpp). A `HOST_TEST_HARNESS`-guarded
+`harness_set_x_funcs()` exposes the static `set_x_funcs()`.
+
+**Phase 1 (engine import) — substantially DONE; MMU is translating.**
+- Source pinned to **WinUAE 4.4.0** (`c7b24b37`); API-drift report done (decision #4).
+- Stage 1: full `cpummu030.h`/`cpummu.h`/`mmu_common.h` + 15 regstruct fields +
+  the 030/040 accessor decl blocks imported — non-breaking (harness stayed green).
+- Stage 2: `cpummu030.cpp` (3560) + `cpummu.cpp` (1788) compile+link; the ~45
+  stripped accessor pointers/functions live in one shared `newcpu_mmu_glue.cpp`
+  (phys pass-throughs for the CE/040-cache/prefetch paths the Z3660 doesn't use).
+- Stage 3 (partial): the engine is **driven and validated** through the real
+  `mmu_op30_pmove` path:
+  - **decision #6 test 1 (TTR transparent translation) — PASS.**
+  - **decision #6 test 2 (2-level page-table walk + ATC) — PASS** (logical
+    `0x00405678` → physical `0x0A000678`).
+  **36/36 harness assertions pass.**
+
+**Remaining:**
+- decision #6 tests 3–5: fault/restart (the hard one), RMW (`CAS`/`TAS`), PFLUSH/ATC.
+- Phase 2/3 firmware wiring: `cputbls` MMU column, `set_x_funcs()` MMU arm
+  (point `x_get_long`→`get_long_mmu030`, repoint `read_data_030_*` at the
+  translating accessors), restore the real `mmu_op30` dispatch arm behind
+  `if (currprefs.mmu_model)`, generate `cpuemu_31.cpp`.
+- Phase 7 enum threading + the bare-`else` dispatch fix (decision #8), docker-verified.
+- Phase 0.5 on-target C++ unwind gate (decision #7) — hardware-only.
 
 ## Context & goal
 
