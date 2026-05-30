@@ -143,6 +143,12 @@ struct regstruct
 
 	uae_u8* natmem_offset;
 
+	/* Cycle countdown ("countdown" macro == regs.pissoff in events.h). Used by
+	 * non-JIT paths (do_extra_cycles, events.cpp) too, so it must exist even when
+	 * JIT is off — e.g. the x86-64 host MMU harness. Previously JIT-only, which
+	 * compiled only because the ARM target always builds with JIT enabled. */
+	int pissoff;
+
 #ifdef JIT
 	/* store scratch regs also in this struct to avoid load of mem pointer */
 	uae_u32 scratchregs[VREGS - S1];
@@ -153,7 +159,6 @@ struct regstruct
 	uae_u32* raw_cputbl_count;
 	uintptr mem_banks;
 	uintptr cache_tags;
-	int pissoff;
 
 #endif
 };

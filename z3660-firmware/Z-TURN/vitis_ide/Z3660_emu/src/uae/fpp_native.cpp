@@ -54,11 +54,19 @@ static int fpu_prec;
 
 static void fesetround(uint32_t v)
 {
+#if defined(CPU_arm)
 	int fpscr_value;
 	__asm("vmrs %0, fpscr" : "=r" (fpscr_value));
 	fpscr_value&=~FE_MASK;
 	fpscr_value|=v;
 	__asm("vmsr fpscr, %0" : : "r" (fpscr_value));
+#else
+	/* Host (non-ARM) build, e.g. the x86-64 MMU harness: the ARM FPSCR asm is
+	 * unavailable. The harness exercises MMU translation, not the FPU, so host
+	 * FPU rounding fidelity is irrelevant — no-op. (To add host FPU tests later,
+	 * map v's ARM FPSCR rounding bits to libc <fenv.h> rounding modes here.) */
+	(void)v;
+#endif
 }
 /* Functions for setting host/library modes and getting status */
 static void fp_set_mode(uae_u32 mode_control)
