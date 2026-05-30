@@ -283,6 +283,72 @@ static void test_mmu030_ttr(void)
 	mmu030_reset(1);
 }
 
+/* ==================================================================
+ * MMU030 engine — decision #6 test 2: real 2-level page-table walk.
+ * Builds a short-descriptor (4-byte) table in the flat buffer matching the TC
+ * (TIA=10 @ shift22, TIB=10 @ shift12, 4KB pages) and asserts a logical address
+ * translates to the expected physical address through mmu030_table_search/ATC.
+ * Guarded with TRY/CATCH so a malformed descriptor fails an assertion instead of
+ * unwinding out of the test.
+ * ================================================================== */
+static void test_mmu030_pagewalk(void)
+{
+	printf("[test] MMU030 2-level page-table walk (decision #6 test 2)\n");
+	harness_mem_reset();
+	currprefs.mmu_model = 68030;
+	currprefs.mmu_ec = 0;
+	currprefs.cpu_memory_cycle_exact = false;
+	mmu030_reset(1);
+	m68k_setpc(0x2000);
+
+	const uae_u32 TABLE_A = 0x09000000;   /* root table (1024 * 4B) */
+	const uae_u32 TABLE_B = 0x09001000;   /* second-level table     */
+	const uae_u32 PHYS_PG = 0x0A000000;   /* physical page frame    */
+	const uae_u32 L       = 0x00405678;   /* logical address to map */
+
+	/* index math for TIA/TIB=10, IS=0, PS=12 */
+	uae_u32 ai = (L >> 22) & 0x3FF;       /* table A index = 1   */
+	uae_u32 bi = (L >> 12) & 0x3FF;       /* table B index = 5   */
+	uae_u32 off = L & 0xFFF;              /* page offset = 0x678 */
+
+	/* TableA[ai] = VALID4 (type 2) descriptor -> TableB base */
+	hram_poke32(TABLE_A + ai * 4, (TABLE_B & 0xFFFFFFF0u) | 0x2u);
+	/* TableB[bi] = PAGE (type 1) descriptor -> physical page (bits 31-8) */
+	hram_poke32(TABLE_B + bi * 4, (PHYS_PG & 0xFFFFFF00u) | 0x1u);
+
+	/* Root pointers (set directly): upper longword = limit 0x7FFF (upper limit,
+	 * passes all indices) | type 2 (VALID4); lower = TableA base. Both SRP & CRP
+	 * point at the same root so the test works regardless of SRE/fc selection. */
+	uae_u64 rp = ((uae_u64)0x7FFF0002u << 32) | (TABLE_A & 0xFFFFFFF0u);
+	srp_030 = rp;
+	crp_030 = rp;
+
+	/* Enable translation with a valid TC (PS=12, TIA=10, TIB=10). */
+	tc_030 = Z_TC_ENABLE | (12u << 20) | (10u << 12) | (10u << 8);
+	bool tc_err = mmu030_decode_tc(tc_030, false);   /* returns true on ERROR */
+	CHECK(!tc_err, "decode_tc accepted valid TC for page walk\n");
+
+	uae_u32 phys = 0; bool faulted = false;
+	TRY(p) {
+		phys = mmu030_translate(L, true, true, false);
+	} CATCH(p) {
+		faulted = true; (void)p;
+	} ENDTRY
+	CHECK(!faulted, "page walk completed without bus fault\n");
+	CHECK_EQ32(phys, PHYS_PG | off, "logical 0x00405678 -> physical 0x0A000678");
+
+	/* A second access to the same page should hit the ATC and give the same result. */
+	faulted = false;
+	TRY(p2) {
+		phys = mmu030_translate(L & ~0xFFFu, true, true, false);
+	} CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	CHECK(!faulted, "ATC re-access no fault\n");
+	CHECK_EQ32(phys, PHYS_PG, "ATC hit: page base maps to physical page base");
+
+	currprefs.mmu_model = 0;
+	mmu030_reset(1);
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -303,6 +369,7 @@ int main(int argc, char **argv)
 	test_movem();
 	test_misaligned_long();
 	test_mmu030_ttr();
+	test_mmu030_pagewalk();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
