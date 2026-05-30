@@ -83,6 +83,12 @@ typedef struct
 #include "jit/compemu.h"
 #endif
 
+/* 020/030 prefetch pipeline depth — needed by the WinUAE 4.4.0 MMU engine
+ * (cpummu030.cpp) imported for UAE_030_MMU. */
+#ifndef CPU_PIPELINE_MAX
+#define CPU_PIPELINE_MAX 4
+#endif
+
 struct regstruct
 {
 	uae_u32 regs[16];
@@ -137,6 +143,24 @@ struct regstruct
 	uae_u32 itt0, itt1, dtt0, dtt1;
 	uae_u32 tcr, mmusr, urp, srp;
 	uae_u32 mmu_fault_addr;
+
+	/* MMU engine state required by the imported WinUAE 4.4.0 cpummu030.cpp /
+	 * cpummu.cpp (UAE_030_MMU). Field types/order verbatim from WinUAE 4.4.0
+	 * newcpu.h so the engine and its (gencpu-generated) cpuemu_31 agree. */
+	uae_u32 mmu_fslw;            /* 060 fault status longword */
+	uae_u32 mmu_effective_addr;  /* EA at fault */
+	uae_u16 mmu_ssw;             /* 030/040 special status word (bus-error frame) */
+	uae_u32 wb2_address;
+	uae_u32 wb3_data;
+	uae_u8  wb3_status, wb2_status;
+	int     mmu_enabled;         /* per-regs MMU-active fast-path flag */
+	int     mmu_page_size;       /* cached from TC */
+	uae_u16 prefetch020[CPU_PIPELINE_MAX];
+	uae_u8  prefetch020_valid[CPU_PIPELINE_MAX];
+	int     pipeline_pos;
+	int     pipeline_r8[2];
+	int     pipeline_stop;
+	uae_u8  fc030;               /* function code for 030 bus cycle */
 
 	uae_u32 pcr;
 	uae_u32 address_space_mask;
@@ -369,6 +393,67 @@ STATIC_INLINE void m68k_setpc_normal(uaecptr pc)
 
 extern void check_t0_trace(void);
 
+/* 030/040 MMU + cache memory accessors, imported from WinUAE 4.4.0 newcpu.h for
+ * UAE_030_MMU. The 030 function pointers and the dcache030/icache functions are
+ * referenced by the inline wrappers in cpummu030.h and cpummu.h; defined in
+ * cpummu030.cpp and newcpu.cpp. (Stripped from this tree's faked-MMU build.) */
+extern uae_u32(*read_data_030_bget)(uaecptr);
+extern uae_u32(*read_data_030_wget)(uaecptr);
+extern uae_u32(*read_data_030_lget)(uaecptr);
+extern void(*write_data_030_bput)(uaecptr,uae_u32);
+extern void(*write_data_030_wput)(uaecptr,uae_u32);
+extern void(*write_data_030_lput)(uaecptr,uae_u32);
+
+extern uae_u32(*read_data_030_fc_bget)(uaecptr, uae_u32);
+extern uae_u32(*read_data_030_fc_wget)(uaecptr, uae_u32);
+extern uae_u32(*read_data_030_fc_lget)(uaecptr, uae_u32);
+extern void(*write_data_030_fc_bput)(uaecptr, uae_u32, uae_u32);
+extern void(*write_data_030_fc_wput)(uaecptr, uae_u32, uae_u32);
+extern void(*write_data_030_fc_lput)(uaecptr, uae_u32, uae_u32);
+
+extern void write_dcache030_bput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_wput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_lput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_retry(uaecptr addr, uae_u32 v, uae_u32 fc, int size, int flags);
+extern uae_u32 read_dcache030_bget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_wget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_lget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_retry(uaecptr addr, uae_u32 fc, int size, int flags);
+
+extern void write_dcache030_mmu_bput(uaecptr, uae_u32);
+extern void write_dcache030_mmu_wput(uaecptr, uae_u32);
+extern void write_dcache030_mmu_lput(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_mmu_bget(uaecptr);
+extern uae_u32 read_dcache030_mmu_wget(uaecptr);
+extern uae_u32 read_dcache030_mmu_lget(uaecptr);
+extern void write_dcache030_lrmw_mmu(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_lrmw_mmu_fcx(uaecptr, uae_u32, uae_u32, int);
+extern uae_u32 read_dcache030_lrmw_mmu(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_lrmw_mmu_fcx(uaecptr, uae_u32, int);
+
+extern uae_u32 get_word_icache030(uaecptr addr);
+extern uae_u32 get_long_icache030(uaecptr addr);
+
+uae_u32 fill_icache040(uae_u32 addr);
+extern void put_long_cache_040(uaecptr, uae_u32);
+extern void put_word_cache_040(uaecptr, uae_u32);
+extern void put_byte_cache_040(uaecptr, uae_u32);
+extern uae_u32 get_ilong_cache_040(int);
+extern uae_u32 get_iword_cache_040(int);
+extern uae_u32 get_long_cache_040(uaecptr);
+extern uae_u32 get_word_cache_040(uaecptr);
+extern uae_u32 get_byte_cache_040(uaecptr);
+extern uae_u32 next_iword_cache040(void);
+extern uae_u32 next_ilong_cache040(void);
+extern uae_u32 get_word_icache040(uaecptr addr);
+extern uae_u32 get_long_icache040(uaecptr addr);
+
+extern uae_u32 sfc_nommu_get_byte(uaecptr);
+extern uae_u32 sfc_nommu_get_word(uaecptr);
+extern uae_u32 sfc_nommu_get_long(uaecptr);
+extern void dfc_nommu_put_byte(uaecptr, uae_u32);
+extern void dfc_nommu_put_word(uaecptr, uae_u32);
+extern void dfc_nommu_put_long(uaecptr, uae_u32);
 
 extern void (*x_do_cycles)(int);
 extern void (*x_do_cycles_pre)(int);
