@@ -249,6 +249,7 @@ STATIC_INLINE void unset_special(uae_u32 x)
 #define m68k_dreg(r,num) ((r).regs[(num)])
 #define m68k_areg(r,num) (((r).regs + 8)[(num)])
 
+extern uae_u32(*x_prefetch)(int);   /* WinUAE 4.4.0 MMU engine (cpummu030.cpp) */
 extern uae_u32(*x_get_byte)(uaecptr addr);
 extern uae_u32(*x_get_word)(uaecptr addr);
 extern uae_u32(*x_get_long)(uaecptr addr);
@@ -553,6 +554,31 @@ extern void cpu_change(int newmodel);
 extern void cpu_fallback(int mode);
 
 extern void fill_prefetch(void);
+extern void fill_prefetch_020_ntx(void);   /* WinUAE 4.4.0 MMU engine */
+extern void fill_prefetch_030_ntx(void);
+extern void fill_prefetch_030_ntx_continue(void);
+extern void fill_prefetch_020(void);
+extern void fill_prefetch_030(void);
+
+/* Cycle-exact memory-access-with-delay helpers (WinUAE 4.4.0 newcpu.h). The
+ * imported MMU engine references these in its CE paths; the Z3660 runs the MMU
+ * in direct (non-CE) mode so they are not on the hot path, but must resolve.
+ * Defined as pass-throughs in newcpu_mmu_glue.cpp. */
+void mem_access_delay_long_write_ce020 (uaecptr addr, uae_u32 v);
+void mem_access_delay_word_write_ce020 (uaecptr addr, uae_u32 v);
+void mem_access_delay_byte_write_ce020 (uaecptr addr, uae_u32 v);
+uae_u32 mem_access_delay_byte_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_word_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_long_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_longi_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_wordi_read_ce020 (uaecptr addr);
+void mem_access_delay_long_write_c040 (uaecptr addr, uae_u32 v);
+void mem_access_delay_word_write_c040 (uaecptr addr, uae_u32 v);
+void mem_access_delay_byte_write_c040 (uaecptr addr, uae_u32 v);
+uae_u32 mem_access_delay_byte_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_word_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_long_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_longi_read_c040 (uaecptr addr);
 
 #define CPU_OP_NAME(a) op ## a
 

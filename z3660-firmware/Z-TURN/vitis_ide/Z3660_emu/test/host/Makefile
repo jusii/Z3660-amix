@@ -24,7 +24,8 @@ CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions \
 UAE_SRCS := newcpu.cpp newcpu_common.cpp readcpu.cpp cpudefs.cpp cpustbl.cpp \
             memory.cpp events.cpp fpp.cpp \
             cpuemu_0.cpp cpuemu_4.cpp cpuemu_11.cpp cpuemu_13.cpp \
-            cpuemu_40.cpp cpuemu_44.cpp
+            cpuemu_40.cpp cpuemu_44.cpp \
+            cpummu030.cpp cpummu.cpp newcpu_mmu_glue.cpp
 
 HOST_SRCS := board_stubs.cpp harness_main.cpp
 
