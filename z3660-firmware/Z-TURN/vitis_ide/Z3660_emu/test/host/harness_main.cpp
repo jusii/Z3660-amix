@@ -442,6 +442,55 @@ static void test_mmu030_pflush(void)
 	currprefs.mmu_model = 0; mmu030_reset(1);
 }
 
+/* ==================================================================
+ * MMU030 interpreter end-to-end: execute an instruction through the generated
+ * cpuemu_32 (op_smalltbl_32_ff) handlers, fetching the opcode from a *virtual*
+ * code page that the MMU translates. Proves build_cpufunctbl(mode 4) +
+ * set_x_funcs(MMU arm, x_prefetch=get_iword_mmu030) + the page-table walk all
+ * cooperate to run translated code (the m68k_run_mmu030 inner step).
+ * ================================================================== */
+static void test_mmu030_interp_exec(void)
+{
+	printf("[test] MMU030 interpreter executes from a translated virtual page\n");
+	const uae_u32 VCODE = 0x00408000;        /* virtual code addr (TableA[1] range) */
+	const uae_u32 BI_C  = (VCODE >> 12) & 0x3FF;
+	const uae_u32 PCODE = 0x0C000000;        /* physical code frame  */
+
+	mmu_pt_init();                           /* mmu_model=68030, TC enabled */
+	currprefs.cpu_model = 68030;
+	mmu_map_page(BI_C, PCODE);
+	mmu030_flush_atc_all();
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x7042);   /* moveq #$42,d0 at phys */
+
+	init_m68k();
+	build_cpufunctbl();          /* mmu_model set -> mode 4 -> op_smalltbl_32_ff */
+	harness_set_x_funcs();       /* MMU arm: x_prefetch = get_iword_mmu030 */
+
+	regs.s = 1;
+	m68k_dreg(regs, 0) = 0;
+	m68k_setpc(VCODE);
+
+	/* one m68k_run_mmu030 inner iteration */
+	mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+	mmu030_opcode = -1;
+	bool faulted = false;
+	TRY(p) {
+		regs.opcode = x_prefetch(0);          /* translate VCODE->PCODE, read 0x7042 */
+		mmu030_opcode = regs.opcode;
+		mmu030_idx_done = 0;
+		regs.opcode = regs.irc = mmu030_opcode;
+		mmu030_idx = 0; mmu030_retry = false;
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	CHECK(!faulted, "MMU interpreter step did not fault\n");
+	CHECK_EQ32(regs.opcode, 0x7042, "opcode fetched via MMU from virtual page");
+	CHECK_EQ32(m68k_dreg(regs, 0), 0x42, "moveq executed via cpuemu_32 (op_smalltbl_32_ff)");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+	cpu_bringup(68030);          /* restore the non-MMU cpufunctbl for any later use */
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -466,6 +515,7 @@ int main(int argc, char **argv)
 	test_mmu030_fault_restart();
 	test_mmu030_lrmw();
 	test_mmu030_pflush();
+	test_mmu030_interp_exec();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

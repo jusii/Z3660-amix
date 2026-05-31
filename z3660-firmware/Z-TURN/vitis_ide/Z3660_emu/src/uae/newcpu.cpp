@@ -671,6 +671,7 @@ static void set_x_funcs (void)
       // fault-safe handlers also use the read_data_030_*/write_data_030_*
       // pointers, repointed here from their physical defaults to the
       // translating uae_mmu030_* accessors. (Verbatim shape from WinUAE 4.4.0.)
+      x_prefetch = get_iword_mmu030;     // opcode fetch in m68k_run_mmu030
       x_get_iword = get_iword_mmu030;
       x_next_iword = next_iword_mmu030;
       x_next_ilong = next_ilong_mmu030;
@@ -3841,6 +3842,89 @@ static void m68k_run_2_020(void)
    }
 }
 
+// UAE_030_MMU run loop. Fetches opcodes through the MMU (x_prefetch =
+// get_iword_mmu030) and dispatches the fault-restartable cpuemu_32 handlers
+// (op_smalltbl_32_ff). Adapted from WinUAE 4.4.0 m68k_run_mmu030 for the Z3660
+// (non-cycle-exact, non-compatible). On a page fault the cpummu030 engine THROWs;
+// we restore flags, build the 030 bus-error frame via Exception() and resume.
+static void m68k_run_mmu030(void)
+{
+   struct flag_struct f;
+   int halt = 0;
+
+   mmu030_opcode_stageb = -1;
+   mmu030_fake_prefetch = -1;
+   while (!halt) {
+      TRY(prb) {
+         for (;;) {
+            int cnt;
+insretry:
+            regs.instruction_pc = m68k_getpc();
+            f = regs.ccrflags;
+
+            mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+            mmu030_opcode = -1;
+            if (mmu030_opcode_stageb < 0) {
+               regs.opcode = x_prefetch(0);
+            } else {
+               regs.opcode = mmu030_opcode_stageb;
+               mmu030_opcode_stageb = -1;
+            }
+            mmu030_opcode = regs.opcode;
+            mmu030_idx_done = 0;
+
+            cnt = 50;
+            for (;;) {
+               regs.opcode = regs.irc = mmu030_opcode;
+               mmu030_idx = 0;
+               mmu030_retry = false;
+
+               count_instr(regs.opcode);
+               do_cycles(cpu_cycles);
+               cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+
+               cnt--; // don't loop forever if things go wrong
+               if (!mmu030_retry)
+                  break;
+               if (cnt < 0) {
+                  cpu_halt(CPU_HALT_CPU_STUCK);
+                  break;
+               }
+               if (mmu030_retry && mmu030_opcode == -1)
+                  goto insretry;
+            }
+
+            mmu030_opcode = -1;
+            cpu_cycles = adjust_cycles(cpu_cycles);
+            check_uae_int_request();
+            if (regs.spcflags) {
+               if (do_specialties(cpu_cycles))
+                  return;
+            }
+         }
+      } CATCH(prb) {
+         if (mmu030_opcode == -1) {
+            // fault during opcode prefetch
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else {
+            regs.ccrflags = f;
+            cpu_restore_fixup();
+         }
+         m68k_setpci(regs.instruction_pc);
+         TRY(prb2) {
+            Exception(prb);
+         } CATCH(prb2) {
+            halt = 1;
+         } ENDTRY
+      } ENDTRY
+   }
+   cpu_halt(halt);
+}
+
 static int in_m68k_go = 0;
 
 static bool cpu_hardreset, cpu_keyboardreset;
@@ -4048,7 +4132,9 @@ void m68k_go (int may_quit)
          }
       }
 
-      run_func = currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
+      run_func =
+         currprefs.mmu_model == 68030 ? m68k_run_mmu030 :   // UAE_030_MMU
+         currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
          currprefs.cpu_compatible && currprefs.cpu_model <= 68010 ? m68k_run_1 :
 #ifdef JIT
          currprefs.cpu_model >= 68020 && currprefs.cachesize ? m68k_run_jit :
