@@ -48,11 +48,15 @@ LDFLAGS := $(CFLAGS) -T $(LDSCRIPT) -specs=$(SRCDIR)/Xilinx.spec \
 # Sources (musashi/uae emulators)
 C_SRCS   := $(shell find $(SRCDIR) -type f -name "*.c")
 CXX_SRCS := $(shell find $(SRCDIR) -type f \( -name "*.cc" -o -name "*.cpp" -o -name "*.cxx" \))
-# Exclude specific files
+# Exclude specific files.
+# NB: main.cpp and set_cpu_freq.cpp are byte-identical twins of main.cc / set_cpu_freq.cc;
+# both members of each pair map to the same build/<base>.o (collision fixed for main in
+# 623c315). Filter out the .cpp of each twin so only the .cc is built.
 C_SRCS   := $(filter-out $(SRCDIR)/musashi/m68kfpu.c,$(C_SRCS))
 CXX_SRCS := $(filter-out \
 	$(SRCDIR)/uae/fpp_native.cpp \
 	$(SRCDIR)/main.cpp \
+	$(SRCDIR)/set_cpu_freq.cpp \
 	$(SRCDIR)/uae/jit/codegen_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm2.cpp,$(CXX_SRCS))
