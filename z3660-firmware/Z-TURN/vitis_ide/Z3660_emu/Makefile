@@ -52,6 +52,7 @@ CXX_SRCS := $(shell find $(SRCDIR) -type f \( -name "*.cc" -o -name "*.cpp" -o -
 C_SRCS   := $(filter-out $(SRCDIR)/musashi/m68kfpu.c,$(C_SRCS))
 CXX_SRCS := $(filter-out \
 	$(SRCDIR)/uae/fpp_native.cpp \
+	$(SRCDIR)/main.cpp \
 	$(SRCDIR)/uae/jit/codegen_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm2.cpp,$(CXX_SRCS))
