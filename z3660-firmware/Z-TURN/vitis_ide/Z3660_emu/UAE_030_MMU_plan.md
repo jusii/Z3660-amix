@@ -1,6 +1,16 @@
 # Plan: Enable real 68030 MMU in the UAE (WinUAE) emulator core
 
-> **Status: design / not started.** This is the prerequisite for running AMIX
+> **Status: IMPLEMENTED (branch `uae-030-mmu`), pending on-hardware AMIX boot.**
+> The `UAE_030_MMU` boot mode exists end to end: the WinUAE-4.4.0 030 MMU engine
+> is imported and translates correctly (host harness, 49/49 incl. a `moveq`
+> executed from a translated virtual page), the generated `cpuemu_32` MMU
+> instruction table + `m68k_run_mmu030` run loop are wired, the mode is selectable
+> via the threaded `BOOTMODE` enum, and **the emulator firmware cross-compiles +
+> links for ARM** (`make z3660_emu`, clean). Remaining: boot AMIX on real hardware
+> (the only step the host harness can't do), the on-target C++-unwind gate
+> (decision #7), and the 68040-MMU stretch goal. See the Progress log below.
+>
+> This is the prerequisite for running AMIX
 > (Amiga Unix) and any other MMU-dependent OS on the Z3660. The companion
 > Ethernet-driver plan that depends on this living at
 > [../../../../z3660-drivers/amix/AMIX_ethernet_driver_plan.md](../../../../z3660-drivers/amix/AMIX_ethernet_driver_plan.md).
@@ -129,7 +139,34 @@ for context but read these first.
     **`cpu_compatible = false`** ("More Compatible" OFF; ON panics AMIX), JIT off,
     A3000-class only.
 
-### Progress log (implementation, 2026-05-30 branch `uae-030-mmu`)
+### Progress log (implementation, 2026-05-30/31 branch `uae-030-mmu`)
+
+**FINAL STATUS (2026-05-31): Phases 0-4 + 7 implemented; emulator builds for ARM.**
+- **Phase 1 (engine):** WinUAE 4.4.0 `cpummu030.cpp`/`cpummu.cpp` imported; all 5
+  decision-#6 scenarios pass in the host harness (TTR, page-table walk,
+  fault->map->restart, LRMW, PFLUSH/ATC).
+- **Phase 2 (faithful table):** `cpuemu_32.cpp` (id 32 = 68030 MMU, NOT 31)
+  generated with WinUAE 4.4.0 gencpu, integrated via `cpustbl_mmu030.cpp`
+  (op_smalltbl_32_ff), wired into `cputbls[5][5]` column 4 + `build_cpufunctbl`.
+- **Phase 3 (wiring):** real `mmu_op30` dispatch + `set_x_funcs` MMU arm
+  (x_*->*_mmu030, read_data_030_*->uae_mmu030_*); `uae_emulator(...,enable_mmu)`
+  sets `mmu_model`, JIT off, `cpu_compatible=false`.
+- **Phase 4 (run loop):** `m68k_run_mmu030` (translated opcode fetch via
+  `x_prefetch=get_iword_mmu030`, fault-restart, `mmu030_retry`); `m68k_go`
+  selects it. **Harness proves a `moveq` runs from a translated virtual page.**
+- **Phase 7 (selection):** `UAE_030_MMU` appended to the `BOOTMODE` enum in ALL
+  replicas (Z3660_emu/main.{h,cc}, Z3660/config_file.{h,c}, ZTop/Ztop.c,
+  ARM_ztop/list_button.{c,h}) + labels + `static_assert` tripwire; the bare-`else`
+  dispatch landmine (decision #8) is fixed in both `main.cc` blocks.
+- **ARM build VERIFIED:** clean `make z3660_emu` in docker -> `Z3660_emu.elf`/`.bin`
+  with the full MMU stack. Fixed `usleep2` (committed) and a latent
+  `main.cc`/`main.cpp`->`build/main.o` collision along the way.
+- **NOT done / next:** boot AMIX on real hardware (host harness can't); the
+  on-target C++-unwind gate (decision #7, hardware-only); 68040-MMU stretch
+  (`cpuemu_31`). The `z3660` *control core* has SEPARATE pre-existing USB-driver
+  build breaks in the docker path (`ch9.h __packed`, `usb_int_msg` arity) that are
+  unrelated to the MMU work and block only the full `BOOT.BIN`.
+
 
 **Phase 0 — DONE.** gencpu host toolchain builds; the non-MMU baseline is green
 ([test/gencpu/](test/gencpu/)): this tree's `cpuemu_4/11/13/44` are byte-identical
