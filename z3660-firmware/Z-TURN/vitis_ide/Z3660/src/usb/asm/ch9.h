@@ -37,6 +37,12 @@
 #include <usb/asm/byteorder.h>	/* le16_to_cpu */
 #include <usb/asm/unaligned.h>	/* get_unaligned() */
 
+/* Z3660: __packed (the Linux-kernel-ism used by the `struct __packed ...` decls
+ * below) is not provided by arm-none-eabi/newlib in the docker build path. */
+#ifndef __packed
+#define __packed __attribute__((__packed__))
+#endif
+
 /*-------------------------------------------------------------------------*/
 
 /* CONTROL REQUEST SUPPORT */

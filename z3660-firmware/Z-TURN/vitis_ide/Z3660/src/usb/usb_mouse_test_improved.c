@@ -26,7 +26,8 @@ static void test_mouse_manual_polling(struct usb_device *mouse_dev, int endpoint
     int timeout_ms = 50;
     
     for (int i = 0; i < 30; i++) { // Try 30 times
-        int ret = usb_int_msg(NULL, mouse_dev, usb_rcvintpipe(mouse_dev, endpoint),
+        // usb_int_msg(dev, pipe, buffer, len, interval) -- had a stray leading NULL
+        int ret = usb_int_msg(mouse_dev, usb_rcvintpipe(mouse_dev, endpoint),
                              buffer, maxpacketsize, timeout_ms);
         
         if (ret > 0) {
