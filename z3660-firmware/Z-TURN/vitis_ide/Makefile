@@ -18,14 +18,19 @@ WINE          ?= MVK_CONFIG_LOG_LEVEL=0 WINEDEBUG=-all wine
 # Example: BOOTGEN_EXE_HOST ?= /opt/Xilinx/Vivado/2021.2/bin/bootgen.exe
 # Example: BOOTGEN_EXE_HOST ?= $(HOME)/.wine/drive_c/Xilinx/bin/bootgen.exe
 #BOOTGEN_EXE_HOST := $(HOME)/.wine64/drive_c/Xilinx/bin/bootgen.exe
-BOOTGEN_EXE_HOST := $(HOME)/git/zynq-mkbootimage/mkbootimage
+# Prefer an mkbootimage on PATH (the docker build image ships one in
+# /usr/local/bin); fall back to the host checkout. Overridable from the
+# command line / environment.
+BOOTGEN_EXE_HOST ?= $(or $(shell command -v mkbootimage 2>/dev/null),$(HOME)/git/zynq-mkbootimage/mkbootimage)
 MAKE = make
 
-# Paths (Unix side)
+# Paths (Unix side). system_cli.bif uses explicit ELF paths (mkbootimage-friendly)
+# and is committed; the old default (system_macos.bif) is not in the repo, so a
+# clean Linux/docker checkout could never assemble BOOT.BIN.
 ifeq ($(OS),Windows_NT)
 	BIF_FILE = system.bif
 else
-	BIF_FILE = system_macos.bif
+	BIF_FILE ?= system_cli.bif
 endif
 BIF           := Z3660_system/Alfa/$(BIF_FILE)
 BOOTBIN       := Z3660_system/Alfa/sd_card/BOOT.BIN
