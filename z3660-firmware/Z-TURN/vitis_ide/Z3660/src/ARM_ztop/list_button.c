@@ -36,6 +36,7 @@ void b_list_emu_action(void)
       "030 UAE JIT emu ",
       "040 UAE emu     ",
       "040 UAE JIT emu ",
+      "030 UAE MMU emu ",   // index-aligned with BOOTMODE; append-only
    };
    for(int i=0;i<NUM_BOOT_MODE_LABELS;i++)
    {

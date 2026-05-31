@@ -904,12 +904,16 @@ extern "C" void make_dummy_address_bank(uint32_t address)
    int add=address>>16;
    RANGE_MAP(add,add,dmmy_bank); // dummy
 }
-void uae_emulator(int enable_jit, int cpu_model)
+void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
 {
-   z3660_printf("[Core1] Starting UAE%s_%s emulator\n",enable_jit?"JIT":"",cpu_model==68030?"030":"040");
+   z3660_printf("[Core1] Starting UAE%s_%s%s emulator\n",enable_jit?"JIT":"",cpu_model==68030?"030":"040",enable_mmu?"_MMU":"");
    currprefs.cpu_model              = changed_prefs.cpu_model=cpu_model;
    currprefs.fpu_model              = changed_prefs.fpu_model=cpu_model==68030?68882:68040;
-   currprefs.mmu_model              = changed_prefs.mmu_model=0;//enable_jit?0:cpu_model;
+   // UAE_030_MMU: real 68030 PMMU. enable_mmu and JIT are mutually exclusive (the
+   // JIT inlines direct pointers and cannot restart on faults); callers pass
+   // enable_jit=0 for MMU mode, so cachesize stays 0 below. cpu_compatible stays
+   // false (AMIX kernel-panics with "More Compatible" on).
+   currprefs.mmu_model              = changed_prefs.mmu_model=enable_mmu?cpu_model:0;
    currprefs.cpu_compatible         = changed_prefs.cpu_compatible=false;
    currprefs.address_space_24       = changed_prefs.address_space_24=false;
    currprefs.cpu_cycle_exact        = changed_prefs.cpu_cycle_exact=false;

@@ -254,6 +254,7 @@ enum {
    UAEJIT_030,
    UAE_040,
    UAEJIT_040,
+   UAE_030_MMU,        // index-aligned with the firmware BOOTMODE enums; append-only
    NUM_BOOTMODES
 };
 char bootmode_names[NUM_BOOTMODES][25]={
@@ -265,6 +266,7 @@ char bootmode_names[NUM_BOOTMODES][25]={
    "030 UAE JIT emu ",
    "040 UAE emu     ",
    "040 UAE JIT emu ",
+   "030 UAE MMU emu ",
 };
 
 #define KS_CHARS "012345678901234567890123456789"

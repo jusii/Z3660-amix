@@ -107,6 +107,7 @@ const char *bootmode_names[BOOTMODE_NUM] = {
       "UAEJIT_030",
       "UAE_040",
       "UAEJIT_040",
+      "UAE_030_MMU",
 };
 const char *yesno_names[YESNO_NUM] = {
       "NO",
@@ -210,11 +211,12 @@ void write_config_file(char *filename)
    print_line(&fil,"\n");
    print_line(&fil,"##General Configuration\n");
    print_line(&fil,"\n");
-   print_line(&fil,"# Select boot mode:  \"MOBOCPU\" for Mother Board CPU, \"CPU\" for 060 CPU, \"MUSASHI\" \"UAE\" or \"UAEJIT\" for emulator\n");
+   print_line(&fil,"# Select boot mode:  \"MOBOCPU\" for Mother Board CPU, \"CPU\" for 060 CPU, \"MUSASHI\" \"UAE\" or \"UAEJIT\" for emulator, \"UAE_030_MMU\" for 68030 with real MMU (AMIX)\n");
    print_line(&fil,"#bootmode MOBOCPU\n");
    print_line(&fil,"#bootmode CPU\n");
    print_line(&fil,"#bootmode MUSASHI\n");
    print_line(&fil,"#bootmode UAE\n");
+   print_line(&fil,"#bootmode UAE_030_MMU\n");
    print_line(&fil,"bootmode UAEJIT\n");
    print_line(&fil,"\n");
    print_line(&fil,"# Select 060 CPU frequency in MHz\n");

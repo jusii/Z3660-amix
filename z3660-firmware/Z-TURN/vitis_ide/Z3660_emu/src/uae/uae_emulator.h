@@ -8,7 +8,7 @@
 #ifndef SRC_UAE_UAE_EMULATOR_H_
 #define SRC_UAE_UAE_EMULATOR_H_
 
-void uae_emulator(int enable_jit, int cpu_model);
+void uae_emulator(int enable_jit, int cpu_model, int enable_mmu = 0);
 
 
 #endif /* SRC_UAE_UAE_EMULATOR_H_ */

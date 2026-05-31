@@ -113,8 +113,15 @@ enum BOOTMODE{
    UAEJIT_030,
    UAE_040,
    UAEJIT_040,
+   UAE_030_MMU,        // appended at end so stored indices/configs keep meaning
    BOOTMODE_NUM
 };
+// Tripwire: this enum is replicated index-aligned in ../Z3660/src/config_file.h,
+// z3660-drivers/ZTop/Ztop.c and ../Z3660/src/ARM_ztop. Keep all in sync; append
+// new modes at the end only. (See UAE_030_MMU_plan.md Phase 7.)
+#if defined(__cplusplus)
+static_assert(BOOTMODE_NUM == 8, "BOOTMODE changed: update the replicas in config_file.h / Ztop.c / ARM_ztop");
+#endif
 typedef struct {
    uint32_t load_rom_emu;
    uint32_t load_romext_emu;
