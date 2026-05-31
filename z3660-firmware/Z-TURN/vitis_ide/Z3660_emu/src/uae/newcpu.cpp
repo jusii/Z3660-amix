@@ -665,6 +665,30 @@ static void set_x_funcs (void)
          x_do_cycles_pre = do_cycles;
          x_do_cycles_post = do_cycles_post;
       }
+   } else if (currprefs.mmu_model == 68030) {
+      // UAE_030_MMU: route every CPU memory access through the 68030 MMU
+      // translating accessors (cpummu030.h inlines). The generated cpuemu_31
+      // fault-safe handlers also use the read_data_030_*/write_data_030_*
+      // pointers, repointed here from their physical defaults to the
+      // translating uae_mmu030_* accessors. (Verbatim shape from WinUAE 4.4.0.)
+      x_get_iword = get_iword_mmu030;
+      x_next_iword = next_iword_mmu030;
+      x_next_ilong = next_ilong_mmu030;
+      x_put_long = put_long_mmu030;
+      x_put_word = put_word_mmu030;
+      x_put_byte = put_byte_mmu030;
+      x_get_long = get_long_mmu030;
+      x_get_word = get_word_mmu030;
+      x_get_byte = get_byte_mmu030;
+      x_do_cycles = do_cycles;
+      x_do_cycles_pre = do_cycles;
+      x_do_cycles_post = do_cycles_post;
+      read_data_030_bget = uae_mmu030_get_byte;
+      read_data_030_wget = uae_mmu030_get_word;
+      read_data_030_lget = uae_mmu030_get_long;
+      write_data_030_bput = uae_mmu030_put_byte;
+      write_data_030_wput = uae_mmu030_put_word;
+      write_data_030_lput = uae_mmu030_put_long;
    } else {
       // 68020+ no ce
       set_x_ifetches();
@@ -2430,13 +2454,23 @@ bool mmu_op30 (uaecptr pc, uae_u32 opcode, uae_u16 extra, uaecptr extraa)
    case 0:
    case 2:
    case 3:
-      fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
+      // UAE_030_MMU: real PMOVE actually loads TC/SRP/CRP/TT into the engine.
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pmove (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
       break;
    case 1:
-      fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pflush (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
       break;
    case 4:
-      fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_ptest (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
       break;
    }
    if (fline) {
