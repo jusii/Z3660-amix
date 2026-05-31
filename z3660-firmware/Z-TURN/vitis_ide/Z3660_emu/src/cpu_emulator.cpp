@@ -1844,6 +1844,17 @@ unsigned int  m68k_read_disassembler_32(unsigned int address)
 {
    return(read_long(address));
 }
+
+/*
+ * newcpu.cpp renames Xilinx sleep.h's usleep -> usleep2 (to avoid a clash with
+ * UAE's own declarations) but never provides the backing symbol, so it ends up
+ * with undefined references to usleep2. Define it here, where the real Xilinx
+ * usleep() is in scope, with C linkage to match the renamed extern "C" decl.
+ */
+void usleep2(ULONG useconds)
+{
+   usleep(useconds);
+}
 #ifdef __cplusplus
 }
 #endif
