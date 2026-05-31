@@ -110,6 +110,10 @@ void do_cycles_ce(int){ }
 bool is_cycle_ce(uaecptr){ return false; }
 extern "C" void reset_autoconfig(void){ }
 
+/* Host backing for newcpu.cpp's renamed usleep (firmware defines this in
+ * cpu_emulator.cpp, which the harness excludes). */
+extern "C" void usleep2(unsigned long useconds){ usleep(useconds); }
+
 /* Board signal variables (defined in cpu_emulator.cpp on target) */
 int ovl = 0;
 int read_irq = 0;

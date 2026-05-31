@@ -349,6 +349,99 @@ static void test_mmu030_pagewalk(void)
 	mmu030_reset(1);
 }
 
+/* ==================================================================
+ * Shared 2-level page-table fixture for MMU tests 3-5.
+ *   TableA @ 0x09000000, TableB @ 0x09001000, SRP/CRP -> TableA, TC enabled.
+ *   Logical 0x004xxxxx uses TableA[1] -> TableB; bi = (L>>12)&0x3FF.
+ * ================================================================== */
+#define MPT_A     0x09000000u
+#define MPT_B     0x09001000u
+static void mmu_pt_init(void)
+{
+	harness_mem_reset();
+	currprefs.mmu_model = 68030;
+	currprefs.mmu_ec = 0;
+	currprefs.cpu_compatible = false;
+	currprefs.cpu_memory_cycle_exact = false;
+	mmu030_reset(1);
+	m68k_setpc(0x2000);
+	regs.s = 1;
+	hram_poke32(MPT_A + 1 * 4, (MPT_B & 0xFFFFFFF0u) | 0x2u);   /* TableA[1] -> TableB (VALID4) */
+	uae_u64 rp = ((uae_u64)0x7FFF0002u << 32) | (MPT_A & 0xFFFFFFF0u);
+	srp_030 = crp_030 = rp;
+	tc_030 = Z_TC_ENABLE | (12u << 20) | (10u << 12) | (10u << 8);
+	mmu030_decode_tc(tc_030, false);
+}
+static void mmu_map_page(uae_u32 bi, uae_u32 phys) { hram_poke32(MPT_B + bi * 4, (phys & 0xFFFFFF00u) | 0x1u); }
+static void mmu_unmap_page(uae_u32 bi)             { hram_poke32(MPT_B + bi * 4, 0u); } /* invalid descriptor */
+
+static void test_mmu030_fault_restart(void)
+{
+	printf("[test] MMU030 page fault -> map -> restart (decision #6 test 3)\n");
+	const uae_u32 L = 0x00405678, BI = 5, PHYS = 0x0A000000;
+	mmu_pt_init();
+	mmu_unmap_page(BI);
+	mmu030_flush_atc_all();
+
+	bool faulted = false;
+	TRY(p) { (void)mmu030_get_long(L, 5); } CATCH(p) { faulted = true; (void)p; } ENDTRY
+	CHECK(faulted, "unmapped logical access raises a bus fault (THROW)\n");
+
+	/* fault handler maps the page; flush stale ATC; restart succeeds */
+	mmu_map_page(BI, PHYS);
+	mmu030_flush_atc_all();
+	hram_poke32(PHYS | (L & 0xFFF), 0xCAFEBABE);
+	uae_u32 v = 0; faulted = false;
+	TRY(p2) { v = mmu030_get_long(L, 5); } CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	CHECK(!faulted, "restart after mapping does not fault\n");
+	CHECK_EQ32(v, 0xCAFEBABE, "restarted access reads the now-mapped page");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+}
+
+static void test_mmu030_lrmw(void)
+{
+	printf("[test] MMU030 locked RMW through translation (decision #6 test 4)\n");
+	const uae_u32 L = 0x00405678, BI = 5, PHYS = 0x0A000000, PA = PHYS | (L & 0xFFF);
+	mmu_pt_init();
+	mmu_map_page(BI, PHYS);
+	mmu030_flush_atc_all();
+	hram_poke32(PA, 0x11112222);
+
+	uae_u32 v = 0; bool faulted = false;
+	TRY(p) { v = uae_mmu030_get_lrmw(L, sz_long); } CATCH(p) { faulted = true; (void)p; } ENDTRY
+	CHECK(!faulted, "lrmw read no fault\n");
+	CHECK_EQ32(v, 0x11112222, "lrmw read returns translated value");
+	faulted = false;
+	TRY(p2) { uae_mmu030_put_lrmw(L, 0x33334444, sz_long); } CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	CHECK(!faulted, "lrmw write no fault\n");
+	CHECK_EQ32(hram_peek32(PA), 0x33334444, "lrmw write lands at translated physical");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+}
+
+static void test_mmu030_pflush(void)
+{
+	printf("[test] MMU030 PFLUSH / ATC invalidation (decision #6 test 5)\n");
+	const uae_u32 L = 0x00405678, BI = 5, PA = 0x0A000000, PB = 0x0B000000;
+	mmu_pt_init();
+	mmu_map_page(BI, PA);
+	mmu030_flush_atc_all();
+	hram_poke32(PA | (L & 0xFFF), 0xAAAA0000);
+	CHECK_EQ32(mmu030_get_long(L, 5), 0xAAAA0000, "initial mapping -> page A (caches ATC)");
+
+	/* remap to page B; without a flush the ATC still resolves to A */
+	mmu_map_page(BI, PB);
+	hram_poke32(PB | (L & 0xFFF), 0xBBBB1111);
+	CHECK_EQ32(mmu030_get_long(L, 5), 0xAAAA0000, "stale ATC still resolves to page A pre-flush");
+
+	/* PFLUSH (flush ATC) -> re-walk picks up the new mapping */
+	mmu030_flush_atc_all();
+	CHECK_EQ32(mmu030_get_long(L, 5), 0xBBBB1111, "after PFLUSH, mapping -> page B");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -370,6 +463,9 @@ int main(int argc, char **argv)
 	test_misaligned_long();
 	test_mmu030_ttr();
 	test_mmu030_pagewalk();
+	test_mmu030_fault_restart();
+	test_mmu030_lrmw();
+	test_mmu030_pflush();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
