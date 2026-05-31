@@ -24,6 +24,19 @@
 /* ---- cache-attribute table normally defined in custom.cpp (stripped here) ---- */
 uae_u8 ce_cachable[65536];
 
+/* Branch-trace debugger flag (cpuemu_32). Always off on the Z3660. */
+bool debugmem_trace = false;
+
+/* Savestate MMU fixup hook referenced by cpuemu_32 RTE/restore paths. The Z3660
+ * has no savestate, so nothing to fix up. */
+void cpu_restore_fixup(void) { }
+
+/* MMU-named bitfield aliases used by cpuemu_32 — forward to the real ones. */
+uae_u32 REGPARAM2 x_get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width)
+{ return get_bitfield(src, bdata, offset, width); }
+void REGPARAM2 x_put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width)
+{ put_bitfield(dst, bdata, val, offset, width); }
+
 /* ================= physical (post-MMU) access wrappers ================= */
 static uae_u32 z_phys_get_byte(uaecptr a){ return memory_get_byte(a); }
 static uae_u32 z_phys_get_word(uaecptr a){ return memory_get_word(a); }

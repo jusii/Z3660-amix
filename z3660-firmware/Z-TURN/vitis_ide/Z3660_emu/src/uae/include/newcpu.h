@@ -469,6 +469,10 @@ extern void m68k_cancel_idle(void);
 extern uae_u32 REGPARAM3 get_disp_ea_020(uae_u32 base) REGPARAM;
 extern uae_u32 REGPARAM3 get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width) REGPARAM;
 extern void REGPARAM3 put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width) REGPARAM;
+/* MMU-named aliases used by the generated cpuemu_32 (68030 MMU). Pure bit ops on
+ * already-loaded bdata[] (no memory access), so they just forward. */
+extern uae_u32 REGPARAM3 x_get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width) REGPARAM;
+extern void REGPARAM3 x_put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width) REGPARAM;
 
 extern int get_cpu_model(void);
 
@@ -488,6 +492,13 @@ extern int m68k_move2c(int, uae_u32*);
 extern int m68k_movec2(int, uae_u32*);
 extern int m68k_divl(uae_u32, uae_u32, uae_u16, uaecptr);
 extern int m68k_mull(uae_u32, uae_u32, uae_u16);
+/* The WinUAE 4.4.0 gencpu (cpuemu_32) emits 3-arg m68k_divl; this tree's real one
+ * takes the restart pc explicitly. Forward to it with the instruction pc. */
+static inline int m68k_divl(uae_u32 opcode, uae_u32 dst, uae_u16 extra)
+{ return m68k_divl(opcode, dst, extra, regs.instruction_pc); }
+/* WinUAE re-checks pending interrupts when SR intmask changes here; the Z3660
+ * path re-evaluates via the following MakeFromSR_T0()/spcflags, so this is inert. */
+static inline void MakeFromSR_intmask(uae_u16 oldsr, uae_u16 newsr) { (void)oldsr; (void)newsr; }
 extern void init_m68k(void);
 extern void m68k_go(int);
 extern int getMulu68kCycles(uae_u16 src);
