@@ -21,7 +21,12 @@
 #include "newcpu.h"
 #include "cpummu030.h"
 
-/* ---- cache-attribute table normally defined in custom.cpp (stripped here) ---- */
+/* ce_cachable: hardware cache-attribute table. Upstream owner is memory.cpp (def +
+ * memset/per-bank init) but that whole block is #if 0'd out in this fork, so this
+ * glue is the SOLE definition — if a future reinauer sync re-enables memory.cpp's
+ * block this becomes a multiple-definition link error. Left all-zero on purpose: the
+ * Z3660 emulates NO 030 data/instruction cache, so mmu030_cache_state stores a .cs
+ * hint in the ATC that never gates a real access. (custom.cpp does NOT own this.) */
 uae_u8 ce_cachable[65536];
 
 /* Branch-trace debugger flag (cpuemu_32). Always off on the Z3660. */
@@ -47,6 +52,13 @@ static void z_phys_put_byte(uaecptr a, uae_u32 v){ memory_put_byte(a, v); }
 static void z_phys_put_word(uaecptr a, uae_u32 v){ memory_put_word(a, v); }
 static void z_phys_put_long(uaecptr a, uae_u32 v){ memory_put_long(a, v); }
 
+/* These static initializers are LOAD-BEARING: the engine's physical accessors are
+ * otherwise (re)assigned only inside mmu030_set_funcs(), which runs solely from
+ * mmu030_reset(). m68k_reset_newcpu() now calls mmu030_reset() in MMU mode, so
+ * set_funcs does run on the firmware — but it re-points iword/ilong to the non-i
+ * phys_get_word/long (equivalent to these i-variant defaults for RAM execution,
+ * which is all AMIX does). Do NOT drop these defaults to NULL "because set_funcs
+ * sets them": the descriptor-walk path (cpummu030.cpp) would jump through null. */
 uae_u32 (*x_phys_get_iword)(uaecptr) = z_phys_get_iword;
 uae_u32 (*x_phys_get_ilong)(uaecptr) = z_phys_get_ilong;
 uae_u32 (*x_phys_get_byte)(uaecptr)  = z_phys_get_byte;

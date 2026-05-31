@@ -9,6 +9,12 @@
 
 #define MMU_DPAGECACHE030 1
 #define MMU_IPAGECACHE030 1
+/* Must stay 0 on this fork: the MMU_DIRECT_ACCESS path dereferences
+ * get_real_address(), which here is stubbed to `(uae_u8*)addr` (memory.h) rather
+ * than returning a real host buffer pointer. Direct access would bypass the
+ * byte-swap accessors — invalid on the 64-bit LE host harness (SIGSEGV) and only
+ * accidentally correct on 32-bit ARM. Make the (previously implicit) default explicit. */
+#define MMU_DIRECT_ACCESS 0
 
 extern uae_u64 srp_030, crp_030;
 extern uae_u32 tt0_030, tt1_030, tc_030;

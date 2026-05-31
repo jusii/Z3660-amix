@@ -1140,7 +1140,17 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		x_put_long(m68k_areg(regs, 7), oldpc);
 		break;
 	case 0xB: // long bus cycle fault stack frame (68020, 68030)
-		// Store state information to internal register space
+		// Store state information to internal register space.
+		// NOTE (UAE_030_MMU): this is a SIMPLIFIED 030 frame. The fault address (0x10),
+		// SSW (0x0a) and opcode (0x14) ARE stored, which is enough for m68k_do_rte_mmu030
+		// to resume a SIMPLE aligned single data access (verified by the host harness'
+		// demand-paged read/write tests). The internal pipeline/sub-access fields below
+		// (mmu030_state[], idx word at 0x36, mmu030_ad[], stage B/C) are still written as
+		// 0 — so a fault PART-WAY through a MOVEM / unaligned / RMW resumes by restarting
+		// the whole access rather than continuing mid-instruction. That is correct for
+		// idempotent RAM but not bit-exact; faithful partial-resume needs the full WinUAE
+		// 4.4.0 frame storage. Extend + add a MOVEM-cross-page harness test before relying
+		// on it for those cases.
 		for (i = 0; i < 1; i++) {
 			m68k_areg(regs, 7) -= 4;
 			x_put_long(m68k_areg(regs, 7), 0);
@@ -1193,14 +1203,17 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 			x_put_long(m68k_areg(regs, 7), ps); // 28 0x1c
 		}
 		m68k_areg(regs, 7) -= 4;
-		// Data output buffer = value that was going to be written
-		x_put_long(m68k_areg(regs, 7), 0); // 24 0x18
+		// Data output buffer = value that was going to be written. For a 68030 MMU
+		// frame A (last-write fault) m68k_do_rte_mmu030 re-issues this value, so it
+		// must be the real pending write (regs.wb3_data = mmu030_data_buffer_out,
+		// saved by mmu030_page_fault); 0 here made every resumed store write 0.
+		x_put_long(m68k_areg(regs, 7), regs.wb3_data); // 24 0x18
 		m68k_areg(regs, 7) -= 4;
-		if (format == 0xb) {
-			x_put_long(m68k_areg(regs, 7), 0);  // Internal register (opcode storage) 20 0x14
-		} else {
-			x_put_long(m68k_areg(regs, 7), regs.irc);  // Internal register (opcode storage)  20 0x14
-		}
+		// Internal register (opcode storage) 20 0x14. m68k_do_rte_mmu030 reads this
+		// back as the opcode to re-dispatch on resume; storing 0 for frame B made the
+		// CPU resume into opcode $0000 (ORI.B) instead of the faulting instruction.
+		// regs.irc == mmu030_opcode for the faulting instruction in both frame kinds.
+		x_put_long(m68k_areg(regs, 7), regs.irc);
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // data cycle fault address 16 0x10
 		m68k_areg(regs, 7) -= 2;

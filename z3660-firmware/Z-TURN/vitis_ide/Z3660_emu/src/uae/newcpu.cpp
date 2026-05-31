@@ -146,7 +146,13 @@ struct cputbl_data
 };
 static struct cputbl_data cpudatatbl[65536];
 
-struct mmufixup mmufixup[1];
+/* Two elements: index 1 is driven by the imported 68030-MMU table (cpuemu_32.cpp
+ * MOVES/CAS2/double-(An) handlers), the m68k_run_mmu030 CATCH path below, and
+ * cpummu030.cpp's mmu030fixupreg(1)/mmu030fixupmod(...,1). Upstream WinUAE 4.4.0
+ * sizes this [2]; the fork had shrunk it to [1] (UB once MMU mode drives idx 1). */
+struct mmufixup mmufixup[2];
+static_assert(sizeof(mmufixup) / sizeof(mmufixup[0]) >= 2,
+              "mmufixup must hold index 1 (MMU030_REG_FIXUP) used by cpuemu_32 + run-loop CATCH");
 
 static uae_u64 fake_srp_030, fake_crp_030;
 static uae_u32 fake_tt0_030, fake_tt1_030, fake_tc_030;
@@ -667,10 +673,12 @@ static void set_x_funcs (void)
       }
    } else if (currprefs.mmu_model == 68030) {
       // UAE_030_MMU: route every CPU memory access through the 68030 MMU
-      // translating accessors (cpummu030.h inlines). The generated cpuemu_31
-      // fault-safe handlers also use the read_data_030_*/write_data_030_*
-      // pointers, repointed here from their physical defaults to the
-      // translating uae_mmu030_* accessors. (Verbatim shape from WinUAE 4.4.0.)
+      // translating accessors (cpummu030.h inlines). The generated cpuemu_32
+      // table (op_smalltbl_32_ff) reaches memory via the *_mmu030_state inlines
+      // -> uae_mmu030_*, NOT via the read_data_030_* pointers. We still repoint
+      // read_data_030_*/write_data_030_* from their physical defaults to the
+      // translating uae_mmu030_* accessors for completeness (consumed only by the
+      // inactive mmu030c cache family). (Verbatim shape from WinUAE 4.4.0.)
       x_prefetch = get_iword_mmu030;     // opcode fetch in m68k_run_mmu030
       x_get_iword = get_iword_mmu030;
       x_next_iword = next_iword_mmu030;
@@ -905,8 +913,10 @@ void build_cpufunctbl (void)
    int lvl, mode;
 
    if (!currprefs.cachesize) {
-      if (currprefs.mmu_model) {
+      if (currprefs.mmu_model == 68030) {
          mode = 4;   // UAE_030_MMU: op_smalltbl_32_ff (indirect, fault-restartable)
+                     // == 68030 (not just truthy): only the 030 row of cputbls has a
+                     // mode-4 table; a non-030 mmu_model must fall through, not index NULL.
       } else if (currprefs.cpu_cycle_exact) {
          mode = 3;
       } else if (currprefs.cpu_compatible && currprefs.cpu_model < 68020) {
@@ -1872,7 +1882,19 @@ static void Exception_normal (int nr)
       nextpc = exception_pc (nr);
       if (nr == 2 || nr == 3) {
          int i;
-         if (currprefs.cpu_model >= 68040) {
+         if (currprefs.mmu_model && nr == 2) {
+            // UAE_030_MMU: a real 68030 data/instruction bus fault from the page-fault
+            // engine. mmu030_page_fault() already computed regs.mmu_ssw (with DF set and
+            // the real RW/SIZE/FC) and regs.mmu_fault_addr; stack them VERBATIM so that
+            // m68k_do_rte_mmu030() re-performs the faulted access on RTE (it is gated on
+            // ssw & MMU030_SSW_DF). Frame A (short) if the instruction's LAST write
+            // faulted, else frame B (long). Restores the WinUAE 4.4.0 mmu_model branch the
+            // fork dropped: without it the nr==2 path below synthesizes an SSW with no DF
+            // and a stale fault address, so demand paging never resumes (AMIX won't boot).
+            int frameformat = (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) ? 0xa : 0xb;
+            Exception_build_stack_frame(regs.instruction_pc, currpc, regs.mmu_ssw, nr, frameformat);
+            used_exception_build_stack_frame = true;
+         } else if (currprefs.cpu_model >= 68040) {
             if (nr == 2) {
 
                   // 68040 bus error (not really, some garbage?)
@@ -2145,6 +2167,15 @@ void m68k_reset_newcpu(bool hardreset)
    uae_u32 v;
 
    regs.pissoff = 0;
+
+   /* UAE_030_MMU: a 68030 CPU reset zeroes the E-bits of TC/TT (translation off).
+    * The firmware otherwise never resets the real MMU engine, so after AMIX enables
+    * it a warm reset (this fn is the boot AND the n040RSTI GPIO reset path) would run
+    * the reset-vector fetch (get_long(4) below) through the previous session's stale
+    * page tables. mmu030_reset clears mmu030.enabled + TC E-bit (hardreset>=0) and,
+    * for a full reset, SRP/CRP/TT/ATC (hardreset>0). Must precede the get_long(4). */
+   if (currprefs.mmu_model == 68030)
+      mmu030_reset(hardreset ? 1 : 0);
 
    regs.halted = 0;
 //   gui_data.cpu_halted = 0;
@@ -3918,7 +3949,8 @@ insretry:
          TRY(prb2) {
             Exception(prb);
          } CATCH(prb2) {
-            halt = 1;
+            // Fault while building the bus-error frame == double fault.
+            halt = CPU_HALT_BUS_ERROR_DOUBLE_FAULT;
          } ENDTRY
       } ENDTRY
    }

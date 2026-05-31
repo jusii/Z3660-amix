@@ -71,7 +71,7 @@ struct mmufixup
 	int reg;
 	uae_u32 value;
 };
-extern struct mmufixup mmufixup[1];
+extern struct mmufixup mmufixup[2];   /* idx 1 used by cpuemu_32 / mmu030 fixup (WinUAE 4.4.0) */
 
 typedef struct
 {
@@ -496,8 +496,11 @@ extern int m68k_mull(uae_u32, uae_u32, uae_u16);
  * takes the restart pc explicitly. Forward to it with the instruction pc. */
 static inline int m68k_divl(uae_u32 opcode, uae_u32 dst, uae_u16 extra)
 { return m68k_divl(opcode, dst, extra, regs.instruction_pc); }
-/* WinUAE re-checks pending interrupts when SR intmask changes here; the Z3660
- * path re-evaluates via the following MakeFromSR_T0()/spcflags, so this is inert. */
+/* Inert on the Z3660: the SR-write handlers' following MakeFromSR_T0() ->
+ * MakeFromSR_x() -> doint_imm() unconditionally sets SPCFLAG_INT in the no-JIT
+ * path (cachesize==0), forcing do_specialties() to re-check intlev() against the
+ * NEW intmask on the next pass. (The regs.ipl_pin fold-in in MakeFromSR_x is NOT
+ * the guarantee — ipl_pin is not refreshed per-instruction in m68k_run_mmu030.) */
 static inline void MakeFromSR_intmask(uae_u16 oldsr, uae_u16 newsr) { (void)oldsr; (void)newsr; }
 extern void init_m68k(void);
 extern void m68k_go(int);

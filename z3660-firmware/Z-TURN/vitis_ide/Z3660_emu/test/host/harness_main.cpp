@@ -486,9 +486,189 @@ static void test_mmu030_interp_exec(void)
 	CHECK(!faulted, "MMU interpreter step did not fault\n");
 	CHECK_EQ32(regs.opcode, 0x7042, "opcode fetched via MMU from virtual page");
 	CHECK_EQ32(m68k_dreg(regs, 0), 0x42, "moveq executed via cpuemu_32 (op_smalltbl_32_ff)");
+	CHECK_EQ32(m68k_getpc(), VCODE + 2, "pc advanced past moveq via translated fetch");
 
 	currprefs.mmu_model = 0; mmu030_reset(1);
 	cpu_bringup(68030);          /* restore the non-MMU cpufunctbl for any later use */
+}
+
+/* ==================================================================
+ * MMU030 demand-paging END TO END (the path AMIX actually depends on).
+ * Earlier MMU tests stop at the THROW; this one drives the WHOLE loop:
+ *   fault -> (run-loop CATCH) Exception(2) builds the 030 bus-error frame
+ *         -> "OS" maps the page -> m68k_do_rte_mmu030() -> instruction resumes.
+ * It fails unless the stacked SSW carries MMU030_SSW_DF (so RTE re-performs the
+ * faulted access) AND the frame stores the faulting opcode (so the resume
+ * re-dispatches the right instruction). Both were broken before the fix.
+ *
+ * Maps everything inside the fixture's TableA[1] window (0x00400000+):
+ *   VCODE/VDATA/VSTK/VVEC virtual pages -> distinct physical frames.
+ * ================================================================== */
+static void test_mmu030_demand_page_read(void)
+{
+	printf("[test] MMU030 demand-paged READ fault -> Exception -> RTE -> resume (decision #6 test 6)\n");
+	const uae_u32 VCODE = 0x00408000, PCODE = 0x0C000000;
+	const uae_u32 VDATA = 0x00409000, PDATA = 0x0D000000;
+	const uae_u32 VSTK  = 0x0040A000, PSTK  = 0x0E000000;
+	const uae_u32 VVEC  = 0x0040B000, PVEC  = 0x0F000000;
+	const uae_u32 VALUE = 0xC0DEF00D;
+
+	mmu_pt_init();                                  /* mmu_model=68030, TC on, regs.s=1 */
+	currprefs.cpu_model = 68030;
+	mmu_map_page((VCODE >> 12) & 0x3FF, PCODE);     /* code page mapped */
+	mmu_map_page((VSTK  >> 12) & 0x3FF, PSTK);      /* supervisor stack mapped */
+	mmu_map_page((VVEC  >> 12) & 0x3FF, PVEC);      /* vector table mapped */
+	mmu030_flush_atc_all();                         /* VDATA deliberately left UNMAPPED */
+
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x2210);   /* move.l (a0),d1 */
+	hram_poke32(PVEC  | 8, VCODE);                  /* bus-error vector (2) -> even handler addr */
+
+	init_m68k();
+	build_cpufunctbl();                             /* mode 4 -> op_smalltbl_32_ff */
+	harness_set_x_funcs();                          /* MMU arm: x_prefetch/x_get/x_put -> mmu030 */
+
+	regs.s = 1;
+	regs.vbr = VVEC;
+	m68k_dreg(regs, 1) = 0;
+	m68k_areg(regs, 0) = VDATA;                     /* load source (still unmapped) */
+	m68k_areg(regs, 7) = VSTK | 0xFF0;              /* supervisor stack (mapped) */
+	m68k_setpc(VCODE);
+
+	struct flag_struct f;
+	bool faulted = false;
+	regs.instruction_pc = m68k_getpc();
+	f = regs.ccrflags;
+	mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+	mmu030_opcode = -1;
+	TRY(prb) {
+		regs.opcode = x_prefetch(0);                /* fetch 0x2210 from mapped code page */
+		mmu030_opcode = regs.opcode;
+		mmu030_idx_done = 0;
+		regs.opcode = regs.irc = mmu030_opcode;
+		mmu030_idx = 0; mmu030_retry = false;
+		(*cpufunctbl[regs.opcode])(regs.opcode);    /* read VDATA (unmapped) -> THROW(2) */
+	} CATCH(prb) {
+		faulted = true;
+		/* exactly m68k_run_mmu030's CATCH for a non-last-write data fault */
+		regs.ccrflags = f;
+		cpu_restore_fixup();
+		m68k_setpci(regs.instruction_pc);
+		Exception(prb);                             /* build the 030 bus-error stack frame */
+	} ENDTRY
+
+	CHECK(faulted, "unmapped load raised a bus fault (THROW)\n");
+	CHECK_EQ32(m68k_dreg(regs, 1), 0, "d1 not written before the page is mapped");
+
+	/* "OS page-fault handler": map the page, deposit the value, flush the stale ATC */
+	mmu_map_page((VDATA >> 12) & 0x3FF, PDATA);
+	mmu030_flush_atc_all();
+	hram_poke32(PDATA | (VDATA & 0xFFF), VALUE);
+
+	/* RTE: restore frame state, re-perform the faulted access, arm mmu030_retry */
+	m68k_do_rte_mmu030(m68k_areg(regs, 7));
+
+	/* resume: re-dispatch the faulted instruction, as m68k_run_mmu030 does on retry */
+	int guard = 16; bool rfaulted = false;
+	TRY(prb2) {
+		while (mmu030_retry && guard-- > 0) {
+			regs.opcode = regs.irc = mmu030_opcode;
+			mmu030_idx = 0; mmu030_retry = false;
+			(*cpufunctbl[regs.opcode])(regs.opcode);
+		}
+	} CATCH(prb2) { rfaulted = true; (void)prb2; } ENDTRY
+
+	CHECK(!rfaulted, "resumed instruction did not re-fault\n");
+	CHECK_EQ32(m68k_dreg(regs, 1), VALUE, "demand-paged load resumed and wrote d1");
+	CHECK_EQ32(m68k_getpc(), VCODE + 2, "pc advanced past the resumed instruction");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+	cpu_bringup(68030);
+}
+
+/* Companion to the read test: a demand-paged WRITE fault. Exercises the
+ * last-write (frame A) path + the data-output-buffer fix (regs.wb3_data) — RTE
+ * must re-issue the REAL stored value, not 0. */
+static void test_mmu030_demand_page_write(void)
+{
+	printf("[test] MMU030 demand-paged WRITE fault -> Exception -> RTE -> resume (decision #6 test 7)\n");
+	const uae_u32 VCODE = 0x00408000, PCODE = 0x0C000000;
+	const uae_u32 VDATA = 0x00409000, PDATA = 0x0D000000;
+	const uae_u32 VSTK  = 0x0040A000, PSTK  = 0x0E000000;
+	const uae_u32 VVEC  = 0x0040B000, PVEC  = 0x0F000000;
+	const uae_u32 VALUE = 0xFEEDFACE;
+
+	mmu_pt_init();
+	currprefs.cpu_model = 68030;
+	mmu_map_page((VCODE >> 12) & 0x3FF, PCODE);
+	mmu_map_page((VSTK  >> 12) & 0x3FF, PSTK);
+	mmu_map_page((VVEC  >> 12) & 0x3FF, PVEC);
+	mmu030_flush_atc_all();                         /* VDATA left UNMAPPED */
+
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x2081);   /* move.l d1,(a0) */
+	hram_poke32(PVEC  | 8, VCODE);
+
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+
+	regs.s = 1;
+	regs.vbr = VVEC;
+	m68k_dreg(regs, 1) = VALUE;                      /* value to store */
+	m68k_areg(regs, 0) = VDATA;                      /* dest (unmapped) */
+	m68k_areg(regs, 7) = VSTK | 0xFF0;
+	m68k_setpc(VCODE);
+
+	struct flag_struct f;
+	bool faulted = false;
+	regs.instruction_pc = m68k_getpc();
+	f = regs.ccrflags;
+	mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+	mmu030_opcode = -1;
+	TRY(prb) {
+		regs.opcode = x_prefetch(0);
+		mmu030_opcode = regs.opcode;
+		mmu030_idx_done = 0;
+		regs.opcode = regs.irc = mmu030_opcode;
+		mmu030_idx = 0; mmu030_retry = false;
+		(*cpufunctbl[regs.opcode])(regs.opcode);    /* store to VDATA (unmapped) -> THROW(2) */
+	} CATCH(prb) {
+		faulted = true;
+		/* full m68k_run_mmu030 CATCH branch logic (this is the last-write case) */
+		if (mmu030_opcode == -1) {
+			mmufixup[0].reg = -1; mmufixup[1].reg = -1;
+		} else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
+			mmufixup[0].reg = -1; mmufixup[1].reg = -1;
+		} else {
+			regs.ccrflags = f; cpu_restore_fixup();
+		}
+		m68k_setpci(regs.instruction_pc);
+		bool dbl = false;
+		TRY(prb2) { Exception(prb); } CATCH(prb2) { dbl = true; (void)prb2; } ENDTRY
+		CHECK(!dbl, "Exception(2) for write fault did not double-fault\n");
+	} ENDTRY
+
+	CHECK(faulted, "unmapped store raised a bus fault (THROW)\n");
+	CHECK_EQ32(hram_peek32(PDATA | (VDATA & 0xFFF)), 0, "nothing written before the page is mapped");
+
+	mmu_map_page((VDATA >> 12) & 0x3FF, PDATA);
+	mmu030_flush_atc_all();
+
+	m68k_do_rte_mmu030(m68k_areg(regs, 7));
+
+	int guard = 16; bool rfaulted = false;
+	TRY(prb2) {
+		while (mmu030_retry && guard-- > 0) {
+			regs.opcode = regs.irc = mmu030_opcode;
+			mmu030_idx = 0; mmu030_retry = false;
+			(*cpufunctbl[regs.opcode])(regs.opcode);
+		}
+	} CATCH(prb2) { rfaulted = true; (void)prb2; } ENDTRY
+
+	CHECK(!rfaulted, "resumed store did not re-fault\n");
+	CHECK_EQ32(hram_peek32(PDATA | (VDATA & 0xFFF)), VALUE, "demand-paged store resumed and wrote memory");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+	cpu_bringup(68030);
 }
 
 /* ================================================================== */
@@ -516,6 +696,8 @@ int main(int argc, char **argv)
 	test_mmu030_lrmw();
 	test_mmu030_pflush();
 	test_mmu030_interp_exec();
+	test_mmu030_demand_page_read();
+	test_mmu030_demand_page_write();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
