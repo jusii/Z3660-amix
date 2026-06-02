@@ -1182,9 +1182,13 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 			m68k_areg(regs, 7) -= 4;
 			x_put_long(m68k_areg(regs, 7), ps);
 		}
-		// stage b address
+		// stage b address: for an INSTRUCTION (prefetch) fault the faulting fetch address lives here, and the
+		// 030 bus-error handler reads THIS field (the SSW marks an instruction fault: FB set / DF clear), not
+		// the 0x10 data-cycle fault address. Writing 0 made AMIX report "User BUS ERROR at 0" the first time it
+		// demand-paged a TEXT page (the dynamic linker /usr/lib/libc.so.1 _rt_boot entry at 0xC100F348 — init is
+		// dynamically linked). Data faults (DF set) read 0x10, so keep 0 there (the proven path).
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
+		x_put_long(m68k_areg(regs, 7), (ssw & MMU030_SSW_DF) ? 0 : regs.mmu_fault_addr);
 		// 2xinternal
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), 0);
