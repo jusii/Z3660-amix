@@ -6332,10 +6332,11 @@ uae_u32 REGPARAM2 CPUFUNC(op_0e10_32)(uae_u32 opcode)
 		uae_u32 src = regs.regs[(extra >> 12) & 15];
 		uaecptr dsta;
 		dsta = m68k_areg(regs, dstreg);
-		m68k_incpci(4);
-		regs.instruction_pc = m68k_getpci();
+		// MOVES-write fault fix (see op_0e98_32): plain (An), no postincrement, so advance the PC AFTER the
+		// (faulting) write (the pre-advance + demand-page re-run would advance the PC twice).
 		mmu030_state[1] |= MMU030_STATEFLAG1_LASTWRITE;
 		dfc030_put_byte_state(dsta, src);
+		m68k_incpci(4);
 	} else {
 		uaecptr srca;
 		srca = m68k_areg(regs, dstreg);
@@ -6593,10 +6594,11 @@ uae_u32 REGPARAM2 CPUFUNC(op_0e50_32)(uae_u32 opcode)
 		uae_u32 src = regs.regs[(extra >> 12) & 15];
 		uaecptr dsta;
 		dsta = m68k_areg(regs, dstreg);
-		m68k_incpci(4);
-		regs.instruction_pc = m68k_getpci();
+		// MOVES-write fault fix (see op_0e98_32): plain (An), no postincrement, so advance the PC AFTER the
+		// (faulting) write (the pre-advance + demand-page re-run would advance the PC twice).
 		mmu030_state[1] |= MMU030_STATEFLAG1_LASTWRITE;
 		dfc030_put_word_state(dsta, src);
+		m68k_incpci(4);
 	} else {
 		uaecptr srca;
 		srca = m68k_areg(regs, dstreg);
@@ -6854,10 +6856,12 @@ uae_u32 REGPARAM2 CPUFUNC(op_0e90_32)(uae_u32 opcode)
 		uae_u32 src = regs.regs[(extra >> 12) & 15];
 		uaecptr dsta;
 		dsta = m68k_areg(regs, dstreg);
-		m68k_incpci(4);
-		regs.instruction_pc = m68k_getpci();
+		// MOVES-write fault fix (see op_0e98_32): plain (An), no postincrement, so advance the PC AFTER the
+		// (faulting) write. The pre-advance + demand-page re-run advanced the PC twice; for the exec arg-push
+		// (lsuword 'moves.l dn,(a0)' into the fresh user stack) that corrupted the restart -> execve EFAULT.
 		mmu030_state[1] |= MMU030_STATEFLAG1_LASTWRITE;
 		dfc030_put_long_state(dsta, src);
+		m68k_incpci(4);
 	} else {
 		uaecptr srca;
 		srca = m68k_areg(regs, dstreg);

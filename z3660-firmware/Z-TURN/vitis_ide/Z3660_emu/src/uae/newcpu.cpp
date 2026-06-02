@@ -3895,6 +3895,12 @@ static void m68k_run_2_020(void)
 // (op_smalltbl_32_ff). Adapted from WinUAE 4.4.0 m68k_run_mmu030 for the Z3660
 // (non-cycle-exact, non-compatible). On a page fault the cpummu030 engine THROWs;
 // we restore flags, build the 030 bus-error frame via Exception() and resume.
+// Instruction-START pc, saved each instruction before any handler runs. Several cpuemu_32 write handlers
+// (MOVES and regular (An)+/-(An) moves) advance the pc and overwrite regs.instruction_pc BEFORE the
+// faulting store; on a demand-page fault the CATCH below must build the 030 bus-error frame with the
+// instruction-START pc so the RTE/re-run restarts the whole instruction. Read-side and prefetch faults
+// already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
+static uaecptr mmu030_insn_start_pc;
 static void m68k_run_mmu030(void)
 {
    struct flag_struct f;
@@ -3908,6 +3914,7 @@ static void m68k_run_mmu030(void)
             int cnt;
 insretry:
             regs.instruction_pc = m68k_getpc();
+            mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
             f = regs.ccrflags;
 
             mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
@@ -3971,6 +3978,11 @@ insretry:
             regs.ccrflags = f;
             cpu_restore_fixup();
          }
+         // A faulting write handler may have advanced the pc + overwritten regs.instruction_pc before the
+         // store; rebuild the bus-error frame from the instruction-START pc so the re-run restarts cleanly
+         // (matches the per-handler MOVES fixes; also covers the regular (An)+/-(An) moves like op_20d8 used
+         // by locore bcopy, whose mid-instruction landing caused the kernel "Line-F" panic at 0x070002EA).
+         regs.instruction_pc = mmu030_insn_start_pc;
          m68k_setpci(regs.instruction_pc);
          TRY(prb2) {
             Exception(prb);
