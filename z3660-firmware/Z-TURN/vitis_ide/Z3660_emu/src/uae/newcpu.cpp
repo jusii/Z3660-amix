@@ -3956,6 +3956,15 @@ insretry:
             mmufixup[0].reg = -1;
             mmufixup[1].reg = -1;
          } else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
+            // (An)+ rollback for a MOVES-write page fault. cpu_restore_fixup() is an empty stub on this fork, so
+            // the post-increment of An was never undone here; the simplified resume then RESTARTS the whole MOVES
+            // and re-runs the write to An+size. On a demand-paged copyout whose first store faults (e.g. lcopyout
+            // pushing the PID-1 icode into the fresh user page 0x80800000), that re-run wrote the source longword
+            // to dest+size, DUPLICATING the first longword and shifting the rest of the copy -> the icode's lea
+            // displacement was corrupted -> wrong user stack pointer -> execve("/sbin/init") returned EFAULT.
+            // Restore An to its pre-increment value so the restart writes to the original address.
+            if (mmufixup[0].reg >= 0) m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value;
+            if (mmufixup[1].reg >= 0) m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value;
             mmufixup[0].reg = -1;
             mmufixup[1].reg = -1;
          } else {
