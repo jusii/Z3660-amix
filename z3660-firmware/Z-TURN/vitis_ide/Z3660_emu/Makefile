@@ -30,7 +30,7 @@ INCLUDES:= -I$(SRCDIR) \
            -I$(BSP_CORE1_INC) \
            -I$(BSP_CORE1_EXPORT_INC)
 
-CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -O3 -std=c++11 \
+CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 \
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
            -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY
@@ -41,8 +41,10 @@ CXXFLAGS := $(CFLAGS)
 ASFLAGS := $(CFLAGS)
 LDFLAGS := $(CFLAGS) -T $(LDSCRIPT) -specs=$(SRCDIR)/Xilinx.spec \
            -Wl,-build-id=none,-Map=$(BUILDDIR)/mapfile.txt \
+           -Wl,--gc-sections \
            -flto -L$(BSP_CORE1_EXPORT_LIB) -L$(BSP_CORE1_LIB) -L$(BSP_CORE1_LIB)/cpu/cortexa9 -L$(dir $(BSP_CORE1_LIB))
-#-Wl,--gc-sections
+# --gc-sections: behavior-preserving dead-code strip (critical sections are KEEP'd in lscript.ld).
+# Shrinks Z3660_emu so BOOT.BIN clears the SD-write size threshold (~12MB) for TFTP deploy.
 #-nostdlib -specs=nosys.specs 
 
 # Sources (musashi/uae emulators)

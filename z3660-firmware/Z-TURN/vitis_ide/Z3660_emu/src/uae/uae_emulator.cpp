@@ -145,6 +145,10 @@ extern uint32_t autoConfigBaseRTG;
 extern volatile uint8_t *Z3660_RTG_BASE;
 extern volatile uint8_t *Z3660_Z3RAM_BASE;
 extern uint32_t autoConfigBaseSCSI;
+// AMIX A3000 onboard SCSI (WD33C93 + SuperDMAC) emulation, src/uae/a3000_scsi.cpp.
+extern "C" uint32_t a3000_scsi_read(uint32_t offset, int size);
+extern "C" void     a3000_scsi_write(uint32_t offset, uint32_t data, int size);
+extern "C" void     a3000_scsi_init(void);
 
 unsigned int z2scsi_read_32(uaecptr address)
 {
@@ -819,6 +823,73 @@ addrbank z2scsi_bank = {
       ABFLAG_NONE, MB_READ, MB_WRITE
 };
 
+// Emulated A3000 mainboard SCSI (WD33C93 + Commodore SuperDMAC) for AMIX boot.
+// Fixed motherboard page $00DD0000; handlers pass the page-relative offset to
+// a3000_scsi.cpp. ABFLAG_IO: register reads have side effects (SCSI_STATUS read
+// clears the WD INT; ISTR read clears bits) so never direct/JIT-bypass them.
+#define A3000_SCSI_BASE 0x00DD0000
+unsigned int a3000scsi_read_32(uaecptr address) { return a3000_scsi_read(address - A3000_SCSI_BASE, 2); }
+unsigned int a3000scsi_read_16(uaecptr address) { return a3000_scsi_read(address - A3000_SCSI_BASE, 1); }
+unsigned int a3000scsi_read_8 (uaecptr address) { return a3000_scsi_read(address - A3000_SCSI_BASE, 0); }
+void a3000scsi_write_32(uaecptr address, unsigned int data) { a3000_scsi_write(address - A3000_SCSI_BASE, data, 2); }
+void a3000scsi_write_16(uaecptr address, unsigned int data) { a3000_scsi_write(address - A3000_SCSI_BASE, data, 1); }
+void a3000scsi_write_8 (uaecptr address, unsigned int data) { a3000_scsi_write(address - A3000_SCSI_BASE, data, 0); }
+int a3000scsi_check(uaecptr add, uae_u32) { return 1; }
+addrbank a3000_scsi_bank = {
+      a3000scsi_read_32, a3000scsi_read_16, a3000scsi_read_8,
+      a3000scsi_write_32, a3000scsi_write_16, a3000scsi_write_8,
+      dummy_xlate, a3000scsi_check, NULL, NULL, NULL,
+      a3000scsi_read_32, a3000scsi_read_16,
+      ABFLAG_IO, MB_READ, MB_WRITE
+};
+
+// AMIX A3000 motherboard fast RAM (a3000mem) at GUEST $07000000 (where a real
+// A3000 has its motherboard RAM and where AMIX maps/runs its kernel), backed by
+// FREE host DDR at $09000000. Host $07000000 itself is owned by core0 (video
+// DECODED buffer), so we can't be 1:1 there; instead get_real_address() maps the
+// $07xxxxxx window to host $09xxxxxx for the MMU/direct paths, and these functions
+// + a3000mem_xlate do the same for the normal access paths.
+// Big-endian-swapped like z3ram so byte-wise DMA stores + longword reads agree.
+#define A3000MEM_HOST 0x09000000u
+// DIAG (TEMPORARY - remove before commit): log the first accesses to a3000mem so we can
+// tell whether the A3000 Kickstart PROBES $07000000 during RAM detection (write/read pattern
+// test). Zero [A3KMEM] lines before the SCSI boot => Kickstart never probes it (Ramsey/bank
+// not signalled). [A3KMEM] W/R of the rotating patterns ($5AC3.., $AC35.. etc) => it probes.
+extern "C" void z3660_printf(const char *fmt, ...);
+static volatile int a3kmem_logn = 0;
+#define A3KLOG(rw,sz,a) do{ if(a3kmem_logn<40){ a3kmem_logn++; z3660_printf("[A3KMEM] %s%d %2d @%08lX h%08lX\r\n",(rw),(sz),a3kmem_logn,(unsigned long)(a),(unsigned long)(A3000MEM_HOST+((a)-0x07000000))); } }while(0)
+unsigned int a3000mem_read_32(uaecptr address){ A3KLOG("R",32,address); return(swap32(*(uint32_t*)(A3000MEM_HOST+(address-0x07000000)))); }
+unsigned int a3000mem_read_16(uaecptr address){ A3KLOG("R",16,address); return(swap16(*(uint16_t*)(A3000MEM_HOST+(address-0x07000000)))); }
+unsigned int a3000mem_read_8 (uaecptr address){ A3KLOG("R", 8,address); return(*(uint8_t*)(A3000MEM_HOST+(address-0x07000000))); }
+void a3000mem_write_32(uaecptr address, unsigned int data){ A3KLOG("W",32,address); *(uint32_t*)(A3000MEM_HOST+(address-0x07000000))=swap32(data); }
+void a3000mem_write_16(uaecptr address, unsigned int data){ A3KLOG("W",16,address); *(uint16_t*)(A3000MEM_HOST+(address-0x07000000))=swap16(data); }
+void a3000mem_write_8 (uaecptr address, unsigned int data){ A3KLOG("W", 8,address); *(uint8_t*)(A3000MEM_HOST+(address-0x07000000))=data&0xFF; }
+int a3000mem_check(uaecptr add, uae_u32){ return(1); }
+uae_u8 *a3000mem_xlate(uaecptr add){ return((uae_u8*)(A3000MEM_HOST+(add-0x07000000))); }
+// baseaddr = host_base - guest_base = $09000000 - $07000000 = $02000000, so any bulk
+// path that does `baseaddr + guest_addr` (e.g. the loader/AmigaOS) lands on host
+// $09xxxxxx. (drct has host==guest so its baseaddr is NULL; ours can't be.)
+// Full direct-access bank like drct_bank, but mapping guest $07000000 -> host $09000000.
+// baseaddr = host-guest offset ($02000000); baseaddr_direct_r/w = host base ($09000000);
+// mask = 0xFFFFFFFF; allocated_size = 8MB. This lets a3000mem be the SOLE RAM (the boot's
+// executing code needs real direct-access RAM - function-based gave illegal-instruction Gurus).
+addrbank a3000mem_bank = {
+      a3000mem_read_32, a3000mem_read_16, a3000mem_read_8,
+      a3000mem_write_32, a3000mem_write_16, a3000mem_write_8,
+      a3000mem_xlate, a3000mem_check, (uae_u8*)0x09000000u, NULL, NULL,   // baseaddr = ABSOLUTE host base $09000000 (WinUAE convention). map_banks (memory.h:515) sets the CPU fast-path ptr baseaddr[idx] = baseaddr - realstart = $09000000 - $07000000 = $02000000, so a direct/exec/RAM-probe access to guest $07xxxxxx = $02000000 + $07xxxxxx = host $09xxxxxx (correct). (NULL forced the slow function path which the A3000 ROM's downward RAM-probe doesn't use; $02000000 offset made baseaddr[] negative -> host $02xxxxxx = core0 firmware.)
+      a3000mem_read_32, a3000mem_read_16,
+      ABFLAG_RAM | ABFLAG_DIRECTACCESS, 0, 0,
+      NULL,                      // sub_banks
+      0xFFFFFFFF,                // mask
+      0,                         // startmask
+      0,                         // start
+      0x01000000,                // allocated_size = 16MB (was stale 8MB; match AMIX_A3000MEM_MB + the RANGE_MAP)
+      0x01000000,                // reserved_size = 16MB
+      (uae_u8*)0x09000000u,      // baseaddr_direct_r
+      (uae_u8*)0x09000000u,      // baseaddr_direct_w
+      0x01000000,                // startaccessmask = 16MB (= allocated_size, like drct_bank)
+};
+
 addrbank z3ram_bank = {
       z3ram_read_32, z3ram_read_16, z3ram_read_8,
       z3ram_write_32, z3ram_write_16, z3ram_write_8,
@@ -919,7 +990,10 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
    currprefs.cpu_cycle_exact        = changed_prefs.cpu_cycle_exact=false;
    currprefs.cpu_memory_cycle_exact = changed_prefs.cpu_memory_cycle_exact=false;
    currprefs.int_no_unimplemented   = changed_prefs.int_no_unimplemented=false;
-   currprefs.fpu_no_unimplemented   = changed_prefs.fpu_no_unimplemented=false;
+   // 68881/68882 implement ALL FPU opcodes (incl transcendentals) in hardware -> fpu_no_unimplemented=1
+   // so they are NOT treated as 68040/060-style unimplemented (which fires Line-F). Matches Amiberry's
+   // AmigaUnix.uae (fpu_no_unimplemented=true for its 68882). Keep 0 for the 68040 (AmigaOS emulates).
+   currprefs.fpu_no_unimplemented   = changed_prefs.fpu_no_unimplemented=(changed_prefs.fpu_model==68881 || changed_prefs.fpu_model==68882);
    currprefs.crash_auto_reset       = changed_prefs.crash_auto_reset=true;
 //   currprefs.blitter_cycle_exact    = changed_prefs.blitter_cycle_exact=false;
    currprefs.m68k_speed             = changed_prefs.m68k_speed=-1;//M68K_SPEED_25MHZ_CYCLES;
@@ -952,9 +1026,15 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
    }
    RANGE_MAP(0x0008,0x00B8,chpr_bank); // Mother Board bank ( Chip RAM and Zorro II Expansion Space )
    RANGE_MAP(0x00BF,0x00C0,slow_bank); // Slow bank ( CIA ports & Timers ) <----- Amiga crashes with mobo_bank
-   RANGE_MAP(0x00DC,0x00DD,mobo_bank); // Mother Board bank ( RTC, SCSI, Mobo Resources & Custom chips)
-   RANGE_MAP(0x00DD,0x00DE,slow_bank); // Mother Board bank ( RTC, SCSI, Mobo Resources & Custom chips)
-   RANGE_MAP(0x00DE,0x00E0,mobo_bank); // Mother Board bank ( RTC, SCSI, Mobo Resources & Custom chips)
+   RANGE_MAP(0x00DC,0x00DD,mobo_bank); // Mother Board bank ( RTC )
+   // AMIX (UAE_030_MMU) only: intercept $00DD0000 with the emulated A3000 SCSI
+   // (WD33C93+SuperDMAC). Other emulator modes keep slow_bank so a normal
+   // A3000-Kickstart AmigaOS boot is unaffected (its scsi.device sees no change).
+   if(enable_mmu)
+      RANGE_MAP(0x00DD,0x00DE,a3000_scsi_bank); // emulated A3000 SCSI @ $00DD0000
+   else
+      RANGE_MAP(0x00DD,0x00DE,slow_bank);
+   RANGE_MAP(0x00DE,0x00E0,mobo_bank); // Mother Board bank ( Mobo Resources & Custom chips)
    RANGE_MAP(0x00E8,0x00E9,auto_z2_bank); // Z2 Autoconfig bank ( Zorro II AutoConfig )
    RANGE_MAP(0x00E9,0x00EA,mobo_bank); // Mother Board bank ( Zorro II Autoconfig )
 //   RANGE_MAP(0x00EA,0x00EB,test_bank); // Z2 Autoconfig bank ( Zorro II AutoConfig )
@@ -983,9 +1063,38 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
          MMUL2Table[i]=0;
       RANGE_MAP(0x00F0,0x00F8,slow_bank);//mobo_bank); // Mother Board bank ( Mobo ROM )
    }
-   RANGE_MAP(0x0100,0x0800,slow_bank);//mbrm_bank); // Mother Board bank ( Mother board RAM )
-//   RANGE_MAP(0x0100,0x0800,dmmy_bank);//mbrm_bank); // Mother Board bank ( Mother board RAM )
-   RANGE_MAP(0x0800,0x1000,drct_bank); // Direct bank ( CPU RAM )
+   // AMIX (UAE_030_MMU): confirmed from the AMIX kernel source (sys/immu.h + amiga/kernel/
+   // support.c). The m68k kernel maps physical main RAM into ONE section, SCN1 = kernel VA
+   // 0x40000000-0x7FFFFFFF. config() sizes that single window [MAINSTORE, MAINSTORE+VSIZOFMEM)
+   // from the AmigaOS memory list (copied verbatim into bootinfo.memory[]); its QUICK_KLUDGE
+   // forces MAINSTORE=$07000000, VSIZOFMEM=16MB (window [$07000000,$08000000)) for a high-
+   // loaded kernel. EVERY RAM region AmigaOS lists must lie INSIDE that one window, else the
+   // kernel adds the stray pages to its pool, touches one outside SCN1, and panics
+   // vatosde() ("address not in SCN1"). Two adjacent banks ($07+$08) COALESCE into a >16MB
+   // window (also fatal); a split leaves the $08 region outside SCN1 (fatal). So present
+   // a3000mem as the SOLE Fast RAM: 16MB CONTIGUOUS at GUEST $07000000, NOTHING at $08000000+.
+   // The AMIX bootstrap then AllocMem(MEMF_FAST)s the kernel straight from this region. Backed
+   // by FREE host DDR $09000000; baseaddr=NULL (function path, like drct) + get_real_address()
+   // + the bank funcs all map $07xxxxxx -> host $09xxxxxx consistently across fetch/data/MMU
+   // walk/SCSI DMA. (Was an 8MB+$08000000 split / 8MB-only-with-baseaddr-bug; both failed.)
+#define AMIX_A3000MEM_MB 16
+   if(enable_mmu)
+   {
+      (void)((AMIX_A3000MEM_MB * 1024 * 1024) >> 16);            // (a3000mem page count - unused in PATH B)
+      // PATH B (use the REAL A4000 motherboard SIMMs): the emulated a3000mem @ $07000000 was
+      // never DETECTED by the A3000 ROM's downward RAM-probe from $08000000 (the real SIMMs do
+      // respond to it natively). So map $01000000-$07FFFFFF onto the REAL bus (slow_bank) -
+      // same as the non-AMIX map - so the ROM probes the real populated SIMMs at $07000000 and
+      // adds them to the MemList; the AMIX loader's AllocMem(MEMF_FAST) then succeeds. $08000000+
+      // stays dummy (no Z3660 CPU RAM) so the kernel sees only the <=16MB mobo RAM = one SCN1 window.
+      RANGE_MAP(0x0100, 0x0800, slow_bank);                       // real A4000 motherboard RAM (incl SIMMs @ $07000000) via the real bus
+      RANGE_MAP(0x0800, 0x1000, dmmy_bank);                       // no RAM at $08000000+ (single SCN1 window, no vatosde coalesce)
+   }
+   else
+   {
+      RANGE_MAP(0x0100,0x0800,slow_bank); // Mother Board bank ( Mother board RAM )
+      RANGE_MAP(0x0800,0x1000,drct_bank); // Direct bank ( CPU RAM, full 128 MB )
+   }
    RANGE_MAP(0x1000,0x1800,dmmy_bank); // dummy
 //   RANGE_MAP(0x1000,0x1800,dflt_bank); // Direct bank ( extended CPU RAM )
    RANGE_MAP(0x1800,0x4000,dmmy_bank); // dummy
@@ -1027,6 +1136,11 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
 
    m68k_reset_newcpu(1);
    reset_autoconfig();
+   if(enable_mmu)
+   {
+      memset((void*)A3000MEM_HOST, 0, AMIX_A3000MEM_MB * 1024 * 1024); // clear a3000mem host backing ($09000000)
+      a3000_scsi_init(); // AMIX: reset emulated A3000 WD33C93+SuperDMAC state
+   }
 
    init_m68k();
    build_cpufunctbl();

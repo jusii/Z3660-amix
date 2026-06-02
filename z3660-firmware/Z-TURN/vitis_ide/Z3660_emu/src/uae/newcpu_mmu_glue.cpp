@@ -36,11 +36,86 @@ bool debugmem_trace = false;
  * has no savestate, so nothing to fix up. */
 void cpu_restore_fixup(void) { }
 
-/* MMU-named bitfield aliases used by cpuemu_32 — forward to the real ones. */
+/* MMU-named bitfield aliases used by cpuemu_32 (BFEXTU/BFEXTS/BFINS/BFCLR/BFSET/
+ * BFCHG/BFTST/BFFFO on a memory operand). These MUST translate through the 68030
+ * PMMU and use the _mmu030_state accessors — same as every other operand access in
+ * the MMU interpreter (e.g. op_2168_32's get_long_mmu030_state/put_long_mmu030_state)
+ * so a mid-bitfield demand-page fault replays correctly on retry. The bare
+ * get_bitfield/put_bitfield in newcpu_common.cpp use PHYSICAL get_byte/get_word/
+ * get_long (= memory_get_*), which read/write the UNTRANSLATED logical address —
+ * for a SCN1 kernel-stack VA that lands in slow_bank (the real bus) instead of the
+ * MMU-mapped a3000mem page the move.l just wrote, corrupting the value (this was the
+ * AMIX "vatosde() address not in SCN1" panic: bfextu read the high byte off the bus).
+ * Bodies mirror newcpu_common.cpp get_bitfield/put_bitfield with each accessor swapped
+ * for its _mmu030_state twin. */
 uae_u32 REGPARAM2 x_get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width)
-{ return get_bitfield(src, bdata, offset, width); }
+{
+	uae_u32 tmp, res, mask;
+	offset &= 7;
+	mask = 0xffffffffu << (32 - width);
+	switch ((offset + width + 7) >> 3) {
+	case 1:
+		tmp = get_byte_mmu030_state(src);
+		res = tmp << (24 + offset);
+		bdata[0] = tmp & ~(mask >> (24 + offset));
+		break;
+	case 2:
+		tmp = get_word_mmu030_state(src);
+		res = tmp << (16 + offset);
+		bdata[0] = tmp & ~(mask >> (16 + offset));
+		break;
+	case 3:
+		tmp = get_word_mmu030_state(src);
+		res = tmp << (16 + offset);
+		bdata[0] = tmp & ~(mask >> (16 + offset));
+		tmp = get_byte_mmu030_state(src + 2);
+		res |= tmp << (8 + offset);
+		bdata[1] = tmp & ~(mask >> (8 + offset));
+		break;
+	case 4:
+		tmp = get_long_mmu030_state(src);
+		res = tmp << offset;
+		bdata[0] = tmp & ~(mask >> offset);
+		break;
+	case 5:
+		tmp = get_long_mmu030_state(src);
+		res = tmp << offset;
+		bdata[0] = tmp & ~(mask >> offset);
+		tmp = get_byte_mmu030_state(src + 4);
+		res |= tmp >> (8 - offset);
+		bdata[1] = tmp & ~(mask << (8 - offset));
+		break;
+	default:
+		res = 0;
+		break;
+	}
+	return res;
+}
 void REGPARAM2 x_put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width)
-{ put_bitfield(dst, bdata, val, offset, width); }
+{
+	offset = (offset & 7) + width;
+	switch ((offset + 7) >> 3) {
+	case 1:
+		put_byte_mmu030_state(dst, bdata[0] | (val << (8 - offset)));
+		break;
+	case 2:
+		put_word_mmu030_state(dst, bdata[0] | (val << (16 - offset)));
+		break;
+	case 3:
+		put_word_mmu030_state(dst, bdata[0] | (val >> (offset - 16)));
+		put_byte_mmu030_state(dst + 2, bdata[1] | (val << (24 - offset)));
+		break;
+	case 4:
+		put_long_mmu030_state(dst, bdata[0] | (val << (32 - offset)));
+		break;
+	case 5:
+		put_long_mmu030_state(dst, bdata[0] | (val >> (offset - 32)));
+		put_byte_mmu030_state(dst + 4, bdata[1] | (val << (40 - offset)));
+		break;
+	default:
+		break;
+	}
+}
 
 /* ================= physical (post-MMU) access wrappers ================= */
 static uae_u32 z_phys_get_byte(uaecptr a){ return memory_get_byte(a); }

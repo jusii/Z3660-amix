@@ -1236,6 +1236,16 @@ retry:
       config.bp_toff=env_file_vars_temp[preset_selected].bp_toff;
       config.monitor_switch=env_file_vars_temp[preset_selected].monitor_switch;
       config.arm_frequency=env_file_vars_temp[preset_selected].arm_frequency;
+      // AMIX (UAE_030_MMU): force cpu_ram OFF so scsiboot_rom_loaded stays 0 (main.c:1430-1442):
+      // no emulated PISCSI Z2 autoboot ROM (its driver needs $08000000 and stalled the AMIX boot
+      // at the RDB - "[PISCSI] DRIVER ... not mapped in FPGA RAM"). AMIX instead autoboots via the
+      // a3k204 ROM scsi.device from the A3000 SCSI @ $00DD0000 (a3000_scsi, gated only on enable_mmu).
+      // scsiboot itself stays as the preset set it, so piscsi_init() still maps devs[6]/Amix.hdf for
+      // the a3000_scsi cross-core backend. The emulator presents NO RAM at $08000000 (dmmy_bank), so
+      // the ROM's motherboard-RAM probe (emulated CPU) only finds the 16MB a3000mem @ $07000000 => a
+      // single contiguous SCN1 window, no vatosde() coalesce.
+      if(config.boot_mode==UAE_030_MMU)
+         config.cpu_ram=0;
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 

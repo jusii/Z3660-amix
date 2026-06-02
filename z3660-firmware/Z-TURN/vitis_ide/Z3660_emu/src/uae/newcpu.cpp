@@ -1538,8 +1538,13 @@ static int iack_cycle(int nr)
 {
    int vector;
 
-   // non-autovectored
-   vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
+   // The autovector IACK is an FC=7 (CPU-space) access on real HW; the 68030 MMU NEVER
+   // translates it. iack_cycle runs in Exception_normal BEFORE the supervisor-mode switch,
+   // so x_get_byte() here would walk the *current* (user) page tables when an interrupt is
+   // taken while a user task runs (e.g. AMIX init) -> bus error at 0x00FFFFFx. Use the bare
+   // physical bank accessor (get_byte) so the autovector read bypasses the user MMU. In
+   // supervisor/identity context get_byte_mmu030 reaches this same bank, so the value matches.
+   vector = get_byte(0x00fffff1 | ((nr - 24) << 1));
    if (currprefs.cpu_compatible)
       x_do_cycles(4 * CYCLE_UNIT / 2);
    return vector;
@@ -2607,20 +2612,32 @@ int pissoff_int=1024;
 int set_special_var=1;
 void z3660_tasks(void);
 extern "C" void ipl_main_read(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // A3000 SCSI WD33C93 int-countdown pump
+extern "C" void a3000_scsi_hsync(void);
 static inline void check_uae_int_request(void)
 {
    z3660_tasks();
    ipl_main_read();
+   // A3000 SCSI WD33C93 interrupt-delay pump: advances the status countdown on a fixed cadence in
+   // EVERY CPU run loop (including the MMU-off loop the Kickstart ROM uses to load the kernel), so the
+   // SELECT and SRV_REQ INT2s stay spaced for AMIX's step-by-step sd open WITHOUT stalling the boot load.
+   if(a3000_amix_mode){ static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
 #if INT_IPL_ON_THIS_CORE == 0
    if(shared->int_available)
    {
       shared->int_available=0;
       read_irq=shared->irq;
-      if(read_irq>regs.intmask || read_irq==7)
+      // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); gate on
+      // the effective level so a freshly-asserted SCSI INT2 latches SPCFLAG_DOINT.
+      int eff_irq=intlev();
+      if(eff_irq>regs.intmask || eff_irq==7)
          set_special(SPCFLAG_DOINT);
    }
 #else
-   if(read_irq>regs.intmask || read_irq==7)
+   // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); must gate on
+   // the effective level, not the bare physical read_irq, or the SCSI INT2 never latches.
+   int eff_irq=intlev();
+   if(eff_irq>regs.intmask || eff_irq==7)
    {
       set_special(SPCFLAG_DOINT);
       if(pissoff_int!=0)

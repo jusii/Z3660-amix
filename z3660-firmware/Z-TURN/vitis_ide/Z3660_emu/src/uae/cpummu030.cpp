@@ -39,6 +39,9 @@
 #include "cputbl.h"
 #include "cpu_prefetch.h"   /* Z3660 port: mem_access_delay_*_ce020 declared here */
 
+extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
+extern "C" volatile int amix_mmu_on;       // set below when AMIX's 2KB-page MMU comes up
+
 // Prefetch mode and prefetch bus error: always flush and refill prefetch pipeline
 #define MMU030_ALWAYS_FULL_PREFETCH 1
  // if CPU is 68030 and faulted access' addressing mode was -(an) or (an)+
@@ -876,6 +879,7 @@ bool mmu030_decode_tc(uae_u32 TC, bool check)
 	regs.mmu_page_size = 1 << mmu030.translation.page.size;
 
 	write_log(_T("68030 MMU enabled. Page size = %d PC=%08x\n"), regs.mmu_page_size, M68K_GETPC);
+	if (a3000_amix_mode && regs.mmu_page_size == 2048) amix_mmu_on = 1; // AMIX kernel up: hide $08000000
 
 	if (mmu030.translation.page.size<8) {
         write_log(_T("MMU Configuration Exception: Bad value in TC register! (bad page size: %i byte)\n"),

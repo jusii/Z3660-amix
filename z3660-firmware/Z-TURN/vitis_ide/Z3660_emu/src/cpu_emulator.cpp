@@ -1576,8 +1576,30 @@ extern "C" uint32_t arm_read_amiga_byte(uint32_t address)
    BUS_RELINQUISH();
    return(data_read);
 }
+// diagnostic: tally guest physical-bus accesses by region to find the slow hot spot
+volatile uint32_t ps_count=0, ps_chip=0, ps_cia=0, ps_custom=0, ps_other=0, ps_lastaddr=0;
+volatile uint32_t custom_hist[256]; // accesses per custom-chip register ($DFF000 + 2*idx)
+volatile uint32_t cia_hist[16];     // accesses per CIA register ((addr>>8)&0xF)
+// AMIX A3000 SCSI: the emulated controller raises a software level-2 (a3000_scsi_irq),
+// but the guest's interrupt handler identifies the source via Paula INTREQR ($DFF01E,
+// PORTS=INT2=bit3). Make INTREQR reads show PORTS set while our SCSI INT is pending so
+// the guest stops spin-polling INTREQR/INTENAR (~39K reads/block) and services promptly.
+extern "C" volatile int a3000_scsi_irq;
+extern "C" volatile int a3000_amix_mode;   // set once the emulated A3000 SCSI (AMIX) is active
+extern "C" volatile int amix_kernel_loaded; // set once the kernel image starts loading (UNIX_Boot)
+#define INTREQR_PORTS 0x0008
+static inline void ps_tally(unsigned int a)
+{
+   ps_count++;
+   if(a < 0x00200000)                    ps_chip++;     // chip RAM
+   else if(a >= 0x00BFC000 && a < 0x00C00000) { ps_cia++; cia_hist[(a>>8)&0xF]++; } // CIA
+   else if(a >= 0x00DFF000 && a < 0x00E00000) { ps_custom++; custom_hist[(a>>1)&0xFF]++; } // custom chips
+   else                                  ps_other++;
+   ps_lastaddr = a;
+}
 extern "C" void ps_write_32(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
    switch(address&3)
    {
       case 0:
@@ -1601,6 +1623,11 @@ extern "C" void ps_write_32(unsigned int address, unsigned int value)
 }
 extern "C" void ps_write_16(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF030) { // Paula SERDAT: mirror AMIX serial console to jtag
+      char c = (char)(value & 0xFF);
+      if (c == '\n') z3660_printf("\r\n"); else if (c >= 9) z3660_printf("%c", c);
+   }
    switch(address&3)
    {
       case 0:
@@ -1621,6 +1648,7 @@ extern "C" void ps_write_16(unsigned int address, unsigned int value)
 }
 extern "C" void ps_write_8(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
    switch(address&3)
    {
       case 0:
@@ -1640,6 +1668,34 @@ extern "C" void ps_write_8(unsigned int address, unsigned int value)
 
 extern "C" unsigned int ps_read_8(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01F)   // low byte of INTREQR holds PORTS bit
+      return ((arm_read_amiga_byte(address)) & 0xFF) | INTREQR_PORTS;
+   if (a3000_amix_mode && !amix_kernel_loaded && address == 0x00BFE001) { // CIA-A PRA (LMB=bit6, low)
+      // Auto-click past the AmigaOS boot-loader's "Press a mouse button to continue."
+      // prompt ONLY. We stop the instant the kernel starts loading from UNIX_Boot, so
+      // AMIX's own later (pre-root) prompt is left completely untouched for a REAL mouse
+      // click (its button handling differs - left only redraws, right opens a menu).
+      // Detect the mouse-poll spin via rapid consecutive PRA reads (tiny ps_count gaps).
+      static uint32_t last_ps = 0, spin = 0, press = 0, eclicks = 0;
+      static int armed = 0;
+      unsigned int v = (arm_read_amiga_byte(address) >> 16) & 0xFF;
+      uint32_t gap = ps_count - last_ps; last_ps = ps_count;
+      if (gap < 16) {
+         if (spin < 0x0FFFFFFF) spin++;
+         if (eclicks < 6 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {
+            armed = 1; press = 0; eclicks++;
+            z3660_printf("[CLICK] e%lu spin=%lu\n", (unsigned long)eclicks, (unsigned long)spin);
+         }
+         if (armed) {
+            if (press < 40000) { v &= ~0x40u; press++; } // hold the left button
+            else armed = 0;                              // release
+         }
+      } else {
+         spin = 0; armed = 0; eclicks = 0;   // spin ended (loader moved on) -> re-arm next prompt
+      }
+      return v;
+   }
    switch(address&3)
    {
       case 0:
@@ -1655,6 +1711,9 @@ extern "C" unsigned int ps_read_8(unsigned int address)
 }
 extern "C" unsigned int ps_read_16(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01E)   // INTREQR word: show PORTS (INT2) pending
+      return ((arm_read_amiga_word(address)) & 0xFFFF) | INTREQR_PORTS;
    switch(address&3)
    {
       case 0:
@@ -1676,6 +1735,9 @@ extern "C" unsigned int ps_read_16(unsigned int address)
 }
 extern "C" unsigned int ps_read_32(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01C)   // INTENAR:INTREQR long: PORTS in low word
+      return arm_read_amiga_long(address) | INTREQR_PORTS;
    switch(address&3)
    {
       case 0:

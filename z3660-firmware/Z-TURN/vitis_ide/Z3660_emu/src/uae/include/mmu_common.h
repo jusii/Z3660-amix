@@ -118,28 +118,41 @@ static ALWAYS_INLINE bool is_unaligned_bus(uaecptr addr, int size)
     return (addr & (size - 1));
 }
 
+// AMIX: hide the boot RAM at $08000000 from the kernel's MMU-time accesses (phys_* is
+// ONLY the MMU-translated physical path; the boot runs MMU-off via get_*). Once the AMIX
+// MMU is up the kernel has relocated to $07000000 and must NOT see RAM at $08000000, or it
+// over-uses the address space and panics vatosde. Reads return ~0, writes are dropped, so
+// the kernel's RAM probe sees "no RAM" there. (Page tables live at $07xxxxxx, untouched.)
+extern "C" volatile int amix_mmu_on;
+#define AMIX_HIDE08(a) (amix_mmu_on && ((a) & 0xFF000000u) == 0x08000000u)
 static ALWAYS_INLINE void phys_put_long(uaecptr addr, uae_u32 l)
 {
+    if (AMIX_HIDE08(addr)) return;
     put_long(addr, l);
 }
 static ALWAYS_INLINE void phys_put_word(uaecptr addr, uae_u32 w)
 {
+    if (AMIX_HIDE08(addr)) return;
     put_word(addr, w);
 }
 static ALWAYS_INLINE void phys_put_byte(uaecptr addr, uae_u32 b)
 {
+    if (AMIX_HIDE08(addr)) return;
     put_byte(addr, b);
 }
 static ALWAYS_INLINE uae_u32 phys_get_long(uaecptr addr)
 {
+    if (AMIX_HIDE08(addr)) return 0xFFFFFFFFu;
     return get_long(addr);
 }
 static ALWAYS_INLINE uae_u32 phys_get_word(uaecptr addr)
 {
+    if (AMIX_HIDE08(addr)) return 0xFFFFu;
     return get_word(addr);
 }
 static ALWAYS_INLINE uae_u32 phys_get_byte(uaecptr addr)
 {
+    if (AMIX_HIDE08(addr)) return 0xFFu;
     return get_byte(addr);
 }
 

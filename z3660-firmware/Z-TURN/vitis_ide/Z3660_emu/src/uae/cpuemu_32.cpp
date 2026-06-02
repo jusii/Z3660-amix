@@ -6371,10 +6371,10 @@ uae_u32 REGPARAM2 CPUFUNC(op_0e18_32)(uae_u32 opcode)
 		mmufixup[0].value = m68k_areg(regs, dstreg);
 		m68k_areg(regs, dstreg) += areg_byteinc[dstreg];
 		src = regs.regs[(extra >> 12) & 15];
-		m68k_incpci(4);
-		regs.instruction_pc = m68k_getpci();
+		// MOVES-write fault fix (see op_0e98_32): advance PC AFTER the faulting write.
 		mmu030_state[1] |= MMU030_STATEFLAG1_LASTWRITE;
 		dfc030_put_byte_state(dsta, src);
+		m68k_incpci(4);
 	} else {
 		uaecptr srca;
 		srca = m68k_areg(regs, dstreg);
@@ -6893,10 +6893,12 @@ uae_u32 REGPARAM2 CPUFUNC(op_0e98_32)(uae_u32 opcode)
 		mmufixup[0].value = m68k_areg(regs, dstreg);
 		m68k_areg(regs, dstreg) += 4;
 		src = regs.regs[(extra >> 12) & 15];
-		m68k_incpci(4);
-		regs.instruction_pc = m68k_getpci();
+		// MOVES-write fault fix: advance PC AFTER the (faulting) write (like the read branch), so a
+		// user page-fault during copyout produces a frame with the instruction-START pc; otherwise the
+		// pre-advance frame pc + page-in re-run advance the PC twice -> lands mid-instruction (0x5CA panic).
 		mmu030_state[1] |= MMU030_STATEFLAG1_LASTWRITE;
 		dfc030_put_long_state(dsta, src);
+		m68k_incpci(4);
 	} else {
 		uaecptr srca;
 		srca = m68k_areg(regs, dstreg);
