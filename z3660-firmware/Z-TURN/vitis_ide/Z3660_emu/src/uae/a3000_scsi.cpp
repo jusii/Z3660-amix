@@ -169,6 +169,10 @@ struct wd_chip_state {
    int resetnodelay_active;
    struct status_data status[WD_STATUS_QUEUE];
    int queue_index;
+   int async_pending;    /* ASYNC-DMA: a SEL_ATN_XFER deferred from the WD_COMMAND write — execute it (DMA+status)
+                          * only when the guest leaves the level-2 ISR (intmask<2) or polls, so a3091intr's frame
+                          * never nests a full cross-core command execution (the synchronous-DMA queue-corruption fix). */
+   uae_u8 async_cmd;     /* the deferred WD command byte */
 };
 
 struct sdmac_state {
@@ -232,6 +236,12 @@ extern "C" { volatile int amix_kernel_loaded = 0; }
 // so AMIX's RAM probe doesn't count it (AMIX needs $08000000+ free; too much RAM => vatosde).
 extern "C" { volatile int amix_mmu_on = 0; }
 extern "C" int amix_cpu_intmask(void);   /* guest CPU SR interrupt mask (newcpu.cpp) — gates AMIX completion delivery */
+extern "C" uae_u32 amix_cpu_pc(void);    /* TEMP diag: guest PC + frame, to record WHO reads WD_SCSI_STATUS */
+extern "C" uae_u32 amix_cpu_a6(void);
+extern "C" uae_u32 amix_cpu_kread(uae_u32);
+volatile uae_u32 amix_statrd_pc[8], amix_statrd_c1[8], amix_statrd_c2[8]; volatile int amix_statrd_head=0;  /* TEMP */
+/* TEMP: per-completion guest state filled from newcpu.cpp a3091intr hooks (head=curunit->head buf, unit=curunitp) */
+extern "C" { volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_compl_csr[16], amix_compl_unit[16], amix_compl_head[16]; volatile int amix_compl_h=0; }
 
 /* per-unit geometry cache (lazy cross-core fetch) */
 static struct { int valid, present; uae_u32 nblocks, bsize, cyls, heads, secs; } geo[8];
@@ -287,6 +297,10 @@ static void copy_guest_to_bounce(volatile uae_u8 *dst, uae_u32 gaddr, uae_u32 le
    for (uae_u32 i = 0; i < len; i++)
       dst[i] = (uae_u8)get_byte(gaddr + i);
 }
+/* TEMP write-persistence test: do AMIX-runtime disk WRITES actually stick? (degraded SD / read-only hdf would make
+ * fsck loop re-writing the same blocks forever — matching the observed write-loop.) After a write, read the block
+ * back and compare. */
+volatile uae_u32 amix_wv_n = 0, amix_wv_ok = 0, amix_wv_fail = 0;
 
 /* Bulk block transfer between Amix.hdf (devs[unit], core0 FatFS) and guest RAM
  * at the SuperDMAC ACR. Reuses the proven PISCSI READ/WRITE path: core0 stages
@@ -316,6 +330,21 @@ static int a3000_scsi_dma(int unit, uae_u32 lba, uae_u32 bytecount, uae_u32 gadd
          write_scsi_register(PISCSI_CMD_WRITE_ADDR2, chunk, 2);
          write_scsi_register(PISCSI_CMD_WRITE_ADDR3, 0, 2);   /* target 0 -> bounce */
          write_scsi_register(PISCSI_CMD_WRITE, drvnum_for_target(unit), 2);
+         /* WRITE-VERIFY (TEMP, first 32 AMIX writes): read the block back + compare the first 16 bytes. */
+         if (amix_mmu_on && amix_wv_n < 32) {
+            amix_wv_n++;
+            uae_u8 saved[16]; for (int k = 0; k < 16; k++) saved[k] = bounce[k];   /* what we just wrote */
+            write_scsi_register(PISCSI_CMD_READ_ADDR1, lba, 2);
+            write_scsi_register(PISCSI_CMD_READ_ADDR2, chunk, 2);
+            write_scsi_register(PISCSI_CMD_READ_ADDR3, 0, 2);
+            write_scsi_register(PISCSI_CMD_READ, drvnum_for_target(unit), 2);
+            Xil_DCacheInvalidateRange((INTPTR)SCSI_NO_DMA_ADDRESS, chunk);
+            int mismatch = 0; for (int k = 0; k < 16; k++) if (bounce[k] != saved[k]) mismatch = 1;
+            if (mismatch) { amix_wv_fail++;
+               if (amix_wv_fail <= 4) z3660_printf("[WVERIFY] lba=%lu WROTE %02X%02X%02X%02X READ %02X%02X%02X%02X = WRITE DID NOT STICK\r\n",
+                  (unsigned long)lba, saved[0],saved[1],saved[2],saved[3], (unsigned)bounce[0],(unsigned)bounce[1],(unsigned)bounce[2],(unsigned)bounce[3]);
+            } else amix_wv_ok++;
+         }
       } else {
          write_scsi_register(PISCSI_CMD_READ_ADDR1, lba, 2);
          write_scsi_register(PISCSI_CMD_READ_ADDR2, chunk, 2);
@@ -581,7 +610,28 @@ volatile uae_u32 amix_tick = 0;                          // TEMP: ~guest-instruc
 volatile uae_u32 amix_assert_tick = 0, amix_acklat = 0, amix_acklatmax = 0; // TEMP: INT2 assert->ack delivery latency
 volatile uae_u32 amix_clobber_int = 0, amix_clobber_q = 0; // TEMP: pending completion / queued statuses clobbered by a new SEL_ATN_XFER
 volatile uae_u32 amix_qovf = 0; // TEMP: status-queue overflow drops (a dropped completion = a stranded I/O)
+volatile uae_u32 amix_disc_q = 0;          // TEMP: trailing CSR_DISC statuses QUEUED by wd_cmd_sel_xfer (is CTL_EDI clear?)
+volatile uae_u32 amix_disc_dropped = 0;    // # trailing CSR_DISC dropped at istate==0 (the root-cause fix firing)
+volatile uae_u32 amix_delv_istate0 = 0;    // # statuses DELIVERED while guest istate==0 (should drop toward 0 with the fix)
+static uae_u32 amix_delv_csr[16], amix_delv_ist[16]; static int amix_delv_h = 0;  // ring of (csr,istate) at delivery
+volatile uae_u32 amix_rnd_fire = 0;        // TEMP: resetnodelay queue-clears on a WD_SCSI_STATUS ack
+volatile uae_u32 amix_rnd_disc = 0;        // TEMP: total queued statuses discarded by resetnodelay
+volatile uae_u32 amix_rnd_compl = 0;       // TEMP: CSR_SEL_XFER_DONE completions discarded by resetnodelay (= LOST completions!)
+volatile uae_u32 amix_async_exec_n = 0;    // TEMP: # deferred (async-DMA) SEL_ATN_XFER commands actually executed
 static int amix_aux_streak = 0;   // consecutive WD AUX-status reads with no other register touch between (poll detector)
+/* DESYNC DETECTOR (2026-06-03): a3091intr's COMPLETE arm biodones curunitp->4 (the unit's current request). If curunitp
+ * (or its ->4) MOVED between the cmd=08 issue and the WD_SCSI_STATUS completion ack, the completion biodones the WRONG buf
+ * = the intermittent lost-completion that strands a buf_breakup chunk. Capture curunitp->4 at issue vs at completion. */
+volatile uae_u32 amix_issued_req = 0, amix_desync_n = 0, amix_match_n = 0;
+volatile uae_u32 amix_dsy_iss[8], amix_dsy_cmp[8], amix_dsy_cu[8]; volatile int amix_dsy_h = 0;
+static uae_u32 amix_cpu_curunitp_req(void)   /* curunitp->4 (the request a3091intr's COMPLETE arm will biodone) */
+{
+   #define GB4(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
+   uae_u32 cpa = GB4(0x0700D176u);            /* &curunitp (operand of a3091intr movea.l curunitp,a3 @d174) */
+   uae_u32 cu  = GB4(cpa);
+   return cu ? GB4(cu + 4) : 0;
+   #undef GB4
+}
 
 /* SDMAC interrupt level == WinUAE isirq(COMMODORE_SDMAC), folded into the
  * software Amiga INT2 line a3000_scsi_irq. ASR_INT is the master. */
@@ -607,9 +657,98 @@ extern "C" void a3000_scsi_dumpstate(void)
       wc.queue_index, wc.queue_index > 0 ? wc.status[0].irq : -1, wc.wd_busy,
       (unsigned long)amix_setst_n, (unsigned long)amix_assert_n,
       (unsigned long)amix_acklat, (unsigned long)amix_acklatmax);
-   z3660_printf("[SCSIST2] clobber_int=%lu clobber_q=%lu qovf=%lu\r\n",
-      (unsigned long)amix_clobber_int, (unsigned long)amix_clobber_q, (unsigned long)amix_qovf);
+   z3660_printf("[SCSIST2] clobber_int=%lu clobber_q=%lu qovf=%lu disc_q=%lu disc_drop=%lu delv_ist0=%lu rnd_fire=%lu rnd_disc=%lu rnd_compl=%lu\r\n",
+      (unsigned long)amix_clobber_int, (unsigned long)amix_clobber_q, (unsigned long)amix_qovf,
+      (unsigned long)amix_disc_q, (unsigned long)amix_disc_dropped, (unsigned long)amix_delv_istate0,
+      (unsigned long)amix_rnd_fire, (unsigned long)amix_rnd_disc, (unsigned long)amix_rnd_compl);
+   z3660_printf("[SCSIST3] async_exec=%lu async_pending=%d wverify_ok=%lu wverify_FAIL=%lu\r\n",
+      (unsigned long)amix_async_exec_n, wc.async_pending, (unsigned long)amix_wv_ok, (unsigned long)amix_wv_fail);
+   z3660_printf("[DESYNC] curunitp->4 moved issue->completion: n=%lu (matched=%lu) last_issued=%08lX\r\n",
+      (unsigned long)amix_desync_n, (unsigned long)amix_match_n, (unsigned long)amix_issued_req);
+   for (int k = 0; k < 8; k++) { int i = (amix_dsy_h - 8 + k) & 7;
+      if (amix_dsy_iss[i] || amix_dsy_cmp[i])
+         z3660_printf("[DESYNC] issued_req=%08lX completed_req=%08lX csr=%02lX\r\n",
+            (unsigned long)amix_dsy_iss[i], (unsigned long)amix_dsy_cmp[i], (unsigned long)amix_dsy_cu[i]); }
+   { z3660_printf("[DELV]"); for (int k = 0; k < 16; k++) { int i = (amix_delv_h - 16 + k) & 15;
+        z3660_printf(" %02lX@%lu", (unsigned long)amix_delv_csr[i], (unsigned long)amix_delv_ist[i]); } z3660_printf("\r\n"); }
+   for (int k = 0; k < 8; k++) { int i = (amix_statrd_head - 8 + k) & 7;
+      z3660_printf("[STATRD] pc=%08lX caller=%08lX cc=%08lX\r\n",
+         (unsigned long)amix_statrd_pc[i], (unsigned long)amix_statrd_c1[i], (unsigned long)amix_statrd_c2[i]); }
+   for (int k = 0; k < 16; k++) { int i = (amix_compl_h - 16 + k) & 15;
+      z3660_printf("[COMPL] t=%lu ist=%lu csr=%02lX unit=%08lX head=%08lX\r\n",
+         (unsigned long)amix_compl_tick[i], (unsigned long)amix_compl_istate[i], (unsigned long)amix_compl_csr[i],
+         (unsigned long)amix_compl_unit[i], (unsigned long)amix_compl_head[i]); }
 }
+
+/* TEMP: dump the GUEST a3091 driver queue directly. Kernel .data (istate/curunitp/units, VA 0x07xxxxxx) is
+ * IDENTITY-mapped => read via get_byte (PHYSICAL); it is NOT in the srp page tables so amix_kget2 fails for it.
+ * The sc/buf structs are at VA 0x40xxxxxx (page-table mapped) => read via amix_cpu_kread (srp walk). Addresses of
+ * the .data globals come from the linker-patched operands in .text (a3091queue/startany/a3091intr). */
+extern "C" void a3000_scsi_dumpqueue(void)
+{
+   #define PL(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
+   uae_u32 tst = PL(0x0700D014u);                 /* sanity: tst.l istate opcode, expect 0x4AB9xxxx */
+   uae_u32 ia = PL(0x0700D016u);                  /* &istate   (operand of startany tst.l istate @d014) */
+   uae_u32 cpa = PL(0x0700D176u);                 /* &curunitp (operand of a3091intr movea.l curunitp,a3 @d174) */
+   uae_u32 sha = PL(0x0700D020u);                 /* &starthead(operand of startany movea.l starthead,a4 @d01e) */
+   uae_u32 ua = PL(0x0700CF8Cu);                  /* units base(operand of a3091queue adda.l #units,a2 @cf8a) */
+   uae_u32 istate = PL(ia), curunitp = PL(cpa), starthead = PL(sha);
+   uae_u32 unit6 = ua + 0x60;                      /* units[6] (16-byte units, id<<4) */
+   uae_u32 u6head = PL(unit6 + 4), u6tail = PL(unit6 + 8);
+   z3660_printf("[QUEUE] tst=%08lX istate@%08lX=%lu curunitp@%08lX=%08lX starthead@%08lX=%08lX units=%08lX u6.head=%08lX u6.tail=%08lX\r\n",
+      (unsigned long)tst, (unsigned long)ia, (unsigned long)istate, (unsigned long)cpa, (unsigned long)curunitp,
+      (unsigned long)sha, (unsigned long)starthead, (unsigned long)ua, (unsigned long)u6head, (unsigned long)u6tail);
+   /* unit6 command chain: head -> sc[0] -> sc[0] -> ... (a3091queue threads via sc+0x00); sc is a buf @0x40xxxxxx */
+   uae_u32 b = u6head;
+   for (int i = 0; i < 12 && b && b != 0xDEADBEEFu && (b >> 28) == 4; i++) {
+      uae_u32 nxt = amix_cpu_kread(b + 0), blk = amix_cpu_kread(b + 0x28), bc = amix_cpu_kread(b + 0x20);
+      z3660_printf("[QCHAIN] +%d sc=%08lX blkno=%lu bcount=%lX next=%08lX\r\n", i,
+         (unsigned long)b, (unsigned long)blk, (unsigned long)bc, (unsigned long)nxt);
+      b = nxt;
+   }
+   /* starthead ready-unit list: unit -> unit[0] -> ... (uqueue threads units via unit+0x00); units are .data 0x07xxxxxx */
+   uae_u32 u = starthead;
+   for (int i = 0; i < 6 && u && (u >> 24) == 7; i++) {
+      uae_u32 unxt = PL(u + 0), uhead = PL(u + 4);
+      z3660_printf("[QREADY] +%d unit=%08lX head=%08lX next=%08lX\r\n", i, (unsigned long)u, (unsigned long)uhead, (unsigned long)unxt);
+      u = unxt;
+   }
+   /* ddtab device-state machine: ddtab@.data 0x36e0 -> runtime 0x070EA740; entry[lun0,tgt] = base + tgt*0x44;
+    * +0=state(0/1/2), +4=head buf, +8=tail buf, +0xc=embedded q. If state!=0 (busy) while units[tgt] is empty
+    * (idle), ddstrategy queues new bufs WITHOUT startio -> the page-in read never issues. Dump all 8 targets. */
+   for (int t = 0; t < 8; t++) {
+      uae_u32 dd = 0x070EA740u + (uae_u32)t * 0x44u;
+      uae_u32 st = PL(dd + 0), hd = PL(dd + 4), tl = PL(dd + 8);
+      if (st || hd || tl)
+         z3660_printf("[DDTAB] tgt%d @%08lX state=%lu head=%08lX tail=%08lX\r\n", t, (unsigned long)dd,
+            (unsigned long)st, (unsigned long)hd, (unsigned long)tl);
+   }
+   /* target-6 ddtab Q1 buf chain (av_forw @ bp+0xc; bufs 0x40xxxxxx -> amix_cpu_kread) + each buf's b_blkno(+0x28) */
+   { uae_u32 b = PL(0x070EA740u + 6 * 0x44u + 4);   /* ddtab[6].head */
+     for (int i = 0; i < 10 && b && (b >> 28) == 4; i++) {
+        uae_u32 nxt = amix_cpu_kread(b + 0xc), blk = amix_cpu_kread(b + 0x28), fl = amix_cpu_kread(b + 0);
+        z3660_printf("[DDQ1] +%d bp=%08lX bflags=%08lX blkno=%lu av_forw=%08lX\r\n", i,
+           (unsigned long)b, (unsigned long)fl, (unsigned long)blk, (unsigned long)nxt);
+        b = nxt;
+     } }
+   #undef PL
+}
+
+/* Read the GUEST a3091 driver's istate (.data, physical/identity-mapped). &istate comes from startany's patched
+ * tst.l operand @ runtime 0x0700D016 (verified vs reloc R_68K_32->istate). Used to gate trailing completion statuses. */
+static int amix_cpu_istate(void)
+{
+   #define GB4(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
+   uae_u32 ia = GB4(0x0700D016u);
+   return (int)GB4(ia);
+   #undef GB4
+}
+/* ROOT-CAUSE FIX + diag (workflow 2026-06-03): each autonomous SEL_ATN_XFER can queue a TRAILING CSR_DISC after the
+ * real CSR_SEL_XFER_DONE. a3091intr is single-shot per INT2; when the unit queue has drained the driver is at istate==0,
+ * and the trailing DISC's INT2 then dispatches BACK INTO the COMPLETE arm (atab[0*9+itab[0x85]]) which biodone's a
+ * stale/advanced/NULL curunitp->head -> orphans the buf a process biowait's on -> hard idle. Fix: drop a trailing
+ * CSR_DISC delivered at guest istate==0 (the real completion is always delivered at istate>=1, so it is untouched).
+ * Counters amix_disc_q/amix_disc_dropped/amix_delv_istate0 + the [DELV] ring are defined above near amix_qovf. */
 
 static void doscsistatus(uae_u8 status)
 {
@@ -618,6 +757,9 @@ static void doscsistatus(uae_u8 status)
    wc.wdregs[WD_SCSI_STATUS] = status;
    wc.auxstatus |= ASR_INT;
    amix_aux_streak = 0;   /* a fresh completion starts a new poll context (so a3091intr's entry cipwait can't inherit a streak) */
+   if (amix_mmu_on) { int ist = amix_cpu_istate();   /* TEMP diag: which CSR delivered at which guest istate */
+      int h = amix_delv_h & 15; amix_delv_csr[h] = status; amix_delv_ist[h] = (uae_u32)ist; amix_delv_h++;
+      if (ist == 0) amix_delv_istate0++; }
    a3000_recompute_irq();
 }
 
@@ -631,14 +773,14 @@ static void set_status(uae_u8 status, int delay)
 {
    if (wc.queue_index >= WD_STATUS_QUEUE) { amix_qovf++; dbg("[A3000SCSI] int queue overflow\n"); return; }   // TEMP counter
    amix_setst_n++;   // TEMP: count queued statuses
-   /* Boot-load (autonomous SEL_ATN_XFER, wd_delay_mode==0) keeps every status immediate (irq=1) =
-    * the proven kernel-load behavior. Only the step-by-step open path honors the WinUAE countdown. */
-   int eff = wd_delay_mode ? delay : 0;
-   /* NOTE (2026-06-02 night): tried `|| amix_mmu_on` here to defer AMIX-runtime completions (hypothesis:
-    * the synchronous completion races gen_strategy's sleep -> lost wakeup). It did NOT fix the stall
-    * (mmu_on confirmed 1) and made it worse: queued completions then sit long enough to be DISCARDED by
-    * queue resets (setst >> assert). The lost-wakeup is guest-side, exposed by the synchronous DMA model;
-    * fixing it likely needs cycle-accurate/async DMA completion, not a queue delay. Reverted. */
+   /* ROM load (autonomous SEL_ATN_XFER, amix_mmu_on==0) keeps every status immediate (irq=1) = the
+    * proven kernel-load behavior. AMIX runtime (amix_mmu_on==1) AND the step-by-step open honor the
+    * WinUAE countdown so the autonomous SEL_ATN_XFER's two completion statuses (SEL_XFER_DONE then
+    * DISC) are spaced by hsync ticks, letting a3091intr run and rte between them.
+    * (2026-06-03 PACED-COMPLETION FIX: the earlier `|| amix_mmu_on` attempt failed because the
+    * band-aids (intmask-hold gate D + DISC-drop gate E) and the async-DMA defer double-deferred on top
+    * of the delay; those are now REMOVED so the countdown is the SOLE deferral mechanism.) */
+   int eff = (wd_delay_mode || amix_mmu_on) ? delay : 0;
    int irq = (eff == 0) ? 1 : (eff <= 2 ? 2 : eff);
    wc.status[wc.queue_index].status = status;
    wc.status[wc.queue_index].irq = irq;
@@ -659,20 +801,13 @@ static void wd_check_interrupt(int checkonly, int force)
    if (wc.queue_index == 0) return;
    if (wc.status[0].irq > 1) {                /* still counting down */
       if (!checkonly) wc.status[0].irq--;
-      return;
+      if (!force) return;                     /* a genuine AUX poll (force=1) force-ripens NOW */
+      wc.status[0].irq = 1;                   /* otherwise hold until the hsync tick ripens it */
    }
-   /* AMIX runtime: deliver a completion only when the guest is OUTSIDE a level-2 (or higher) critical
-    * section (CPU intmask < 2) -- UNLESS the guest is actively polling the AUX status (force=1), which
-    * is how the driver's POLLED paths (e.g. initialize()) wait for a completion and so must see ASR_INT
-    * immediately even at high spl. The hazard the intmask hold prevents: a3091intr issues the next
-    * autonomous SEL_ATN_XFER from inside its own ISR; the synchronous completion would set that new
-    * command's INT2 while a3091intr is still running, and its next WD_SCSI_STATUS read would
-    * ack-without-biodone it -> the I/O's buf is never completed -> hard hang. a3091intr reads the SDMAC
-    * ISTR (device+0x1e), NOT the WD AUX status (0x1f), so the force path never fires for it; its
-    * completion is held until it rte's (intmask<2) and becomes a clean separate INT2. ROM load
-    * (amix_mmu_on==0) keeps the proven synchronous delivery. */
-   if (amix_mmu_on && !force && amix_cpu_intmask() >= 2)
-      return;                                 /* hold: still in an ISR/critical section, not polling */
+   /* PACED-COMPLETION FIX (2026-06-03): the per-status hsync countdown (set_status irq + the gate
+    * above) now provides the spacing that keeps a3091intr's in-ISR re-issued completion from landing
+    * before the ISR rte's. The two former band-aids -- the intmask>=2 hold and the CSR_DISC-at-istate0
+    * drop -- are REMOVED: they double-deferred on top of the countdown and dropped a legitimate INT2. */
    wc.status[0].irq = 0;
    doscsistatus(wc.status[0].status);
    wc.wd_busy = 0;
@@ -680,6 +815,12 @@ static void wd_check_interrupt(int checkonly, int force)
       for (int i = 1; i < wc.queue_index; i++)
          wc.status[i - 1] = wc.status[i];
       wc.queue_index--;
+      /* WinUAE-style: the promoted head needs ONE MORE hsync tick after the guest acks the status we
+       * just delivered (ASR_INT held meanwhile), so its INT2 lands on a later pump tick AFTER the
+       * current ISR rte's. Re-arm to irq=2 so the per-access checkonly pump (settle / WD_SCSI_STATUS
+       * ack) cannot deliver it inside the same ISR (our gate delivers any irq<=1 on checkonly). */
+      if (amix_mmu_on && wc.status[0].irq <= 1)
+         wc.status[0].irq = 2;
    } else {
       wc.queue_index = 0;
    }
@@ -977,6 +1118,7 @@ end:
    if (!(wc.wdregs[WD_CONTROL] & CTL_EDI)) {
       wc.wd_phase = CSR_DISC;
       set_status(wc.wd_phase, 0);
+      amix_disc_q++;   // TEMP diag: how many trailing CSR_DISC are actually queued (is CTL_EDI clear here?)
    }
    wc.wd_selected = 0;
 }
@@ -1058,6 +1200,7 @@ static void wd_cmd_reset(int irq, int fast)
    wc.queue_index = 0;
    wc.auxstatus = 0;
    wc.wd_data_avail = 0;
+   wc.async_pending = 0;
    wc.resetnodelay_active = 0;
    if (irq) {
       uae_u8 status = (wc.wdregs[0] & 0x08) ? 1 : 0;
@@ -1111,6 +1254,9 @@ static void wd_execute_cmd(int cmd)
    }
 }
 
+/* (amix_async_exec retired 2026-06-03 — the async-DMA defer is replaced by the per-status hsync
+ * countdown in set_status/wd_check_interrupt, which spaces the completion statuses directly.) */
+
 /* ===================== WD33C93 host register access ===================== */
 
 static uae_u8 wdscsi_getauxstatus(void)
@@ -1123,8 +1269,11 @@ static uae_u8 wdscsi_getauxstatus(void)
     * in wd_check_interrupt defers a3091intr's in-ISR re-issued completion until it rte's; forcing it out via
     * cipwait was the residual lost-completion race. amix_aux_streak resets on any non-AUX register touch. */
    amix_aux_streak++;
-   if (amix_aux_streak >= 2)
+   if (amix_aux_streak >= 2) {
+      /* a genuine poll (e.g. initialize()'s busy-wait): force-ripen + deliver the held completion so the
+       * polled wait at high spl still sees ASR_INT. */
       wd_check_interrupt(1, 1);
+   }
    return (wc.auxstatus & ASR_INT) |
           ((wc.wd_busy || wc.wd_data_avail < 0) ? ASR_BSY : 0) |
           ((wc.wd_data_avail != 0) ? ASR_DBR : 0);
@@ -1158,6 +1307,13 @@ static void wdscsi_put(uae_u8 d)
       { int h=amix_wcmd_head&15; amix_wcmd_cmd[h]=d&0x7f; amix_wcmd_dest[h]=wc.wdregs[WD_DESTINATION_ID]&7;
         amix_wcmd_ph[h]=wc.wdregs[WD_COMMAND_PHASE]; amix_wcmd_head++; }   // TEMP command ring
       wc.wd_busy = 1;
+      /* DESYNC DETECTOR: snapshot curunitp->4 (the request the guest dispatcher set just before this
+       * WD_COMMAND write) so the WD_SCSI_STATUS completion ack can verify it didn't move. */
+      if ((d & 0x7f) == WD_CMD_SEL_ATN_XFER && amix_mmu_on) amix_issued_req = amix_cpu_curunitp_req();
+      /* Execute synchronously; the per-status hsync countdown (set_status / wd_check_interrupt) now
+       * spaces the two completion statuses so a3091intr's in-ISR re-issued completion lands AFTER the
+       * ISR rte's. (The async-DMA defer is retired -- it double-deferred the command without spacing
+       * the 2-deep status queue, the actual bug.) */
       wd_execute_cmd(d);
    }
    incsasr(1);
@@ -1182,11 +1338,34 @@ static uae_u8 wdscsi_get(void)
          wd_do_transfer_in(1);
       }
    } else if (wc.sasr == WD_SCSI_STATUS) {
+      { int h=amix_statrd_head&7; uae_u32 a6=amix_cpu_a6();   /* TEMP: which guest code reads the completion status? */
+        amix_statrd_pc[h]=amix_cpu_pc(); amix_statrd_c1[h]=amix_cpu_kread(a6+4);
+        amix_statrd_c2[h]=amix_cpu_kread(amix_cpu_kread(a6)+4); amix_statrd_head++; }
       if (wc.auxstatus & ASR_INT) {
          wc.auxstatus &= ~ASR_INT;
-         { uae_u32 l = amix_tick - amix_assert_tick; amix_acklat = l; if (l > amix_acklatmax) amix_acklatmax = l; } // TEMP: assert->ack latency
-         if (wc.resetnodelay_active)
-            wc.queue_index = 0;
+         /* DESYNC DETECTOR: at this completion ack, does curunitp->4 still equal the request issued by the
+          * matching cmd=08? a3091intr's COMPLETE arm is about to biodone curunitp->4 -- if it moved, that
+          * biodone hits the WRONG buf and the issued chunk is stranded (the intermittent lost-completion). */
+         if (amix_mmu_on && amix_issued_req) {
+            uae_u32 cmp = amix_cpu_curunitp_req();
+            if (cmp != amix_issued_req) {
+               int h = amix_dsy_h & 7; amix_dsy_iss[h] = amix_issued_req; amix_dsy_cmp[h] = cmp;
+               amix_dsy_cu[h] = wc.wdregs[WD_SCSI_STATUS]; amix_dsy_h++; amix_desync_n++;
+            } else amix_match_n++;
+         }
+         if (wc.resetnodelay_active) {
+            /* resetnodelay models a WD reset clearing pending INTs — but it must NOT discard a real pending
+             * completion (CSR_SEL_XFER_DONE) the driver is waiting on (that = a LOST completion -> orphaned buf
+             * -> deadlock). Compact the queue: drop everything EXCEPT pending SEL_XFER_DONE completions. */
+            amix_rnd_fire++; amix_rnd_disc += wc.queue_index;
+            int keep = 0;
+            for (int i = 0; i < wc.queue_index; i++) {
+               if (wc.status[i].status == CSR_SEL_XFER_DONE) { wc.status[keep] = wc.status[i]; wc.status[keep].irq = 1; keep++; }
+            }
+            amix_rnd_compl += keep;
+            amix_rnd_disc -= keep;
+            wc.queue_index = keep;
+         }
          wc.resetnodelay_active = 0;
       }
       sd.dmac_istr &= ~ISTR_INTS;
