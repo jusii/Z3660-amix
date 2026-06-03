@@ -2613,7 +2613,31 @@ int set_special_var=1;
 void z3660_tasks(void);
 extern "C" void ipl_main_read(void);
 extern "C" { extern volatile int a3000_amix_mode; }   // A3000 SCSI WD33C93 int-countdown pump
+extern "C" { extern volatile uae_u32 amix_tick; }     // TEMP: ~guest-instruction counter for INT2 latency
 extern "C" void a3000_scsi_hsync(void);
+// a3000_scsi.cpp gates AMIX completion delivery on the guest's CPU interrupt mask so a SCSI INT2 is
+// taken at most once per command at an instruction boundary OUTSIDE the level-2 ISR — never while
+// a3091intr is mid-flight issuing the next autonomous command (which would ack/lose the new completion).
+extern "C" int amix_cpu_intmask(void) { return (int)regs.intmask; }
+// ===== AMIX sleep-channel trace (TEMP — remove before commit) =====
+// Walk the AMIX 030 supervisor page tables (srp_030) to read a kernel SCN1 VA. DT-aware.
+extern uae_u64 srp_030;
+static uae_u32 amix_kget2(uae_u32 va){
+   uae_u32 idx[3]={(va>>30)&3,(va>>17)&0x1FFF,(va>>11)&0x3F};
+   uae_u32 tbl=(uae_u32)srp_030&0xFFFFFFF0u; int dt=(int)((srp_030>>32)&3);
+   for(int l=0;l<3;l++){ int ds=(dt==3)?8:4; uae_u32 da=tbl+idx[l]*ds;
+      uae_u32 d0=get_long(da), aw=(ds==8)?get_long(da+4):d0;
+      if((d0&3)==0) return 0xDEADBEEFu;
+      if(l==2||(d0&3)==1) return get_long((aw&0xFFFFF800u)|(va&0x7FF));
+      tbl=aw&0xFFFFFFF0u; dt=(int)(d0&3); }
+   return 0xDEADBEEFu;
+}
+static uae_u32 amix_slpchan[8], amix_slpcaller[8]; static int amix_slphead=0;
+static uae_u32 amix_donebuf[16], amix_donetick[16]; static int amix_donehead=0;  // TEMP: biodone(bp) buf+tick ring
+static uae_u32 amix_stuckbuf=0, amix_stucktick=0;                                // TEMP: last buf_breakup biowait target
+extern "C" { extern volatile uae_u32 amix_scmd_unit[16],amix_scmd_lba[16],amix_scmd_n[16],amix_scmd_w[16]; extern volatile int amix_scmd_head; }
+extern "C" void a3000_scsi_dumpstate(void);
+extern "C" { extern volatile uae_u32 amix_wcmd_cmd[16],amix_wcmd_dest[16],amix_wcmd_ph[16]; extern volatile int amix_wcmd_head; }
 static inline void check_uae_int_request(void)
 {
    z3660_tasks();
@@ -2621,7 +2645,49 @@ static inline void check_uae_int_request(void)
    // A3000 SCSI WD33C93 interrupt-delay pump: advances the status countdown on a fixed cadence in
    // EVERY CPU run loop (including the MMU-off loop the Kickstart ROM uses to load the kernel), so the
    // SELECT and SRV_REQ INT2s stay spaced for AMIX's step-by-step sd open WITHOUT stalling the boot load.
-   if(a3000_amix_mode){ static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
+   if(a3000_amix_mode){ amix_tick++; static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
+   // ===== AMIX sleep-channel + PC sampler (TEMP — remove before commit) =====
+   if(a3000_amix_mode){
+      uae_u32 ipc=(uae_u32)regs.instruction_pc;
+      if(ipc==0x070485F4u){   // sleep(chan,pri): just after 'link.w a6,#0', so caller=(a6+4), chan=(a6+8)
+         uae_u32 a6=(uae_u32)m68k_areg(regs,6);
+         uae_u32 caller=amix_kget2(a6+4);
+         if((caller<0x07059000u||caller>=0x0705A000u) && caller!=0x0703D9F0u){   // skip swapper/sched idle (0x07059xxx) AND buf_breakup (0x0703D9F0) so init's blocking sleep is retained
+            amix_slpcaller[amix_slphead&7]=caller;
+            amix_slpchan[amix_slphead&7]=amix_kget2((uae_u32)m68k_areg(regs,7)+4);   // REAL sleep chan (sleep's 1st arg on the stack, a7+4 before its link executes)
+            amix_slphead++;
+         }
+      }
+      if(ipc==0x0703CE18u){   // biodone: after 'movea.l $8(a6),a2', a2 = bp (the completing buf)
+         amix_donebuf[amix_donehead&15]=(uae_u32)m68k_areg(regs,2);
+         amix_donetick[amix_donehead&15]=amix_tick;
+         amix_donehead++;
+      }
+      if(ipc==0x0703D1DCu || ipc==0x0703D22Cu){   // buf_breakup 'jsr sleep': a2 = the chunk buf it biowaits on
+         amix_stuckbuf=(uae_u32)m68k_areg(regs,2);
+         amix_stucktick=amix_tick;
+      }
+      static uae_u32 pcc=0; if((++pcc & 0x3FFFFF)==0){
+         z3660_printf("[PC] %08lX s=%d msk=%d\r\n",(unsigned long)ipc,(int)regs.s,(int)regs.intmask);
+         // when idling in swtch (0x070b90xx), dump the last sleep callers/chans + last SCSI commands
+         if(ipc>=0x070B9000u && ipc<0x070B9300u){
+            for(int k=0;k<8;k++){ int i=(amix_slphead-8+k)&7;
+               z3660_printf("[SLP] caller=%08lX chan=%08lX\r\n",(unsigned long)amix_slpcaller[i],(unsigned long)amix_slpchan[i]); }
+            { int donefound=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_stuckbuf && amix_stuckbuf){ donefound=(int)amix_donetick[k]; } }
+              z3660_printf("[STUCKBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)  tick_now=%lu\r\n",
+                 (unsigned long)amix_stuckbuf,(unsigned long)amix_stucktick, donefound>=0?"YES":"NO", donefound,(unsigned long)amix_tick);
+              for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15;
+                 z3660_printf("[DONE] buf=%08lX tick=%lu\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_donetick[i]); } }
+            for(int k=0;k<16;k++){ int i=(amix_scmd_head-16+k)&15;
+               z3660_printf("[SDMA] %c unit=%lu lba=%lu n=%lu\r\n",amix_scmd_w[i]?'W':'R',
+                  (unsigned long)amix_scmd_unit[i],(unsigned long)amix_scmd_lba[i],(unsigned long)amix_scmd_n[i]); }
+            a3000_scsi_dumpstate();   // why isn't the SCSI INT2 firing at the stall?
+            for(int k=0;k<16;k++){ int i=(amix_wcmd_head-16+k)&15;
+               z3660_printf("[WCMD] cmd=%02lX dest=%lu ph=%02lX\r\n",(unsigned long)amix_wcmd_cmd[i],
+                  (unsigned long)amix_wcmd_dest[i],(unsigned long)amix_wcmd_ph[i]); }
+         }
+      }
+   }
 #if INT_IPL_ON_THIS_CORE == 0
    if(shared->int_available)
    {

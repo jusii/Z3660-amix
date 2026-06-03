@@ -151,7 +151,7 @@ static uint32_t t_ps_last=0, t_chip_last=0, t_cia_last=0, t_cust_last=0, t_oth_l
 #define CTL_EDI               0x08   /* Ending Disconnect Interrupt enable */
 #define CTL_IDI               0x04   /* Intermediate Disconnect Interrupt enable */
 
-#define WD_STATUS_QUEUE       4
+#define WD_STATUS_QUEUE       16   /* was 4; the AMIX intmask-hold can queue several completions before the ISR rte's */
 
 /* ================================ state ================================ */
 struct status_data { uae_u8 status; int irq; };
@@ -231,6 +231,7 @@ extern "C" { volatile int amix_kernel_loaded = 0; }
 // and no longer needs the boot RAM at $08000000. After this, phys_get/put hide $08000000
 // so AMIX's RAM probe doesn't count it (AMIX needs $08000000+ free; too much RAM => vatosde).
 extern "C" { volatile int amix_mmu_on = 0; }
+extern "C" int amix_cpu_intmask(void);   /* guest CPU SR interrupt mask (newcpu.cpp) — gates AMIX completion delivery */
 
 /* per-unit geometry cache (lazy cross-core fetch) */
 static struct { int valid, present; uae_u32 nblocks, bsize, cyls, heads, secs; } geo[8];
@@ -291,8 +292,11 @@ static void copy_guest_to_bounce(volatile uae_u8 *dst, uae_u32 gaddr, uae_u32 le
  * at the SuperDMAC ACR. Reuses the proven PISCSI READ/WRITE path: core0 stages
  * the FatFS I/O through SCSI_NO_DMA_ADDRESS (forced by a non-window target=0),
  * core1 scatters/gathers to the real guest address. Returns 1 on success. */
+// ===== AMIX SCSI command ring (TEMP — remove before commit): last reads/writes before the hang =====
+extern "C" { volatile uae_u32 amix_scmd_unit[16], amix_scmd_lba[16], amix_scmd_n[16], amix_scmd_w[16]; volatile int amix_scmd_head=0; }
 static int a3000_scsi_dma(int unit, uae_u32 lba, uae_u32 bytecount, uae_u32 gaddr, int write)
 {
+   { int h=amix_scmd_head&15; amix_scmd_unit[h]=unit; amix_scmd_lba[h]=lba; amix_scmd_n[h]=bytecount/512; amix_scmd_w[h]=write; amix_scmd_head++; }
    volatile uae_u8 *bounce = (volatile uae_u8 *)SCSI_NO_DMA_ADDRESS;
    uae_u32 bsize = (unit >= 0 && unit < 8 && geo[unit].bsize) ? geo[unit].bsize : 512;
    if (!write && lba > 1700000) amix_kernel_loaded = 1; // past the boot-loader prompt
@@ -572,6 +576,13 @@ static void writewdreg(int sasr, uae_u8 val)
    wc.wdregs[sasr] = val;
 }
 
+volatile uae_u32 amix_setst_n = 0, amix_assert_n = 0;   // TEMP: statuses queued vs INT2 0->2 assertions
+volatile uae_u32 amix_tick = 0;                          // TEMP: ~guest-instruction counter (bumped in check_uae_int_request)
+volatile uae_u32 amix_assert_tick = 0, amix_acklat = 0, amix_acklatmax = 0; // TEMP: INT2 assert->ack delivery latency
+volatile uae_u32 amix_clobber_int = 0, amix_clobber_q = 0; // TEMP: pending completion / queued statuses clobbered by a new SEL_ATN_XFER
+volatile uae_u32 amix_qovf = 0; // TEMP: status-queue overflow drops (a dropped completion = a stranded I/O)
+static int amix_aux_streak = 0;   // consecutive WD AUX-status reads with no other register touch between (poll detector)
+
 /* SDMAC interrupt level == WinUAE isirq(COMMODORE_SDMAC), folded into the
  * software Amiga INT2 line a3000_scsi_irq. ASR_INT is the master. */
 static void a3000_recompute_irq(void)
@@ -583,7 +594,21 @@ static void a3000_recompute_irq(void)
    int line = 0;
    if ((sd.dmac_cntr & SCNTR_INTEN) && (sd.dmac_istr & (ISTR_INTS | ISTR_E_INT)))
       line = 2;
+   if (line == 2 && a3000_scsi_irq != 2) { amix_assert_n++; amix_assert_tick = amix_tick; }   // TEMP: count + stamp 0->2 INT2 assertions
    a3000_scsi_irq = line;
+}
+
+// TEMP diagnostic: dump the INT2-relevant SCSI state at a stall (remove before commit).
+extern "C" void a3000_scsi_dumpstate(void)
+{
+   z3660_printf("[SCSIST] irq=%d mmu_on=%d cntr=%02X INTEN=%d asr=%02X ASRINT=%d qi=%d q0irq=%d busy=%d setst=%lu assert=%lu acklat=%lu acklatmax=%lu\r\n",
+      (int)a3000_scsi_irq, (int)amix_mmu_on, (unsigned)sd.dmac_cntr, (sd.dmac_cntr & SCNTR_INTEN) ? 1 : 0,
+      (unsigned)wc.auxstatus, (wc.auxstatus & ASR_INT) ? 1 : 0,
+      wc.queue_index, wc.queue_index > 0 ? wc.status[0].irq : -1, wc.wd_busy,
+      (unsigned long)amix_setst_n, (unsigned long)amix_assert_n,
+      (unsigned long)amix_acklat, (unsigned long)amix_acklatmax);
+   z3660_printf("[SCSIST2] clobber_int=%lu clobber_q=%lu qovf=%lu\r\n",
+      (unsigned long)amix_clobber_int, (unsigned long)amix_clobber_q, (unsigned long)amix_qovf);
 }
 
 static void doscsistatus(uae_u8 status)
@@ -592,6 +617,7 @@ static void doscsistatus(uae_u8 status)
       a3000_scsi_irq);  /* [SCSITRACE] rm before commit */
    wc.wdregs[WD_SCSI_STATUS] = status;
    wc.auxstatus |= ASR_INT;
+   amix_aux_streak = 0;   /* a fresh completion starts a new poll context (so a3091intr's entry cipwait can't inherit a streak) */
    a3000_recompute_irq();
 }
 
@@ -603,10 +629,16 @@ static void doscsistatus(uae_u8 status)
  * CSR_SELECT and the following CSR_SRV_REQ were delivered back-to-back, mis-sequencing sdopen.) */
 static void set_status(uae_u8 status, int delay)
 {
-   if (wc.queue_index >= WD_STATUS_QUEUE) { dbg("[A3000SCSI] int queue overflow\n"); return; }
+   if (wc.queue_index >= WD_STATUS_QUEUE) { amix_qovf++; dbg("[A3000SCSI] int queue overflow\n"); return; }   // TEMP counter
+   amix_setst_n++;   // TEMP: count queued statuses
    /* Boot-load (autonomous SEL_ATN_XFER, wd_delay_mode==0) keeps every status immediate (irq=1) =
     * the proven kernel-load behavior. Only the step-by-step open path honors the WinUAE countdown. */
    int eff = wd_delay_mode ? delay : 0;
+   /* NOTE (2026-06-02 night): tried `|| amix_mmu_on` here to defer AMIX-runtime completions (hypothesis:
+    * the synchronous completion races gen_strategy's sleep -> lost wakeup). It did NOT fix the stall
+    * (mmu_on confirmed 1) and made it worse: queued completions then sit long enough to be DISCARDED by
+    * queue resets (setst >> assert). The lost-wakeup is guest-side, exposed by the synchronous DMA model;
+    * fixing it likely needs cycle-accurate/async DMA completion, not a queue delay. Reverted. */
    int irq = (eff == 0) ? 1 : (eff <= 2 ? 2 : eff);
    wc.status[wc.queue_index].status = status;
    wc.status[wc.queue_index].irq = irq;
@@ -621,7 +653,7 @@ static void set_status0(uae_u8 status) { set_status(status, 0); }
  * still-counting head. checkonly==1 (a probe/ack, e.g. the WD_SCSI_STATUS ack read or any
  * per-access settle) MAY deliver an already-ripe status but must NEVER advance the countdown,
  * so the next status cannot fire back-to-back inside the same access. One pending at a time. */
-static void wd_check_interrupt(int checkonly)
+static void wd_check_interrupt(int checkonly, int force)
 {
    if (wc.auxstatus & ASR_INT) return;        /* one pending at a time */
    if (wc.queue_index == 0) return;
@@ -629,6 +661,18 @@ static void wd_check_interrupt(int checkonly)
       if (!checkonly) wc.status[0].irq--;
       return;
    }
+   /* AMIX runtime: deliver a completion only when the guest is OUTSIDE a level-2 (or higher) critical
+    * section (CPU intmask < 2) -- UNLESS the guest is actively polling the AUX status (force=1), which
+    * is how the driver's POLLED paths (e.g. initialize()) wait for a completion and so must see ASR_INT
+    * immediately even at high spl. The hazard the intmask hold prevents: a3091intr issues the next
+    * autonomous SEL_ATN_XFER from inside its own ISR; the synchronous completion would set that new
+    * command's INT2 while a3091intr is still running, and its next WD_SCSI_STATUS read would
+    * ack-without-biodone it -> the I/O's buf is never completed -> hard hang. a3091intr reads the SDMAC
+    * ISTR (device+0x1e), NOT the WD AUX status (0x1f), so the force path never fires for it; its
+    * completion is held until it rte's (intmask<2) and becomes a clean separate INT2. ROM load
+    * (amix_mmu_on==0) keeps the proven synchronous delivery. */
+   if (amix_mmu_on && !force && amix_cpu_intmask() >= 2)
+      return;                                 /* hold: still in an ISR/critical section, not polling */
    wc.status[0].irq = 0;
    doscsistatus(wc.status[0].status);
    wc.wd_busy = 0;
@@ -802,6 +846,8 @@ static void wd_cmd_sel_xfer(int atn)
 {
    int tmp_tc;
    wd_delay_mode = 0;   /* autonomous ROM boot-load: immediate delivery (no inter-INT2 gap wanted) */
+   if (wc.auxstatus & ASR_INT) amix_clobber_int++;   // TEMP: new cmd issued while a completion INT was still pending
+   if (wc.queue_index > 0) amix_clobber_q += wc.queue_index;   // TEMP: queued statuses about to be stranded
    wc.auxstatus = 0;
    wc.wd_data_avail = 0;
    tmp_tc = gettc();
@@ -1069,6 +1115,16 @@ static void wd_execute_cmd(int cmd)
 
 static uae_u8 wdscsi_getauxstatus(void)
 {
+   /* Force-deliver a held completion ONLY to a genuine POLL of the AUX status (>=2 consecutive AUX reads,
+    * e.g. the driver's initialize() busy-wait `while(!(reg(0x1f)&0x80))`), so a polled wait at high spl
+    * still sees ASR_INT. Do NOT force on a SINGLE AUX read: a3091intr's entry cipwait() reads the AUX
+    * exactly once (it tests ASR_CIP, which we never set, so it never loops) and is immediately followed by
+    * a WD_SCSI_STATUS read that would ack-without-biodone any completion we leaked to it. The intmask hold
+    * in wd_check_interrupt defers a3091intr's in-ISR re-issued completion until it rte's; forcing it out via
+    * cipwait was the residual lost-completion race. amix_aux_streak resets on any non-AUX register touch. */
+   amix_aux_streak++;
+   if (amix_aux_streak >= 2)
+      wd_check_interrupt(1, 1);
    return (wc.auxstatus & ASR_INT) |
           ((wc.wd_busy || wc.wd_data_avail < 0) ? ASR_BSY : 0) |
           ((wc.wd_data_avail != 0) ? ASR_DBR : 0);
@@ -1076,8 +1132,12 @@ static uae_u8 wdscsi_getauxstatus(void)
 
 static void wdscsi_sasr(uae_u8 b) { wc.sasr = b; }
 
+// TEMP: ring of the last WD33C93 commands the guest issued (to pair against the [SDMA] DMA ring).
+extern "C" { volatile uae_u32 amix_wcmd_cmd[16], amix_wcmd_dest[16], amix_wcmd_ph[16]; volatile int amix_wcmd_head = 0; }
+
 static void wdscsi_put(uae_u8 d)
 {
+   amix_aux_streak = 0;   /* any register WRITE breaks an AUX poll streak */
    if (!writeonlyreg(wc.sasr))
       writewdreg(wc.sasr, d);
    if (wc.sasr == WD_COMMAND_PHASE) {
@@ -1095,6 +1155,8 @@ static void wdscsi_put(uae_u8 d)
    } else if (wc.sasr == WD_COMMAND) {
       if (wd_trace_on()) dbg("[WDCMD] cmd=%02X destid=%X ph=%02X\n", d & 0x7f,
          wc.wdregs[WD_DESTINATION_ID] & 7, wc.wdregs[WD_COMMAND_PHASE]);  /* [SCSITRACE] rm */
+      { int h=amix_wcmd_head&15; amix_wcmd_cmd[h]=d&0x7f; amix_wcmd_dest[h]=wc.wdregs[WD_DESTINATION_ID]&7;
+        amix_wcmd_ph[h]=wc.wdregs[WD_COMMAND_PHASE]; amix_wcmd_head++; }   // TEMP command ring
       wc.wd_busy = 1;
       wd_execute_cmd(d);
    }
@@ -1103,6 +1165,7 @@ static void wdscsi_put(uae_u8 d)
 
 static uae_u8 wdscsi_get(void)
 {
+   if (wc.sasr != WD_AUXILIARY_STATUS) amix_aux_streak = 0;   /* a non-AUX register read breaks an AUX poll streak */
    uae_u8 v = wc.wdregs[wc.sasr];
    if (wc.sasr == WD_DATA) {
       if (!wc.wd_data_avail) return 0;
@@ -1121,12 +1184,13 @@ static uae_u8 wdscsi_get(void)
    } else if (wc.sasr == WD_SCSI_STATUS) {
       if (wc.auxstatus & ASR_INT) {
          wc.auxstatus &= ~ASR_INT;
+         { uae_u32 l = amix_tick - amix_assert_tick; amix_acklat = l; if (l > amix_acklatmax) amix_acklatmax = l; } // TEMP: assert->ack latency
          if (wc.resetnodelay_active)
             wc.queue_index = 0;
          wc.resetnodelay_active = 0;
       }
       sd.dmac_istr &= ~ISTR_INTS;
-      wd_check_interrupt(1);                  /* pump the next queued status */
+      wd_check_interrupt(1, 0);               /* pump the next queued status */
    } else if (wc.sasr == WD_AUXILIARY_STATUS) {
       v = wdscsi_getauxstatus();
    }
@@ -1146,6 +1210,12 @@ static void mbdmac_write_word(uae_u32 addr, uae_u32 val)
    case 0x0a:
       sd.dmac_cntr = val;
       if (sd.dmac_cntr & SCNTR_PREST) dmac_reset();
+      // INT2 is a LEVEL function of (CNTR & INTEN) && ASR_INT (see file header). Writing CNTR changes
+      // INTEN, so the line must be re-evaluated: without this, a SCSI completion that arrived while the
+      // guest ISR had INTEN masked is never re-asserted when the ISR re-enables INTEN -> AMIX sleeps
+      // forever on that I/O until an UNRELATED level-2 INT (e.g. a keyboard press) wakes it and its ISR
+      // polls the WD status. That made the boot stall intermittently in gen_strategy disk waits.
+      a3000_recompute_irq();
       break;
    case 0x0c: sd.dmac_acr = (sd.dmac_acr & 0x0000ffff) | (val << 16); break;
    case 0x0e: sd.dmac_acr = (sd.dmac_acr & 0xffff0000) | (val & 0xfffe); break;
@@ -1228,7 +1298,7 @@ static void a3000_scsi_settle(void)
       if (v) { cur.direction = 0; wc.wd_data_avail = 0; }
       else   set_dma_done();
    }
-   wd_check_interrupt(1);   /* per-access: deliver a ripe status, but do NOT advance the countdown */
+   wd_check_interrupt(1, 0);   /* per-access: deliver a ripe status, but do NOT advance the countdown */
    a3000_recompute_irq();
 }
 
@@ -1238,7 +1308,7 @@ static void a3000_scsi_settle(void)
  * where the guest ISR runs between the SELECT and the service-request INT2s. */
 extern "C" void a3000_scsi_hsync(void)
 {
-   wd_check_interrupt(0);
+   wd_check_interrupt(0, 0);
    a3000_recompute_irq();
 }
 
