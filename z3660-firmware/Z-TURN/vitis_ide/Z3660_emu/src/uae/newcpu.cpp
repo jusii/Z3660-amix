@@ -2632,12 +2632,26 @@ static uae_u32 amix_kget2(uae_u32 va){
       tbl=aw&0xFFFFFFF0u; dt=(int)(d0&3); }
    return 0xDEADBEEFu;
 }
+// expose guest CPU PC / frame so a3000_scsi.cpp can record WHO reads WD_SCSI_STATUS (TEMP)
+extern "C" uae_u32 amix_cpu_pc(void){ return (uae_u32)regs.instruction_pc; }
+extern "C" uae_u32 amix_cpu_a6(void){ return (uae_u32)m68k_areg(regs,6); }
+extern "C" uae_u32 amix_cpu_kread(uae_u32 va){ return amix_kget2(va); }
 static uae_u32 amix_slpchan[8], amix_slpcaller[8]; static int amix_slphead=0;
-static uae_u32 amix_donebuf[16], amix_donetick[16]; static int amix_donehead=0;  // TEMP: biodone(bp) buf+tick ring
+static uae_u32 amix_donebuf[16], amix_donetick[16], amix_donecaller[16]; static int amix_donehead=0;  // TEMP: biodone(bp) buf+tick+caller ring
+static uae_u32 amix_selflink=0, amix_biodone_last=0, amix_biodone_same=0, amix_biodone_maxsame=0;  // TEMP: detect Q1 self-link (bp->av_forw==bp) + repeated same-buf biodone (the write loop)
 static uae_u32 amix_stuckbuf=0, amix_stucktick=0;                                // TEMP: last buf_breakup biowait target
+static uae_u32 amix_pageinbuf=0, amix_pageintick=0;                              // TEMP: last ufs_getapage(0x07082398) biowait buf = the stranded page-in
+static uae_u32 amix_a3091_istate[8]={0,0,0,0,0,0,0,0};                           // TEMP: (unused now) istate histogram
+static uae_u32 amix_issue_buf[16], amix_issue_unit[16], amix_issue_tick[16]; static int amix_issue_h=0;  // TEMP: bufs startany ISSUES (a3) + unit (a4)
+static uae_u32 amix_disp_csr[16], amix_disp_act[16], amix_disp_tick[16]; static int amix_disp_h=0;  // TEMP: a3091intr@0xd142 dispatch (d2=csr, d0=action)
+static uae_u32 amix_disp_acthist[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};  // TEMP: count per dispatched action (action 1 = badhardware = the strand)
+static uae_u32 amix_badhw_n=0, amix_badhw_tick=0;  // TEMP: a3091 badhardware(0x700cf46) hits = completion dispatched with NO biodone
+static int amix_ddcrit=0; static uae_u32 amix_ddstrat_n=0, amix_preempt_n=0, amix_preempt_tick=0;  // TEMP: a3091intr ENTERED during ddstrategy's IPL2 splbio window = the IPL-preemption strand
 extern "C" { extern volatile uae_u32 amix_scmd_unit[16],amix_scmd_lba[16],amix_scmd_n[16],amix_scmd_w[16]; extern volatile int amix_scmd_head; }
 extern "C" void a3000_scsi_dumpstate(void);
+extern "C" void a3000_scsi_dumpqueue(void);
 extern "C" { extern volatile uae_u32 amix_wcmd_cmd[16],amix_wcmd_dest[16],amix_wcmd_ph[16]; extern volatile int amix_wcmd_head; }
+extern "C" { extern volatile uae_u32 amix_compl_tick[16],amix_compl_istate[16],amix_compl_csr[16],amix_compl_unit[16],amix_compl_head[16]; extern volatile int amix_compl_h; }
 static inline void check_uae_int_request(void)
 {
    z3660_tasks();
@@ -2649,19 +2663,45 @@ static inline void check_uae_int_request(void)
    // ===== AMIX sleep-channel + PC sampler (TEMP — remove before commit) =====
    if(a3000_amix_mode){
       uae_u32 ipc=(uae_u32)regs.instruction_pc;
+      if(ipc==0x0700BED8u){ amix_ddcrit=1; amix_ddstrat_n++; }   // ddstrategy: just did move.w #$2200,sr (IPL2 splbio) -> enter critical
+      if(ipc==0x0700BF04u){ amix_ddcrit=0; }                       // ddstrategy: move.w d2,sr (splx) -> leave critical
+      if(ipc==0x0700D0E0u && amix_ddcrit){ amix_preempt_n++; amix_preempt_tick=amix_tick; }  // a3091intr ENTERED while ddstrategy holds IPL2 = IPL-preemption violation
+      if(ipc==0x0700D142u){   // a3091intr: d0 = atab[istate*9+itab[csr]] = the dispatched ACTION (just set @0xd13e); d2 = csr
+         int h=amix_disp_h&15; uae_u32 act=(uae_u32)(m68k_dreg(regs,0)&0xff);
+         amix_disp_csr[h]=(uae_u32)(m68k_dreg(regs,2)&0xff); amix_disp_act[h]=act; amix_disp_tick[h]=amix_tick; amix_disp_h++;
+         if(act<16) amix_disp_acthist[act]++;
+      }
+      if(ipc==0x0700CF46u){ amix_badhw_n++; amix_badhw_tick=amix_tick; }   // badhardware: a completion that biodones NOTHING
       if(ipc==0x070485F4u){   // sleep(chan,pri): just after 'link.w a6,#0', so caller=(a6+4), chan=(a6+8)
          uae_u32 a6=(uae_u32)m68k_areg(regs,6);
          uae_u32 caller=amix_kget2(a6+4);
          if((caller<0x07059000u||caller>=0x0705A000u) && caller!=0x0703D9F0u){   // skip swapper/sched idle (0x07059xxx) AND buf_breakup (0x0703D9F0) so init's blocking sleep is retained
+            uae_u32 chan=amix_kget2((uae_u32)m68k_areg(regs,7)+4);   // REAL sleep chan (sleep's 1st arg on the stack, a7+4 before its link executes)
             amix_slpcaller[amix_slphead&7]=caller;
-            amix_slpchan[amix_slphead&7]=amix_kget2((uae_u32)m68k_areg(regs,7)+4);   // REAL sleep chan (sleep's 1st arg on the stack, a7+4 before its link executes)
+            amix_slpchan[amix_slphead&7]=chan;
             amix_slphead++;
+            if(caller==0x07082398u){ amix_pageinbuf=chan; amix_pageintick=amix_tick; }   // ufs_getapage page-in buf = the stranded read
          }
       }
-      if(ipc==0x0703CE18u){   // biodone: after 'movea.l $8(a6),a2', a2 = bp (the completing buf)
-         amix_donebuf[amix_donehead&15]=(uae_u32)m68k_areg(regs,2);
+      if(ipc==0x0700D034u){   // startany: a3 = the sc(=bp) it is about to issue, a4 = its unit (regs reliable)
+         int hh=amix_issue_h&15;
+         amix_issue_buf[hh]=(uae_u32)m68k_areg(regs,3); amix_issue_unit[hh]=(uae_u32)m68k_areg(regs,4);
+         amix_issue_tick[hh]=amix_tick; amix_issue_h++;
+      }
+      if(ipc==0x0700D17Eu){   // a3091intr d16e COMPLETE handler: a2 = curunit->head (buf being biodone'd), a3 = curunitp
+         int hh=amix_compl_h&15;
+         amix_compl_head[hh]=(uae_u32)m68k_areg(regs,2); amix_compl_unit[hh]=(uae_u32)m68k_areg(regs,3);
+         amix_compl_istate[hh]=1; amix_compl_csr[hh]=0x16; amix_compl_tick[hh]=amix_tick; amix_compl_h++;
+      }
+      if(ipc==0x0703CE18u){   // biodone: after 'movea.l $8(a6),a2', a2 = bp (the completing buf); 4(a6) = caller
+         uae_u32 bp=(uae_u32)m68k_areg(regs,2);
+         amix_donebuf[amix_donehead&15]=bp;
          amix_donetick[amix_donehead&15]=amix_tick;
+         amix_donecaller[amix_donehead&15]=amix_kget2((uae_u32)m68k_areg(regs,6)+4);
          amix_donehead++;
+         { uae_u32 avf=amix_kget2(bp+0xcu); if(bp && avf==bp) amix_selflink++; }   // bp->av_forw(+0xc)==bp = Q1 SELF-LINK
+         if(bp==amix_biodone_last){ amix_biodone_same++; if(amix_biodone_same>amix_biodone_maxsame) amix_biodone_maxsame=amix_biodone_same; }
+         else { amix_biodone_same=0; amix_biodone_last=bp; }
       }
       if(ipc==0x0703D1DCu || ipc==0x0703D22Cu){   // buf_breakup 'jsr sleep': a2 = the chunk buf it biowaits on
          amix_stuckbuf=(uae_u32)m68k_areg(regs,2);
@@ -2677,11 +2717,36 @@ static inline void check_uae_int_request(void)
               z3660_printf("[STUCKBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)  tick_now=%lu\r\n",
                  (unsigned long)amix_stuckbuf,(unsigned long)amix_stucktick, donefound>=0?"YES":"NO", donefound,(unsigned long)amix_tick);
               for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15;
-                 z3660_printf("[DONE] buf=%08lX tick=%lu\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_donetick[i]); } }
+                 z3660_printf("[DONE] buf=%08lX tick=%lu by=%08lX\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_donetick[i],(unsigned long)amix_donecaller[i]); } }
+            { int pf=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_pageinbuf && amix_pageinbuf){ pf=(int)amix_donetick[k]; } }
+              z3660_printf("[PGINBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)\r\n",
+                 (unsigned long)amix_pageinbuf,(unsigned long)amix_pageintick, pf>=0?"YES":"NO", pf); }
+            for(int k=0;k<16;k++){ int i=(amix_issue_h-16+k)&15;
+               z3660_printf("[ISSUE] buf=%08lX unit=%08lX tick=%lu\r\n",(unsigned long)amix_issue_buf[i],(unsigned long)amix_issue_unit[i],(unsigned long)amix_issue_tick[i]); }
+            { int iss=0,cmp=0; for(int k=0;k<16;k++){ if(amix_pageinbuf){ if(amix_issue_buf[k]==amix_pageinbuf) iss=1; if(amix_compl_head[k]==amix_pageinbuf) cmp=1; } }
+              z3660_printf("[PGINTRK] pageinbuf=%08lX in_issue=%d in_compl=%d\r\n",(unsigned long)amix_pageinbuf,iss,cmp); }
+            z3660_printf("[LOOP] selflink(bp->av_forw==bp)=%lu maxsame_biodone=%lu last=%08lX\r\n",
+               (unsigned long)amix_selflink,(unsigned long)amix_biodone_maxsame,(unsigned long)amix_biodone_last);
+            // Dump raw buf headers (bufs live at 0x40xxxxxx = MMU section 1, so amix_kget2 reads them reliably).
+            // Reverse-engineer: b_flags (B_DONE/B_READ/B_BUSY/B_ERROR), b_forw/av_forw (0x40xxxxxx links), b_blkno (=an [SDMA] lba).
+            { uae_u32 b=amix_pageinbuf; z3660_printf("[BUFHDR] pagein  %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
+            { uae_u32 b=amix_donebuf[(amix_donehead-1)&15]; z3660_printf("[BUFHDR] lastdone %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
             for(int k=0;k<16;k++){ int i=(amix_scmd_head-16+k)&15;
                z3660_printf("[SDMA] %c unit=%lu lba=%lu n=%lu\r\n",amix_scmd_w[i]?'W':'R',
                   (unsigned long)amix_scmd_unit[i],(unsigned long)amix_scmd_lba[i],(unsigned long)amix_scmd_n[i]); }
+            z3660_printf("[PREEMPT] a3091intr-during-ddstrategy-IPL2 = %lu (last@%lu)  ddstrategy_n=%lu  ddcrit=%d\r\n",
+               (unsigned long)amix_preempt_n,(unsigned long)amix_preempt_tick,(unsigned long)amix_ddstrat_n,amix_ddcrit);
+            z3660_printf("[DISPACT] hist: a0(COMPLETE)=%lu a1(BADHW)=%lu a2=%lu a3=%lu a4=%lu a5=%lu a6=%lu a7(DISC)=%lu a8=%lu a9=%lu  badhw_n=%lu@%lu\r\n",
+               (unsigned long)amix_disp_acthist[0],(unsigned long)amix_disp_acthist[1],(unsigned long)amix_disp_acthist[2],
+               (unsigned long)amix_disp_acthist[3],(unsigned long)amix_disp_acthist[4],(unsigned long)amix_disp_acthist[5],
+               (unsigned long)amix_disp_acthist[6],(unsigned long)amix_disp_acthist[7],(unsigned long)amix_disp_acthist[8],
+               (unsigned long)amix_disp_acthist[9],(unsigned long)amix_badhw_n,(unsigned long)amix_badhw_tick);
+            for(int k=0;k<16;k++){ int i=(amix_disp_h-16+k)&15;
+               z3660_printf("[DISP] csr=%02lX act=%lu tick=%lu\r\n",(unsigned long)amix_disp_csr[i],(unsigned long)amix_disp_act[i],(unsigned long)amix_disp_tick[i]); }
             a3000_scsi_dumpstate();   // why isn't the SCSI INT2 firing at the stall?
+            a3000_scsi_dumpqueue();   // dump the guest a3091 queue (istate/curunitp/units6 chain) directly
             for(int k=0;k<16;k++){ int i=(amix_wcmd_head-16+k)&15;
                z3660_printf("[WCMD] cmd=%02lX dest=%lu ph=%02lX\r\n",(unsigned long)amix_wcmd_cmd[i],
                   (unsigned long)amix_wcmd_dest[i],(unsigned long)amix_wcmd_ph[i]); }
