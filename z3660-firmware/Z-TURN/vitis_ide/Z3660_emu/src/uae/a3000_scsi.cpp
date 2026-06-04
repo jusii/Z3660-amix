@@ -178,6 +178,14 @@ struct wd_chip_state {
 struct sdmac_state {
    uae_u32 dmac_cntr, dmac_istr, dmac_wtc, dmac_acr, dmac_dawr;
    int dmac_dma;         /* 0 idle, 1 running, -1 done */
+   int dmac_eop_delay;   /* 2026-06-04 SDMAC END-OF-PROCESS model: pump-tick countdown modeling the real
+                          * SuperDMAC's WTC-underflow -> DMA-done interrupt, which on real A3000 takes many
+                          * bus cycles AFTER the START strobe. The emulator's do_dma is zero-latency, so the
+                          * autonomous block-I/O completion can ripen + be delivered (via the per-access
+                          * settle) WHILE a3091intr's in-ISR re-issue is still on the ISR stack -> curunitp
+                          * desync -> the ~2 stranded page-ins. This counter withholds the block-I/O
+                          * SEL_XFER_DONE until it elapses on the STEADY hsync pump (NOT collapsible by an
+                          * AUX poll or a per-access settle), re-creating the hardware temporal separation. */
 };
 
 /* The selected target's command/data context (one outstanding command). */
@@ -799,6 +807,11 @@ static void wd_check_interrupt(int checkonly, int force)
 {
    if (wc.auxstatus & ASR_INT) return;        /* one pending at a time */
    if (wc.queue_index == 0) return;
+   /* SDMAC EOP gate: withhold a block-I/O SEL_XFER_DONE until the modeled DMA-done latency elapses on the
+    * STEADY hsync pump. Unlike the irq countdown this returns for EVERY caller (hsync, per-access settle,
+    * AUX-poll force) so neither a settle nor an AUX poll can deliver it early, inside a3091intr's in-ISR
+    * re-issue. dmac_eop_delay is decremented ONLY in a3000_scsi_hsync(). */
+   if (amix_mmu_on && sd.dmac_eop_delay > 0 && wc.status[0].status == CSR_SEL_XFER_DONE) return;
    if (wc.status[0].irq > 1) {                /* still counting down */
       if (!checkonly) wc.status[0].irq--;
       if (!force) return;                     /* a genuine AUX poll (force=1) force-ripens NOW */
@@ -827,9 +840,9 @@ static void wd_check_interrupt(int checkonly, int force)
 }
 
 static void dmac_reset(void) { dbg("[A3000SCSI] SCSI reset\n"); }
-static void dmac_cint(void) { sd.dmac_istr = 0; a3000_recompute_irq(); }
+static void dmac_cint(void) { sd.dmac_istr = 0; sd.dmac_eop_delay = 0; a3000_recompute_irq(); }
 static void scsi_dmac_start_dma(void) { sd.dmac_dma = 1; }
-static void scsi_dmac_stop_dma(void) { sd.dmac_dma = 0; sd.dmac_istr &= ~ISTR_E_INT; }
+static void scsi_dmac_stop_dma(void) { sd.dmac_dma = 0; sd.dmac_istr &= ~ISTR_E_INT; sd.dmac_eop_delay = 0; }
 static void set_dma_done(void) { sd.dmac_dma = -1; }
 static int  is_dma_enabled(void) { return sd.dmac_dma > 0; }
 
@@ -1115,6 +1128,12 @@ end:
     * Matches a2091.cpp:1257-1266. */
    wc.wd_phase = CSR_SEL_XFER_DONE;
    set_status(wc.wd_phase, 2);
+   /* SDMAC END-OF-PROCESS model: an autonomous block READ/WRITE (SEL_ATN_XFER) completion on real A3000 is
+    * gated by the SuperDMAC's WTC-underflow interrupt, which lands MANY bus cycles after the command is
+    * issued. The emulator's do_dma is zero-latency, so without this the completion can be delivered (via the
+    * per-access settle) before a3091intr's in-ISR re-issue rte's. Withhold it for N steady hsync pump ticks.
+    * Gated on amix_mmu_on + is_block_io so the Kickstart ROM load + the step-by-step sd-open are untouched. */
+   if (amix_mmu_on && cur.is_block_io) sd.dmac_eop_delay = 3;
    if (!(wc.wdregs[WD_CONTROL] & CTL_EDI)) {
       wc.wd_phase = CSR_DISC;
       set_status(wc.wd_phase, 0);
@@ -1202,6 +1221,7 @@ static void wd_cmd_reset(int irq, int fast)
    wc.wd_data_avail = 0;
    wc.async_pending = 0;
    wc.resetnodelay_active = 0;
+   sd.dmac_eop_delay = 0;   /* a WD/DMAC reset abandons any pending SDMAC end-of-process latency */
    if (irq) {
       uae_u8 status = (wc.wdregs[0] & 0x08) ? 1 : 0;
       if (fast) {
@@ -1487,6 +1507,12 @@ static void a3000_scsi_settle(void)
  * where the guest ISR runs between the SELECT and the service-request INT2s. */
 extern "C" void a3000_scsi_hsync(void)
 {
+   /* SDMAC END-OF-PROCESS: advance the modeled DMA-done latency on the steady pump cadence only. When it
+    * underflows, raise the SuperDMAC's own end-of-process edge (ISTR_E_INT + INT_P, the bits the guest's
+    * a3091intr entry gate + stopdma read), then the withheld block-I/O SEL_XFER_DONE may deliver below. */
+   if (amix_mmu_on && sd.dmac_eop_delay > 0) {
+      if (--sd.dmac_eop_delay == 0) sd.dmac_istr |= ISTR_E_INT | ISTR_INT_P;
+   }
    wd_check_interrupt(0, 0);
    a3000_recompute_irq();
 }
