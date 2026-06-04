@@ -807,11 +807,6 @@ static void wd_check_interrupt(int checkonly, int force)
 {
    if (wc.auxstatus & ASR_INT) return;        /* one pending at a time */
    if (wc.queue_index == 0) return;
-   /* SDMAC EOP gate: withhold a block-I/O SEL_XFER_DONE until the modeled DMA-done latency elapses on the
-    * STEADY hsync pump. Unlike the irq countdown this returns for EVERY caller (hsync, per-access settle,
-    * AUX-poll force) so neither a settle nor an AUX poll can deliver it early, inside a3091intr's in-ISR
-    * re-issue. dmac_eop_delay is decremented ONLY in a3000_scsi_hsync(). */
-   if (amix_mmu_on && sd.dmac_eop_delay > 0 && wc.status[0].status == CSR_SEL_XFER_DONE) return;
    if (wc.status[0].irq > 1) {                /* still counting down */
       if (!checkonly) wc.status[0].irq--;
       if (!force) return;                     /* a genuine AUX poll (force=1) force-ripens NOW */
@@ -1128,12 +1123,6 @@ end:
     * Matches a2091.cpp:1257-1266. */
    wc.wd_phase = CSR_SEL_XFER_DONE;
    set_status(wc.wd_phase, 2);
-   /* SDMAC END-OF-PROCESS model: an autonomous block READ/WRITE (SEL_ATN_XFER) completion on real A3000 is
-    * gated by the SuperDMAC's WTC-underflow interrupt, which lands MANY bus cycles after the command is
-    * issued. The emulator's do_dma is zero-latency, so without this the completion can be delivered (via the
-    * per-access settle) before a3091intr's in-ISR re-issue rte's. Withhold it for N steady hsync pump ticks.
-    * Gated on amix_mmu_on + is_block_io so the Kickstart ROM load + the step-by-step sd-open are untouched. */
-   if (amix_mmu_on && cur.is_block_io) sd.dmac_eop_delay = 3;
    if (!(wc.wdregs[WD_CONTROL] & CTL_EDI)) {
       wc.wd_phase = CSR_DISC;
       set_status(wc.wd_phase, 0);
@@ -1289,9 +1278,11 @@ static uae_u8 wdscsi_getauxstatus(void)
     * in wd_check_interrupt defers a3091intr's in-ISR re-issued completion until it rte's; forcing it out via
     * cipwait was the residual lost-completion race. amix_aux_streak resets on any non-AUX register touch. */
    amix_aux_streak++;
-   if (amix_aux_streak >= 2) {
-      /* a genuine poll (e.g. initialize()'s busy-wait): force-ripen + deliver the held completion so the
-       * polled wait at high spl still sees ASR_INT. */
+   /* WinUAE has NO force-ripen path: a polled AUX wait sees ASR_INT only once the steady hsync pump delivers
+    * the status. The Z3660 force on a >=2 AUX-read streak can deliver the in-ISR re-issued completion early
+    * for AMIX -> curunitp desync. Gate it out for amix_mmu_on (the hsync pump delivers it instead, like
+    * Amiberry); keep it for the Kickstart ROM load (amix_mmu_on==0) where it is proven harmless. */
+   if (amix_aux_streak >= 2 && !amix_mmu_on) {
       wd_check_interrupt(1, 1);
    }
    return (wc.auxstatus & ASR_INT) |
@@ -1497,7 +1488,13 @@ static void a3000_scsi_settle(void)
       if (v) { cur.direction = 0; wc.wd_data_avail = 0; }
       else   set_dma_done();
    }
-   wd_check_interrupt(1, 0);   /* per-access: deliver a ripe status, but do NOT advance the countdown */
+   /* 2026-06-04 WinUAE-FAITHFUL DELIVERY: WinUAE delivers a queued status ONLY from scsi_hsync (decrement)
+    * and the WD_SCSI_STATUS-read ack -- NEVER from a per-access settle on other registers. The Z3660 added
+    * this per-access pump; for the AMIX runtime it can deliver the in-ISR re-issued completion EARLY (on a
+    * register touch inside a3091intr, before it rte's) -> curunitp desync -> stranded page-ins. Gate it out
+    * for amix_mmu_on so AMIX completions land only on the steady hsync pump or the status-read, exactly like
+    * the working Amiberry. The Kickstart ROM load (amix_mmu_on==0) keeps the per-access pump unchanged. */
+   if (!amix_mmu_on) wd_check_interrupt(1, 0);
    a3000_recompute_irq();
 }
 
@@ -1507,13 +1504,7 @@ static void a3000_scsi_settle(void)
  * where the guest ISR runs between the SELECT and the service-request INT2s. */
 extern "C" void a3000_scsi_hsync(void)
 {
-   /* SDMAC END-OF-PROCESS: advance the modeled DMA-done latency on the steady pump cadence only. When it
-    * underflows, raise the SuperDMAC's own end-of-process edge (ISTR_E_INT + INT_P, the bits the guest's
-    * a3091intr entry gate + stopdma read), then the withheld block-I/O SEL_XFER_DONE may deliver below. */
-   if (amix_mmu_on && sd.dmac_eop_delay > 0) {
-      if (--sd.dmac_eop_delay == 0) sd.dmac_istr |= ISTR_E_INT | ISTR_INT_P;
-   }
-   wd_check_interrupt(0, 0);
+   wd_check_interrupt(0, 0);   /* the steady pump: decrement the countdown + deliver a ripe status (WinUAE scsi_hsync) */
    a3000_recompute_irq();
 }
 
