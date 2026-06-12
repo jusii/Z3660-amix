@@ -1810,8 +1810,28 @@ static void mmu030fixupmod(uae_u8 data, int dir, int idx)
 #endif
 }
 
+// TEMP (re-fault detector): ring of the last 16 demand-paging fault VAs + faulting PCs, a consecutive-same-VA max,
+// and a small top-by-count histogram. Dumped from newcpu.cpp at the AMIX stall.
+extern "C" { extern volatile int amix_mmu_on; }
+extern "C" {
+volatile uae_u32 amix_fring_va[16]={0}, amix_fring_pc[16]={0}, amix_fring_rw[16]={0}; volatile int amix_fring_h=0;
+volatile uae_u32 amix_ftot=0, amix_flast=0, amix_fsame=0, amix_fsamemax=0, amix_fsameva=0;
+volatile uae_u32 amix_fhva[16]={0}, amix_fhcnt[16]={0}, amix_fhpc[16]={0};
+}
+
 void mmu030_page_fault(uaecptr addr, bool read, int flags, uae_u32 fc)
 {
+	if (amix_mmu_on) {   // TEMP fault tracker
+		amix_ftot++;
+		uae_u32 pc=(uae_u32)regs.instruction_pc;
+		int h=amix_fring_h&15; amix_fring_va[h]=addr; amix_fring_pc[h]=pc; amix_fring_rw[h]=read?1:0; amix_fring_h++;
+		if (addr==amix_flast) { amix_fsame++; if (amix_fsame>amix_fsamemax){ amix_fsamemax=amix_fsame; amix_fsameva=addr; } }
+		else { amix_fsame=1; amix_flast=addr; }
+		int slot=-1, minc=0x7fffffff, mins=0;
+		for (int i=0;i<16;i++){ if (amix_fhva[i]==addr && amix_fhcnt[i]){ slot=i; break; } if ((int)amix_fhcnt[i]<minc){ minc=(int)amix_fhcnt[i]; mins=i; } }
+		if (slot<0){ slot=mins; amix_fhva[slot]=addr; amix_fhcnt[slot]=0; amix_fhpc[slot]=pc; }
+		amix_fhcnt[slot]++;
+	}
 	if (flags < 0) {
 		read = (regs.mmu_ssw & MMU030_SSW_RW) ? 1 : 0;
 		fc = regs.mmu_ssw & MMU030_SSW_FC_MASK;

@@ -614,6 +614,9 @@ static void writewdreg(int sasr, uae_u8 val)
 }
 
 volatile uae_u32 amix_setst_n = 0, amix_assert_n = 0;   // TEMP: statuses queued vs INT2 0->2 assertions
+volatile uae_u32 amix_burst_depth = 0;                  // TEMP: max wc.queue_index ever (FIFO pileup test: >2 => clustered burst; <=2 => serial, refutes interleave)
+volatile uae_u32 amix_dlv_sxd = 0, amix_dlv_disc = 0, amix_dlv_other = 0;  // TEMP: delivered-status type counts (SEL_XFER_DONE vs DISC vs other)
+volatile uae_u32 amix_dlv_seq[24]; volatile int amix_dlv_seqh = 0;         // TEMP: last-24 delivered CSR sequence (to see DISC interleaving SEL_XFER_DONEs)
 volatile uae_u32 amix_tick = 0;                          // TEMP: ~guest-instruction counter (bumped in check_uae_int_request)
 volatile uae_u32 amix_assert_tick = 0, amix_acklat = 0, amix_acklatmax = 0; // TEMP: INT2 assert->ack delivery latency
 volatile uae_u32 amix_clobber_int = 0, amix_clobber_q = 0; // TEMP: pending completion / queued statuses clobbered by a new SEL_ATN_XFER
@@ -671,6 +674,10 @@ extern "C" void a3000_scsi_dumpstate(void)
       (unsigned long)amix_rnd_fire, (unsigned long)amix_rnd_disc, (unsigned long)amix_rnd_compl);
    z3660_printf("[SCSIST3] async_exec=%lu async_pending=%d wverify_ok=%lu wverify_FAIL=%lu\r\n",
       (unsigned long)amix_async_exec_n, wc.async_pending, (unsigned long)amix_wv_ok, (unsigned long)amix_wv_fail);
+   z3660_printf("[BURST] peak_queue_depth=%lu delivered: SEL_XFER_DONE=%lu DISC=%lu other=%lu\r\n",
+      (unsigned long)amix_burst_depth, (unsigned long)amix_dlv_sxd, (unsigned long)amix_dlv_disc, (unsigned long)amix_dlv_other);
+   { z3660_printf("[DLVSEQ]"); for (int k = 0; k < 24; k++) { int i = (amix_dlv_seqh - 24 + k); if (i < 0) i += 24; i %= 24;
+        z3660_printf(" %02lX", (unsigned long)amix_dlv_seq[i]); } z3660_printf("  (16=SEL_XFER_DONE 85=DISC)\r\n"); }
    z3660_printf("[DESYNC] curunitp->4 moved issue->completion: n=%lu (matched=%lu) last_issued=%08lX\r\n",
       (unsigned long)amix_desync_n, (unsigned long)amix_match_n, (unsigned long)amix_issued_req);
    for (int k = 0; k < 8; k++) { int i = (amix_dsy_h - 8 + k) & 7;
@@ -764,6 +771,8 @@ static void doscsistatus(uae_u8 status)
       a3000_scsi_irq);  /* [SCSITRACE] rm before commit */
    wc.wdregs[WD_SCSI_STATUS] = status;
    wc.auxstatus |= ASR_INT;
+   if (status == CSR_SEL_XFER_DONE) amix_dlv_sxd++; else if (status == CSR_DISC) amix_dlv_disc++; else amix_dlv_other++;  // TEMP: delivered-type
+   { int h = amix_dlv_seqh % 24; amix_dlv_seq[h] = status; amix_dlv_seqh++; }   // TEMP: delivery sequence ring
    amix_aux_streak = 0;   /* a fresh completion starts a new poll context (so a3091intr's entry cipwait can't inherit a streak) */
    if (amix_mmu_on) { int ist = amix_cpu_istate();   /* TEMP diag: which CSR delivered at which guest istate */
       int h = amix_delv_h & 15; amix_delv_csr[h] = status; amix_delv_ist[h] = (uae_u32)ist; amix_delv_h++;
@@ -793,6 +802,7 @@ static void set_status(uae_u8 status, int delay)
    wc.status[wc.queue_index].status = status;
    wc.status[wc.queue_index].irq = irq;
    wc.queue_index++;
+   if ((uae_u32)wc.queue_index > amix_burst_depth) amix_burst_depth = wc.queue_index;   // TEMP: peak FIFO depth
    if (wd_trace_on()) dbg("[WDQ] st=%02X dly=%d eff=%d irq=%d qi=%d m=%d\n",
       status, delay, eff, irq, wc.queue_index, wd_delay_mode);  /* [SCSITRACE] rm before commit */
 }
