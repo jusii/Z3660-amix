@@ -1151,26 +1151,46 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// idempotent RAM but not bit-exact; faithful partial-resume needs the full WinUAE
 		// 4.4.0 frame storage. Extend + add a MOVEM-cross-page harness test before relying
 		// on it for those cases.
-		for (i = 0; i < 1; i++) {
-			m68k_areg(regs, 7) -= 4;
-			x_put_long(m68k_areg(regs, 7), 0);
+		// Per-access data value array (mmu030_ad[]): storing these (not 0) is what lets
+		// m68k_do_rte_mmu030 RESUME a fault that hit PART-WAY through a non-idempotent
+		// instruction (MOVEM list, (An)+/-(An), RMW) instead of restarting it with a wrong
+		// effective address -> the SIGSEGV that survived the c8b9398 ifetch-resume fix.
+		// A write fault's pending value lives in regs.wb3_data and must be folded into the
+		// array slot first (upstream WinUAE newcpu_common.cpp:1508-1516).
+		if (!(ssw & MMU030_SSW_RW)) {
+			mmu030_ad[mmu030_idx_done].val = regs.wb3_data;
 		}
-		while (i < 9) {
+		for (i = 0; i < mmu030_idx_done + 1; i++) {
+			m68k_areg(regs, 7) -= 4;
+			x_put_long(m68k_areg(regs, 7), mmu030_ad[i].val);
+		}
+		while (i < MAX_MMU030_ACCESS) {
 			uae_u32 v = 0;
 			m68k_areg(regs, 7) -= 4;
+			if (mmu030_state[1] & MMU030_STATEFLAG1_FMOVEM) {
+				if (i == MAX_MMU030_ACCESS - 2)
+					v = mmu030_fmovem_store[0];
+				else if (i == MAX_MMU030_ACCESS - 1)
+					v = mmu030_fmovem_store[1];
+			}
 			x_put_long(m68k_areg(regs, 7), v);
 			i++;
 		}
-		// version & internal information (We store index here)
+		// version & internal information: idx / idx_done / wb2 status (offset 0x36).
+		// The reader derives idxsize, idxsize_done and regs.wb2_status from this word;
+		// 0 here forced idx_done=0 = "single access", defeating mid-instruction resume.
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
-		// 3* internal registers
+		x_put_word(m68k_areg(regs, 7),
+			(mmu030_idx & 0xf) | ((mmu030_idx_done & 0xf) << 4) | (regs.wb2_status << 8));
+		// 3* internal registers = mmu030_state[2..0] (offsets 0x34, 0x32, 0x30).
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), mmu030_state[2] | (regs.wb3_status << 8));
+		// 0x32: use the fault-time saved copy (mmu030_page_fault:1870 sets
+		// regs.wb2_address = mmu030_state[1]) rather than the live global, matching WinUAE.
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb2_address);   // = mmu030_state[1]
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), mmu030_state[0]);
 		// data input buffer = fault address
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr);
@@ -1198,9 +1218,9 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// dynamically linked). Data faults (DF set) read 0x10, so keep 0 there (the proven path).
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), (ssw & MMU030_SSW_DF) ? 0 : regs.mmu_fault_addr);
-		// 2xinternal
+		// get_disp_ea_020 displacement store, word 1 (offset 0x20)
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
+		x_put_long(m68k_areg(regs, 7), mmu030_disp_store[1]);
 		/* fall through */
 		/* no break */
 	case 0xA:
@@ -1208,7 +1228,7 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// used when instruction's last write causes bus fault
 		m68k_areg(regs, 7) -= 4;
 		if (format == 0xb) {
-			  x_put_long(m68k_areg(regs, 7), 0); // 28 0x1c
+			  x_put_long(m68k_areg(regs, 7), mmu030_disp_store[0]); // get_disp_ea_020 store word 0, 0x1c
 		  } else {
 			  uae_u32 ps = 0;
 			ps |= (7 << 8);
