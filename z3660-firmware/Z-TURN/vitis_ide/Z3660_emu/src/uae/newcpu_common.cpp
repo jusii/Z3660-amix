@@ -1179,6 +1179,15 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 			uae_u32 ps = 0;
 			ps |= (7 << 8);
 			ps |= (7 << 11);
+			// "fault during opcode prefetch" sentinel (upstream WinUAE newcpu_common.cpp:1555).
+			// m68k_do_rte_mmu030 decodes this bit to restore mmu030_opcode = -1, which is what
+			// makes m68k_run_mmu030 take `goto insretry` and RE-FETCH the opcode through the MMU
+			// from the freshly mapped page after the OS handles a demand-paging ifetch fault.
+			// Without it the RTE resume re-dispatched the stale frame opcode (regs.irc = the
+			// kernel's return-to-user RTE, 0x4E73) in user mode -> Exception(8) -> SIGILL at the
+			// entry of every first-touch text page: AMIX init died at libc _rt_boot+0.
+			if (mmu030_opcode == -1)
+				ps |= 0x80000000;
 			m68k_areg(regs, 7) -= 4;
 			x_put_long(m68k_areg(regs, 7), ps);
 		}
@@ -1216,8 +1225,12 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// Internal register (opcode storage) 20 0x14. m68k_do_rte_mmu030 reads this
 		// back as the opcode to re-dispatch on resume; storing 0 for frame B made the
 		// CPU resume into opcode $0000 (ORI.B) instead of the faulting instruction.
-		// regs.irc == mmu030_opcode for the faulting instruction in both frame kinds.
-		x_put_long(m68k_areg(regs, 7), regs.irc);
+		// For frame B DATA faults mmu030_opcode == regs.irc (the in-flight instruction);
+		// for frame B PREFETCH faults mmu030_opcode is -1 and the slot is ignored by the
+		// reader once ps bit 31 is set (the slot becomes 0xFFFF, never dispatched).
+		// regs.irc would be the PREVIOUS instruction there -- the stale-opcode trap.
+		// Upstream reference: WinUAE newcpu_common.cpp:1585-1589.
+		x_put_long(m68k_areg(regs, 7), format == 0xb ? (uae_u32)(mmu030_opcode & 0xffff) : regs.irc);
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // data cycle fault address 16 0x10
 		m68k_areg(regs, 7) -= 2;

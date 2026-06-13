@@ -2938,6 +2938,12 @@ void m68k_do_rte_mmu030 (uaecptr a7)
 		uae_u32 mmu030_state_2 = get_word_mmu030(a7 + 0x34);
 
 		uae_u32 mmu030_opcode_v = (ps & 0x80000000) ? -1U : (oc & 0xffff);
+		// One-line confirmation probe for ifetch-fault resumes (FB set, DF clear): with the
+		// frame-builder fix, opcode must be ffffffff (-1 -> insretry refetch). Rare (text
+		// demand-pages only), so UART volume is negligible.
+		if ((ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
+			write_log(_T("[RTE-B-IF] pc=%08x ssw=%04x ps=%08x oc=%08x -> opcode=%08x\n"),
+				pc, ssw, ps, oc, mmu030_opcode_v);
 
 		uae_u32 mmu030_fmovem_store_0 = 0;
 		uae_u32 mmu030_fmovem_store_1 = 0;
@@ -3386,6 +3392,12 @@ void m68k_do_rte_mmu030c (uaecptr a7)
 		uae_u32 mmu030_state_2 = get_word_mmu030c(a7 + 0x34);
 
 		uae_u32 mmu030_opcode_v = (ps & 0x80000000) ? -1U : (oc & 0xffff);
+		// One-line confirmation probe for ifetch-fault resumes (FB set, DF clear): with the
+		// frame-builder fix, opcode must be ffffffff (-1 -> insretry refetch). Rare (text
+		// demand-pages only), so UART volume is negligible.
+		if ((ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
+			write_log(_T("[RTE-B-IF] pc=%08x ssw=%04x ps=%08x oc=%08x -> opcode=%08x\n"),
+				pc, ssw, ps, oc, mmu030_opcode_v);
 
 		uae_u32 mmu030_fmovem_store_0 = 0;
 		uae_u32 mmu030_fmovem_store_1 = 0;
