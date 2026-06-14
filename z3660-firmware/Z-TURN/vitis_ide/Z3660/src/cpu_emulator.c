@@ -421,6 +421,18 @@ int emulator_reset_thread(struct pt *pt)
          usleep(100000);
          ethernet_init();
 
+         /* Re-load the PISCSI boot ROM + re-map the HDFs, exactly as cold boot
+          * (main.c piscsi_init()) does. This guest-reset path re-inits video/
+          * audio/ethernet but previously SKIPPED PISCSI (the two calls near the
+          * top of this block were commented out), so after an Amix soft reboot
+          * -- e.g. fsck's post-repair reboot -- Kickstart restarted with no SCSI
+          * boot device and hung forever at 0x00F81212. piscsi_init() is
+          * idempotent (forces piscsi_rom_ptr=NULL, re-mounts the SD, re-opens the
+          * HDFs into the static FIL slots) and touches only the SCSI ROM/device
+          * tables -- NOT DDR/GIC/FPGA-clocks/ethernet/REG0 latches. The 68k is
+          * still held in reset here; it is released by CPLD_RESET_ARM(1) below. */
+         piscsi_init();
+
          DiscreteSet(REG0, FPGA_RESET);
          usleep(1000);
          CPLD_RESET_ARM(1);
