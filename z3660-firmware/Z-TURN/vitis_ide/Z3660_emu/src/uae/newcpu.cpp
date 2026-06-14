@@ -79,6 +79,37 @@ extern "C" void reset_autoconfig(void);
 extern int ovl;
 void fill_prefetch_quick (void);
 void custom_reset_cpu(bool hardreset, bool keyboardreset);
+
+/* ---- Z3660 warm-reset real-chipset quiesce -------------------------------------
+ * A real Amiga RESET resets Paula/CIA; this emulated warm (guest) reset does NOT, so
+ * AMIX leaves chip interrupts enabled+latched and the rebooted Kickstart -- which has
+ * not re-installed its handlers yet -- drowns in an EXTER (level-6) interrupt it can
+ * never clear (the storm observed at Kickstart 0x00F81212, sampler s=1 msk=2 = a
+ * level>2 IRQ held permanently asserted; a cold boot never hits this because the chips
+ * start reset).  We run on Core1, the live bus master for the emulated 68k, so these
+ * chip accesses are timeout-bounded (ps_*->arm_*_amiga_* wait_*_ack) and do NOT hang
+ * -- unlike the abandoned Core0 attempt whose arm_read_amiga spun on an ack that never
+ * came in the reset window.  Disable+clear all real Paula interrupts and clear both CIA
+ * ICR latches, then force the injected IPL to 0: ipl_main_read() only re-samples the
+ * GPIO IPL lines when ipl_read>0, so bump it and re-sample (now de-asserted), then
+ * hard-zero the two globals intlev() max()es over (read_irq, a3000_scsi_irq). */
+extern "C" void ps_write_16(unsigned int address, unsigned int value);
+extern "C" unsigned int ps_read_8(unsigned int address);
+extern "C" void ipl_main_read(void);
+extern int read_irq;
+extern volatile int a3000_scsi_irq;
+extern int ipl_read;
+static void z3660_quiesce_real_chipset_on_reset(void)
+{
+   ps_write_16(0x00DFF09A, 0x7FFF);   /* INTENA: clear master + all enable bits */
+   ps_write_16(0x00DFF09C, 0x7FFF);   /* INTREQ: clear all pending bits         */
+   (void)ps_read_8(0x00BFED01);       /* CIA-A ICR: reading clears the latch    */
+   (void)ps_read_8(0x00BFDD00);       /* CIA-B ICR: reading clears the latch    */
+   ipl_read = 4;
+   for (int i = 0; i < 8; i++) ipl_main_read();   /* re-snapshot now-idle IPL lines */
+   read_irq = 0;
+   a3000_scsi_irq = 0;
+}
 #ifdef JIT
 #include "jit/compemu.h"
 #include <signal.h>
@@ -2980,6 +3011,7 @@ static inline void check_uae_int_request(void)
       addrbank *ab;
 
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       ovl=1;
       m68k_reset_newcpu(1);
@@ -5164,6 +5196,7 @@ bool cpureset (void)
 
       ins = get_word (pc);
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       cpu_emulator_reset_core0();
       reset_autoconfig();
@@ -5194,6 +5227,7 @@ bool cpureset (void)
 
    write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
    custom_reset_cpu(false, false);
+   z3660_quiesce_real_chipset_on_reset();
    m68k_setpc_normal (ksboot);
    cpu_emulator_reset_core0();
    reset_autoconfig();
