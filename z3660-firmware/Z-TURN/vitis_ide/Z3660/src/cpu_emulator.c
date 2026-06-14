@@ -444,6 +444,36 @@ int emulator_reset_thread(struct pt *pt)
           * deasserts FPGA_INT6 since the mask goes to 0) before releasing the 68k. */
          amiga_interrupt_clear(0xFFFFFFFF);
 
+         /* Reset the real A4000 chipset interrupt state before the 68k restarts.
+          * A real Amiga reset resets Paula/CIA; this warm (guest) reset path does
+          * NOT, so AMIX leaves chip interrupts enabled+pending and the rebooted
+          * Kickstart -- which hasn't re-installed its handlers yet -- drowns in an
+          * interrupt it cannot clear (the storm at Kickstart 0x00F81212, the
+          * level-handler adda/rte exit, s=1 msk=2; clearing only the Z3660 INT6
+          * above was not enough -> the source is the chipset).  Log what is
+          * pending/enabled, then disable all (INTENA=0x7FFF) and clear all pending
+          * (INTREQ=0x7FFF), exactly as a cold reset leaves Paula; Kickstart
+          * re-enables what it needs.  68k is held in reset and the FPGA bus is
+          * live here (before the FPGA_RESET pulse below). */
+         {
+            uint32_t intreqr = arm_read_amiga(0x00DFF01C, WORD_);
+            uint32_t intenar = arm_read_amiga(0x00DFF01E, WORD_);
+            arm_write_amiga(0x00DFF09A, 0x7FFF, WORD_); /* INTENA: clear all enable bits */
+            arm_write_amiga(0x00DFF09C, 0x7FFF, WORD_); /* INTREQ: clear all pending bits */
+            /* The storm is EXTER (level 6) held permanently asserted (msk=2 -> a
+             * level>2 interrupt is taken with no forward progress).  EXTER is the
+             * CIA-B line: a latched CIA-B ICR keeps INT6 asserted even after INTREQ
+             * is cleared, so masking at Paula alone may re-fire the instant
+             * Kickstart re-enables EXTER.  Reading each CIA ICR clears its latch
+             * (as a cold reset quiesces the CIAs).  CIA-A ICR=0xBFED01,
+             * CIA-B ICR=0xBFDD00. */
+            uint32_t ciaa_icr = arm_read_amiga(0x00BFED01, BYTE_);
+            uint32_t ciab_icr = arm_read_amiga(0x00BFDD00, BYTE_);
+            printf("[RESET] chipset INTREQR=%04lx INTENAR=%04lx CIAA_ICR=%02lx CIAB_ICR=%02lx -> quiesced\n",
+                   (unsigned long)(intreqr & 0xFFFF), (unsigned long)(intenar & 0xFFFF),
+                   (unsigned long)(ciaa_icr & 0xFF), (unsigned long)(ciab_icr & 0xFF));
+         }
+
          DiscreteSet(REG0, FPGA_RESET);
          usleep(1000);
          CPLD_RESET_ARM(1);
