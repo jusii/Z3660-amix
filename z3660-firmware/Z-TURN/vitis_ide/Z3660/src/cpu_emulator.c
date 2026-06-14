@@ -422,16 +422,27 @@ int emulator_reset_thread(struct pt *pt)
          ethernet_init();
 
          /* Re-load the PISCSI boot ROM + re-map the HDFs, exactly as cold boot
-          * (main.c piscsi_init()) does. This guest-reset path re-inits video/
-          * audio/ethernet but previously SKIPPED PISCSI (the two calls near the
-          * top of this block were commented out), so after an Amix soft reboot
-          * -- e.g. fsck's post-repair reboot -- Kickstart restarted with no SCSI
-          * boot device and hung forever at 0x00F81212. piscsi_init() is
-          * idempotent (forces piscsi_rom_ptr=NULL, re-mounts the SD, re-opens the
-          * HDFs into the static FIL slots) and touches only the SCSI ROM/device
-          * tables -- NOT DDR/GIC/FPGA-clocks/ethernet/REG0 latches. The 68k is
-          * still held in reset here; it is released by CPLD_RESET_ARM(1) below. */
+          * (main.c piscsi_init()) does. Idempotent (forces piscsi_rom_ptr=NULL,
+          * re-mounts the SD, re-opens the HDFs into the static FIL slots) and
+          * touches only the SCSI ROM/device tables -- NOT DDR/GIC/FPGA-clocks/
+          * ethernet/REG0 latches. Needed so the rebooted guest sees the boot
+          * device; the 68k is still held in reset here. */
          piscsi_init();
+
+         /* Clear any pending Z3660-board interrupt left asserted across the guest
+          * reset.  amiga_interrupt_set() drives FPGA_INT6 (REG0) HIGH to raise the
+          * Amiga's level-6/EXTER line for board events (USB/audio); the bit (and
+          * thus INT6) is only deasserted once the Amiga's Z3660 INT6 handler reads
+          * the cause and the firmware calls amiga_interrupt_clear().  If any source
+          * is still pending when AMIX soft-reboots (e.g. fsck's reboot), FPGA_INT6
+          * stays HIGH -- and the freshly-restarted Kickstart has no Z3660 INT6
+          * handler installed yet, so it can never clear the source.  The level-6
+          * interrupt re-fires forever -> the 68k storms in Kickstart's autovector
+          * handler and never progresses (observed stuck at 0x00F81212, the INT
+          * handler's adda/rte exit, s=1 msk=2).  Cold boot starts with
+          * amiga_interrupts==0 so it never happens.  Force it clear here (also
+          * deasserts FPGA_INT6 since the mask goes to 0) before releasing the 68k. */
+         amiga_interrupt_clear(0xFFFFFFFF);
 
          DiscreteSet(REG0, FPGA_RESET);
          usleep(1000);
