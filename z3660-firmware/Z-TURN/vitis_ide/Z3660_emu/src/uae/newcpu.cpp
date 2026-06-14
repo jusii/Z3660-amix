@@ -5195,30 +5195,31 @@ bool cpureset (void)
       write_log (_T("CPU reset PC=%x\n"), pc - 2);
 
       ins = get_word (pc);
+      (void)ins; /* reset/jmp PC-hack removed below: do a full clean reset instead */
       custom_reset_cpu(false, false);
       z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       cpu_emulator_reset_core0();
+      /* The old reset/jmp PC-hack left the 68k mid-vector (0xF80002) with stale
+       * SR/SSP/MMU, so AMIX's warm (uadmin) reboot never actually restarted
+       * Kickstart -- only the EXTER storm (now fixed) had masked it.  Do the same
+       * full CPU reset the cold-boot and n040RSTI paths use: overlay ROM at 0
+       * (ovl=1, which AMIX had cleared) so get_long(4) returns the real reset
+       * vector, then m68k_reset_newcpu(1) sets PC=0xF800D2, SSP, SR(intmask=7),
+       * and resets MMU/caches. */
+      ovl = 1;
+      m68k_reset_newcpu(1);
       reset_autoconfig();
-      // did memory disappear under us?
-//      if (ab == &get_mem_bank (pc))
-//         return false;
-      // it did
-      if ((ins & ~7) == 0x4ed0) {
-         int reg = ins & 7;
-         uae_u32 addr = m68k_areg (regs, reg);
-         if (addr < 0x80000)
-            addr += 0xf80000;
-         write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
-         m68k_setpc_normal (addr +2 - 2);
-//         reset_loop_counter++;
-//         if(reset_loop_counter>=5)
-//         {
-//        	 printf("Emulator reset loop detected -> Hard reboot\n");
-//        	 hard_reboot();
-//         }
-         return false;
-      }
+      /* Pre-compensate for the caller's trailing m68k_incpc(2): the RESET opcode
+       * handler (op_4e70_*) does `cpureset(); m68k_incpc(2);`, unconditionally
+       * advancing PC by 2 after we return.  Leave PC at (reset PC - 2) so the +2
+       * restores Kickstart's entry 0xF800D2.  (The n040RSTI path has no trailing
+       * +2, hence it doesn't need this.) */
+      m68k_setpc_normal (m68k_getpc () - 2);
+      fill_prefetch_quick ();
+      set_cycles (start_cycles);
+      regs.stopped = false;
+      return false;
    }
 
    // the best we can do, jump directly to ROM entrypoint
@@ -5230,7 +5231,14 @@ bool cpureset (void)
    z3660_quiesce_real_chipset_on_reset();
    m68k_setpc_normal (ksboot);
    cpu_emulator_reset_core0();
+   /* full clean reset, same as the main branch (see comments there) */
+   ovl = 1;
+   m68k_reset_newcpu(1);
    reset_autoconfig();
+   m68k_setpc_normal (m68k_getpc () - 2);
+   fill_prefetch_quick ();
+   set_cycles (start_cycles);
+   regs.stopped = false;
    return false;
 }
 
