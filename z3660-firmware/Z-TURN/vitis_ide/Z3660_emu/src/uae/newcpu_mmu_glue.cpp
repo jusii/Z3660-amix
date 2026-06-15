@@ -32,9 +32,22 @@ uae_u8 ce_cachable[65536];
 /* Branch-trace debugger flag (cpuemu_32). Always off on the Z3660. */
 bool debugmem_trace = false;
 
-/* Savestate MMU fixup hook referenced by cpuemu_32 RTE/restore paths. The Z3660
- * has no savestate, so nothing to fix up. */
-void cpu_restore_fixup(void) { }
+/* (An)+/-(An) address-register fixup, called from the bus-fault CATCH READ path
+ * (newcpu.cpp's `else` branch, ~4333) and the gencpu MULL sub-fault paths
+ * (cpuemu_32.cpp). In WinUAE this restores An to its pre-(An)+ value and DISARMS
+ * the mmufixup[] records after a fault, so the instruction restart re-arms them
+ * cleanly. This fork previously stubbed it out (misread as a savestate hook),
+ * which left a stale (An)+ fixup record ARMED on a READ-fault restart; the next
+ * data fault's mmu030_page_fault then re-applied that stale record to an address
+ * register the new instruction never incremented -> corrupted An (observed:
+ * strcmp's `cmp.b (a1)+,d0` landing on a1=0 -> getty/cron User BUS ERROR -> no
+ * login). Mirror the hand-patched WRITE branch (newcpu.cpp ~4327, commits
+ * f0325ee/2fac97d) and upstream cpu_restore_fixup(): restore + disarm. */
+void cpu_restore_fixup(void)
+{
+   if (mmufixup[0].reg >= 0) { m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value; mmufixup[0].reg = -1; }
+   if (mmufixup[1].reg >= 0) { m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value; mmufixup[1].reg = -1; }
+}
 
 /* MMU-named bitfield aliases used by cpuemu_32 (BFEXTU/BFEXTS/BFINS/BFCLR/BFSET/
  * BFCHG/BFTST/BFFFO on a memory operand). These MUST translate through the 68030

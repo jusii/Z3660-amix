@@ -1260,7 +1260,13 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), ssw); // 10 0x0a
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		// 0x08 = internal register holding mmu030_state[1]. m68k_do_rte_mmu030 reads it back
+		// (cpummu030.cpp:2958 -> 2980) and clears mmu030_retry iff LASTWRITE is set (3177). Storing 0
+		// dropped LASTWRITE -> retry stayed true -> the run loop re-dispatched the faulting RMW
+		// (addq.l #1,abs) -> the count++ double-apply (0->2 -> ttymon NULL-table -> getty SIGBUS).
+		// Store the fault-time state[1] (= regs.wb2_address, set in page_fault:1931), matching the 0xB
+		// path's 0x32 slot (line 1191) and upstream WinUAE.  (2026-06-15 RMW-write-fault fix, EDIT 1/3)
+		x_put_word(m68k_areg(regs, 7), regs.wb2_address);  // = mmu030_state[1]  (frame-$A 0x08)
 		break;
 	default:
 		write_log(_T("Unknown exception stack frame format: %X\n"), format);

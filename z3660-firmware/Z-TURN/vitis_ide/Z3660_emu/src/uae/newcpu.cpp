@@ -4312,31 +4312,53 @@ insretry:
             }
          }
       } CATCH(prb) {
+         bool lastwrite_norestart = false;
          if (mmu030_opcode == -1) {
             // fault during opcode prefetch
             mmufixup[0].reg = -1;
             mmufixup[1].reg = -1;
          } else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
-            // (An)+ rollback for a MOVES-write page fault. cpu_restore_fixup() is an empty stub on this fork, so
-            // the post-increment of An was never undone here; the simplified resume then RESTARTS the whole MOVES
-            // and re-runs the write to An+size. On a demand-paged copyout whose first store faults (e.g. lcopyout
-            // pushing the PID-1 icode into the fresh user page 0x80800000), that re-run wrote the source longword
-            // to dest+size, DUPLICATING the first longword and shifting the rest of the copy -> the icode's lea
-            // displacement was corrupted -> wrong user stack pointer -> execve("/sbin/init") returned EFAULT.
-            // Restore An to its pre-increment value so the restart writes to the original address.
-            if (mmufixup[0].reg >= 0) m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value;
-            if (mmufixup[1].reg >= 0) m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value;
+            // Frame-$A (last-write) fault. Distinguish by whether the instruction's handler already
+            // ADVANCED the PC past itself before the faulting store (2026-06-15 gated fix, audit-refined):
+            //  * Handler ADVANCED the PC (regs.instruction_pc != insn-start): every RMW + plain-store
+            //    handler does `regs.instruction_pc = m68k_getpci()` before the put. The single buffered
+            //    store is replayed by m68k_do_rte_mmu030 and execution resumes at the NEXT instruction --
+            //    do NOT restart. Re-executing would re-READ a just-replayed value and DOUBLE a
+            //    read-modify-write: this is the addq #1,abs (ttymon counter 0->2 -> getty SIGBUS) AND
+            //    the addq #1,(a0)+ / bset #n,(a0)+ etc. case (audit "rmw-with-an"/"misaligned", HIGH).
+            //    Any (An)+/-(An) the handler applied STAYS applied (correct; no rollback) -- the store
+            //    replays to the saved fault address.
+            //  * Handler did NOT advance the PC (== insn-start): the fork's MOVES (An)/(An)+ move
+            //    handlers leave PC at the start. These RESTART the whole instruction, so roll the
+            //    auto-modified An back to its pre-increment value first -- else the re-run writes the
+            //    source longword to dest+size, DUPLICATING it (init icode copyout -> execve EFAULT ->
+            //    hang at 0x80800010). Guard the 2nd rollback against a same-register dual-autoinc move
+            //    (move (a0)+,(a0)+): mmufixup[0] holds the TRUE pre-instruction value (audit
+            //    "an-moves-regular", MEDIUM). The MOVES opcode (0x0Exx) is forced to restart belt-and-
+            //    suspenders in case a MOVES variant advances the PC.
+            if (regs.instruction_pc != mmu030_insn_start_pc
+                  && (mmu030_opcode & 0xFF00) != 0x0E00 /* never no-restart a MOVES */) {
+               lastwrite_norestart = true;   // PC already past the insn: replay-only, do not re-execute
+            } else {
+               if (mmufixup[0].reg >= 0)
+                  m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value;
+               if (mmufixup[1].reg >= 0
+                     && (mmufixup[0].reg < 0 || (mmufixup[1].reg & 7) != (mmufixup[0].reg & 7)))
+                  m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value;
+            }
             mmufixup[0].reg = -1;
             mmufixup[1].reg = -1;
          } else {
             regs.ccrflags = f;
             cpu_restore_fixup();
          }
-         // A faulting write handler may have advanced the pc + overwritten regs.instruction_pc before the
-         // store; rebuild the bus-error frame from the instruction-START pc so the re-run restarts cleanly
-         // (matches the per-handler MOVES fixes; also covers the regular (An)+/-(An) moves like op_20d8 used
-         // by locore bcopy, whose mid-instruction landing caused the kernel "Line-F" panic at 0x070002EA).
-         regs.instruction_pc = mmu030_insn_start_pc;
+         // Frame-$B / prefetch / read faults RESTART the whole instruction -> rebuild the bus-error
+         // frame from the instruction-START pc. Same for a MOVES / (An)+ LASTWRITE write (case 1 above:
+         // rolled-back An + restart). ONLY a no-(An) same-address RMW LASTWRITE (case 2) keeps the
+         // handler-advanced PC so RTE resumes at the NEXT instruction (rewinding re-executed the RMW
+         // -> the addq 0->2 double that crashed ttymon/getty).
+         if (!lastwrite_norestart)
+            regs.instruction_pc = mmu030_insn_start_pc;
          m68k_setpci(regs.instruction_pc);
          TRY(prb2) {
             Exception(prb);
