@@ -851,19 +851,15 @@ addrbank a3000_scsi_bank = {
 // + a3000mem_xlate do the same for the normal access paths.
 // Big-endian-swapped like z3ram so byte-wise DMA stores + longword reads agree.
 #define A3000MEM_HOST 0x09000000u
-// DIAG (TEMPORARY - remove before commit): log the first accesses to a3000mem so we can
-// tell whether the A3000 Kickstart PROBES $07000000 during RAM detection (write/read pattern
-// test). Zero [A3KMEM] lines before the SCSI boot => Kickstart never probes it (Ramsey/bank
-// not signalled). [A3KMEM] W/R of the rotating patterns ($5AC3.., $AC35.. etc) => it probes.
-extern "C" void z3660_printf(const char *fmt, ...);
-static volatile int a3kmem_logn = 0;
-#define A3KLOG(rw,sz,a) do{ if(a3kmem_logn<40){ a3kmem_logn++; z3660_printf("[A3KMEM] %s%d %2d @%08lX h%08lX\r\n",(rw),(sz),a3kmem_logn,(unsigned long)(a),(unsigned long)(A3000MEM_HOST+((a)-0x07000000))); } }while(0)
-unsigned int a3000mem_read_32(uaecptr address){ A3KLOG("R",32,address); return(swap32(*(uint32_t*)(A3000MEM_HOST+(address-0x07000000)))); }
-unsigned int a3000mem_read_16(uaecptr address){ A3KLOG("R",16,address); return(swap16(*(uint16_t*)(A3000MEM_HOST+(address-0x07000000)))); }
-unsigned int a3000mem_read_8 (uaecptr address){ A3KLOG("R", 8,address); return(*(uint8_t*)(A3000MEM_HOST+(address-0x07000000))); }
-void a3000mem_write_32(uaecptr address, unsigned int data){ A3KLOG("W",32,address); *(uint32_t*)(A3000MEM_HOST+(address-0x07000000))=swap32(data); }
-void a3000mem_write_16(uaecptr address, unsigned int data){ A3KLOG("W",16,address); *(uint16_t*)(A3000MEM_HOST+(address-0x07000000))=swap16(data); }
-void a3000mem_write_8 (uaecptr address, unsigned int data){ A3KLOG("W", 8,address); *(uint8_t*)(A3000MEM_HOST+(address-0x07000000))=data&0xFF; }
+// AMIX a3000mem ($07000000 guest -> host DDR $09000000) byte-swapped like z3ram/drct so byte-wise
+// DMA stores + longword reads agree. (Vestigial under the $08000000-DDR boot path; see the RANGE_MAP
+// comment in uae_emulator() -- AMIX runs from $08000000, this window is mapped but not in the memlist.)
+unsigned int a3000mem_read_32(uaecptr address){ return(swap32(*(uint32_t*)(A3000MEM_HOST+(address-0x07000000)))); }
+unsigned int a3000mem_read_16(uaecptr address){ return(swap16(*(uint16_t*)(A3000MEM_HOST+(address-0x07000000)))); }
+unsigned int a3000mem_read_8 (uaecptr address){ return(*(uint8_t*)(A3000MEM_HOST+(address-0x07000000))); }
+void a3000mem_write_32(uaecptr address, unsigned int data){ *(uint32_t*)(A3000MEM_HOST+(address-0x07000000))=swap32(data); }
+void a3000mem_write_16(uaecptr address, unsigned int data){ *(uint16_t*)(A3000MEM_HOST+(address-0x07000000))=swap16(data); }
+void a3000mem_write_8 (uaecptr address, unsigned int data){ *(uint8_t*)(A3000MEM_HOST+(address-0x07000000))=data&0xFF; }
 int a3000mem_check(uaecptr add, uae_u32){ return(1); }
 uae_u8 *a3000mem_xlate(uaecptr add){ return((uae_u8*)(A3000MEM_HOST+(add-0x07000000))); }
 // baseaddr = host_base - guest_base = $09000000 - $07000000 = $02000000, so any bulk
@@ -878,7 +874,7 @@ addrbank a3000mem_bank = {
       a3000mem_write_32, a3000mem_write_16, a3000mem_write_8,
       a3000mem_xlate, a3000mem_check, (uae_u8*)0x09000000u, NULL, NULL,   // baseaddr = ABSOLUTE host base $09000000 (WinUAE convention). map_banks (memory.h:515) sets the CPU fast-path ptr baseaddr[idx] = baseaddr - realstart = $09000000 - $07000000 = $02000000, so a direct/exec/RAM-probe access to guest $07xxxxxx = $02000000 + $07xxxxxx = host $09xxxxxx (correct). (NULL forced the slow function path which the A3000 ROM's downward RAM-probe doesn't use; $02000000 offset made baseaddr[] negative -> host $02xxxxxx = core0 firmware.)
       a3000mem_read_32, a3000mem_read_16,
-      ABFLAG_RAM | ABFLAG_DIRECTACCESS, 0, 0,
+      ABFLAG_RAM | ABFLAG_DIRECTACCESS, 0, 0,   // direct-access: the AMIX kernel executes from this window
       NULL,                      // sub_banks
       0xFFFFFFFF,                // mask
       0,                         // startmask
@@ -1071,24 +1067,29 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
    // loaded kernel. EVERY RAM region AmigaOS lists must lie INSIDE that one window, else the
    // kernel adds the stray pages to its pool, touches one outside SCN1, and panics
    // vatosde() ("address not in SCN1"). Two adjacent banks ($07+$08) COALESCE into a >16MB
-   // window (also fatal); a split leaves the $08 region outside SCN1 (fatal). So present
-   // a3000mem as the SOLE Fast RAM: 16MB CONTIGUOUS at GUEST $07000000, NOTHING at $08000000+.
-   // The AMIX bootstrap then AllocMem(MEMF_FAST)s the kernel straight from this region. Backed
-   // by FREE host DDR $09000000; baseaddr=NULL (function path, like drct) + get_real_address()
-   // + the bank funcs all map $07xxxxxx -> host $09xxxxxx consistently across fetch/data/MMU
-   // walk/SCSI DMA. (Was an 8MB+$08000000 split / 8MB-only-with-baseaddr-bug; both failed.)
+   // window (also fatal); a split leaves a region outside SCN1 (fatal). So AMIX must see exactly
+   // ONE <=16MB Fast-RAM window in its memlist -- we give it 16MB of DDR CPU RAM @ $08000000 (the
+   // per-bank map below). Result: AMIX runs on fast Zynq DDR, ~3.4x faster than the mobo SIMMs.
 #define AMIX_A3000MEM_MB 16
    if(enable_mmu)
    {
-      (void)((AMIX_A3000MEM_MB * 1024 * 1024) >> 16);            // (a3000mem page count - unused in PATH B)
-      // PATH B (use the REAL A4000 motherboard SIMMs): the emulated a3000mem @ $07000000 was
-      // never DETECTED by the A3000 ROM's downward RAM-probe from $08000000 (the real SIMMs do
-      // respond to it natively). So map $01000000-$07FFFFFF onto the REAL bus (slow_bank) -
-      // same as the non-AMIX map - so the ROM probes the real populated SIMMs at $07000000 and
-      // adds them to the MemList; the AMIX loader's AllocMem(MEMF_FAST) then succeeds. $08000000+
-      // stays dummy (no Z3660 CPU RAM) so the kernel sees only the <=16MB mobo RAM = one SCN1 window.
-      RANGE_MAP(0x0100, 0x0800, slow_bank);                       // real A4000 motherboard RAM (incl SIMMs @ $07000000) via the real bus
-      RANGE_MAP(0x0800, 0x1000, dmmy_bank);                       // no RAM at $08000000+ (single SCN1 window, no vatosde coalesce)
+      (void)((AMIX_A3000MEM_MB * 1024 * 1024) >> 16);            // (a3000mem page count)
+      // AMIX on Zynq-local DDR (NOT the slow motherboard SIMMs) -- per-bank map:
+      //  $0100-$0700 slow_bank : real bus; no RAM lives below $07000000 on the A4000 (unchanged from PATH B).
+      //  $0700-$0800 a3000mem  : 16MB DDR (host $09000000). VESTIGIAL -- NOT in the AmigaOS memlist (the
+      //                          Kickstart's mobo-RAM detection never CPU-probes it; proven via the now-removed
+      //                          [A3KMEM] diag = 0 hits even function-path). AMIX never uses it; left mapped for safety.
+      //  $0800-$0900 drct_bank : 16MB DDR CPU RAM (host 1:1 $08000000) = AMIX's ACTUAL main RAM. The ext-kickstart/
+      //                          autoconfig adds $08000000 to the AmigaOS memlist, the AMIX loader AllocMem(MEMF_FAST)s
+      //                          the kernel there, and THIS kernel brings up its 2KB-page MMU IN PLACE at $08000000
+      //                          (serial "MMU enabled ... PC=08000fe6") and RUNS there -- it does NOT relocate to $07000000.
+      //  $0900-$1000 dmmy_bank : nothing above, so the memlist holds exactly one 16MB window (no >16MB SCN1 coalesce).
+      // NOTE: AMIX_HIDE08 (mmu_common.h) is DISABLED -- it was built for an older kernel that relocated to $07000000;
+      //       hiding $08000000 under THIS in-place kernel would yank its own running code -> reboot loop.
+      RANGE_MAP(0x0100, 0x0700, slow_bank);                       // real bus, $01000000-$06FFFFFF (no RAM here)
+      RANGE_MAP(0x0700, 0x0800, a3000mem_bank);                   // 16MB DDR AMIX main RAM @ guest $07000000 -> host $09000000
+      RANGE_MAP(0x0800, 0x0900, drct_bank);                       // 16MB DDR CPU RAM @ $08000000 (loader memlist scratch; hidden post-MMU)
+      RANGE_MAP(0x0900, 0x1000, dmmy_bank);                       // nothing above $09000000
    }
    else
    {

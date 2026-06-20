@@ -124,7 +124,14 @@ static ALWAYS_INLINE bool is_unaligned_bus(uaecptr addr, int size)
 // over-uses the address space and panics vatosde. Reads return ~0, writes are dropped, so
 // the kernel's RAM probe sees "no RAM" there. (Page tables live at $07xxxxxx, untouched.)
 extern "C" volatile int amix_mmu_on;
-#define AMIX_HIDE08(a) (amix_mmu_on && ((a) & 0xFF000000u) == 0x08000000u)
+// EXPERIMENT (2026-06-20): the CURRENT AMIX kernel brings up its MMU while STILL at $08000000
+// (serial: "MMU enabled ... PC=08000fe6", NOT the 07000fe6 this hide assumed) -- i.e. it runs in
+// PLACE at $08000000 (its MAINSTORE) and does NOT relocate to $07000000. With only $08000000 in
+// the memlist (the DDR drct CPU-RAM), AMIX sees a single 16MB window there, so hiding $08000000
+// just yanks the running kernel's own code -> halt/reboot-loop. Disable the hide so the kernel
+// runs on DDR @ $08000000. amix_mmu_on stays live (a3000_scsi.cpp completion timing needs it).
+#define AMIX_HIDE08(a) (0)
+#define AMIX_HIDE08_OLD(a) (amix_mmu_on && ((a) & 0xFF000000u) == 0x08000000u)
 static ALWAYS_INLINE void phys_put_long(uaecptr addr, uae_u32 l)
 {
     if (AMIX_HIDE08(addr)) return;
