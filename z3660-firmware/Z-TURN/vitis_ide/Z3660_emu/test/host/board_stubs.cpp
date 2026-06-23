@@ -133,3 +133,28 @@ addrbank dmmy_bank = {
 	dmmy_lget, dmmy_wget,
 	ABFLAG_NONE, 0, 0
 };
+
+/* =====================================================================
+ *  A3000-SCSI emulation seams — referenced by the portable MMU core
+ *  (newcpu.cpp INT2 completion pump + cpummu030.cpp AMIX gate) but
+ *  defined in a3000_scsi.cpp / main.cc, which this harness excludes.
+ *  Stubbed inert so the MMU harness links on the A3000-SCSI base.
+ * ===================================================================== */
+extern "C" {
+volatile int a3000_amix_mode = 0;          /* AMIX (A3000 SCSI) mode — off for MMU tests */
+volatile int amix_mmu_on = 0;
+volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_compl_csr[16],
+                 amix_compl_unit[16], amix_compl_head[16];
+volatile int amix_compl_h = 0;
+volatile uae_u32 amix_scmd_unit[16], amix_scmd_lba[16], amix_scmd_n[16], amix_scmd_w[16];
+volatile int amix_scmd_head = 0;
+volatile uae_u32 amix_wcmd_cmd[16], amix_wcmd_dest[16], amix_wcmd_ph[16];
+volatile int amix_wcmd_head = 0;
+void a3000_scsi_hsync(void){ }
+void a3000_scsi_dumpstate(void){ }
+void a3000_scsi_dumpqueue(void){ }
+}
+/* plain C++ linkage (defined in a3000_scsi.cpp / main.cc on target) */
+volatile uae_u32 amix_tick = 0;
+volatile int a3000_scsi_irq = 0;
+int ipl_read = 0;
