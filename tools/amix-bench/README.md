@@ -45,6 +45,23 @@ BENCHDIR=.      # directory for the I/O test file -- must be on a REAL disk
   `time cmd | other` on SVR4 sh, so the runner wraps timed commands as
   `{ time ...; } 2>&1` — keep that if you adapt it.
 
+## Precompiled binaries (AMIX / SVR4-m68k)
+
+`dhry.amix` and `hz.amix` are the AMIX-built executables (m68k ELF, dynamically linked
+against `/usr/lib/libc.so.1`; **HZ=60 baked into `dhry.amix`**). On AMIX — or any
+SVR4-m68k system with that libc and a 60 Hz clock — you can skip compiling entirely:
+
+```sh
+echo 50000 | ./dhry.amix     # run Dhrystone directly
+./hz.amix                    # prints the clock-tick rate (HZ) this binary assumes
+sh runbench.sh               # auto-falls back to these if no cc/gcc is present
+```
+
+`runbench.sh` prefers building from source (so it picks up the machine's *correct* HZ);
+it uses `dhry.amix`/`hz.amix` only when no compiler is found. **On a machine with a
+different HZ (e.g. 100) or a different m68k UNIX flavour, recompile** — otherwise
+`dhry.amix`'s baked-in HZ=60 skews its reported rate.
+
 ## Reporting back
 
 Include in / alongside `bench-results.<host>.txt`:

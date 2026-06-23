@@ -33,7 +33,8 @@ IOBLKS=`expr $IOMB \* 128`        # 128 blocks of 8192 bytes = 1 MB
 # Order: caller-supplied $HZ  >  getconf  >  compiled sysconf helper  >  100.
 if [ -z "$HZ" ]; then HZ=`( getconf CLK_TCK ) 2>/dev/null`; fi
 if [ -z "$HZ" ]; then
-  if cc -O hz.c -o hz 2>/dev/null || gcc -O hz.c -o hz 2>/dev/null; then HZ=`./hz 2>/dev/null`; fi
+  if cc -O hz.c -o hz 2>/dev/null || gcc -O hz.c -o hz 2>/dev/null; then HZ=`./hz 2>/dev/null`
+  elif [ -x ./hz.amix ]; then HZ=`./hz.amix 2>/dev/null`; fi    # precompiled AMIX helper
 fi
 [ -z "$HZ" ] && HZ=100
 
@@ -41,9 +42,10 @@ fi
 #      "extern int times()" removed (clashes with <sys/times.h> on ANSI cc).
 #      Some vintage gcc reject -O2 -- use -O. ----
 CCNAME=
-if   cc  -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="cc -O"
-elif gcc -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="gcc -O"
-else echo "ERROR: cannot compile dhry.c with cc or gcc" >&2; exit 1
+if   cc  -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="cc -O -DHZ=$HZ"
+elif gcc -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="gcc -O -DHZ=$HZ"
+elif [ -x ./dhry.amix ]; then cp dhry.amix dhry; CCNAME="precompiled dhry.amix (AMIX/SVR4-m68k, HZ=60)"; HZ=60
+else echo "ERROR: no compiler (cc/gcc) and no usable precompiled dhry.amix" >&2; exit 1
 fi
 
 log() { echo "$*"; echo "$*" >> "$OUT"; }
