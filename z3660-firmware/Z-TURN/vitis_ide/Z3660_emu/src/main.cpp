@@ -722,7 +722,7 @@ int main()
          }
          else if(shared->cfg_emu==UAE_030_MMU)
          {
-            uae_emulator(0,68030,1); // real 68030 PMMU, JIT off
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
          }
          else if(shared->cfg_emu==MUSASHI)
          {
@@ -749,7 +749,7 @@ int main()
          }
          else if(shared->cfg_emu==UAE_030_MMU)
          {
-            uae_emulator(0,68030,1); // real 68030 PMMU, JIT off
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
          }
          else if(shared->cfg_emu==UAEJIT_040)
          {

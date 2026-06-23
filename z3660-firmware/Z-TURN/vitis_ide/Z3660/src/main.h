@@ -113,6 +113,7 @@ typedef struct {
    volatile uint32_t printhist_dataabort; // 0xFFFF0094
    volatile uint32_t arm_freq_code;       // 0xFFFF0098
    volatile uint32_t debug_emu;           // 0xFFFF009C  emulator-core debug spam toggle (0=off,1=on): [PC]/[RTE-B-IF]/fixup (DEMU menu cmd)
+   volatile uint32_t amix_mode;           // 0xFFFF00A0  AMIX memory contract on/off (control core sets from config.amix_mode)
 } SHARED;
 extern SHARED *shared;
 #define REG_BASE_ADDRESS XPAR_Z3660_0_BASEADDR

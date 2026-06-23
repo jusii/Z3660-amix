@@ -98,6 +98,7 @@ const char *config_item_names[CONFITEM_NUM] = {
       "test_range6",
       "test_range7",
       "arm_frequency",
+      "amix_mode",
 };
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
@@ -161,6 +162,7 @@ void load_default_config(void)
    config.autoconfig_ram=0;
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
+   config.amix_mode=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -266,6 +268,12 @@ void write_config_file(char *filename)
    print_line(&fil,"# (YES or NO, in capitals)\n");
    print_line(&fil,"#cpu_ram NO\n");
    print_line(&fil,"cpu_ram YES\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# AMIX memory contract (16MB cap, A3000-SCSI emulation, no $08 CPU RAM board)\n");
+   print_line(&fil,"# Default when omitted: YES iff bootmode UAE_030_MMU, else NO\n");
+   print_line(&fil,"# (YES or NO, in capitals)\n");
+   print_line(&fil,"amix_mode NO\n");
+   print_line(&fil,"#amix_mode YES\n");
    print_line(&fil,"\n");
    print_line(&fil,"# MOUNT SD 0x76 partition\n");
    print_line(&fil,"# (YES or NO, in capitals)\n");
@@ -563,6 +571,7 @@ retry:
    config.autoconfig_ram=0;
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
+   config.amix_mode=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -695,6 +704,12 @@ retry:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.cpu_ram=get_yesno_type(cur_cmd);
          if(verbose) printf("[CFG] CPU RAM %s.\n", yesno_names[config.cpu_ram]);
+         break;
+
+      case CONFITEM_AMIX_MODE:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.amix_mode=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] AMIX mode %s.\n", yesno_names[config.amix_mode]);
          break;
 
       case CONFITEM_MOUNT_SD_0x76:
@@ -895,7 +910,18 @@ load_successful:;
    f_umount(Path);
    if(verbose) printf("Config file read OK\n");
 
+   // default_config is the preset template: keep amix_mode as the parsed value (incl.
+   // -1 = "unset") so each preset resolves its own default against ITS own boot_mode
+   // (in read_env_files). Resolve the ACTIVE config (no-preset path) separately below.
    memcpy(&default_config,&config,sizeof(CONFIG));
+
+   // no-preset path: resolve the amix_mode default (-1 = unset) now that the whole
+   // config file is parsed, so config.amix_mode is always 0/1 by the time anything
+   // (here, the shared field below, or downstream) reads it. Default: AMIX iff UAE_030_MMU.
+   if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
+   if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
+   shared->amix_mode=config.amix_mode;
+
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
    for(int i=0;i<8;i++)
@@ -906,6 +932,7 @@ load_successful:;
       COPY_DEFAULT(autoconfig_ram);
       COPY_DEFAULT(autoconfig_rtg);
       COPY_DEFAULT(cpu_ram);
+      COPY_DEFAULT(amix_mode);
       COPY_DEFAULT(mount_sd_0x76);
       COPY_DEFAULT(mount_sd_root);
       COPY_DEFAULT(kickstart);
@@ -1128,6 +1155,12 @@ retry:
                   if(preset==preset_selected)
                      if(verbose) printf("\e[30m\e[103m[ENV] CPU Ram %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].cpu_ram]);
                   break;
+               case CONFITEM_AMIX_MODE:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].amix_mode=get_yesno_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] AMIX mode %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].amix_mode]);
+                  break;
                case CONFITEM_MOUNT_SD_0x76:
                   get_next_string(parse_line, cur_cmd, &str_pos, ' ');
                   env_file_vars_temp[preset].mount_sd_0x76=get_yesno_type(cur_cmd);
@@ -1225,6 +1258,7 @@ retry:
       config.autoconfig_ram=env_file_vars_temp[preset_selected].autoconfig_ram;
       config.autoconfig_rtg=env_file_vars_temp[preset_selected].autoconfig_rtg;
       config.cpu_ram=env_file_vars_temp[preset_selected].cpu_ram;
+      config.amix_mode=env_file_vars_temp[preset_selected].amix_mode;
       config.mount_sd_0x76=env_file_vars_temp[preset_selected].mount_sd_0x76;
       config.mount_sd_root=env_file_vars_temp[preset_selected].mount_sd_root;
       config.cpufreq=env_file_vars_temp[preset_selected].cpufreq;
@@ -1244,8 +1278,12 @@ retry:
       // the a3000_scsi cross-core backend. The emulator presents NO RAM at $08000000 (dmmy_bank), so
       // the ROM's motherboard-RAM probe (emulated CPU) only finds the 16MB a3000mem @ $07000000 => a
       // single contiguous SCN1 window, no vatosde() coalesce.
-      if(config.boot_mode==UAE_030_MMU)
-         config.cpu_ram=0;
+      // amix_mode decouples the AMIX memory contract from UAE_030_MMU (the PMMU boot mode). Default
+      // (amix_mode==-1, i.e. no amix_mode line in the preset): AMIX iff UAE_030_MMU, so every existing
+      // preset stays byte-identical in behaviour. Only when amix_mode is ON do we force cpu_ram OFF.
+      if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
+      if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
+      shared->amix_mode=config.amix_mode;
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 
@@ -1314,6 +1352,8 @@ retry:
          f_printf(&fil,"autoconfig_ram %s\n",yesno_names[env_file->autoconfig_ram]);
          f_printf(&fil,"autoconfig_rtg %s\n",yesno_names[env_file->autoconfig_rtg]);
          f_printf(&fil,"cpu_ram %s\n",yesno_names[env_file->cpu_ram]);
+         if(env_file->amix_mode!=-1)
+            f_printf(&fil,"amix_mode %s\n",yesno_names[env_file->amix_mode]);
          f_printf(&fil,"mount_sd_0x76 %s\n",yesno_names[env_file->mount_sd_0x76]);
          f_printf(&fil,"mount_sd_root %s\n",yesno_names[env_file->mount_sd_root]);
          f_printf(&fil,"cpufreq %d\n",env_file->cpufreq);
@@ -1365,6 +1405,7 @@ int write_env_files_boot(ENV_FILE_VARS *env_file)
 //   env_file->autoconfig_rtg=config.autoconfig_rtg;
 //   env_file->enable_test=config.enable_test;
 //   env_file->cpu_ram=config.cpu_ram;
+//   env_file->amix_mode=config.amix_mode;
 //   env_file->mount_sd_0x76=config.mount_sd_0x76;
 //   env_file->mount_sd_root=config.mount_sd_root;
 //   env_file->cpufreq=config.cpufreq;
@@ -1392,6 +1433,7 @@ int write_env_files_scsi(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1419,6 +1461,7 @@ int write_env_files_bootscres(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1447,6 +1490,7 @@ int write_env_files_misc(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1474,6 +1518,7 @@ int write_env_files_preset(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1535,6 +1580,7 @@ retry:
    DELETE_FILE("env/autoconfig_ram");
    DELETE_FILE("env/autoconfig_rtg");
    DELETE_FILE("env/cpu_ram");
+   DELETE_FILE("env/amix_mode");
    DELETE_FILE("env/cpufreq");
    DELETE_FILE("env/kickstart");
    DELETE_FILE("env/ext_kickstart");

@@ -971,9 +971,9 @@ extern "C" void make_dummy_address_bank(uint32_t address)
    int add=address>>16;
    RANGE_MAP(add,add,dmmy_bank); // dummy
 }
-void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
+void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
 {
-   z3660_printf("[Core1] Starting UAE%s_%s%s emulator\n",enable_jit?"JIT":"",cpu_model==68030?"030":"040",enable_mmu?"_MMU":"");
+   z3660_printf("[Core1] Starting UAE%s_%s%s%s emulator\n",enable_jit?"JIT":"",cpu_model==68030?"030":"040",enable_mmu?"_MMU":"",amix_mode?"_AMIX":"");
    currprefs.cpu_model              = changed_prefs.cpu_model=cpu_model;
    currprefs.fpu_model              = changed_prefs.fpu_model=cpu_model==68030?68882:68040;
    // UAE_030_MMU: real 68030 PMMU. enable_mmu and JIT are mutually exclusive (the
@@ -1023,10 +1023,10 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
    RANGE_MAP(0x0008,0x00B8,chpr_bank); // Mother Board bank ( Chip RAM and Zorro II Expansion Space )
    RANGE_MAP(0x00BF,0x00C0,slow_bank); // Slow bank ( CIA ports & Timers ) <----- Amiga crashes with mobo_bank
    RANGE_MAP(0x00DC,0x00DD,mobo_bank); // Mother Board bank ( RTC )
-   // AMIX (UAE_030_MMU) only: intercept $00DD0000 with the emulated A3000 SCSI
-   // (WD33C93+SuperDMAC). Other emulator modes keep slow_bank so a normal
-   // A3000-Kickstart AmigaOS boot is unaffected (its scsi.device sees no change).
-   if(enable_mmu)
+   // AMIX (amix_mode) only: intercept $00DD0000 with the emulated A3000 SCSI
+   // (WD33C93+SuperDMAC). Other modes (incl. plain UAE_030_MMU with amix_mode off)
+   // keep slow_bank so a normal A3000-Kickstart AmigaOS boot is unaffected.
+   if(amix_mode)
       RANGE_MAP(0x00DD,0x00DE,a3000_scsi_bank); // emulated A3000 SCSI @ $00DD0000
    else
       RANGE_MAP(0x00DD,0x00DE,slow_bank);
@@ -1071,7 +1071,7 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
    // ONE <=16MB Fast-RAM window in its memlist -- we give it 16MB of DDR CPU RAM @ $08000000 (the
    // per-bank map below). Result: AMIX runs on fast Zynq DDR, ~3.4x faster than the mobo SIMMs.
 #define AMIX_A3000MEM_MB 16
-   if(enable_mmu)
+   if(amix_mode)
    {
       (void)((AMIX_A3000MEM_MB * 1024 * 1024) >> 16);            // (a3000mem page count)
       // AMIX on Zynq-local DDR (NOT the slow motherboard SIMMs) -- per-bank map:
@@ -1137,7 +1137,7 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu)
 
    m68k_reset_newcpu(1);
    reset_autoconfig();
-   if(enable_mmu)
+   if(amix_mode)
    {
       memset((void*)A3000MEM_HOST, 0, AMIX_A3000MEM_MB * 1024 * 1024); // clear a3000mem host backing ($09000000)
       a3000_scsi_init(); // AMIX: reset emulated A3000 WD33C93+SuperDMAC state
