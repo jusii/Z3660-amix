@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "newcpu.h"
 #include "harness.h"
+#include "main.h"      /* SHARED struct (harness-safe; newcpu.cpp pulls it via ../main.h) */
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,13 @@
 
 /* ---- Emulator config globals (normally in uae_emulator.cpp, excluded) ---- */
 struct uae_prefs currprefs, changed_prefs;
+
+/* Cross-core SHARED struct (defined in main.cc on target, excluded here) + the
+ * emulator-debug gate accessor (main.cc). Inert in the harness: debug_emu / amix_mode
+ * zero, z3660_dbg_emu()==0, so the [PC]/[RTE-B-IF]/fixup traces stay off. */
+SHARED _harness_shared;
+SHARED *shared = &_harness_shared;
+extern "C" int z3660_dbg_emu(void){ return 0; }
 
 /* =====================================================================
  *  Flat-RAM machine
