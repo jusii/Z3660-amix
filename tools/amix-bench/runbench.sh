@@ -32,9 +32,9 @@ IOBLKS=`expr $IOMB \* 128`        # 128 blocks of 8192 bytes = 1 MB
 # ---- Clock-tick rate (HZ) for Dhrystone's times()-based timing (-DHZ=) ----
 # Order: caller-supplied $HZ  >  getconf  >  compiled sysconf helper  >  100.
 if [ -z "$HZ" ]; then HZ=`( getconf CLK_TCK ) 2>/dev/null`; fi
-if [ -z "$HZ" ]; then
-  if cc -O hz.c -o hz 2>/dev/null || gcc -O hz.c -o hz 2>/dev/null; then HZ=`./hz 2>/dev/null`
-  elif [ -x ./hz.amix ]; then HZ=`./hz.amix 2>/dev/null`; fi    # precompiled AMIX helper
+if [ -z "$HZ" ] && [ -x ./hz ]; then HZ=`./hz 2>/dev/null`; fi             # use ./hz if it runs here (no rebuild)
+if [ -z "$HZ" ]; then                                                       # else build hz from source
+  if cc -O hz.c -o hz 2>/dev/null || gcc -O hz.c -o hz 2>/dev/null; then HZ=`./hz 2>/dev/null`; fi
 fi
 [ -z "$HZ" ] && HZ=100
 
@@ -42,10 +42,14 @@ fi
 #      "extern int times()" removed (clashes with <sys/times.h> on ANSI cc).
 #      Some vintage gcc reject -O2 -- use -O. ----
 CCNAME=
-if   cc  -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="cc -O -DHZ=$HZ"
-elif gcc -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="gcc -O -DHZ=$HZ"
-elif [ -x ./dhry.amix ]; then cp dhry.amix dhry; CCNAME="precompiled dhry.amix (AMIX/SVR4-m68k, HZ=60)"; HZ=60
-else echo "ERROR: no compiler (cc/gcc) and no usable precompiled dhry.amix" >&2; exit 1
+# Reuse an existing ./dhry if present (no rebuild); otherwise build it from dhry.c, and that
+# build is then reused on later runs.  To force a rebuild: delete the binaries (rm dhry hz)
+# or set BUILD=1.  The bundled binaries are AMIX m68k ELF -- on any other m68k UNIX they
+# won't execute, so delete them there and the runner builds from source (correct local HZ).
+if [ "$BUILD" != 1 ] && [ -x ./dhry ]; then CCNAME="existing ./dhry (no rebuild)"
+elif cc  -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="cc -O"
+elif gcc -O -DHZ="$HZ" dhry.c -o dhry 2>/dev/null && [ -f dhry ]; then CCNAME="gcc -O"
+else echo "ERROR: no ./dhry and cc/gcc can't build dhry.c" >&2; exit 1
 fi
 
 log() { echo "$*"; echo "$*" >> "$OUT"; }

@@ -11,9 +11,10 @@ we can line your numbers up against the emulator.
 sh runbench.sh
 ```
 
-Requirements: `/bin/sh`, a C compiler (`cc` or `gcc`), `dd`; `compress` optional.
-It builds Dhrystone, runs the tests, and writes **`bench-results.<hostname>.txt`** —
-send that file back.
+Requirements: `/bin/sh`, `dd`; `compress` optional. A C compiler (`cc`/`gcc`) is needed
+**only** if the bundled `dhry`/`hz` binaries don't run on your machine (see below).
+It reuses-or-builds Dhrystone, runs the tests, and writes **`bench-results.<hostname>.txt`**
+— send that file back.
 
 ## What it measures
 
@@ -30,6 +31,7 @@ RUNS=50000      # Dhrystone iterations. The RATE is what's comparable, so any va
                 # giving a >=2 s run is fine; bump it on fast machines.
 IOMB=2          # disk I/O test size, MB
 BENCHDIR=.      # directory for the I/O test file -- must be on a REAL disk
+BUILD=1         # force compiling dhry.c from source even if a precompiled binary runs
 ```
 
 ## Notes
@@ -38,29 +40,30 @@ BENCHDIR=.      # directory for the I/O test file -- must be on a REAL disk
   combined into one file. The only change from pristine: the redundant K&R
   `extern int times()` declaration is removed — it conflicts with `<sys/times.h>`'s
   prototype on an ANSI `cc` (e.g. AMIX's SVR4 `cc`). Built with
-  `-DHZ=$(getconf CLK_TCK)` for correct timing (falls back to `HZ=100`).
+  `-DHZ=<detected>` (via `getconf CLK_TCK`, else the `hz` helper's `sysconf`, else 100).
   `dhry-RATIONALE.txt` / `dhry-README_C.txt` are the original netlib docs.
 - Some vintage `gcc` reject `-O2`; the runner uses `-O`.
 - The shell-builtin `time` does **not** reliably print `real/user/sys` for a bare
   `time cmd | other` on SVR4 sh, so the runner wraps timed commands as
   `{ time ...; } 2>&1` — keep that if you adapt it.
 
-## Precompiled binaries (AMIX / SVR4-m68k)
+## Precompiled binaries (`dhry`, `hz`)
 
-`dhry.amix` and `hz.amix` are the AMIX-built executables (m68k ELF, dynamically linked
-against `/usr/lib/libc.so.1`; **HZ=60 baked into `dhry.amix`**). On AMIX — or any
-SVR4-m68k system with that libc and a 60 Hz clock — you can skip compiling entirely:
+The package ships with **`dhry` and `hz` prebuilt on AMIX** (m68k ELF, dynamically linked
+against `/usr/lib/libc.so.1`; HZ=60). The runner **reuses an existing `./dhry`/`./hz` if present**
+(no rebuild) — so on AMIX there is no compile step at all:
 
 ```sh
-echo 50000 | ./dhry.amix     # run Dhrystone directly
-./hz.amix                    # prints the clock-tick rate (HZ) this binary assumes
-sh runbench.sh               # auto-falls back to these if no cc/gcc is present
+sh runbench.sh               # reuses the bundled dhry/hz here; builds them elsewhere
+echo 50000 | ./dhry          # or run Dhrystone directly
+./hz                         # prints this machine's clock-tick rate (HZ)
 ```
 
-`runbench.sh` prefers building from source (so it picks up the machine's *correct* HZ);
-it uses `dhry.amix`/`hz.amix` only when no compiler is found. **On a machine with a
-different HZ (e.g. 100) or a different m68k UNIX flavour, recompile** — otherwise
-`dhry.amix`'s baked-in HZ=60 skews its reported rate.
+**To build from source instead, delete the binaries** (`rm dhry hz`) and run again — the
+runner compiles `dhry.c` / `hz.c` and that fresh build is reused on later runs. (`BUILD=1`
+does the same without deleting.) On a non-AMIX m68k UNIX the bundled binaries won't execute —
+`rm dhry hz` there and the runner builds from source (with that machine's correct HZ). The
+bundled `dhry` assumes **HZ=60**, so on a different-HZ machine, rebuild.
 
 ## Reporting back
 
