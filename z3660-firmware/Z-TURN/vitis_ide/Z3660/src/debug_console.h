@@ -50,12 +50,4 @@ typedef struct {
 void debug_console_loop(void);
 void debug_console_init(void);
 
-/* Serial debug verbosity, set by the DBGLVL menu command (shared->debug_level):
- *   0 = OFF   (errors only)
- *   1 = INFO  (boot milestones: kickstart, A3000SCSI init, MMU enabled, partitions)
- *   2 = DEBUG (full per-command traces)
- * `shared` (SHARED*, from main.h) must be in scope at the call site. */
-#define DBG_INFO(...)   do{ if(shared->debug_level>=1) printf(__VA_ARGS__); }while(0)
-#define DBG_DEBUG(...)  do{ if(shared->debug_level>=2) printf(__VA_ARGS__); }while(0)
-
 #endif // _CONSOLE_H_

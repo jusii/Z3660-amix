@@ -63,7 +63,7 @@ typedef enum {
    PHD,     PRINT_HIST_DATAABORT,
    VMR,     VIDEO_MODE_RESET,
    OVL,     TOGGLE_OVERLAY,
-   DBGLVL,  DEBUG_LEVEL,
+   DEMU,    DEBUG_EMU,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -108,7 +108,7 @@ const char *command_names[NUM_COMMANDS] = {
       "PHD",     "PRINT_HIST_DATAABORT",
       "VMR",     "VIDEO_MODE_RESET",
       "OVL",     "TOGGLE_OVERLAY",
-      "DBGLVL",  "DEBUG LEVEL",
+      "DEMU",    "DEBUG EMU",
 };
 extern clock_data cd[];
 extern CONFIG config;
@@ -124,7 +124,7 @@ void debug_console_init(void)
    debug_console.debug_ethernet=0;
    debug_console.debug_soft3d=0;
    debug_console.debug_i2c=0;
-   shared->debug_level=0;       // serial debug verbosity default OFF (DBGLVL menu cmd cycles off/info/debug)
+   shared->debug_emu=0;         // emulator-core debug spam default OFF (DEMU menu cmd toggles)
    debug_console.stop_i2c=0;
    debug_console.step=0;
    debug_console.hist_pointer=0;
@@ -346,10 +346,10 @@ int debug_thread(struct pt *pt)
                         xil_printf("DEBUG SCSI OFF\r\n");
                      debug_console.subcmd=0;
                      break;
-                  case DBGLVL:
-                  case DEBUG_LEVEL:
-                     shared->debug_level=(shared->debug_level+1)%3;   // cycle OFF -> INFO -> DEBUG -> OFF
-                     xil_printf("DEBUG LEVEL: %s\r\n", shared->debug_level==0?"OFF":(shared->debug_level==1?"INFO":"DEBUG"));
+                  case DEMU:
+                  case DEBUG_EMU:
+                     shared->debug_emu=!shared->debug_emu;   // emulator-core debug spam: [PC]/[RTE-B-IF]/fixup
+                     xil_printf("DEBUG EMU %s\r\n", shared->debug_emu?"ON":"OFF");
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:

@@ -88,7 +88,7 @@ static const char *op_type_names[4] = {
 extern DEBUG_CONSOLE debug_console;
 void DEBUG(const char *format, ...)
 {
-   if(shared->debug_level<2)   // DEBUG() is the verbose (level 2 = DEBUG) channel
+   if(debug_console.debug_scsi==0)   // SCSI debug channel (DSCSI menu toggle)
       return;
    va_list args;
    va_start(args, format);
@@ -1120,8 +1120,10 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       d = &devs[val];
       if(val != piscsi_cur_drive)
       {
-         printf("[PISCSI] Warning val=%ld piscsi_cur_drive=%d\n",val,piscsi_cur_drive);
-         printf("[PISCSI] Command cmd=%d\n",cmd);
+         if(debug_console.debug_scsi){   // idle-poll flood -> behind the SCSI debug toggle
+            printf("[PISCSI] Warning val=%ld piscsi_cur_drive=%d\n",val,piscsi_cur_drive);
+            printf("[PISCSI] Command cmd=%d\n",cmd);
+         }
       }
       if (d->fd == 0) {
          DEBUG("[!!!PISCSI] BUG: Attempted write to unmapped drive %ld.\n", val);

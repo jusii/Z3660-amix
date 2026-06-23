@@ -2840,7 +2840,7 @@ static inline void check_uae_int_request(void)
          amix_stuckbuf=(uae_u32)m68k_areg(regs,2);
          amix_stucktick=amix_tick;
       }
-      static uae_u32 pcc=0; if((++pcc & 0x3FFFFF)==0){
+      static uae_u32 pcc=0; if(shared->debug_emu && (++pcc & 0x3FFFFF)==0){   // [PC]/[SLP] trace behind the DEMU toggle
          z3660_printf("[PC] %08lX s=%d msk=%d\r\n",(unsigned long)ipc,(int)regs.s,(int)regs.intmask);
          // when idling in swtch (0x070b90xx), dump the last sleep callers/chans + last SCSI commands
          if(ipc>=0x070B9000u && ipc<0x070B9300u){

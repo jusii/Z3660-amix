@@ -55,6 +55,9 @@ void init_shared(void)
    shared->nops_write=DEFAULT_NOPS_WRITE;
    shared->nops_read=DEFAULT_NOPS_READ;
 }
+/* Emulator-core debug spam gate (DEMU menu toggle). Accessor so the uae files
+ * (newcpu.cpp / cpummu030.cpp) can check it without pulling in the SHARED struct. */
+extern "C" int z3660_dbg_emu(void){ return shared ? (int)shared->debug_emu : 0; }
 XGpioPs GpioPs;
 XGpioPs_Config *GpioPsConfigPtr;
 /*

@@ -41,6 +41,7 @@
 
 extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
 extern "C" volatile int amix_mmu_on;       // set below when AMIX's 2KB-page MMU comes up
+extern "C" int z3660_dbg_emu(void);        // DEMU menu toggle (main.cc): gate emulator debug spam
 
 // Prefetch mode and prefetch bus error: always flush and refill prefetch pipeline
 #define MMU030_ALWAYS_FULL_PREFETCH 1
@@ -1806,7 +1807,7 @@ static void mmu030fixupmod(uae_u8 data, int dir, int idx)
 		struct mmufixup *m = &mmufixup[idx];
 		m->value += adj;
 	}
-	write_log("fixup %04x %d %d\n", mmu030_opcode & 0xffff, reg, adj);
+	if(z3660_dbg_emu()) write_log("fixup %04x %d %d\n", mmu030_opcode & 0xffff, reg, adj);
 #endif
 }
 
@@ -2941,7 +2942,7 @@ void m68k_do_rte_mmu030 (uaecptr a7)
 		// One-line confirmation probe for ifetch-fault resumes (FB set, DF clear): with the
 		// frame-builder fix, opcode must be ffffffff (-1 -> insretry refetch). Rare (text
 		// demand-pages only), so UART volume is negligible.
-		if ((ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
+		if (z3660_dbg_emu() && (ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
 			write_log(_T("[RTE-B-IF] pc=%08x ssw=%04x ps=%08x oc=%08x -> opcode=%08x\n"),
 				pc, ssw, ps, oc, mmu030_opcode_v);
 
@@ -3395,7 +3396,7 @@ void m68k_do_rte_mmu030c (uaecptr a7)
 		// One-line confirmation probe for ifetch-fault resumes (FB set, DF clear): with the
 		// frame-builder fix, opcode must be ffffffff (-1 -> insretry refetch). Rare (text
 		// demand-pages only), so UART volume is negligible.
-		if ((ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
+		if (z3660_dbg_emu() && (ssw & MMU030_SSW_FB) && !(ssw & MMU030_SSW_DF))
 			write_log(_T("[RTE-B-IF] pc=%08x ssw=%04x ps=%08x oc=%08x -> opcode=%08x\n"),
 				pc, ssw, ps, oc, mmu030_opcode_v);
 
