@@ -130,7 +130,6 @@ void debug_console_init(void)
    debug_console.debug_i2c=0;
    shared->debug_emu=0;         // emulator-core debug spam default OFF (DEMU menu cmd toggles)
    shared->perf_report=0;       // 030-MMU instruction-rate readout default OFF (PERF menu cmd)
-   shared->service_cadence=1;   // 030-MMU IPL/task poll cadence default 1 = poll every instruction (SERV cycles it)
    debug_console.stop_i2c=0;
    debug_console.step=0;
    debug_console.hist_pointer=0;

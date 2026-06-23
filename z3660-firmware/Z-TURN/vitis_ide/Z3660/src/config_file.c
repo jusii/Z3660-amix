@@ -99,6 +99,7 @@ const char *config_item_names[CONFITEM_NUM] = {
       "test_range7",
       "arm_frequency",
       "amix_mode",
+      "service_cadence",
 };
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
@@ -163,6 +164,7 @@ void load_default_config(void)
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
    config.amix_mode=-1;
+   config.service_cadence=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -274,6 +276,7 @@ void write_config_file(char *filename)
    print_line(&fil,"# (YES or NO, in capitals)\n");
    print_line(&fil,"amix_mode NO\n");
    print_line(&fil,"#amix_mode YES\n");
+   print_line(&fil,"#service_cadence 8\n");
    print_line(&fil,"\n");
    print_line(&fil,"# MOUNT SD 0x76 partition\n");
    print_line(&fil,"# (YES or NO, in capitals)\n");
@@ -572,6 +575,7 @@ retry:
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
    config.amix_mode=-1;
+   config.service_cadence=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -710,6 +714,12 @@ retry:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.amix_mode=get_yesno_type(cur_cmd);
          if(verbose) printf("[CFG] AMIX mode %s.\n", yesno_names[config.amix_mode]);
+         break;
+
+      case CONFITEM_SERVICE_CADENCE:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.service_cadence=get_int_type(cur_cmd);
+         if(verbose) printf("[CFG] service_cadence %d\n", config.service_cadence);
          break;
 
       case CONFITEM_MOUNT_SD_0x76:
@@ -921,6 +931,8 @@ load_successful:;
    if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
    if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
    shared->amix_mode=config.amix_mode;
+   if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
+   shared->service_cadence=config.service_cadence;
 
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
@@ -933,6 +945,7 @@ load_successful:;
       COPY_DEFAULT(autoconfig_rtg);
       COPY_DEFAULT(cpu_ram);
       COPY_DEFAULT(amix_mode);
+      COPY_DEFAULT(service_cadence);
       COPY_DEFAULT(mount_sd_0x76);
       COPY_DEFAULT(mount_sd_root);
       COPY_DEFAULT(kickstart);
@@ -1161,6 +1174,12 @@ retry:
                   if(preset==preset_selected)
                      if(verbose) printf("\e[30m\e[103m[ENV] AMIX mode %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].amix_mode]);
                   break;
+               case CONFITEM_SERVICE_CADENCE:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].service_cadence=get_int_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] service_cadence %d\e[0m\n", env_file_vars_temp[preset].service_cadence);
+                  break;
                case CONFITEM_MOUNT_SD_0x76:
                   get_next_string(parse_line, cur_cmd, &str_pos, ' ');
                   env_file_vars_temp[preset].mount_sd_0x76=get_yesno_type(cur_cmd);
@@ -1259,6 +1278,7 @@ retry:
       config.autoconfig_rtg=env_file_vars_temp[preset_selected].autoconfig_rtg;
       config.cpu_ram=env_file_vars_temp[preset_selected].cpu_ram;
       config.amix_mode=env_file_vars_temp[preset_selected].amix_mode;
+      config.service_cadence=env_file_vars_temp[preset_selected].service_cadence;
       config.mount_sd_0x76=env_file_vars_temp[preset_selected].mount_sd_0x76;
       config.mount_sd_root=env_file_vars_temp[preset_selected].mount_sd_root;
       config.cpufreq=env_file_vars_temp[preset_selected].cpufreq;
@@ -1284,6 +1304,8 @@ retry:
       if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
       if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
       shared->amix_mode=config.amix_mode;
+      if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
+      shared->service_cadence=config.service_cadence;
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 
@@ -1354,6 +1376,8 @@ retry:
          f_printf(&fil,"cpu_ram %s\n",yesno_names[env_file->cpu_ram]);
          if(env_file->amix_mode!=-1)
             f_printf(&fil,"amix_mode %s\n",yesno_names[env_file->amix_mode]);
+         if(env_file->service_cadence!=-1)
+            f_printf(&fil,"service_cadence %d\n",env_file->service_cadence);
          f_printf(&fil,"mount_sd_0x76 %s\n",yesno_names[env_file->mount_sd_0x76]);
          f_printf(&fil,"mount_sd_root %s\n",yesno_names[env_file->mount_sd_root]);
          f_printf(&fil,"cpufreq %d\n",env_file->cpufreq);
@@ -1434,6 +1458,7 @@ int write_env_files_scsi(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1462,6 +1487,7 @@ int write_env_files_bootscres(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1491,6 +1517,7 @@ int write_env_files_misc(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1519,6 +1546,7 @@ int write_env_files_preset(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1581,6 +1609,7 @@ retry:
    DELETE_FILE("env/autoconfig_rtg");
    DELETE_FILE("env/cpu_ram");
    DELETE_FILE("env/amix_mode");
+   DELETE_FILE("env/service_cadence");
    DELETE_FILE("env/cpufreq");
    DELETE_FILE("env/kickstart");
    DELETE_FILE("env/ext_kickstart");
