@@ -114,6 +114,8 @@ typedef struct {
    volatile uint32_t arm_freq_code;       // 0xFFFF0098
    volatile uint32_t debug_emu;           // 0xFFFF009C  emulator-core debug spam toggle (0=off,1=on): [PC]/[RTE-B-IF]/fixup (DEMU menu cmd)
    volatile uint32_t amix_mode;           // 0xFFFF00A0  AMIX memory contract on/off (control core sets from config.amix_mode)
+   volatile uint32_t service_cadence;     // 0xFFFF00A4  030-MMU run loop: instructions between IPL/cross-core polls (1=every; perf knob, SERV cmd)
+   volatile uint32_t perf_report;         // 0xFFFF00A8  030-MMU run loop: 1=print instr/sec to serial ~1Hz (PERF cmd)
 } SHARED;
 extern SHARED *shared;
 #define REG_BASE_ADDRESS XPAR_Z3660_0_BASEADDR

@@ -2721,8 +2721,10 @@ static inline void check_uae_int_request(void)
    // EVERY CPU run loop (including the MMU-off loop the Kickstart ROM uses to load the kernel), so the
    // SELECT and SRV_REQ INT2s stay spaced for AMIX's step-by-step sd open WITHOUT stalling the boot load.
    if(a3000_amix_mode){ amix_tick++; static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
-   // ===== AMIX sleep-channel + PC sampler (TEMP — remove before commit) =====
-   if(a3000_amix_mode){
+   // ===== AMIX sleep-channel + PC sampler (TEMP) — gated behind debug_emu (DEMU) so it is OFF by
+   // default; this per-instruction PC sampling (~40 compares + guest reads) was a real AMIX perf
+   // drain. Turn DEMU on to re-arm it for a3091 work; the dumps need a moment to re-accumulate. =====
+   if(a3000_amix_mode && shared->debug_emu){
       uae_u32 ipc=(uae_u32)regs.instruction_pc;
       if(ipc==0x0700BED8u){ amix_ddcrit=1; amix_ddstrat_n++; }   // ddstrategy: just did move.w #$2200,sr (IPL2 splbio) -> enter critical
       if(ipc==0x0700BF04u){ amix_ddcrit=0; }                       // ddstrategy: move.w d2,sr (splx) -> leave critical
@@ -4255,6 +4257,27 @@ static void m68k_run_2_020(void)
 // instruction-START pc so the RTE/re-run restarts the whole instruction. Read-side and prefetch faults
 // already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
 static uaecptr mmu030_insn_start_pc;
+
+// ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
+#include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
+static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
+static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
+static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
+{
+   int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // pick up the runtime knob (SERV)
+   static uae_u64 lastcnt = 0; static XTime last = 0;
+   XTime now; XTime_GetTime(&now);
+   XTime el = now - last;
+   if(el >= (XTime)COUNTS_PER_SECOND){           // ~1 Hz window
+      if(shared->perf_report && last != 0){
+         uae_u64 di = z3660_perf_count - lastcnt;
+         uint32_t kips = (uint32_t)(di * (uae_u64)COUNTS_PER_SECOND / (uae_u64)el / 1000u);
+         z3660_printf("[PERF] ~%lu kIPS (uncalibrated, use as relative) cadence=%d\r\n",(unsigned long)kips, z3660_service_cadence);
+      }
+      lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
+   }
+}
+
 static void m68k_run_mmu030(void)
 {
    struct flag_struct f;
@@ -4305,7 +4328,14 @@ insretry:
 
             mmu030_opcode = -1;
             cpu_cycles = adjust_cycles(cpu_cycles);
-            check_uae_int_request();
+            // perf investigation: instruction-rate benchmark + tunable IPL/cross-core poll cadence.
+            // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
+            // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
+            // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
+            z3660_perf_count++;
+            if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();
+            { static int serv_ctr = 0;
+              if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } }
             if (regs.spcflags) {
                if (do_specialties(cpu_cycles))
                   return;
