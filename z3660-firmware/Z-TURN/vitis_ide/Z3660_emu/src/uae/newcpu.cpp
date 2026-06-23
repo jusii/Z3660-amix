@@ -79,6 +79,8 @@ extern "C" void reset_autoconfig(void);
 extern int ovl;
 void fill_prefetch_quick (void);
 void custom_reset_cpu(bool hardreset, bool keyboardreset);
+void hard_reboot(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // AMIX (emulated A3000 SCSI) active; gates the warm-reboot guard
 
 /* ---- Z3660 warm-reset real-chipset quiesce -------------------------------------
  * A real Amiga RESET resets Paula/CIA; this emulated warm (guest) reset does NOT, so
@@ -2242,6 +2244,22 @@ void m68k_reset_newcpu(bool hardreset)
    regs.s = 1;
    v = get_long (4);
    printf("Read PC from address 4 : 0x%08X\n",v);
+#ifndef HOST_TEST_HARNESS
+   /* AMIX warm-reboot guard: on `reboot`/`uadmin`, AMIX has cleared the overlay so $0-$8 is chip RAM,
+    * not the Kickstart ROM, and the emulator does not restore it on a 68k reset -> get_long(4) returns
+    * garbage (e.g. 0xFFFFFFFF) instead of the Kickstart reset PC. Letting the 68k run from a garbage PC
+    * scribbles the Z3660 PISCSI registers (the "Unhandled register write" flood) and only ends when a
+    * Data Abort triggers hard_reboot() anyway. So detect the invalid vector (a valid reset PC lives in
+    * the Kickstart ROM, $F00000-$1000000) and do that clean reboot immediately -- no flood, no garbage
+    * execution. The cold-boot vector (Kickstart ROM overlaid at 0 on the real bus) is always valid, so
+    * this never false-fires on a normal boot. Gated on a3000_amix_mode so it engages ONLY under AMIX --
+    * other CPU modes/configs are untouched. (A true in-place warm restart would need the overlay/030-MMU
+    * state fully reset so get_long could fetch the ROM vector at $0/$4 without faulting -- not done here.) */
+   if (a3000_amix_mode && (v < 0x00F00000 || v >= 0x01000000)) {
+      printf("[Core1] Invalid reset vector 0x%08X (AMIX warm reboot, overlay not restored) -> clean reboot\n", v);
+      hard_reboot();
+   }
+#endif
    m68k_areg (regs, 7) = get_long (0);
 
    m68k_setpc_normal(v);
