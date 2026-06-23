@@ -88,7 +88,7 @@ static const char *op_type_names[4] = {
 extern DEBUG_CONSOLE debug_console;
 void DEBUG(const char *format, ...)
 {
-   if(debug_console.debug_scsi==0)
+   if(shared->debug_level<2)   // DEBUG() is the verbose (level 2 = DEBUG) channel
       return;
    va_list args;
    va_start(args, format);

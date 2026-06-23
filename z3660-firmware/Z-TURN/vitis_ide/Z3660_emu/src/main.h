@@ -103,6 +103,7 @@ typedef struct {
    volatile uint32_t z2_enabled;          // 0xFFFF0090
    volatile uint32_t printhist_dataabort; // 0xFFFF0094
    volatile uint32_t arm_freq_code;       // 0xFFFF0098
+   volatile uint32_t debug_level;         // 0xFFFF009C  serial debug verbosity: 0=off 1=info 2=debug (DBGLVL menu cmd)
 } SHARED;
 
 enum BOOTMODE{
