@@ -1,5 +1,38 @@
 # Z3660 by sHaNsHe (Double H Tech)
 
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+> ## This fork — Amiga UNIX (AMIX) support
+>
+> This is an **Amix-interoperability fork** of [shanshe/Z3660](https://github.com/shanshe/Z3660)
+> (GPL-3.0, full credit to sHaNsHe). It adds a **real 68030 PMMU emulator** and an **emulated
+> A3000 mainboard SCSI** so a Z3660 + Z-turn can boot **Amiga UNIX (AMIX) 2.1**. If you don't run
+> AMIX, nothing changes — the additions default to off and upstream behaviour is unchanged.
+>
+> **What's new in this fork** (full reference: **[docs/AMIX.md](docs/AMIX.md)**):
+> - **68030 PMMU emulation** — new `bootmode UAE_030_MMU` (a 68030 interpreter *with* a working PMMU).
+> - **Emulated A3000 SCSI** — AMIX's kernel bootstrap path (SuperDMAC + WD33C93).
+> - **New config knobs** — `amix_mode` (AMIX memory contract) and `service_cadence` (emulator
+>   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating.
+>
+> ### Quick start — try a pre-built firmware
+> 1. Download `BOOT.BIN` from this repo's **Releases** (no build needed).
+> 2. Copy it to the SD card's FAT32 boot partition; use the layout in
+>    [`z3660-zturn_SD_content/`](z3660-zturn_SD_content/) for the rest.
+> 3. **You supply your own Kickstart ROM(s) and disk image** — Amiga OS ROMs and AMIX itself are
+>    copyrighted and are not included.
+>
+> ### Build it yourself
+> A dockerised toolchain builds the firmware and the Amiga-side drivers — see
+> **[docker/README.md](docker/README.md)**. (Drivers build with no AMD account; the full firmware
+> build needs you to download AMD/Xilinx Vitis 2023.2 yourself — it is staged outside the repo and
+> never committed.)
+>
+> ### Running AMIX
+> Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image**.
+> Current boot status and the remaining (guest-side) blocker are in
+> [docs/AMIX.md](docs/AMIX.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+<!-- fork:amix end -->
+
 <br>Z3660 is an Amiga 4000 CPU accelerator board based on A3660 and Z-turn FPGA board.
 <br>
 <br>Compared to A3660, Z3660 has some key differences:

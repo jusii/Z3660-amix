@@ -82,8 +82,15 @@ owned by your host user.
 ### Build the firmware (produces `BOOT.BIN`)
 
 ```sh
-./docker/run.sh make
+./docker/run.sh make bootbin
 ```
+
+Use the `bootbin` target rather than a bare `make`: the default `all` target ends
+with a `version` packaging step (`make_version_alfa.py`) that hard-codes a macOS
+`/Volumes/...` path and therefore errors on Linux — *after* `BOOT.BIN` is already
+built. `make bootbin` builds the firmware and assembles `BOOT.BIN` with a clean
+exit. The result lands at
+`z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN` (~12 MB).
 
 ### Build the drivers + ADF
 
@@ -133,33 +140,21 @@ any Linux host running the existing Makefile. They're listed here so you
 don't conclude the container is broken when a target fails. `git checkout
 --` any binaries that `make clean` removed before `make` errored out.
 
-## Firmware (`make` at the repo root) — upstream issue
+## Firmware (`make` at the repo root)
 
 The container ships with all the right tools (`vivado v2023.2.2`,
 `arm-none-eabi-gcc` from Vitis, `mkbootimage`) and a `system.bif` invocation
-that produces a valid `BOOT.BIN`. However, the firmware sources in
+that produces a valid `BOOT.BIN`. `./docker/run.sh make bootbin` builds the
+firmware cleanly and emits a ~12 MB `BOOT.BIN` (use the `bootbin` target — a bare
+`make` ends with a macOS-only `version` step that errors on Linux after the binary
+is already built; see "Build the firmware" above).
+
+(Historical note: the USB sources in
 [z3660-firmware/Z-TURN/vitis_ide/Z3660/src/usb/asm/ch9.h](../z3660-firmware/Z-TURN/vitis_ide/Z3660/src/usb/asm/ch9.h)
-use the ARMCC/IAR shorthand `__packed` (without `#define`):
-
-```c
-struct __packed usb_class_hid_descriptor {  ...  };
-struct __packed usb_class_report_descriptor { ... };
-```
-
-GCC doesn't recognise that keyword, so the firmware fails to compile under
-`arm-none-eabi-gcc` (which is what Vitis ships on Linux). The rest of the
-codebase uses the portable form `__attribute__((packed))`, so this is
-clearly two strays. Workarounds, listed in order of how invasive they are:
-
-1. Two-line patch to `ch9.h` replacing `__packed` with `__attribute__((packed))`.
-2. Adding `-D__packed=__attribute__((packed))` to the Z3660 sub-Makefile's
-   `CFLAGS`.
-3. Switching to the AMD-provided ARM Compiler (armclang) in Vitis — that
-   compiler does predefine `__packed`. Heavier change.
-
-Option 1 is the cleanest and probably what an upstream PR should look like.
-Until that lands, the firmware build inside the container errors out at the
-`usb` compilation step.
+used the ARMCC/IAR shorthand `struct __packed …`, which `arm-none-eabi-gcc`
+doesn't recognise. That was fixed in-tree by commit `222492e`, which adds a
+`#ifndef __packed` / `#define __packed __attribute__((__packed__))` guard, so
+the build no longer needs any manual patch.)
 
 ## Troubleshooting
 
