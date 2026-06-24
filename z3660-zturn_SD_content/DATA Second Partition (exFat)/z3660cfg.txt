@@ -1,20 +1,35 @@
 #### Z3660 config file
 
 # Select the default boot mode: "MOBOCPU" for mother board CPU, "CPU" for 060 CPU, "MUSASHI" / "UAE_030" / "UAEJIT_030" / "UAE_040" / "UAEJIT_040" for emulator
+# "UAE_030_MMU" is a 68030 emulator WITH a real PMMU, used to boot Amix (Amiga UNIX). See docs/AMIX.md
 # This selection can be overriden by presets/presetX.txt files on SD exFAT partition
 #bootmode UAEJIT_040
 #bootmode UAEJIT_030
 #bootmode UAE_040
 #bootmode UAE_030
+#bootmode UAE_030_MMU
 #bootmode MUSASHI
 bootmode CPU
 #bootmode MOBOCPU
+
+# --- Amix (Amiga UNIX) options --- see docs/AMIX.md for the full reference
+# AMIX mode: applies the AMIX memory contract (single <=16MB window, no CPU RAM
+# board) and the emulated A3000 SCSI bootstrap that AMIX boots through.
+# Default: YES when bootmode is UAE_030_MMU, else NO (so non-AMIX configs are unaffected).
+#amix_mode NO
+# Emulator service cadence: emulated instructions between interrupt-service polls.
+# Default 1. Higher = faster CPU but more interrupt latency. AMIX boot-safe up to 4;
+# cadence 8 hangs the A3000-SCSI bootstrap. Use 4 for AMIX (raise via SERV menu after boot).
+#service_cadence 4
 
 # Select 060 CPU frequency in MHz
 # This value can be overriden by presets/presetX.txt files on SD exFAT partition
 cpufreq 50
 
 # Declare up to 9 kickstarts files. (1-9)
+# NOTE: Amiga OS / Kickstart ROMs are copyrighted and NOT shipped - you supply your own
+# .rom files (and .hdf disk images below) and place them in kicks/ and hdf/.
+# Amix needs an A3000-variant Kickstart (e.g. KS 3.1 r40.68 A3000); A4000 ROMs can't boot Amix.
 kickstart1 kicks/A4kOS322.rom
 kickstart2 kicks/DiagROM1.3.rom
 kickstart3 kicks/A4kOS31.rom
