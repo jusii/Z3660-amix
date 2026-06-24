@@ -2540,7 +2540,10 @@ static bool mmu_op30fake_pflush (uaecptr pc, uae_u32 opcode, uae_u16 next, uaecp
 bool mmu_op30 (uaecptr pc, uae_u32 opcode, uae_u16 extra, uaecptr extraa)
 {
    int type = extra >> 13;
-   bool fline = false;
+   /* tri-state: 0 ok, 1 = F-line, -1 = MMU config exception only (no F-line).
+    * Backport of WinUAE a333766b. mmu_op30_pmove returns the int; the other
+    * handlers still return bool (0/1). */
+   int fline = 0;
 
    switch (type)
    {
@@ -2566,11 +2569,11 @@ bool mmu_op30 (uaecptr pc, uae_u32 opcode, uae_u16 extra, uaecptr extraa)
          fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
       break;
    }
-   if (fline) {
+   if (fline > 0) {
       m68k_setpc(pc);
       op_illg(opcode);
    }
-   return fline;
+   return fline != 0;
 }
 
 /* check if an address matches a ttr */
