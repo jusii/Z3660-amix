@@ -42,3 +42,13 @@ docker/xilinx/
 /tmp/
 /hdf/
 /adf/
+
+# AI-agent / assistant config — kept local, never published
+/.claude/
+/CLAUDE.md
+
+# Local AMIX debug-session investigations — kept local, never published
+/docs/investigations/
+
+# Untracked benchmark archive (rebuilt on demand by tools/amix-bench)
+/tools/amix-bench.tar
