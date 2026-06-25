@@ -4289,6 +4289,12 @@ static uaecptr mmu030_insn_start_pc;
 // to fetch from a wild USER pc, dump the ring + register file ONCE. AMIX-gated, ~5 stores/insn,
 // one-shot serial -> negligible timing shift (and the bug repros ~100% under the storm anyway).
 extern "C" { extern volatile int amix_mmu_on; }
+// RTE-frame ring captured in cpummu030.cpp's m68k_do_rte_mmu030 (see there).
+extern "C" {
+extern volatile uae_u32 amix_rte_a7[16], amix_rte_pc[16], amix_rte_oc[16], amix_rte_fault[16];
+extern volatile uae_u32 amix_rte_ssw[16], amix_rte_frame[16], amix_rte_h;
+extern volatile int amix_wild_rte_pending; extern volatile uae_u32 amix_wild_rte_pc;
+}
 #define AMIX_RRING 32
 static uae_u32 amix_rring_pc[AMIX_RRING];   // retired instruction's start PC
 static uae_u16 amix_rring_op[AMIX_RRING];   // its opcode word
@@ -4317,6 +4323,15 @@ static void amix_dump_wild(uae_u32 wildpc)
       z3660_printf("[WILD]  %08lX  %04X  -> %08lX  [%d]%s\r\n",
          (unsigned long)amix_rring_pc[idx], (unsigned)amix_rring_op[idx], (unsigned long)amix_rring_npc[idx],
          (int)amix_rring_s[idx], (amix_rring_npc[idx] == wildpc) ? "   <== CORRUPTOR" : "");
+   }
+   z3660_printf("[WILD] last 16 RTE-frame resumes (oldest first):  a7        pc        frame oc        ssw   fault\r\n");
+   for (int i = 0; i < 16; i++) {
+      uae_u32 idx = (amix_rte_h + (uae_u32)i) & 15;
+      if (amix_rte_a7[idx] == 0 && amix_rte_pc[idx] == 0) continue;
+      z3660_printf("[WILD]  %08lX  %08lX  %04lX  %08lX  %04lX  %08lX%s\r\n",
+         (unsigned long)amix_rte_a7[idx], (unsigned long)amix_rte_pc[idx], (unsigned long)amix_rte_frame[idx],
+         (unsigned long)amix_rte_oc[idx], (unsigned long)amix_rte_ssw[idx], (unsigned long)amix_rte_fault[idx],
+         (amix_rte_pc[idx] == wildpc) ? "   <== popped the wild PC" : "");
    }
    z3660_printf("[WILD] (one-shot latched; resets on reboot)\r\n\r\n");
 }
@@ -4362,6 +4377,12 @@ insretry:
                amix_wild_latched = 1;
                amix_dump_wild((uae_u32)regs.instruction_pc);
             }
+            // RTE-source detector (any target mode): an RTE popped a wild PC -> dump at the source.
+            if (amix_wild_rte_pending && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild(amix_wild_rte_pc);
+            }
+            amix_wild_rte_pending = 0;
             f = regs.ccrflags;
 
             mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
@@ -4394,6 +4415,17 @@ insretry:
                }
                if (mmu030_retry && mmu030_opcode == -1)
                   goto insretry;
+               // FIX (wip-030-mmu-buserror): a continuation resume — m68k_do_rte_mmu030 replaying a
+               // faulted instruction from its 030 bus-error frame (frame $A/$B), or a sub-access
+               // continue — re-runs the instruction at its OWN pc, which m68k_setpci(pc) has just set.
+               // Re-snapshot the instruction-start pc here so that if the RESUMED instruction faults
+               // AGAIN (e.g. MOVEM.L <regs>,-(SP) crossing into the next not-yet-resident user-stack
+               // page) the CATCH below builds the new bus-error frame from the resumed instruction's
+               // pc — NOT the stale outer-loop pc (the kernel's RTE epilogue). With the stale pc, the
+               // rebuilt frame carried a kernel pc; the next RTE then resumed the user process there in
+               // user mode -> wild PC -> "User BUS ERROR" (cron/in.telnetd etc.). For the common
+               // same-pc sub-access continue this is a no-op (m68k_getpc() == the current snapshot).
+               regs.instruction_pc = mmu030_insn_start_pc = m68k_getpc();
             }
 
             // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the

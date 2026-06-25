@@ -1822,6 +1822,14 @@ extern "C" {
 volatile uae_u32 amix_fring_va[16]={0}, amix_fring_pc[16]={0}, amix_fring_rw[16]={0}; volatile int amix_fring_h=0;
 volatile uae_u32 amix_ftot=0, amix_flast=0, amix_fsame=0, amix_fsamemax=0, amix_fsameva=0;
 volatile uae_u32 amix_fhva[16]={0}, amix_fhcnt[16]={0}, amix_fhpc[16]={0};
+// wip-030-mmu-buserror: ring of the last 16 m68k_do_rte_mmu030 (030 bus-error-frame RTE) resumes.
+// Distinguishes a normal return-to-user (frame=0, user PC already corrupt) from a continuation
+// resume gone wrong (frame=0xA/0xB). Dumped from newcpu.cpp at [WILD].
+volatile uae_u32 amix_rte_a7[16]={0}, amix_rte_pc[16]={0}, amix_rte_oc[16]={0}, amix_rte_fault[16]={0};
+volatile uae_u32 amix_rte_ssw[16]={0}, amix_rte_frame[16]={0}; volatile uae_u32 amix_rte_h=0;
+// RTE-source wild-PC detector: m68k_do_rte_mmu030 sets these when it pops a PC that is wild for its
+// target mode (caught at the source, any mode); newcpu.cpp's run loop dumps + latches on the flag.
+volatile int amix_wild_rte_pending=0; volatile uae_u32 amix_wild_rte_pc=0;
 }
 
 void mmu030_page_fault(uaecptr addr, bool read, int flags, uae_u32 fc)
@@ -2885,6 +2893,23 @@ void m68k_do_rte_mmu030 (uaecptr a7)
 	// Internal register, our opcode storage area
 	uae_u32 oc = get_long_mmu030(a7 + 0x14);
 	int idxsize = -1, idxsize_done = -1;
+
+	// wip-030-mmu-buserror: record this RTE's frame (popped pc, saved opcode, ssw, format) so the
+	// [WILD] dump shows whether the wild user PC came from a normal return-to-user (frame=0) or a
+	// bus-error-frame continuation resume (frame=0xA/0xB). oc/ssw are only meaningful for A/B.
+	if (amix_mmu_on) {
+		uae_u32 h = amix_rte_h & 15;
+		amix_rte_a7[h] = a7; amix_rte_pc[h] = pc; amix_rte_oc[h] = oc;
+		amix_rte_fault[h] = fault_addr; amix_rte_ssw[h] = ssw; amix_rte_frame[h] = frame;
+		amix_rte_h++;
+		// Flag an RTE whose popped PC is wild for its target mode (SR bit13 = supervisor):
+		//   return-to-user (S=0): PC must be >= 0x80000000 (AMIX user base); else wild.
+		//   return-to-super (S=1): PC must be in the kernel code window [0x08000000,0x10000000); else wild.
+		// (A normal format-B continuation resumes a faulted kernel instruction -> S=1, PC in-window -> not flagged.)
+		int sup = (sr & 0x2000) != 0;
+		int wild = (pc & 1) || (sup ? (pc < 0x08000000u || pc >= 0x10000000u) : (pc < 0x80000000u));
+		if (wild) { amix_wild_rte_pc = pc; amix_wild_rte_pending = 1; }
+	}
 
 	// Fetch last word, real CPU does it to allow OS bus handler to map
 	// the page if frame crosses pages and following page is not resident.
