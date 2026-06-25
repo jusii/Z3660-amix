@@ -4279,6 +4279,48 @@ static void m68k_run_2_020(void)
 // already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
 static uaecptr mmu030_insn_start_pc;
 
+// ===== wip-030-mmu-buserror: catch the corruptor of the AMIX user-PC wild-jump =====
+// Symptom: under a fork/exec storm a freshly-exec'd USER process (AMIX user base 0x80000000;
+// e.g. in.telnetd entry 0x80001520) has its PC silently set to a kernel/low-region address
+// (observed CONSTANT 0x080012A0); the next instruction fetch faults and AMIX prints
+// "User BUS ERROR at <pc>, PC:<pc> FAULT:6". The corruption is UPSTREAM of the fault -- some
+// already-retired instruction (rts/jmp/jsr/rte/movem) wrote the bad value into the user PC.
+// Catch it: ring-buffer the last AMIX_RRING retired instructions and, the instant we are about
+// to fetch from a wild USER pc, dump the ring + register file ONCE. AMIX-gated, ~5 stores/insn,
+// one-shot serial -> negligible timing shift (and the bug repros ~100% under the storm anyway).
+extern "C" { extern volatile int amix_mmu_on; }
+#define AMIX_RRING 32
+static uae_u32 amix_rring_pc[AMIX_RRING];   // retired instruction's start PC
+static uae_u16 amix_rring_op[AMIX_RRING];   // its opcode word
+static uae_u32 amix_rring_npc[AMIX_RRING];  // PC after it retired (= branch target for control transfers)
+static uae_u8  amix_rring_s[AMIX_RRING];    // supervisor flag at retire
+static uae_u32 amix_rring_h = 0;            // ring head (next slot to write)
+static int     amix_wild_latched = 0;       // one-shot dump guard
+
+static void amix_dump_wild(uae_u32 wildpc)
+{
+   z3660_printf("\r\n[WILD] AMIX user PC went wild: PC=%08lX  (user-mode ifetch below user-base 0x80000000 -> jumped into kernel/low region)\r\n",
+                (unsigned long)wildpc);
+   z3660_printf("[WILD] D0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[0],(unsigned long)regs.regs[1],(unsigned long)regs.regs[2],(unsigned long)regs.regs[3],
+      (unsigned long)regs.regs[4],(unsigned long)regs.regs[5],(unsigned long)regs.regs[6],(unsigned long)regs.regs[7]);
+   z3660_printf("[WILD] A0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[8],(unsigned long)regs.regs[9],(unsigned long)regs.regs[10],(unsigned long)regs.regs[11],
+      (unsigned long)regs.regs[12],(unsigned long)regs.regs[13],(unsigned long)regs.regs[14],(unsigned long)regs.regs[15]);
+   z3660_printf("[WILD] usp=%08lX isp=%08lX  s=%d intmask=%d sfc=%lu dfc=%lu vbr=%08lX\r\n",
+      (unsigned long)regs.usp,(unsigned long)regs.isp,(int)regs.s,(int)regs.intmask,
+      (unsigned long)regs.sfc,(unsigned long)regs.dfc,(unsigned long)regs.vbr);
+   z3660_printf("[WILD] last %d retired insns (oldest first):  startpc   op    -> nextpc    [s]\r\n", AMIX_RRING);
+   for (int i = 0; i < AMIX_RRING; i++) {
+      uae_u32 idx = (amix_rring_h + (uae_u32)i) & (AMIX_RRING - 1);
+      if (amix_rring_pc[idx] == 0 && amix_rring_npc[idx] == 0) continue;   // unused slot
+      z3660_printf("[WILD]  %08lX  %04X  -> %08lX  [%d]%s\r\n",
+         (unsigned long)amix_rring_pc[idx], (unsigned)amix_rring_op[idx], (unsigned long)amix_rring_npc[idx],
+         (int)amix_rring_s[idx], (amix_rring_npc[idx] == wildpc) ? "   <== CORRUPTOR" : "");
+   }
+   z3660_printf("[WILD] (one-shot latched; resets on reboot)\r\n\r\n");
+}
+
 // ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
 #include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
@@ -4313,6 +4355,13 @@ static void m68k_run_mmu030(void)
 insretry:
             regs.instruction_pc = m68k_getpc();
             mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
+            // wip-030-mmu-buserror: about to fetch from a wild USER pc (user mode + PC below the AMIX
+            // user base 0x80000000 = jumped into the kernel/low region). Dump the corruptor once,
+            // BEFORE the fetch faults, so the retired-insn ring still holds the instruction that did it.
+            if (amix_mmu_on && !regs.s && regs.instruction_pc < 0x80000000u && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild((uae_u32)regs.instruction_pc);
+            }
             f = regs.ccrflags;
 
             mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
@@ -4345,6 +4394,18 @@ insretry:
                }
                if (mmu030_retry && mmu030_opcode == -1)
                   goto insretry;
+            }
+
+            // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the
+            // PC it left behind = branch target for control transfers) so the wild-PC detector above
+            // can show what corrupted the user PC. AMIX-gated; mmu030_opcode still holds the opcode here.
+            if (amix_mmu_on) {
+               uae_u32 h = amix_rring_h & (AMIX_RRING - 1);
+               amix_rring_pc[h]  = (uae_u32)mmu030_insn_start_pc;
+               amix_rring_op[h]  = (uae_u16)mmu030_opcode;
+               amix_rring_npc[h] = (uae_u32)m68k_getpc();
+               amix_rring_s[h]   = (uae_u8)regs.s;
+               amix_rring_h++;
             }
 
             mmu030_opcode = -1;
