@@ -1574,10 +1574,14 @@ static int iack_cycle(int nr)
    // The autovector IACK is an FC=7 (CPU-space) access on real HW; the 68030 MMU NEVER
    // translates it. iack_cycle runs in Exception_normal BEFORE the supervisor-mode switch,
    // so x_get_byte() here would walk the *current* (user) page tables when an interrupt is
-   // taken while a user task runs (e.g. AMIX init) -> bus error at 0x00FFFFFx. Use the bare
-   // physical bank accessor (get_byte) so the autovector read bypasses the user MMU. In
-   // supervisor/identity context get_byte_mmu030 reaches this same bank, so the value matches.
-   vector = get_byte(0x00fffff1 | ((nr - 24) << 1));
+   // taken while a user task runs (e.g. AMIX init) -> bus error at 0x00FFFFFx. Under the real
+   // 030 PMMU use the bare physical bank accessor (get_byte) so the autovector read bypasses
+   // the user MMU; in supervisor/identity context get_byte_mmu030 reaches this same bank, so
+   // the value matches. Every other emulator mode keeps the upstream x_get_byte path verbatim.
+   if (currprefs.mmu_model == 68030)
+      vector = get_byte(0x00fffff1 | ((nr - 24) << 1));
+   else
+      vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
    if (currprefs.cpu_compatible)
       x_do_cycles(4 * CYCLE_UNIT / 2);
    return vector;
@@ -5353,6 +5357,40 @@ bool cpureset (void)
       custom_reset_cpu(false, false);
       return false;
    }
+
+   if (currprefs.mmu_model != 68030) {
+      /* Non-AMIX modes: verbatim upstream reset/jmp-(ax) path (merge-base 159b3b5).
+       * The full clean reset below is needed only for the real 030 PMMU (UAE_030_MMU),
+       * whose stale page tables / AMIX-cleared overlay would otherwise wreck a warm
+       * reboot.  Every other emulator mode keeps the original Z3660 behaviour. */
+      pc = m68k_getpc () + 2;
+      ab = &get_mem_bank (pc);
+      if (ab->check (pc, 2)) {
+         write_log (_T("CPU reset PC=%x\n"), pc - 2);
+         ins = get_word (pc);
+         custom_reset_cpu(false, false);
+         m68k_setpc_normal (ksboot);
+         cpu_emulator_reset_core0();
+         reset_autoconfig();
+         if ((ins & ~7) == 0x4ed0) {
+            int reg = ins & 7;
+            uae_u32 addr = m68k_areg (regs, reg);
+            if (addr < 0x80000)
+               addr += 0xf80000;
+            write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
+            m68k_setpc_normal (addr +2 - 2);
+            return false;
+         }
+      }
+      write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
+      custom_reset_cpu(false, false);
+      m68k_setpc_normal (ksboot);
+      cpu_emulator_reset_core0();
+      reset_autoconfig();
+      return false;
+   }
+
+   /* AMIX / UAE_030_MMU: full clean reset (overlay restore + m68k_reset_newcpu). */
    pc = m68k_getpc () + 2;
 
     ab = &get_mem_bank (pc);
