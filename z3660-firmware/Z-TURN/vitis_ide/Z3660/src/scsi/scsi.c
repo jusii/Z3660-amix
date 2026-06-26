@@ -399,20 +399,32 @@ int piscsi_parse_rdb(PISCSI_DEV *d) {
    int i = 0;
    uint8_t *block = malloc(PISCSI_MAX_BLOCK_SIZE);
 
+   /* non-AMIX path = byte-identical upstream: single seek-to-0, then 64K-stride reads below. */
+   if(!config.amix_mode && fd>(FIL *)1)
+      f_lseek(fd, 0);
    for (i = 0; i < RDB_BLOCK_LIMIT; i++) {
       if(fd>(FIL *)1)
       {
          unsigned int n_bytes;
-         /* The Amiga RDB lives in one of the first RDB_BLOCK_LIMIT *512-byte* blocks
-          * (here at sector 2 = byte 1024).  The old code read PISCSI_MAX_BLOCK_SIZE
-          * (65536) per iteration and only tested the first 4 bytes, so it sampled byte
-          * offsets 0,64K,128K,... and NEVER saw an RDB below 64K -> always "No RDB
-          * found" -> AMIX boots the no-RDB fallback and mounts root READ-WRITE, which
-          * stamps fs_state=FSACTIVE before bcheckrc's fsck -m runs -> fsck-every-boot
-          * loop.  (Amiberry's A3000 SCSI scans 512-byte blocks per the RDB spec, finds
-          * the RDB, and mounts root read-only.)  Read one 512-byte block per index. */
-         f_lseek(fd, (FSIZE_t)i * 512);
-         f_read(fd, block, 512, &n_bytes);
+         if(config.amix_mode)
+         {
+            /* AMIX root RDB is at sector 2 (byte 1024).  The upstream 64K-stride scan only
+             * tested the first 4 bytes of each 64K read -> sampled offsets 0,64K,128K,... ->
+             * NEVER saw the sub-64K RDB -> "No RDB found" -> AMIX booted the no-RDB fallback,
+             * mounted root R/W, stamped fs_state=FSACTIVE before bcheckrc's fsck -m -> fsck-
+             * every-boot loop.  Read one 512-byte block per index so the RDB is found.
+             * AMIX-ONLY: a hybrid AmigaOS HDF (MBR at sector 0, Amiga RDB at sector 2 - like
+             * this card's Workbench image) has its sector-2 RDB FOUND by this per-sector scan
+             * and is then given RDB geometry it was never used with on stock (whose 64K scan
+             * misses it -> synthetic fallback) -> Kickstart can't read DH0 (insert-disk) + a
+             * downstream [Core0] DataAbort in the PISCSI debug-msg path.  So gate the scan. */
+            f_lseek(fd, (FSIZE_t)i * 512);
+            f_read(fd, block, 512, &n_bytes);
+         }
+         else
+         {
+            f_read(fd, block, PISCSI_MAX_BLOCK_SIZE,&n_bytes);
+         }
       }
       else
       {
