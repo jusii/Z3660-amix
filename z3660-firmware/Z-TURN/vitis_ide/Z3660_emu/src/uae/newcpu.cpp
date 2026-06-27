@@ -4281,7 +4281,7 @@ static void m68k_run_2_020(void)
 // faulting store; on a demand-page fault the CATCH below must build the 030 bus-error frame with the
 // instruction-START pc so the RTE/re-run restarts the whole instruction. Read-side and prefetch faults
 // already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
-static uaecptr mmu030_insn_start_pc;
+uaecptr mmu030_insn_start_pc;   // not static: m68k_do_rte_mmu030() re-points it before its retry-access
 
 // ===== wip-030-mmu-buserror: catch the corruptor of the AMIX user-PC wild-jump =====
 // Symptom: under a fork/exec storm a freshly-exec'd USER process (AMIX user base 0x80000000;

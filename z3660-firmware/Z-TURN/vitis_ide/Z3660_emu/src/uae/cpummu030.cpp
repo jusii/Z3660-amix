@@ -1827,6 +1827,7 @@ volatile uae_u32 amix_fhva[16]={0}, amix_fhcnt[16]={0}, amix_fhpc[16]={0};
 // resume gone wrong (frame=0xA/0xB). Dumped from newcpu.cpp at [WILD].
 volatile uae_u32 amix_rte_a7[16]={0}, amix_rte_pc[16]={0}, amix_rte_oc[16]={0}, amix_rte_fault[16]={0};
 volatile uae_u32 amix_rte_ssw[16]={0}, amix_rte_frame[16]={0}; volatile uae_u32 amix_rte_h=0;
+extern uaecptr mmu030_insn_start_pc;   // newcpu.cpp's run-loop snapshot; re-pointed before the retry-access
 // RTE-source wild-PC detector: m68k_do_rte_mmu030 sets these when it pops a PC that is wild for its
 // target mode (caught at the source, any mode); newcpu.cpp's run loop dumps + latches on the flag.
 volatile int amix_wild_rte_pending=0; volatile uae_u32 amix_wild_rte_pc=0;
@@ -3061,6 +3062,20 @@ void m68k_do_rte_mmu030 (uaecptr a7)
 		return;
 	}
 	m68k_setpci(pc);
+	// FIX (residual of 7ff5774): the "retry faulted access" below re-performs the faulted access
+	// INSIDE this RTE. If it faults again (a still-unmappable page -> re-fault loop), the run-loop
+	// CATCH rebuilds the bus-error frame from mmu030_insn_start_pc -- which is still THIS RTE
+	// instruction's outer-loop snapshot (the trap-return pc, e.g. 0x0800129C), because 7ff5774's
+	// inner-loop re-snapshot only runs AFTER the handler returns. The rebuilt frame then inherits the
+	// RTE's pc/opcode (4E73) instead of the resumed instruction's -> "AMIX user PC went wild". Re-point
+	// the snapshot at the instruction we are resuming so a retry-access re-fault attributes correctly.
+	mmu030_insn_start_pc = pc;
+	// ...and the OPCODE the same way: a format-$A rebuild stores regs.irc as the frame opcode field
+	// (newcpu_common.cpp:1253), which at this point is still the RTE's 4E73 (set by the inner-loop
+	// dispatch regs.opcode=regs.irc=mmu030_opcode for the RTE). Re-point regs.opcode/irc at the
+	// resumed instruction's opcode (mmu030_opcode, already restored above) so a frame-$A retry-access
+	// re-fault rebuilds with the right opcode (the boot-time clr.b case: oc flipped 4218 -> 4E73).
+	regs.opcode = regs.irc = mmu030_opcode;
 
 	if ((ssw & MMU030_SSW_DF) && (ssw & MMU030_SSW_RM)) {
 

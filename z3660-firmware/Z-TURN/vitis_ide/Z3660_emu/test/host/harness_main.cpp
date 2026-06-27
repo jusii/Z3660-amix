@@ -671,6 +671,116 @@ static void test_mmu030_demand_page_write(void)
 	cpu_bringup(68030);
 }
 
+/* ==================================================================
+ * MULTI-FAULT CONTINUATION (the residual [WILD] bug, 2026-06-26).
+ * One instruction (MOVEM.L (a0)+,d0-d7) whose read spans TWO unmapped pages:
+ *   fault A -> Exception frame -> "OS" maps A -> m68k_do_rte_mmu030() -> resume
+ *   re-runs the MOVEM, which now faults on page B (the continuation).
+ * Faithfully mirrors m68k_run_mmu030: the inner-loop 7ff5774 re-snapshot
+ * (regs.instruction_pc = mmu030_insn_start_pc = m68k_getpc(), newcpu.cpp:4432)
+ * runs between the RTE and the re-dispatch. The rebuilt frame B must carry the
+ * INSTRUCTION pc (VCODE) so the next RTE resumes there -- not a skewed pc.
+ * The board [WILD] shows frame B carrying a wild pc -> user-mode wild jump.
+ * ================================================================== */
+static void test_mmu030_multifault_continuation(void)
+{
+	printf("[test] MMU030 multi-fault continuation -> 2nd-page frame carries the instruction pc\n");
+	const uae_u32 VCODE = 0x00408000, PCODE = 0x0C000000;
+	const uae_u32 VD1   = 0x00409000, PD1   = 0x0D000000;   /* MOVEM source page A */
+	const uae_u32 VD2   = 0x0040A000, PD2   = 0x0D100000;   /* MOVEM source page B */
+	const uae_u32 VSTK  = 0x0040E000, PSTK  = 0x0E000000;
+	const uae_u32 VVEC  = 0x0040B000, PVEC  = 0x0F000000;
+
+	mmu_pt_init();
+	currprefs.cpu_model = 68030;
+	mmu_map_page((VCODE >> 12) & 0x3FF, PCODE);
+	mmu_map_page((VSTK  >> 12) & 0x3FF, PSTK);
+	mmu_map_page((VVEC  >> 12) & 0x3FF, PVEC);
+	mmu030_flush_atc_all();                          /* VD1, VD2 left UNMAPPED */
+
+	hram_poke16(PCODE | (VCODE & 0xFFF),       0x4CD8);   /* MOVEM.L (a0)+,<list> */
+	hram_poke16(PCODE | ((VCODE + 2) & 0xFFF), 0x00FF);   /* mask = d0-d7 (8 longs) */
+	hram_poke32(PVEC  | 8, VCODE);                        /* bus-error vector (2) */
+
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+
+	regs.s = 1;
+	regs.vbr = VVEC;
+	m68k_areg(regs, 0) = VD1 | 0xFF0;                /* 32-byte read spans VD1[FF0..FFF]+VD2[000..00F] */
+	m68k_areg(regs, 7) = VSTK | 0xFF0;
+	m68k_setpc(VCODE);
+
+	struct flag_struct f;
+	/* outer snapshot (m68k_run_mmu030:4375-4376) */
+	regs.instruction_pc = m68k_getpc();
+	uae_u32 snap = regs.instruction_pc;       /* mirrors newcpu.cpp's static mmu030_insn_start_pc */
+	f = regs.ccrflags;
+	mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+	mmu030_opcode = -1;
+
+	/* ---- first execution -> fault on page A ---- */
+	bool f1 = false;
+	TRY(p1) {
+		regs.opcode = x_prefetch(0);
+		mmu030_opcode = regs.opcode;
+		mmu030_idx_done = 0;
+		regs.opcode = regs.irc = mmu030_opcode;
+		mmu030_idx = 0; mmu030_retry = false;
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p1) {
+		f1 = true;                                   /* run-loop CATCH: frame-$B read fault */
+		regs.ccrflags = f; cpu_restore_fixup();
+		regs.instruction_pc = snap;
+		m68k_setpci(regs.instruction_pc);
+		Exception(p1);
+	} ENDTRY
+	CHECK(f1, "MOVEM faulted on page A\n");
+
+	/* ---- OS: map page A, RTE ---- */
+	mmu_map_page((VD1 >> 12) & 0x3FF, PD1);
+	mmu030_flush_atc_all();
+	m68k_do_rte_mmu030(m68k_areg(regs, 7));
+
+	/* ---- inner-loop 7ff5774 re-snapshot (m68k_run_mmu030:4432) -- THE SUSPECT ---- */
+	uae_u32 resnap = m68k_getpc();
+	printf("       re-snapshot: m68k_getpc()=%08X  regs.pc(getpci)=%08X  expected=%08X\n",
+	       (unsigned)resnap, (unsigned)m68k_getpci(), (unsigned)VCODE);
+	CHECK_EQ32(resnap, VCODE, "re-snapshot pc == instruction pc (no prefetch skew)");
+	regs.instruction_pc = snap = resnap;
+
+	/* ---- re-dispatch -> fault on page B (the continuation) ---- */
+	bool f2 = false;
+	TRY(p2) {
+		int guard = 8;
+		while (mmu030_retry && guard-- > 0) {
+			regs.opcode = regs.irc = mmu030_opcode;
+			mmu030_idx = 0; mmu030_retry = false;
+			(*cpufunctbl[regs.opcode])(regs.opcode);
+		}
+	} CATCH(p2) {
+		f2 = true;
+		regs.ccrflags = f; cpu_restore_fixup();
+		regs.instruction_pc = snap;
+		m68k_setpci(regs.instruction_pc);
+		Exception(p2);
+	} ENDTRY
+	CHECK(f2, "resumed MOVEM faulted again on page B (continuation)\n");
+
+	/* ---- map page B, RTE from frame B: must resume at the instruction pc ---- */
+	mmu_map_page((VD2 >> 12) & 0x3FF, PD2);
+	mmu030_flush_atc_all();
+	m68k_do_rte_mmu030(m68k_areg(regs, 7));
+	uae_u32 resume2 = m68k_getpci();
+	printf("       RTE from frame B resumes at pc=%08X  expected=%08X\n",
+	       (unsigned)resume2, (unsigned)VCODE);
+	CHECK_EQ32(resume2, VCODE, "RTE from the 2nd-page frame resumes at the instruction pc (not a wild pc)");
+
+	currprefs.mmu_model = 0; mmu030_reset(1);
+	cpu_bringup(68030);
+}
+
 /* ================================================================== */
 int main(int argc, char **argv)
 {
@@ -698,6 +808,7 @@ int main(int argc, char **argv)
 	test_mmu030_interp_exec();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
+	test_mmu030_multifault_continuation();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;
