@@ -1683,7 +1683,7 @@ extern "C" unsigned int ps_read_8(unsigned int address)
       uint32_t gap = ps_count - last_ps; last_ps = ps_count;
       if (gap < 16) {
          if (spin < 0x0FFFFFFF) spin++;
-         if (eclicks < 6 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {
+         if (eclicks < 64 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {  // cap 6->64: the post-warm-reboot A3000-KS prompt isn't dismissed by 6 clicks; self-limited because the else branch (gap>=16) re-arms/zeroes eclicks the instant the poll spin ends
             armed = 1; press = 0; eclicks++;
             z3660_printf("[CLICK] e%lu spin=%lu\n", (unsigned long)eclicks, (unsigned long)spin);
          }
