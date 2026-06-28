@@ -1,0 +1,29 @@
+#### Vitis Unified Software Platform 2023.2 batch-install config
+#### Generated for the Z3660 project from the canonical config produced by
+####     xsetup -b ConfigGen (option 1 = Vitis)
+#### Zynq-7000 is the only device family enabled; everything else is set to 0
+#### so the resulting install fits in ~25 GB rather than ~60 GB.
+####
+#### If `xsetup --batch Install` rejects this file on a future patch level,
+#### regenerate by running:
+####     docker/regenerate-install-config.sh
+#### (or run xsetup -b ConfigGen by hand and trim the Modules= line below).
+
+Edition=Vitis Unified Software Platform
+Product=Vitis
+
+Destination=/opt/Xilinx
+
+# Module selection — keep ONLY Zynq-7000 enabled.
+Modules=Versal HBM Series:0,Versal Prime Series ES1:0,Virtex UltraScale+ 58G:0,Versal Prime Series:0,Install Devices for Kria SOMs and Starter Kits:0,Versal Premium Series ES1:0,Vitis IP Cache (Enable faster on-boarding for new users):0,Versal Net Series ES1:0,Zynq-7000:1,Kintex UltraScale+:0,Artix UltraScale+:0,Spartan-7:0,Install devices for Alveo and edge acceleration platforms:0,Versal Premium Series:0,Vitis Networking P4:0,Versal AI Edge Series:0,Versal AI Core Series ES1:0,Versal AI Edge Series ES1:0,Artix-7:0,Zynq UltraScale+ MPSoC:0,DocNav:0,Virtex UltraScale+ HBM:0,Kintex-7:0,Virtex UltraScale+:0,Vitis Model Composer(Toolbox for MATLAB and Simulink. Includes the functionality of System Generator for DSP):0,Kintex UltraScale:0,Virtex UltraScale:0,Engineering Sample Devices for Custom Platforms:0,Zynq UltraScale+ RFSoC:0,Versal AI Core Series:0,Virtex-7:0,Virtex UltraScale+ HBM ES:0,Versal HBM Series ES1:0
+
+# No post-install hooks (some prompt for user interaction).
+InstallOptions=
+
+## Shortcuts and file associations — all disabled (headless container).
+CreateProgramGroupShortcuts=0
+ProgramGroupFolder=Xilinx Design Tools
+CreateShortcutsForAllUsers=0
+CreateDesktopShortcuts=0
+CreateFileAssociation=0
+EnableDiskUsageOptimization=1

@@ -2551,7 +2551,7 @@ static inline void check_uae_int_request(void)
    if(read_reset==0 && read_reset_last==1)
    {
 //      printf("Reset!!!\n");
-      usleep(100000L);
+      usleep2(100000L); // this file renames Xilinx sleep.h usleep->usleep2 (see top); usleep2 backed in cpu_emulator.cpp
       do{
          uint32_t read1=*(volatile uint32_t*)(XPAR_PS7_GPIO_0_BASEADDR+XGPIOPS_DATA_RO_OFFSET);
          read_reset=(read1>>(n040RSTI   ))&1;
