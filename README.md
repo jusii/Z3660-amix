@@ -28,9 +28,10 @@
 > never committed.)
 >
 > ### Running AMIX
-> Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image**.
-> Current boot status and the remaining (guest-side) blocker are in
-> [docs/AMIX.md](docs/AMIX.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+> Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image** placed
+> on the **SCSI id it was installed on** (id 6 for the usual A3000 install — see the note in
+> docs/AMIX.md). AMIX 2.1 **boots to a stable multiuser login shell**; full setup, the SCSI-id rule
+> and current status are in **[docs/AMIX.md](docs/AMIX.md)**.
 <!-- fork:amix end -->
 
 <br>Z3660 is an Amiga 4000 CPU accelerator board based on A3660 and Z-turn FPGA board.

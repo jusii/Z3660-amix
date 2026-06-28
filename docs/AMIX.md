@@ -9,10 +9,11 @@ Everything here is **optional**. If you don't run AMIX, none of it changes how y
 AmigaOS — the new options default to off and the new boot mode is just one more entry in the
 existing list. Upstream Z3660 behaviour is unchanged.
 
-> **Status in one line:** the AMIX 2.1 kernel boots under this firmware (you get the SVR4
-> banner, RAM sizing and copyright on screen); reaching a *stable login shell* is still being
-> worked on, and the remaining blocker is **guest-side** (inside AMIX's own SCSI driver), not in
-> the emulator. See [Current status](#current-status--known-limitation) below.
+> **Status in one line:** AMIX 2.1 **boots reliably to a stable multiuser login shell** under this
+> firmware — SVR4 banner, multi-user, root login on the HDMI console and over telnet. It survives
+> repeated reboots and sustained fork/exec load (a 27-reboot soak ran clean). One rare demand-paging
+> edge case under extreme load is tracked but does not block normal use. See
+> [Current status](#current-status) below.
 
 ---
 
@@ -53,6 +54,19 @@ existing Z3660 emulator). On real hardware `mmu.library` correctly detects the e
 
 ## Running AMIX
 
+### Getting started (the quick path)
+
+1. **Firmware.** Grab a pre-built `BOOT.BIN` from this repo's Releases (no build needed) or build it
+   yourself (see [`docker/README.md`](../docker/README.md)), and deploy it to the SD card.
+2. **Supply the bits that can't ship here** — an A3000-variant Kickstart ROM and your AMIX `.hdf`
+   (details just below).
+3. **Put the `.hdf` on the SCSI id AMIX was installed on** — id 6 for the usual A3000 install. This
+   matters: see the ⚠️ note under [Config](#config).
+4. **Configure** `bootmode UAE_030_MMU`, point a `kickstartN` at the A3000 ROM, and map the disk with
+   `hdfN` + `scsiN` (full example under [Config](#config)).
+5. **Boot.** On the serial console you should see `Emulation mode 4` / `68030 MMU enabled`; AMIX then
+   banners and reaches a `login:` prompt (log in as `root`).
+
 ### You must supply (not redistributable)
 
 - **An A3000-variant Kickstart ROM.** AMIX boots through the A3000 mainboard SCSI driver, so it
@@ -77,13 +91,21 @@ service_cadence 4             # AMIX-safe perf; see below
 kickstart5 kicks/A3kKS31.rom
 kickstart 5
 
-# Put the AMIX disk image on a SCSI unit (you supply the .hdf):
+# Put the AMIX disk image on the SCSI ID it was INSTALLED on (you supply the .hdf):
 hdf0 hdf/Amix.hdf
-scsi0 0
+scsi6 0                       # Amix.hdf on SCSI target 6 -- see the SCSI-ID note below
 ```
 
 `amix_mode YES` is the default whenever `bootmode UAE_030_MMU` is selected, so it can be omitted;
 it is shown for clarity. The same options work in a `presets/presetN.txt` quick-select file.
+
+> **⚠️ The SCSI ID must match the ID AMIX was installed on.** AMIX bakes its root device into the
+> kernel as a fixed *(controller, target)* pair — for the usual A3000 install that is **controller 0,
+> target 6** (root then mounts as `/dev/dsk/c6d0s1`). So put `Amix.hdf` on **SCSI id 6** (`scsi6`).
+> On any other id the kernel still loads and you get the SVR4 banner, but the root mount fails
+> (`s5mountroot` → `VOP_OPEN EIO`) and you never reach login. If *your* image was installed on a
+> different id, use that id instead. The firmware presents the disk on exactly the id you configure —
+> there is no hidden id-0 aliasing.
 
 ---
 
@@ -145,7 +167,9 @@ as the imported 030 MMU code), with two deliberate divergences:
 2. **The SCSI target is the Z3660 backend.** Instead of WinUAE's `scsi.cpp`, the emulated
    controller synthesises `INQUIRY` / `READ CAPACITY` / `MODE SENSE` / `TUR` / `REQUEST SENSE`
    and moves `READ`/`WRITE` block data over the existing **PISCSI cross-core channel** to core 0's
-   FatFS. The SCSI target id is the `devs[]` unit index — `Amix.hdf` is target 6.
+   FatFS. The SCSI target id is the `devs[]` unit index set by `scsiN` in the config, and each id maps
+   to its own backend disk — the disk answers on exactly the id you configure, with no id aliasing.
+   AMIX's root lives on the id it was installed on (target 6 in the usual A3000 install).
 
 It runs on core 1 (the 68k emulator); its MMIO lives at the `$00DD0000` page, gated by
 `amix_mode`. Full design notes:
@@ -166,28 +190,39 @@ Emulation mode 4
 If you instead see `Emulation mode 1` or `[SD Init] FAIL`, the firmware fell back to the
 68040-JIT path — re-check that `BOOT.BIN` deployed and that `bootmode UAE_030_MMU` is active.
 
+AMIX then prints the SVR4 banner and memory sizing, runs its rc scripts, and reaches a `login:`
+prompt on the HDMI console (log in as `root`). Once it is multi-user you can also reach it over the
+network (`telnet` to the AMIX guest). If it banners but never reaches `login:`, the most common cause
+is the disk being on the wrong SCSI id — see the SCSI-id note above.
+
 When you issue `reboot` inside AMIX the emulator detects the warm-reset vector (the overlay isn't
 restored on a 68k reset) and performs a **clean Zynq reboot** rather than flooding the bus; the
 board comes back in ~2.5 minutes.
 
 ---
 
-## Current status & known limitation
+## Current status
 
-The AMIX 2.1 kernel **boots** under this firmware: dynamic linker runs, `/sbin/init` runs, the
-SVR4 banner, memory sizing and copyright appear on HDMI. What is **not yet reliable** is reaching
-a steady login shell — and the remaining blocker is **inside AMIX's own software**, not the
-emulator:
+AMIX 2.1 **boots reliably to a stable multiuser login shell** under this firmware: the dynamic
+linker and `/sbin/init` run, the SVR4 banner and memory sizing appear, the system reaches
+multi-user, and you get a root login on both the HDMI console and over telnet. It has survived
+repeated warm/cold reboots (a 27-reboot soak with concurrent fork/exec load, all clean) and stays
+up under sustained load.
 
-- The AMIX `a3091` SCSI driver has a `ddtab.HEAD` / lost-completion race: under certain
-  demand-paging completion orderings it biodone()s the wrong buffer, stranding a page-in. The
-  emulator delivers the completion correctly; the guest driver mis-routes it.
-- A separate memory-coherency line of investigation (`lpsched`) is documented under
-  [`docs/investigations/`](investigations/).
+The post-banner stalls that earlier blocked login are **resolved in practice.** The boot-time
+failures came down to emulator-side 68030 bus-error-frame corruption on the demand-paging path —
+fixed this cycle (see `CHANGES.md`: the in-RTE retry-access frame fix and the multi-fault
+continuation fix). AMIX now boots and runs through that path cleanly, so the earlier `a3091` /
+completion-ordering stall no longer occurs in normal operation.
 
-Neither is a Z3660 hardware or emulator-correctness bug in the usual sense — they are guest-side
-AMIX issues this fork is a vehicle for debugging. If you want to help, the disassembly tooling and
-analysis are in the investigations folder and `KNOWN_ISSUES.md`.
+**Known remaining issue (does not block normal use):** under *extreme* sustained demand-paging load
+a rare 68030 bus-error-frame SR-flip can still trip the emulator's user-PC sanity guard. It did not
+recur across a 27-reboot, multi-hour soak; normal boot and interactive use are unaffected. It is
+tracked for a future fix.
+
+The deeper guest-side analyses (the `a3091` driver disassembly, the `lpsched` memory-coherency
+investigation) are retained under [`docs/investigations/`](investigations/) for reference and for
+anyone who wants to push emulation fidelity further.
 
 ---
 
