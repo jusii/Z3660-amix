@@ -720,6 +720,10 @@ int main()
          {
             uae_emulator(1,68040);
          }
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
          else if(shared->cfg_emu==MUSASHI)
          {
             musashi_emulator();
@@ -743,9 +747,18 @@ int main()
          {
             uae_emulator(0,68040);
          }
-         else// if(shared->cfg_emu==UAEJIT_040)
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAEJIT_040)
          {
             uae_emulator(1,68040);
+         }
+         else // decision #8: was a bare 'else' meaning UAEJIT_040 -- an unknown
+         {    // mode silently booted JIT-040. Halt loudly instead.
+            z3660_printf("[Core1] No emulator selected!!!\nHALT!!!\n");
+            while(1);
          }
 #endif
 #else

@@ -421,6 +421,36 @@ int emulator_reset_thread(struct pt *pt)
          usleep(100000);
          ethernet_init();
 
+         /* Re-load the PISCSI boot ROM + re-map the HDFs, exactly as cold boot
+          * (main.c piscsi_init()) does. Idempotent (forces piscsi_rom_ptr=NULL,
+          * re-mounts the SD, re-opens the HDFs into the static FIL slots) and
+          * touches only the SCSI ROM/device tables -- NOT DDR/GIC/FPGA-clocks/
+          * ethernet/REG0 latches. Needed so the rebooted guest sees the boot
+          * device; the 68k is still held in reset here. */
+         piscsi_init();
+
+         /* Clear any pending Z3660-board interrupt left asserted across the guest
+          * reset.  amiga_interrupt_set() drives FPGA_INT6 (REG0) HIGH to raise the
+          * Amiga's level-6/EXTER line for board events (USB/audio); the bit (and
+          * thus INT6) is only deasserted once the Amiga's Z3660 INT6 handler reads
+          * the cause and the firmware calls amiga_interrupt_clear().  If any source
+          * is still pending when AMIX soft-reboots (e.g. fsck's reboot), FPGA_INT6
+          * stays HIGH -- and the freshly-restarted Kickstart has no Z3660 INT6
+          * handler installed yet, so it can never clear the source.  The level-6
+          * interrupt re-fires forever -> the 68k storms in Kickstart's autovector
+          * handler and never progresses (observed stuck at 0x00F81212, the INT
+          * handler's adda/rte exit, s=1 msk=2).  Cold boot starts with
+          * amiga_interrupts==0 so it never happens.  Force it clear here (also
+          * deasserts FPGA_INT6 since the mask goes to 0) before releasing the 68k. */
+         amiga_interrupt_clear(0xFFFFFFFF);
+
+         /* NOTE: the real A4000 chipset interrupt quiesce that stops the warm-reset
+          * EXTER storm is done on CORE1 (Z3660_emu newcpu.cpp
+          * z3660_quiesce_real_chipset_on_reset(), called from cpureset()/the n040RSTI
+          * handler), NOT here: Core0 cannot read/write Amiga chip space in this window
+          * -- arm_read_amiga() spins forever on read_reg_s00(0x14) (no timeout) because
+          * Core1 owns the bus, which hung the firmware when attempted here. */
+
          DiscreteSet(REG0, FPGA_RESET);
          usleep(1000);
          CPLD_RESET_ARM(1);

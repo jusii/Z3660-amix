@@ -71,7 +71,7 @@ struct mmufixup
 	int reg;
 	uae_u32 value;
 };
-extern struct mmufixup mmufixup[1];
+extern struct mmufixup mmufixup[2];   /* idx 1 used by cpuemu_32 / mmu030 fixup (WinUAE 4.4.0) */
 
 typedef struct
 {
@@ -81,6 +81,12 @@ typedef struct
 #ifdef JIT
 #include "jit/comptbl.h"
 #include "jit/compemu.h"
+#endif
+
+/* 020/030 prefetch pipeline depth — needed by the WinUAE 4.4.0 MMU engine
+ * (cpummu030.cpp) imported for UAE_030_MMU. */
+#ifndef CPU_PIPELINE_MAX
+#define CPU_PIPELINE_MAX 4
 #endif
 
 struct regstruct
@@ -138,10 +144,34 @@ struct regstruct
 	uae_u32 tcr, mmusr, urp, srp;
 	uae_u32 mmu_fault_addr;
 
+	/* MMU engine state required by the imported WinUAE 4.4.0 cpummu030.cpp /
+	 * cpummu.cpp (UAE_030_MMU). Field types/order verbatim from WinUAE 4.4.0
+	 * newcpu.h so the engine and its (gencpu-generated) cpuemu_31 agree. */
+	uae_u32 mmu_fslw;            /* 060 fault status longword */
+	uae_u32 mmu_effective_addr;  /* EA at fault */
+	uae_u16 mmu_ssw;             /* 030/040 special status word (bus-error frame) */
+	uae_u32 wb2_address;
+	uae_u32 wb3_data;
+	uae_u8  wb3_status, wb2_status;
+	int     mmu_enabled;         /* per-regs MMU-active fast-path flag */
+	int     mmu_page_size;       /* cached from TC */
+	uae_u16 prefetch020[CPU_PIPELINE_MAX];
+	uae_u8  prefetch020_valid[CPU_PIPELINE_MAX];
+	int     pipeline_pos;
+	int     pipeline_r8[2];
+	int     pipeline_stop;
+	uae_u8  fc030;               /* function code for 030 bus cycle */
+
 	uae_u32 pcr;
 	uae_u32 address_space_mask;
 
 	uae_u8* natmem_offset;
+
+	/* Cycle countdown ("countdown" macro == regs.pissoff in events.h). Used by
+	 * non-JIT paths (do_extra_cycles, events.cpp) too, so it must exist even when
+	 * JIT is off — e.g. the x86-64 host MMU harness. Previously JIT-only, which
+	 * compiled only because the ARM target always builds with JIT enabled. */
+	int pissoff;
 
 #ifdef JIT
 	/* store scratch regs also in this struct to avoid load of mem pointer */
@@ -153,7 +183,6 @@ struct regstruct
 	uae_u32* raw_cputbl_count;
 	uintptr mem_banks;
 	uintptr cache_tags;
-	int pissoff;
 
 #endif
 };
@@ -220,6 +249,7 @@ STATIC_INLINE void unset_special(uae_u32 x)
 #define m68k_dreg(r,num) ((r).regs[(num)])
 #define m68k_areg(r,num) (((r).regs + 8)[(num)])
 
+extern uae_u32(*x_prefetch)(int);   /* WinUAE 4.4.0 MMU engine (cpummu030.cpp) */
 extern uae_u32(*x_get_byte)(uaecptr addr);
 extern uae_u32(*x_get_word)(uaecptr addr);
 extern uae_u32(*x_get_long)(uaecptr addr);
@@ -364,6 +394,67 @@ STATIC_INLINE void m68k_setpc_normal(uaecptr pc)
 
 extern void check_t0_trace(void);
 
+/* 030/040 MMU + cache memory accessors, imported from WinUAE 4.4.0 newcpu.h for
+ * UAE_030_MMU. The 030 function pointers and the dcache030/icache functions are
+ * referenced by the inline wrappers in cpummu030.h and cpummu.h; defined in
+ * cpummu030.cpp and newcpu.cpp. (Stripped from this tree's faked-MMU build.) */
+extern uae_u32(*read_data_030_bget)(uaecptr);
+extern uae_u32(*read_data_030_wget)(uaecptr);
+extern uae_u32(*read_data_030_lget)(uaecptr);
+extern void(*write_data_030_bput)(uaecptr,uae_u32);
+extern void(*write_data_030_wput)(uaecptr,uae_u32);
+extern void(*write_data_030_lput)(uaecptr,uae_u32);
+
+extern uae_u32(*read_data_030_fc_bget)(uaecptr, uae_u32);
+extern uae_u32(*read_data_030_fc_wget)(uaecptr, uae_u32);
+extern uae_u32(*read_data_030_fc_lget)(uaecptr, uae_u32);
+extern void(*write_data_030_fc_bput)(uaecptr, uae_u32, uae_u32);
+extern void(*write_data_030_fc_wput)(uaecptr, uae_u32, uae_u32);
+extern void(*write_data_030_fc_lput)(uaecptr, uae_u32, uae_u32);
+
+extern void write_dcache030_bput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_wput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_lput(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_retry(uaecptr addr, uae_u32 v, uae_u32 fc, int size, int flags);
+extern uae_u32 read_dcache030_bget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_wget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_lget(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_retry(uaecptr addr, uae_u32 fc, int size, int flags);
+
+extern void write_dcache030_mmu_bput(uaecptr, uae_u32);
+extern void write_dcache030_mmu_wput(uaecptr, uae_u32);
+extern void write_dcache030_mmu_lput(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_mmu_bget(uaecptr);
+extern uae_u32 read_dcache030_mmu_wget(uaecptr);
+extern uae_u32 read_dcache030_mmu_lget(uaecptr);
+extern void write_dcache030_lrmw_mmu(uaecptr, uae_u32, uae_u32);
+extern void write_dcache030_lrmw_mmu_fcx(uaecptr, uae_u32, uae_u32, int);
+extern uae_u32 read_dcache030_lrmw_mmu(uaecptr, uae_u32);
+extern uae_u32 read_dcache030_lrmw_mmu_fcx(uaecptr, uae_u32, int);
+
+extern uae_u32 get_word_icache030(uaecptr addr);
+extern uae_u32 get_long_icache030(uaecptr addr);
+
+uae_u32 fill_icache040(uae_u32 addr);
+extern void put_long_cache_040(uaecptr, uae_u32);
+extern void put_word_cache_040(uaecptr, uae_u32);
+extern void put_byte_cache_040(uaecptr, uae_u32);
+extern uae_u32 get_ilong_cache_040(int);
+extern uae_u32 get_iword_cache_040(int);
+extern uae_u32 get_long_cache_040(uaecptr);
+extern uae_u32 get_word_cache_040(uaecptr);
+extern uae_u32 get_byte_cache_040(uaecptr);
+extern uae_u32 next_iword_cache040(void);
+extern uae_u32 next_ilong_cache040(void);
+extern uae_u32 get_word_icache040(uaecptr addr);
+extern uae_u32 get_long_icache040(uaecptr addr);
+
+extern uae_u32 sfc_nommu_get_byte(uaecptr);
+extern uae_u32 sfc_nommu_get_word(uaecptr);
+extern uae_u32 sfc_nommu_get_long(uaecptr);
+extern void dfc_nommu_put_byte(uaecptr, uae_u32);
+extern void dfc_nommu_put_word(uaecptr, uae_u32);
+extern void dfc_nommu_put_long(uaecptr, uae_u32);
 
 extern void (*x_do_cycles)(int);
 extern void (*x_do_cycles_pre)(int);
@@ -378,6 +469,10 @@ extern void m68k_cancel_idle(void);
 extern uae_u32 REGPARAM3 get_disp_ea_020(uae_u32 base) REGPARAM;
 extern uae_u32 REGPARAM3 get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width) REGPARAM;
 extern void REGPARAM3 put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width) REGPARAM;
+/* MMU-named aliases used by the generated cpuemu_32 (68030 MMU). Pure bit ops on
+ * already-loaded bdata[] (no memory access), so they just forward. */
+extern uae_u32 REGPARAM3 x_get_bitfield(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width) REGPARAM;
+extern void REGPARAM3 x_put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width) REGPARAM;
 
 extern int get_cpu_model(void);
 
@@ -397,6 +492,16 @@ extern int m68k_move2c(int, uae_u32*);
 extern int m68k_movec2(int, uae_u32*);
 extern int m68k_divl(uae_u32, uae_u32, uae_u16, uaecptr);
 extern int m68k_mull(uae_u32, uae_u32, uae_u16);
+/* The WinUAE 4.4.0 gencpu (cpuemu_32) emits 3-arg m68k_divl; this tree's real one
+ * takes the restart pc explicitly. Forward to it with the instruction pc. */
+static inline int m68k_divl(uae_u32 opcode, uae_u32 dst, uae_u16 extra)
+{ return m68k_divl(opcode, dst, extra, regs.instruction_pc); }
+/* Inert on the Z3660: the SR-write handlers' following MakeFromSR_T0() ->
+ * MakeFromSR_x() -> doint_imm() unconditionally sets SPCFLAG_INT in the no-JIT
+ * path (cachesize==0), forcing do_specialties() to re-check intlev() against the
+ * NEW intmask on the next pass. (The regs.ipl_pin fold-in in MakeFromSR_x is NOT
+ * the guarantee — ipl_pin is not refreshed per-instruction in m68k_run_mmu030.) */
+static inline void MakeFromSR_intmask(uae_u16 oldsr, uae_u16 newsr) { (void)oldsr; (void)newsr; }
 extern void init_m68k(void);
 extern void m68k_go(int);
 extern int getMulu68kCycles(uae_u16 src);
@@ -463,6 +568,31 @@ extern void cpu_change(int newmodel);
 extern void cpu_fallback(int mode);
 
 extern void fill_prefetch(void);
+extern void fill_prefetch_020_ntx(void);   /* WinUAE 4.4.0 MMU engine */
+extern void fill_prefetch_030_ntx(void);
+extern void fill_prefetch_030_ntx_continue(void);
+extern void fill_prefetch_020(void);
+extern void fill_prefetch_030(void);
+
+/* Cycle-exact memory-access-with-delay helpers (WinUAE 4.4.0 newcpu.h). The
+ * imported MMU engine references these in its CE paths; the Z3660 runs the MMU
+ * in direct (non-CE) mode so they are not on the hot path, but must resolve.
+ * Defined as pass-throughs in newcpu_mmu_glue.cpp. */
+void mem_access_delay_long_write_ce020 (uaecptr addr, uae_u32 v);
+void mem_access_delay_word_write_ce020 (uaecptr addr, uae_u32 v);
+void mem_access_delay_byte_write_ce020 (uaecptr addr, uae_u32 v);
+uae_u32 mem_access_delay_byte_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_word_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_long_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_longi_read_ce020 (uaecptr addr);
+uae_u32 mem_access_delay_wordi_read_ce020 (uaecptr addr);
+void mem_access_delay_long_write_c040 (uaecptr addr, uae_u32 v);
+void mem_access_delay_word_write_c040 (uaecptr addr, uae_u32 v);
+void mem_access_delay_byte_write_c040 (uaecptr addr, uae_u32 v);
+uae_u32 mem_access_delay_byte_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_word_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_long_read_c040 (uaecptr addr);
+uae_u32 mem_access_delay_longi_read_c040 (uaecptr addr);
 
 #define CPU_OP_NAME(a) op ## a
 

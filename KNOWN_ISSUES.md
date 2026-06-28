@@ -1,5 +1,23 @@
 # Z3660 Known Issues / Limitations
 
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+## Amiga UNIX (AMIX) — fork notes
+
+This fork boots Amiga UNIX (AMIX) 2.1; full setup is in **[docs/AMIX.md](docs/AMIX.md)**. The two
+things most likely to bite:
+
+* **The AMIX disk must be on the SCSI id it was installed on** (`scsiN` in the config). AMIX bakes
+  its root device to a fixed *(controller, target)* — the usual A3000 install is **id 6**
+  (root mounts as `/dev/dsk/c6d0s1`). On any other id the kernel loads (you get the SVR4 banner) but
+  root-mount fails and you never reach login.
+* **Use an A3000-variant Kickstart** (e.g. KS 3.1 r40.68 A3000). A4000 ROMs have no A3000 SCSI driver
+  and can't boot AMIX (you get "insert disk").
+
+AMIX 2.1 boots reliably to a stable multiuser login shell. One rare demand-paging edge case under
+extreme sustained load is tracked but does not block normal use — details in
+[docs/AMIX.md](docs/AMIX.md#current-status).
+<!-- fork:amix end -->
+
 ##Clock configuration
  * upto v1.02 CPLD and FPGA/ARM versions<br>
 The frequency of 060 is limited to 50 and 100 MHz.

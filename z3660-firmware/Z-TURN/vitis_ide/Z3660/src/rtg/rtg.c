@@ -833,7 +833,8 @@ uint32_t read_rtg_register(uint32_t zaddr)
               || env_file_vars_temp[preset_selected].boot_mode==UAE_030
               || env_file_vars_temp[preset_selected].boot_mode==UAEJIT_040
               || env_file_vars_temp[preset_selected].boot_mode==UAE_040
-              || env_file_vars_temp[preset_selected].boot_mode==MUSASHI;
+              || env_file_vars_temp[preset_selected].boot_mode==MUSASHI
+              || env_file_vars_temp[preset_selected].boot_mode==UAE_030_MMU;
          break;
       case REG_ZZ_SCSIBOOT_EN:
          data=env_file_vars_temp[preset_selected].scsiboot==YES;

@@ -30,7 +30,7 @@ INCLUDES:= -I$(SRCDIR) \
            -I$(BSP_CORE1_INC) \
            -I$(BSP_CORE1_EXPORT_INC)
 
-CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -O3 -std=c++11 \
+CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 \
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
            -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY
@@ -41,17 +41,24 @@ CXXFLAGS := $(CFLAGS)
 ASFLAGS := $(CFLAGS)
 LDFLAGS := $(CFLAGS) -T $(LDSCRIPT) -specs=$(SRCDIR)/Xilinx.spec \
            -Wl,-build-id=none,-Map=$(BUILDDIR)/mapfile.txt \
+           -Wl,--gc-sections \
            -flto -L$(BSP_CORE1_EXPORT_LIB) -L$(BSP_CORE1_LIB) -L$(BSP_CORE1_LIB)/cpu/cortexa9 -L$(dir $(BSP_CORE1_LIB))
-#-Wl,--gc-sections
+# --gc-sections: behavior-preserving dead-code strip (critical sections are KEEP'd in lscript.ld).
+# Shrinks Z3660_emu so BOOT.BIN clears the SD-write size threshold (~12MB) for TFTP deploy.
 #-nostdlib -specs=nosys.specs 
 
 # Sources (musashi/uae emulators)
 C_SRCS   := $(shell find $(SRCDIR) -type f -name "*.c")
 CXX_SRCS := $(shell find $(SRCDIR) -type f \( -name "*.cc" -o -name "*.cpp" -o -name "*.cxx" \))
-# Exclude specific files
+# Exclude specific files.
+# NB: main.cpp and set_cpu_freq.cpp are byte-identical twins of main.cc / set_cpu_freq.cc;
+# both members of each pair map to the same build/<base>.o (collision fixed for main in
+# 623c315). Filter out the .cpp of each twin so only the .cc is built.
 C_SRCS   := $(filter-out $(SRCDIR)/musashi/m68kfpu.c,$(C_SRCS))
 CXX_SRCS := $(filter-out \
 	$(SRCDIR)/uae/fpp_native.cpp \
+	$(SRCDIR)/main.cpp \
+	$(SRCDIR)/set_cpu_freq.cpp \
 	$(SRCDIR)/uae/jit/codegen_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm2.cpp,$(CXX_SRCS))

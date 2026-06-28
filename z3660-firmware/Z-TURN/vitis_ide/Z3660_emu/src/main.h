@@ -103,6 +103,10 @@ typedef struct {
    volatile uint32_t z2_enabled;          // 0xFFFF0090
    volatile uint32_t printhist_dataabort; // 0xFFFF0094
    volatile uint32_t arm_freq_code;       // 0xFFFF0098
+   volatile uint32_t debug_emu;           // 0xFFFF009C  emulator-core debug spam toggle (0=off,1=on): [PC]/[RTE-B-IF]/fixup (DEMU menu cmd)
+   volatile uint32_t amix_mode;           // 0xFFFF00A0  AMIX memory contract on/off (control core sets from config.amix_mode)
+   volatile uint32_t service_cadence;     // 0xFFFF00A4  030-MMU run loop: instructions between IPL/cross-core polls (1=every; perf knob, SERV cmd)
+   volatile uint32_t perf_report;         // 0xFFFF00A8  030-MMU run loop: 1=print instr/sec to serial ~1Hz (PERF cmd)
 } SHARED;
 
 enum BOOTMODE{
@@ -113,8 +117,15 @@ enum BOOTMODE{
    UAEJIT_030,
    UAE_040,
    UAEJIT_040,
+   UAE_030_MMU,        // appended at end so stored indices/configs keep meaning
    BOOTMODE_NUM
 };
+// Tripwire: this enum is replicated index-aligned in ../Z3660/src/config_file.h,
+// z3660-drivers/ZTop/Ztop.c and ../Z3660/src/ARM_ztop. Keep all in sync; append
+// new modes at the end only. (See UAE_030_MMU_plan.md Phase 7.)
+#if defined(__cplusplus)
+static_assert(BOOTMODE_NUM == 8, "BOOTMODE changed: update the replicas in config_file.h / Ztop.c / ARM_ztop");
+#endif
 typedef struct {
    uint32_t load_rom_emu;
    uint32_t load_romext_emu;

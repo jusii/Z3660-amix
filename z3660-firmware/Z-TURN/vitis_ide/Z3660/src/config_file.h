@@ -16,7 +16,8 @@ enum BOOTMODE{
    UAEJIT_030,
    UAE_040,
    UAEJIT_040,
-   BOOTMODE_NUM
+   UAE_030_MMU,        // real 68030 PMMU (AMIX). Append-only; index-aligned with
+   BOOTMODE_NUM        // ../Z3660_emu/src/main.h, ZTop/Ztop.c, ARM_ztop.
 };
 
 enum YESNO{
@@ -72,6 +73,8 @@ typedef struct {
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
    float resistor;
@@ -117,6 +120,8 @@ typedef struct {
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
    int kickstart;
@@ -216,6 +221,8 @@ enum CONFITEM {
    CONFITEM_TEST_RANGE6,
    CONFITEM_TEST_RANGE7,
    CONFITEM_ARM_FREQUENCY,
+   CONFITEM_AMIX_MODE,
+   CONFITEM_SERVICE_CADENCE,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50

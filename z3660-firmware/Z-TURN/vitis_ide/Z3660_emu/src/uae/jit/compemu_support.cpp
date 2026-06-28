@@ -29,6 +29,13 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+/* Build this JIT translation unit (and its #included ARM emitters codegen_arm.cpp /
+ * compemu_midfunc_arm*.cpp) at -O3. The firmware is globally -Os/-flto for BOOT.BIN size,
+ * but -Os miscompiles the hand-emitted ARM codegen -> generated blocks ARM-fault
+ * ([Core1] Undefined Exception at JIT-init; [Core1] Prefetch Abort at runtime). -O3 here
+ * restores the codegen the JIT was written for while the rest of the build stays -Os. */
+#pragma GCC optimize("O3")
+
 #include <math.h>
 
 #include "sysdeps.h"
@@ -2169,8 +2176,12 @@ STATIC_INLINE void create_popalls(void)
 
    // no need to further write into popallspace
    //TODO vm_protect(popallspace, POPALLSPACE_SIZE, VM_PAGE_READ | VM_PAGE_EXECUTE);
-   // No need to flush. Initialized and not modified
-   // flush_cpu_icache((void *)popallspace, (void *)target);
+   // popallspace was just written above. With D-cache + I-cache enabled on Core1 and the
+   // firmware built -Os/-flto (the AMIX size change), the first pushall_call_handler() can
+   // fetch STALE I-cache lines for these trampolines -> ARM Undefined Instruction -> reboot
+   // (the "[Core1] Undefined Exception" seen entering any UAEJIT mode). Flush the whole
+   // generated popall region so I-cache is coherent before it is executed.
+   flush_cpu_icache((void *)popallspace, (void *)get_target());
 }
 
 STATIC_INLINE void reset_lists(void)

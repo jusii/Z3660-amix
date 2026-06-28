@@ -1395,7 +1395,8 @@ int main()
       || config.boot_mode==UAE_030
       || config.boot_mode==UAEJIT_030
       || config.boot_mode==UAE_040
-      || config.boot_mode==UAEJIT_040)
+      || config.boot_mode==UAEJIT_040
+      || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
       emu=1;
    else
       emu=0;

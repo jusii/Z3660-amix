@@ -79,6 +79,39 @@ extern "C" void reset_autoconfig(void);
 extern int ovl;
 void fill_prefetch_quick (void);
 void custom_reset_cpu(bool hardreset, bool keyboardreset);
+void hard_reboot(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // AMIX (emulated A3000 SCSI) active; gates the warm-reboot guard
+
+/* ---- Z3660 warm-reset real-chipset quiesce -------------------------------------
+ * A real Amiga RESET resets Paula/CIA; this emulated warm (guest) reset does NOT, so
+ * AMIX leaves chip interrupts enabled+latched and the rebooted Kickstart -- which has
+ * not re-installed its handlers yet -- drowns in an EXTER (level-6) interrupt it can
+ * never clear (the storm observed at Kickstart 0x00F81212, sampler s=1 msk=2 = a
+ * level>2 IRQ held permanently asserted; a cold boot never hits this because the chips
+ * start reset).  We run on Core1, the live bus master for the emulated 68k, so these
+ * chip accesses are timeout-bounded (ps_*->arm_*_amiga_* wait_*_ack) and do NOT hang
+ * -- unlike the abandoned Core0 attempt whose arm_read_amiga spun on an ack that never
+ * came in the reset window.  Disable+clear all real Paula interrupts and clear both CIA
+ * ICR latches, then force the injected IPL to 0: ipl_main_read() only re-samples the
+ * GPIO IPL lines when ipl_read>0, so bump it and re-sample (now de-asserted), then
+ * hard-zero the two globals intlev() max()es over (read_irq, a3000_scsi_irq). */
+extern "C" void ps_write_16(unsigned int address, unsigned int value);
+extern "C" unsigned int ps_read_8(unsigned int address);
+extern "C" void ipl_main_read(void);
+extern int read_irq;
+extern volatile int a3000_scsi_irq;
+extern int ipl_read;
+static void z3660_quiesce_real_chipset_on_reset(void)
+{
+   ps_write_16(0x00DFF09A, 0x7FFF);   /* INTENA: clear master + all enable bits */
+   ps_write_16(0x00DFF09C, 0x7FFF);   /* INTREQ: clear all pending bits         */
+   (void)ps_read_8(0x00BFED01);       /* CIA-A ICR: reading clears the latch    */
+   (void)ps_read_8(0x00BFDD00);       /* CIA-B ICR: reading clears the latch    */
+   ipl_read = 4;
+   for (int i = 0; i < 8; i++) ipl_main_read();   /* re-snapshot now-idle IPL lines */
+   read_irq = 0;
+   a3000_scsi_irq = 0;
+}
 #ifdef JIT
 #include "jit/compemu.h"
 #include <signal.h>
@@ -146,7 +179,13 @@ struct cputbl_data
 };
 static struct cputbl_data cpudatatbl[65536];
 
-struct mmufixup mmufixup[1];
+/* Two elements: index 1 is driven by the imported 68030-MMU table (cpuemu_32.cpp
+ * MOVES/CAS2/double-(An) handlers), the m68k_run_mmu030 CATCH path below, and
+ * cpummu030.cpp's mmu030fixupreg(1)/mmu030fixupmod(...,1). Upstream WinUAE 4.4.0
+ * sizes this [2]; the fork had shrunk it to [1] (UB once MMU mode drives idx 1). */
+struct mmufixup mmufixup[2];
+static_assert(sizeof(mmufixup) / sizeof(mmufixup[0]) >= 2,
+              "mmufixup must hold index 1 (MMU030_REG_FIXUP) used by cpuemu_32 + run-loop CATCH");
 
 static uae_u64 fake_srp_030, fake_crp_030;
 static uae_u32 fake_tt0_030, fake_tt1_030, fake_tc_030;
@@ -665,6 +704,33 @@ static void set_x_funcs (void)
          x_do_cycles_pre = do_cycles;
          x_do_cycles_post = do_cycles_post;
       }
+   } else if (currprefs.mmu_model == 68030) {
+      // UAE_030_MMU: route every CPU memory access through the 68030 MMU
+      // translating accessors (cpummu030.h inlines). The generated cpuemu_32
+      // table (op_smalltbl_32_ff) reaches memory via the *_mmu030_state inlines
+      // -> uae_mmu030_*, NOT via the read_data_030_* pointers. We still repoint
+      // read_data_030_*/write_data_030_* from their physical defaults to the
+      // translating uae_mmu030_* accessors for completeness (consumed only by the
+      // inactive mmu030c cache family). (Verbatim shape from WinUAE 4.4.0.)
+      x_prefetch = get_iword_mmu030;     // opcode fetch in m68k_run_mmu030
+      x_get_iword = get_iword_mmu030;
+      x_next_iword = next_iword_mmu030;
+      x_next_ilong = next_ilong_mmu030;
+      x_put_long = put_long_mmu030;
+      x_put_word = put_word_mmu030;
+      x_put_byte = put_byte_mmu030;
+      x_get_long = get_long_mmu030;
+      x_get_word = get_word_mmu030;
+      x_get_byte = get_byte_mmu030;
+      x_do_cycles = do_cycles;
+      x_do_cycles_pre = do_cycles;
+      x_do_cycles_post = do_cycles_post;
+      read_data_030_bget = uae_mmu030_get_byte;
+      read_data_030_wget = uae_mmu030_get_word;
+      read_data_030_lget = uae_mmu030_get_long;
+      write_data_030_bput = uae_mmu030_put_byte;
+      write_data_030_wput = uae_mmu030_put_word;
+      write_data_030_lput = uae_mmu030_put_long;
    } else {
       // 68020+ no ce
       set_x_ifetches();
@@ -732,6 +798,13 @@ static void set_x_funcs (void)
 
    set_x_cp_funcs();
 }
+
+#ifdef HOST_TEST_HARNESS
+/* Exposes the static set_x_funcs() to the Layer-1 host MMU test harness so it can
+ * wire the x_* memory accessors after build_cpufunctbl(). Never compiled into the
+ * firmware (HOST_TEST_HARNESS is only defined by test/host/Makefile). */
+extern "C" void harness_set_x_funcs(void) { set_x_funcs(); }
+#endif
 
 bool can_cpu_tracer (void)
 {
@@ -846,18 +919,23 @@ uae_u32 REGPARAM2 op_illg_1 (uae_u32 opcode)
 }
 
 // generic+direct, generic+direct+jit, more compatible, cycle-exact
-static const struct cputbl *cputbls[5][4] =
+// UAE_030_MMU: the 68030 MMU instruction table (op_smalltbl_32_ff), generated by
+// WinUAE 4.4.0 gencpu (id 32) and living in cpuemu_32.cpp / cpustbl_mmu030.cpp.
+extern const struct cputbl op_smalltbl_32_ff[];
+
+// Column 4 (mode 4) is the MMU table; selected when currprefs.mmu_model is set.
+static const struct cputbl *cputbls[5][5] =
 {
-   // 68000
-   { op_smalltbl_5, op_smalltbl_45, op_smalltbl_12, op_smalltbl_14 },
+   // 68000  { direct,         jit,           compatible,    cycle-exact,   MMU }
+   { op_smalltbl_5, op_smalltbl_45, op_smalltbl_12, op_smalltbl_14, NULL },
    // 68010
-   { op_smalltbl_4, op_smalltbl_44, op_smalltbl_11, op_smalltbl_13 },
+   { op_smalltbl_4, op_smalltbl_44, op_smalltbl_11, op_smalltbl_13, NULL },
    // 68020
-   { op_smalltbl_3, op_smalltbl_43, NULL, NULL },
-   // 68030
-   { op_smalltbl_2, op_smalltbl_42, NULL, NULL },
-   // 68040
-   { op_smalltbl_1, op_smalltbl_41, NULL, NULL },
+   { op_smalltbl_3, op_smalltbl_43, NULL, NULL, NULL },
+   // 68030  (MMU column = op_smalltbl_32_ff)
+   { op_smalltbl_2, op_smalltbl_42, NULL, NULL, op_smalltbl_32_ff },
+   // 68040  (68040-MMU table not yet generated; stretch goal)
+   { op_smalltbl_1, op_smalltbl_41, NULL, NULL, NULL },
 };
 
 void build_cpufunctbl (void)
@@ -868,7 +946,11 @@ void build_cpufunctbl (void)
    int lvl, mode;
 
    if (!currprefs.cachesize) {
-      if (currprefs.cpu_cycle_exact) {
+      if (currprefs.mmu_model == 68030) {
+         mode = 4;   // UAE_030_MMU: op_smalltbl_32_ff (indirect, fault-restartable)
+                     // == 68030 (not just truthy): only the 030 row of cputbls has a
+                     // mode-4 table; a non-030 mmu_model must fall through, not index NULL.
+      } else if (currprefs.cpu_cycle_exact) {
          mode = 3;
       } else if (currprefs.cpu_compatible && currprefs.cpu_model < 68020) {
          mode = 2;
@@ -1489,8 +1571,17 @@ static int iack_cycle(int nr)
 {
    int vector;
 
-   // non-autovectored
-   vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
+   // The autovector IACK is an FC=7 (CPU-space) access on real HW; the 68030 MMU NEVER
+   // translates it. iack_cycle runs in Exception_normal BEFORE the supervisor-mode switch,
+   // so x_get_byte() here would walk the *current* (user) page tables when an interrupt is
+   // taken while a user task runs (e.g. AMIX init) -> bus error at 0x00FFFFFx. Under the real
+   // 030 PMMU use the bare physical bank accessor (get_byte) so the autovector read bypasses
+   // the user MMU; in supervisor/identity context get_byte_mmu030 reaches this same bank, so
+   // the value matches. Every other emulator mode keeps the upstream x_get_byte path verbatim.
+   if (currprefs.mmu_model == 68030)
+      vector = get_byte(0x00fffff1 | ((nr - 24) << 1));
+   else
+      vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
    if (currprefs.cpu_compatible)
       x_do_cycles(4 * CYCLE_UNIT / 2);
    return vector;
@@ -1833,7 +1924,19 @@ static void Exception_normal (int nr)
       nextpc = exception_pc (nr);
       if (nr == 2 || nr == 3) {
          int i;
-         if (currprefs.cpu_model >= 68040) {
+         if (currprefs.mmu_model && nr == 2) {
+            // UAE_030_MMU: a real 68030 data/instruction bus fault from the page-fault
+            // engine. mmu030_page_fault() already computed regs.mmu_ssw (with DF set and
+            // the real RW/SIZE/FC) and regs.mmu_fault_addr; stack them VERBATIM so that
+            // m68k_do_rte_mmu030() re-performs the faulted access on RTE (it is gated on
+            // ssw & MMU030_SSW_DF). Frame A (short) if the instruction's LAST write
+            // faulted, else frame B (long). Restores the WinUAE 4.4.0 mmu_model branch the
+            // fork dropped: without it the nr==2 path below synthesizes an SSW with no DF
+            // and a stale fault address, so demand paging never resumes (AMIX won't boot).
+            int frameformat = (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) ? 0xa : 0xb;
+            Exception_build_stack_frame(regs.instruction_pc, currpc, regs.mmu_ssw, nr, frameformat);
+            used_exception_build_stack_frame = true;
+         } else if (currprefs.cpu_model >= 68040) {
             if (nr == 2) {
 
                   // 68040 bus error (not really, some garbage?)
@@ -2107,6 +2210,15 @@ void m68k_reset_newcpu(bool hardreset)
 
    regs.pissoff = 0;
 
+   /* UAE_030_MMU: a 68030 CPU reset zeroes the E-bits of TC/TT (translation off).
+    * The firmware otherwise never resets the real MMU engine, so after AMIX enables
+    * it a warm reset (this fn is the boot AND the n040RSTI GPIO reset path) would run
+    * the reset-vector fetch (get_long(4) below) through the previous session's stale
+    * page tables. mmu030_reset clears mmu030.enabled + TC E-bit (hardreset>=0) and,
+    * for a full reset, SRP/CRP/TT/ATC (hardreset>0). Must precede the get_long(4). */
+   if (currprefs.mmu_model == 68030)
+      mmu030_reset(hardreset ? 1 : 0);
+
    regs.halted = 0;
 //   gui_data.cpu_halted = 0;
 //   gui_led (LED_CPU, 0, -1);
@@ -2136,6 +2248,22 @@ void m68k_reset_newcpu(bool hardreset)
    regs.s = 1;
    v = get_long (4);
    printf("Read PC from address 4 : 0x%08X\n",v);
+#ifndef HOST_TEST_HARNESS
+   /* AMIX warm-reboot guard: on `reboot`/`uadmin`, AMIX has cleared the overlay so $0-$8 is chip RAM,
+    * not the Kickstart ROM, and the emulator does not restore it on a 68k reset -> get_long(4) returns
+    * garbage (e.g. 0xFFFFFFFF) instead of the Kickstart reset PC. Letting the 68k run from a garbage PC
+    * scribbles the Z3660 PISCSI registers (the "Unhandled register write" flood) and only ends when a
+    * Data Abort triggers hard_reboot() anyway. So detect the invalid vector (a valid reset PC lives in
+    * the Kickstart ROM, $F00000-$1000000) and do that clean reboot immediately -- no flood, no garbage
+    * execution. The cold-boot vector (Kickstart ROM overlaid at 0 on the real bus) is always valid, so
+    * this never false-fires on a normal boot. Gated on a3000_amix_mode so it engages ONLY under AMIX --
+    * other CPU modes/configs are untouched. (A true in-place warm restart would need the overlay/030-MMU
+    * state fully reset so get_long could fetch the ROM vector at $0/$4 without faulting -- not done here.) */
+   if (a3000_amix_mode && (v < 0x00F00000 || v >= 0x01000000)) {
+      printf("[Core1] Invalid reset vector 0x%08X (AMIX warm reboot, overlay not restored) -> clean reboot\n", v);
+      hard_reboot();
+   }
+#endif
    m68k_areg (regs, 7) = get_long (0);
 
    m68k_setpc_normal(v);
@@ -2416,27 +2544,40 @@ static bool mmu_op30fake_pflush (uaecptr pc, uae_u32 opcode, uae_u16 next, uaecp
 bool mmu_op30 (uaecptr pc, uae_u32 opcode, uae_u16 extra, uaecptr extraa)
 {
    int type = extra >> 13;
-   bool fline = false;
+   /* tri-state: 0 ok, 1 = F-line, -1 = MMU config exception only (no F-line).
+    * Backport of WinUAE a333766b. mmu_op30_pmove returns the int; the other
+    * handlers still return bool (0/1). */
+   int fline = 0;
 
    switch (type)
    {
    case 0:
    case 2:
    case 3:
-      fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
+      // UAE_030_MMU: real PMOVE actually loads TC/SRP/CRP/TT into the engine.
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pmove (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
       break;
    case 1:
-      fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pflush (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
       break;
    case 4:
-      fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_ptest (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
       break;
    }
-   if (fline) {
+   if (fline > 0) {
       m68k_setpc(pc);
       op_illg(opcode);
    }
-   return fline;
+   return fline != 0;
 }
 
 /* check if an address matches a ttr */
@@ -2527,20 +2668,356 @@ int pissoff_int=1024;
 int set_special_var=1;
 void z3660_tasks(void);
 extern "C" void ipl_main_read(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // A3000 SCSI WD33C93 int-countdown pump
+extern "C" { extern volatile uae_u32 amix_tick; }     // TEMP: ~guest-instruction counter for INT2 latency
+extern "C" void a3000_scsi_hsync(void);
+// a3000_scsi.cpp gates AMIX completion delivery on the guest's CPU interrupt mask so a SCSI INT2 is
+// taken at most once per command at an instruction boundary OUTSIDE the level-2 ISR — never while
+// a3091intr is mid-flight issuing the next autonomous command (which would ack/lose the new completion).
+extern "C" int amix_cpu_intmask(void) { return (int)regs.intmask; }
+// ===== AMIX sleep-channel trace (TEMP — remove before commit) =====
+// Walk the AMIX 030 supervisor page tables (srp_030) to read a kernel SCN1 VA. DT-aware.
+extern uae_u64 srp_030;
+static uae_u32 amix_kget2(uae_u32 va){
+   uae_u32 idx[3]={(va>>30)&3,(va>>17)&0x1FFF,(va>>11)&0x3F};
+   uae_u32 tbl=(uae_u32)srp_030&0xFFFFFFF0u; int dt=(int)((srp_030>>32)&3);
+   for(int l=0;l<3;l++){ int ds=(dt==3)?8:4; uae_u32 da=tbl+idx[l]*ds;
+      uae_u32 d0=get_long(da), aw=(ds==8)?get_long(da+4):d0;
+      if((d0&3)==0) return 0xDEADBEEFu;
+      if(l==2||(d0&3)==1) return get_long((aw&0xFFFFF800u)|(va&0x7FF));
+      tbl=aw&0xFFFFFFF0u; dt=(int)(d0&3); }
+   return 0xDEADBEEFu;
+}
+// expose guest CPU PC / frame so a3000_scsi.cpp can record WHO reads WD_SCSI_STATUS (TEMP)
+extern "C" uae_u32 amix_cpu_pc(void){ return (uae_u32)regs.instruction_pc; }
+extern "C" uae_u32 amix_cpu_a6(void){ return (uae_u32)m68k_areg(regs,6); }
+extern "C" uae_u32 amix_cpu_kread(uae_u32 va){ return amix_kget2(va); }
+static uae_u32 amix_slpchan[8], amix_slpcaller[8]; static int amix_slphead=0;
+static uae_u32 amix_slpstk[8][6];   // TEMP: kernel call-stack (6 return addrs via a6 chain) per sleep -> trace init's block path
+static uae_u32 amix_swapconf_n=0, amix_swapadd_n=0, amix_swap_openres=0xdead, amix_swap_sizeres=0xdead, amix_swap_devsz=0, amix_lookupname_n=0, amix_lookup_res=0xdead;  // TEMP: swap-config flow trace
+static uae_u32 amix_ih_n=0, amix_ih_div=0, amix_ih_fdone=0, amix_ih_fhead=0, amix_ih_ftick=0, amix_ih_ldone=0, amix_ih_lhead=0;  // TEMP: ihandle FIFO-divergence (completed buf a0 vs ddtab.HEAD a3)
+static uae_u32 amix_bb_n=0, amix_bb_stk[8]={0}, amix_bb_parent=0;  // TEMP: buf_breakup caller chain (who re-reads init text 179456-179468)
+static uae_u32 amix_oss_chan[16]={0}, amix_oss_caller[16]={0}, amix_oss_tick[16]={0}, amix_oss_stk[16][4]={{0}}; static int amix_oss_valid[16]={0};  // TEMP: outstanding-sleep table (sleep adds, wakeprocs removes) -> the sleep never-woken = init terminal block
+static uae_u32 amix_donebuf[16], amix_donetick[16], amix_donecaller[16]; static int amix_donehead=0;  // TEMP: biodone(bp) buf+tick+caller ring
+static uae_u32 amix_selflink=0, amix_biodone_last=0, amix_biodone_same=0, amix_biodone_maxsame=0;  // TEMP: detect Q1 self-link (bp->av_forw==bp) + repeated same-buf biodone (the write loop)
+static uae_u32 amix_stuckbuf=0, amix_stucktick=0;                                // TEMP: last buf_breakup biowait target
+static uae_u32 amix_pageinbuf=0, amix_pageintick=0;                              // TEMP: last ufs_getapage(0x07082398) biowait buf = the stranded page-in
+static uae_u32 amix_a3091_istate[8]={0,0,0,0,0,0,0,0};                           // TEMP: (unused now) istate histogram
+static uae_u32 amix_issue_buf[16], amix_issue_unit[16], amix_issue_tick[16]; static int amix_issue_h=0;  // TEMP: bufs startany ISSUES (a3) + unit (a4)
+static uae_u32 amix_disp_csr[16], amix_disp_act[16], amix_disp_tick[16]; static int amix_disp_h=0;  // TEMP: a3091intr@0xd142 dispatch (d2=csr, d0=action)
+static uae_u32 amix_disp_acthist[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};  // TEMP: count per dispatched action (action 1 = badhardware = the strand)
+static uae_u32 amix_badhw_n=0, amix_badhw_tick=0;  // TEMP: a3091 badhardware(0x700cf46) hits = completion dispatched with NO biodone
+static int amix_ddcrit=0; static uae_u32 amix_ddstrat_n=0, amix_preempt_n=0, amix_preempt_tick=0;  // TEMP: a3091intr ENTERED during ddstrategy's IPL2 splbio window = the IPL-preemption strand
+static uae_u32 amix_dds_buf[16], amix_dds_valid[16], amix_dds_path[16], amix_dds_tick[16]; static int amix_dds_h=0, amix_dds_cur=-1;  // TEMP: ddstrategy(buf) fate: sdvalid + dispatch path (0=pending 1=startio/dispatch 2=append-no-kick 3=sdvalid-REJECT)
+static uae_u32 amix_dds_reject_n=0, amix_dds_reject_buf=0;  // TEMP: count of sdvalid rejects (ddstrategy drops buf with NO enqueue + NO biodone)
+// PARENT-COMPLETION ACCOUNTING (verdict's experiment): the page-in process biowaits a parent buf woken when a per-parent
+// child-count hits 0. If a child completes WITHOUT decrementing its parent (b_iodone not yet wired = the synchronous-DMA
+// race), the count never hits 0 -> parent never biodone'd -> biowait forever.
+static uae_u32 amix_gio_par[16], amix_gio_cnt[16], amix_gio_child[16]; static int amix_gio_h=0;  // gen_iodone@0x703d940: parent (child->+0x50), count AFTER decrement, child
+static uae_u32 amix_pbio_buf[16]; static int amix_pbio_h=0;          // biodone no-callback (parent/standalone) @0x703ce34: buf set B_DONE+wakeprocs
+static uae_u32 amix_gio_n=0, amix_gio_orphan_n=0, amix_pbio_n=0, amix_cbio_n=0;  // counts: gen_iodone calls, orphan(child->+0x50==0), parent-biodones, child(callback)-biodones
+static uae_u32 amix_bw_buf[8]; static int amix_bw_h=0;               // biowait@0x703cd2c entry: buf a2 (what the page-in process blocks on)
+extern "C" { extern volatile uae_u32 amix_scmd_unit[16],amix_scmd_lba[16],amix_scmd_n[16],amix_scmd_w[16]; extern volatile int amix_scmd_head; }
+extern "C" void a3000_scsi_dumpstate(void);
+extern "C" void a3000_scsi_dumpqueue(void);
+extern "C" { extern volatile uae_u32 amix_wcmd_cmd[16],amix_wcmd_dest[16],amix_wcmd_ph[16]; extern volatile int amix_wcmd_head; }
+extern "C" { extern volatile uae_u32 amix_compl_tick[16],amix_compl_istate[16],amix_compl_csr[16],amix_compl_unit[16],amix_compl_head[16]; extern volatile int amix_compl_h; }
+// ===== STRAND TRACE (TEMP) — per-buf lifecycle to locate where the stranded page-in completion is lost =====
+// stage: 1=ddstrategy entered, 2=startany issued, 3=a3091intr HBA-complete, 4=biodone. ddstrategy(1) RESETS (handles buf-addr reuse).
+// After the strand the system goes idle (no new I/O), so the stranded buf's entry survives = its final stage shows where it stopped.
+#define AMIX_STRK_N 96
+static uae_u32 strk_buf[AMIX_STRK_N]={0}, strk_stg[AMIX_STRK_N]={0};
+static uae_u32 strk_t1[AMIX_STRK_N]={0},strk_t2[AMIX_STRK_N]={0},strk_t3[AMIX_STRK_N]={0},strk_t4[AMIX_STRK_N]={0};
+static uae_u32 strk_ca2=0,strk_ca2_4=0,strk_ca2_1c=0,strk_ca2_20=0;   // a3091intr COMPLETE: resolve a2 = cmd-node vs buf (one sample)
+static uae_u32 amix_done_lba[16]={0}, amix_done_fn[16]={0};   // biodone: buf b_blkno(+0x28) + the TRUE completion fn (iodone's caller, 1 frame up)
+static uae_u32 amix_d16e_n=0;   // a3091intr COMPLETE-arm ENTRY (0x700d16e, the jmp target) hit count — tests jmp-target hook visibility
+static uae_u32 amix_bd_total=0, amix_bd_haveiod=0, amix_bd_shouldcb=0;   // biodone: total, with b_iodone(+48)!=0, with b_iodone&&B_CALL(bit29) [should take callback]
+static uae_u32 amix_bd_iodr[12]={0}, amix_bd_flr[12]={0}, amix_bd_bufr[12]={0}; static int amix_bd_h=0;   // ring of biodones that HAVE a b_iodone
+static uae_u32 amix_pio_su_buf=0, amix_pio_su_iod=0, amix_pio_su_gp=0, amix_pio_su_fl=0, amix_pio_su_n=0;   // ufs_getapage: buf at pageio_setup return (0x70822d8)
+static uae_u32 amix_pio_wt_buf=0, amix_pio_wt_iod=0, amix_pio_wt_gp=0, amix_pio_wt_fl=0, amix_pio_wt_n=0;   // ufs_getapage: buf right before biowait (0x7082390) — stale-at-setup vs set-by-strategy
+static uae_u32 amix_app_n=0, amix_app_drained_n=0, amix_app_ot=0, amix_app_otf=0, amix_app_buf=0, amix_app_tick=0;   // ddstrategy APPEND: count appends onto an already-DRAINED (B_DONE) tail = the IPL2-bypass strand
+static int strk_idx(uae_u32 b){ if(!b) return -1; unsigned h=(b>>4)%AMIX_STRK_N; for(unsigned i=0;i<AMIX_STRK_N;i++){ unsigned j=(h+i)%AMIX_STRK_N; if(strk_buf[j]==b) return (int)j; if(strk_buf[j]==0){ strk_buf[j]=b; return (int)j; } } return -1; }
+static void strk_mk(uae_u32 b,int s,uae_u32 t){ int j=strk_idx(b); if(j<0) return; if(s==1){ strk_stg[j]=1; strk_t1[j]=t; strk_t2[j]=strk_t3[j]=strk_t4[j]=0; } else { if((uae_u32)s>strk_stg[j]) strk_stg[j]=(uae_u32)s; if(s==2)strk_t2[j]=t; else if(s==3)strk_t3[j]=t; else if(s==4)strk_t4[j]=t; } }
 static inline void check_uae_int_request(void)
 {
    z3660_tasks();
    ipl_main_read();
+   // A3000 SCSI WD33C93 interrupt-delay pump: advances the status countdown on a fixed cadence in
+   // EVERY CPU run loop (including the MMU-off loop the Kickstart ROM uses to load the kernel), so the
+   // SELECT and SRV_REQ INT2s stay spaced for AMIX's step-by-step sd open WITHOUT stalling the boot load.
+   if(a3000_amix_mode){ amix_tick++; static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
+   // ===== AMIX sleep-channel + PC sampler (TEMP) — gated behind debug_emu (DEMU) so it is OFF by
+   // default; this per-instruction PC sampling (~40 compares + guest reads) was a real AMIX perf
+   // drain. Turn DEMU on to re-arm it for a3091 work; the dumps need a moment to re-accumulate. =====
+   if(a3000_amix_mode && shared->debug_emu){
+      uae_u32 ipc=(uae_u32)regs.instruction_pc;
+      if(ipc==0x0700BED8u){ amix_ddcrit=1; amix_ddstrat_n++; }   // ddstrategy: just did move.w #$2200,sr (IPL2 splbio) -> enter critical
+      if(ipc==0x0700BF04u){ amix_ddcrit=0; }                       // ddstrategy: move.w d2,sr (splx) -> leave critical
+      if(ipc==0x0700D0E0u && amix_ddcrit){ amix_preempt_n++; amix_preempt_tick=amix_tick; }  // a3091intr ENTERED while ddstrategy holds IPL2 = IPL-preemption violation
+      if(ipc==0x0700D142u){   // a3091intr: d0 = atab[istate*9+itab[csr]] = the dispatched ACTION (just set @0xd13e); d2 = csr
+         int h=amix_disp_h&15; uae_u32 act=(uae_u32)(m68k_dreg(regs,0)&0xff);
+         amix_disp_csr[h]=(uae_u32)(m68k_dreg(regs,2)&0xff); amix_disp_act[h]=act; amix_disp_tick[h]=amix_tick; amix_disp_h++;
+         if(act<16) amix_disp_acthist[act]++;
+      }
+      if(ipc==0x0700D16Eu) amix_d16e_n++;   // a3091intr COMPLETE-arm entry (the jmp target) — does a jmp-target PC-hook fire? (0x700d17e never did)
+      if(ipc==0x070822D8u){ uae_u32 b=(uae_u32)m68k_areg(regs,0); amix_pio_su_buf=b; amix_pio_su_iod=amix_kget2(b+0x48u); amix_pio_su_gp=amix_kget2(b+0x50u); amix_pio_su_fl=amix_kget2(b+0x0u); amix_pio_su_n++; }   // ufs_getapage: pageio_setup just returned buf=a0
+      if(ipc==0x07082390u){ uae_u32 b=(uae_u32)m68k_areg(regs,2); amix_pio_wt_buf=b; amix_pio_wt_iod=amix_kget2(b+0x48u); amix_pio_wt_gp=amix_kget2(b+0x50u); amix_pio_wt_fl=amix_kget2(b+0x0u); amix_pio_wt_n++; }   // ufs_getapage: about to biowait(a2)
+      if(ipc==0x0700CF46u){ amix_badhw_n++; amix_badhw_tick=amix_tick; }   // badhardware: a completion that biodones NOTHING
+      if(ipc==0x0700BE9Au){   // ddstrategy: d0 = sdvalid() result (tst.b d0 next), a2 = buf. Records EVERY ddstrategy call's fate.
+         int h=amix_dds_h&15; amix_dds_buf[h]=(uae_u32)m68k_areg(regs,2);
+         uae_u32 v=(uae_u32)(m68k_dreg(regs,0)&0xff); amix_dds_valid[h]=v; amix_dds_path[h]=v?0:3; amix_dds_tick[h]=amix_tick;
+         amix_dds_cur=h; amix_dds_h++; strk_mk((uae_u32)m68k_areg(regs,2),1,amix_tick);   // STRK stage1: ddstrategy entered (resets buf entry)
+         if(!v){ amix_dds_reject_n++; amix_dds_reject_buf=(uae_u32)m68k_areg(regs,2); }   // sdvalid REJECT: dropped with no enqueue, no biodone
+      }
+      if(ipc==0x0700BEFCu && amix_dds_cur>=0){ amix_dds_path[amix_dds_cur]=1; }   // startio: DDTAB was empty -> dispatched
+      if(ipc==0x0700BEE4u){   // ddstrategy APPEND (a0=old TAIL, a2=buf): DDTAB non-empty -> appended, relies on in-flight completion to re-kick
+         if(amix_dds_cur>=0) amix_dds_path[amix_dds_cur]=2;
+         amix_app_n++;
+         uae_u32 ot=(uae_u32)m68k_areg(regs,0), otf=amix_kget2(ot);
+         if(otf&2u){ amix_app_drained_n++; amix_app_ot=ot; amix_app_otf=otf; amix_app_buf=(uae_u32)m68k_areg(regs,2); amix_app_tick=amix_tick; }   // appended onto an ALREADY-DRAINED (B_DONE) tail = the IPL2-bypass strand
+      }
+      // --- PARENT-COMPLETION accounting (verdict's experiment) ---
+      if(ipc==0x0703D8D6u){   // gen_iodone entry: a0 = child buf; child->+0x50 = parent (0 = orphan = lost decrement)
+         amix_gio_n++; if(amix_kget2((uae_u32)m68k_areg(regs,0)+0x50u)==0) amix_gio_orphan_n++;
+      }
+      if(ipc==0x0703D940u){   // gen_iodone: just did subq.l #1,$54(a2); a2 = parent, a0 = child. Count AFTER decrement.
+         int h=amix_gio_h&15; amix_gio_par[h]=(uae_u32)m68k_areg(regs,2); amix_gio_child[h]=(uae_u32)m68k_areg(regs,0);
+         amix_gio_cnt[h]=amix_kget2((uae_u32)m68k_areg(regs,2)+0x54u); amix_gio_h++;
+      }
+      if(ipc==0x0703CE28u){ amix_cbio_n++; }   // biodone: child path (b_iodone callback = gen_iodone) -> decrements a parent
+      if(ipc==0x0703CE34u){   // biodone: no-callback path -> set B_DONE + (if sync) wakeprocs. This is a parent/standalone buf.
+         amix_pbio_n++; int h=amix_pbio_h&15; amix_pbio_buf[h]=(uae_u32)m68k_areg(regs,2); amix_pbio_h++;
+      }
+      if(ipc==0x0703CD34u){   // biowait entry: just did movea.l $8(a6),a2 -> a2 = the buf the page-in process blocks on
+         int h=amix_bw_h&7; amix_bw_buf[h]=(uae_u32)m68k_areg(regs,2); amix_bw_h++;
+      }
+      if(ipc==0x070485F4u){   // sleep(chan,pri): just after 'link.w a6,#0', so caller=(a6+4), chan=(a6+8)
+         uae_u32 a6=(uae_u32)m68k_areg(regs,6);
+         uae_u32 caller=amix_kget2(a6+4);
+         if((caller<0x07059000u||caller>=0x0705A000u) && caller!=0x0703D9F0u){   // skip swapper/sched idle (0x07059xxx) AND buf_breakup (0x0703D9F0) so init's blocking sleep is retained
+            uae_u32 chan=amix_kget2((uae_u32)m68k_areg(regs,7)+4);   // REAL sleep chan (sleep's 1st arg on the stack, a7+4 before its link executes)
+            int sh=amix_slphead&7;
+            amix_slpcaller[sh]=caller;
+            amix_slpchan[sh]=chan;
+            // walk the kernel call stack (a6 frame chain) -> 6 return addrs, to trace init's syscall->sleep path
+            { uae_u32 fp=a6; for(int L=0;L<6;L++){ if(fp<0x07000000u||fp>=0x42000000u){ amix_slpstk[sh][L]=0; continue; }
+                 amix_slpstk[sh][L]=amix_kget2(fp+4); uae_u32 nf=amix_kget2(fp); if(nf<=fp||nf==0) { for(int M=L+1;M<6;M++) amix_slpstk[sh][M]=0; break; } fp=nf; } }
+            amix_slphead++;
+            // outstanding-sleep table: slot by chan, else free, else oldest
+            { int slot=-1; for(int j=0;j<16;j++) if(amix_oss_valid[j]&&amix_oss_chan[j]==chan){slot=j;break;}
+              if(slot<0) for(int j=0;j<16;j++) if(!amix_oss_valid[j]){slot=j;break;}
+              if(slot<0){ uae_u32 mt=0xffffffffu; for(int j=0;j<16;j++) if(amix_oss_tick[j]<=mt){mt=amix_oss_tick[j];slot=j;} }
+              amix_oss_chan[slot]=chan; amix_oss_caller[slot]=caller; amix_oss_tick[slot]=amix_tick; amix_oss_valid[slot]=1;
+              for(int L=0;L<4;L++) amix_oss_stk[slot][L]=amix_slpstk[sh][L]; }
+            if(caller==0x07082398u){ amix_pageinbuf=chan; amix_pageintick=amix_tick; }   // ufs_getapage page-in buf = the stranded read
+         }
+      }
+      if(ipc==0x0703D14Eu){   // buf_breakup entry: a6 not yet linked; arg parent=$c(a7)+? walk RETURN chain via a7 then a6 after link is later. Use a7: ret@a7, caller frame.
+         amix_bb_n++; amix_bb_parent=amix_kget2((uae_u32)m68k_areg(regs,7)+0xc);   // 2nd arg (the parent buf) at a7+0xc (ret@a7, arg1@a7+4=strategy, arg2@a7+8?, parent@a7+c)
+         uae_u32 ra=amix_kget2((uae_u32)m68k_areg(regs,7)); amix_bb_stk[0]=ra;     // immediate caller (gen_strategy)
+         uae_u32 fp=(uae_u32)m68k_areg(regs,6);
+         for(int L=1;L<8;L++){ if(fp<0x07000000u||fp>=0x42000000u){amix_bb_stk[L]=0;continue;} amix_bb_stk[L]=amix_kget2(fp+4); uae_u32 nf=amix_kget2(fp); if(nf<=fp||nf==0){for(int M=L+1;M<8;M++)amix_bb_stk[M]=0;break;} fp=nf; }
+      }
+      // --- SWAP-CONFIG flow trace ---
+      if(ipc==0x070B3FFAu) amix_swapconf_n++;                          // swapconf entry
+      if(ipc==0x070B4028u){ amix_lookupname_n++; amix_lookup_res=(uae_u32)m68k_dreg(regs,0); }   // after lookupname(swap path): d0=result
+      if(ipc==0x070B3114u) amix_swapadd_n++;                           // swapadd entry
+      if(ipc==0x070B3152u) amix_swap_openres=(uae_u32)m68k_dreg(regs,6);   // after VOP_OPEN (spec_open): d6=open result
+      if(ipc==0x070B318Eu){ amix_swap_sizeres=(uae_u32)m68k_dreg(regs,6); amix_swap_devsz=amix_kget2((uae_u32)m68k_areg(regs,6)-0x4cu); }  // after size VOP: d6=result, -0x4c(a6)=devsize
+      if(ipc==0x070488B6u){   // wakeprocs(chan,flag): at entry a7+4 = chan (1st arg, before link). Clear outstanding sleeps on this chan.
+         uae_u32 wc=amix_kget2((uae_u32)m68k_areg(regs,7)+4);
+         for(int j=0;j<16;j++) if(amix_oss_valid[j]&&amix_oss_chan[j]==wc) amix_oss_valid[j]=0;
+      }
+      if(ipc==0x0700BFE8u){   // ihandle: a0 = cmd_node ($8(a6)); REAL completed buf = cmd_node->4; a3 = ddtab.HEAD (the buf ihandle WILL biodone). Bug if completed!=HEAD.
+         uae_u32 cmdnode=(uae_u32)m68k_areg(regs,0), head=(uae_u32)m68k_areg(regs,3);
+         uae_u32 donebuf=amix_kget2(cmdnode+4u);   // CORRECTED: cmd_node->4 = the buf the HBA actually completed
+         amix_ih_n++; amix_ih_ldone=donebuf; amix_ih_lhead=head;
+         if(donebuf!=head){ amix_ih_div++; if(!amix_ih_fdone){ amix_ih_fdone=donebuf; amix_ih_fhead=head; amix_ih_ftick=amix_tick; } }
+      }
+      if(ipc==0x0700D034u){   // startany: a3 = the sc(=bp) it is about to issue, a4 = its unit (regs reliable)
+         int hh=amix_issue_h&15;
+         amix_issue_buf[hh]=(uae_u32)m68k_areg(regs,3); amix_issue_unit[hh]=(uae_u32)m68k_areg(regs,4);
+         amix_issue_tick[hh]=amix_tick; amix_issue_h++; strk_mk((uae_u32)m68k_areg(regs,3),2,amix_tick);   // STRK stage2: startany issue (a3=sc/buf)
+      }
+      if(ipc==0x0700D17Eu){   // a3091intr d16e COMPLETE handler: a2 = curunit->head (buf being biodone'd), a3 = curunitp
+         int hh=amix_compl_h&15;
+         amix_compl_head[hh]=(uae_u32)m68k_areg(regs,2); amix_compl_unit[hh]=(uae_u32)m68k_areg(regs,3);
+         amix_compl_istate[hh]=1; amix_compl_csr[hh]=0x16; amix_compl_tick[hh]=amix_tick; amix_compl_h++;
+         { uae_u32 a2c=(uae_u32)m68k_areg(regs,2);   // STRK: resolve a2 (cmd-node vs buf) + mark stage3 for BOTH a2 and a2->4 (the real buf gets marked)
+           if(!strk_ca2){ strk_ca2=a2c; strk_ca2_4=amix_kget2(a2c+4); strk_ca2_1c=amix_kget2(a2c+0x1c); strk_ca2_20=amix_kget2(a2c+0x20); }
+           strk_mk(a2c,3,amix_tick); strk_mk(amix_kget2(a2c+4),3,amix_tick); }
+      }
+      if(ipc==0x0703CE18u){   // biodone: after 'movea.l $8(a6),a2', a2 = bp (the completing buf); 4(a6) = caller
+         uae_u32 bp=(uae_u32)m68k_areg(regs,2); strk_mk(bp,4,amix_tick);   // STRK stage4: biodone
+         amix_donebuf[amix_donehead&15]=bp;
+         amix_donetick[amix_donehead&15]=amix_tick;
+         amix_donecaller[amix_donehead&15]=amix_kget2((uae_u32)m68k_areg(regs,6)+4);
+         amix_done_lba[amix_donehead&15]=amix_kget2(bp+0x28u);   // b_blkno
+         amix_done_fn[amix_donehead&15]=amix_kget2(amix_kget2((uae_u32)m68k_areg(regs,6))+4u);   // saved-a6 = iodone's frame; +4 = iodone's caller = the REAL completion fn
+         amix_donehead++;
+         { uae_u32 iod=amix_kget2(bp+0x48u), fl=amix_kget2(bp+0x0u);   // b_iodone(+0x48), flags(+0); biodone callback needs iod!=0 && (fl&bit29=B_CALL)
+           amix_bd_total++;
+           if(iod){ amix_bd_haveiod++; int h=amix_bd_h%12; amix_bd_iodr[h]=iod; amix_bd_flr[h]=fl; amix_bd_bufr[h]=bp; amix_bd_h++;
+              if(fl&0x20000000u) amix_bd_shouldcb++; } }
+         { uae_u32 avf=amix_kget2(bp+0xcu); if(bp && avf==bp) amix_selflink++; }   // bp->av_forw(+0xc)==bp = Q1 SELF-LINK
+         if(bp==amix_biodone_last){ amix_biodone_same++; if(amix_biodone_same>amix_biodone_maxsame) amix_biodone_maxsame=amix_biodone_same; }
+         else { amix_biodone_same=0; amix_biodone_last=bp; }
+      }
+      if(ipc==0x0703D1DCu || ipc==0x0703D22Cu){   // buf_breakup 'jsr sleep': a2 = the chunk buf it biowaits on
+         amix_stuckbuf=(uae_u32)m68k_areg(regs,2);
+         amix_stucktick=amix_tick;
+      }
+      static uae_u32 pcc=0; if(shared->debug_emu && (++pcc & 0x3FFFFF)==0){   // [PC]/[SLP] trace behind the DEMU toggle
+         z3660_printf("[PC] %08lX s=%d msk=%d\r\n",(unsigned long)ipc,(int)regs.s,(int)regs.intmask);
+         // when idling in swtch (0x070b90xx), dump the last sleep callers/chans + last SCSI commands
+         if(ipc>=0x070B9000u && ipc<0x070B9300u){
+            for(int k=0;k<8;k++){ int i=(amix_slphead-8+k)&7;
+               z3660_printf("[SLP] caller=%08lX chan=%08lX  stk: %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+                  (unsigned long)amix_slpcaller[i],(unsigned long)amix_slpchan[i],
+                  (unsigned long)amix_slpstk[i][0],(unsigned long)amix_slpstk[i][1],(unsigned long)amix_slpstk[i][2],
+                  (unsigned long)amix_slpstk[i][3],(unsigned long)amix_slpstk[i][4],(unsigned long)amix_slpstk[i][5]); }
+            z3660_printf("[SWAP] swapconf=%lu lookupname=%lu(res=%ld) swapadd=%lu openVOPres=%ld sizeVOPres=%ld devsz=%lu(=%lu blks)\r\n",
+               (unsigned long)amix_swapconf_n,(unsigned long)amix_lookupname_n,(long)(int32_t)amix_lookup_res,(unsigned long)amix_swapadd_n,
+               (long)(int32_t)amix_swap_openres,(long)(int32_t)amix_swap_sizeres,(unsigned long)amix_swap_devsz,(unsigned long)(amix_swap_devsz>>9));
+            z3660_printf("[IHANDLE] calls=%lu  FIFO-divergences(completed!=ddtab.HEAD)=%lu  first: completed=%08lX head=%08lX @tick=%lu  last: completed=%08lX head=%08lX\r\n",
+               (unsigned long)amix_ih_n,(unsigned long)amix_ih_div,(unsigned long)amix_ih_fdone,(unsigned long)amix_ih_fhead,(unsigned long)amix_ih_ftick,(unsigned long)amix_ih_ldone,(unsigned long)amix_ih_lhead);
+            z3660_printf("[OSS] outstanding sleeps (never woken = the terminal block; oldest tick = init's block):\r\n");
+            for(int j=0;j<16;j++) if(amix_oss_valid[j])
+               z3660_printf("  chan=%08lX caller=%08lX tick=%lu  stk: %08lX %08lX %08lX %08lX\r\n",
+                  (unsigned long)amix_oss_chan[j],(unsigned long)amix_oss_caller[j],(unsigned long)amix_oss_tick[j],
+                  (unsigned long)amix_oss_stk[j][0],(unsigned long)amix_oss_stk[j][1],(unsigned long)amix_oss_stk[j][2],(unsigned long)amix_oss_stk[j][3]);
+            z3660_printf("[BBREAK] buf_breakup calls=%lu parent=%08lX  caller-chain: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+               (unsigned long)amix_bb_n,(unsigned long)amix_bb_parent,(unsigned long)amix_bb_stk[0],(unsigned long)amix_bb_stk[1],(unsigned long)amix_bb_stk[2],(unsigned long)amix_bb_stk[3],
+               (unsigned long)amix_bb_stk[4],(unsigned long)amix_bb_stk[5],(unsigned long)amix_bb_stk[6],(unsigned long)amix_bb_stk[7]);
+            { int donefound=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_stuckbuf && amix_stuckbuf){ donefound=(int)amix_donetick[k]; } }
+              z3660_printf("[STUCKBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)  tick_now=%lu\r\n",
+                 (unsigned long)amix_stuckbuf,(unsigned long)amix_stucktick, donefound>=0?"YES":"NO", donefound,(unsigned long)amix_tick);
+              for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15;
+                 z3660_printf("[DONE] buf=%08lX tick=%lu by=%08lX\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_donetick[i],(unsigned long)amix_donecaller[i]); } }
+            { int pf=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_pageinbuf && amix_pageinbuf){ pf=(int)amix_donetick[k]; } }
+              z3660_printf("[PGINBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)\r\n",
+                 (unsigned long)amix_pageinbuf,(unsigned long)amix_pageintick, pf>=0?"YES":"NO", pf); }
+            for(int k=0;k<16;k++){ int i=(amix_issue_h-16+k)&15;
+               z3660_printf("[ISSUE] buf=%08lX unit=%08lX tick=%lu\r\n",(unsigned long)amix_issue_buf[i],(unsigned long)amix_issue_unit[i],(unsigned long)amix_issue_tick[i]); }
+            { int iss=0,cmp=0; for(int k=0;k<16;k++){ if(amix_pageinbuf){ if(amix_issue_buf[k]==amix_pageinbuf) iss=1; if(amix_compl_head[k]==amix_pageinbuf) cmp=1; } }
+              z3660_printf("[PGINTRK] pageinbuf=%08lX in_issue=%d in_compl=%d\r\n",(unsigned long)amix_pageinbuf,iss,cmp); }
+            // [STRK] CORRECTED lifecycle: resolve a3091intr a2 (cmd-node vs buf) + the stranded buf's furthest stage
+            z3660_printf("[STRK] complete a2=%08lX ->4=%08lX ->1c=%08lX ->20=%08lX  (if cmd-node: ->4=buf ->1c=lun ->20=tgt)\r\n",
+               (unsigned long)strk_ca2,(unsigned long)strk_ca2_4,(unsigned long)strk_ca2_1c,(unsigned long)strk_ca2_20);
+            { uae_u32 cand[3]={amix_pageinbuf,amix_stuckbuf,amix_bb_parent}; const char* nm[3]={"pagein","stuckchunk","bbparent"};
+              for(int c=0;c<3;c++){ uae_u32 sb=cand[c]; if(!sb) continue; int sj=-1; for(int i=0;i<AMIX_STRK_N;i++) if(strk_buf[i]==sb){sj=i;break;}
+                if(sj>=0) z3660_printf("[STRK] %s buf=%08lX stage=%lu t1=%lu t2=%lu t3=%lu t4=%lu  (1=ddstrat 2=issue 3=HBAcompl 4=biodone)\r\n",
+                   nm[c],(unsigned long)sb,(unsigned long)strk_stg[sj],(unsigned long)strk_t1[sj],(unsigned long)strk_t2[sj],(unsigned long)strk_t3[sj],(unsigned long)strk_t4[sj]);
+                else z3660_printf("[STRK] %s buf=%08lX NOT-IN-TABLE\r\n",nm[c],(unsigned long)sb); } }
+            // [STRK-SLP] for each recent sleep chan in buf-range: LIVE B_DONE (buf+0 bit1) + [STRK] stage. DECISIVE:
+            //   B_DONE=1 while still slept-on => LOST WAKEUP (or re-fault); B_DONE=0 => lost completion. gencnt>0 => gen-layer child strand.
+            { uae_u32 seen[8]={0}; int ns=0;
+              for(int s=0;s<8;s++){ uae_u32 sb=amix_slpchan[s]; if(sb<0x40000000u||sb>=0x42000000u) continue;
+                int dup=0; for(int q=0;q<ns;q++) if(seen[q]==sb) dup=1; if(dup) continue; if(ns<8) seen[ns++]=sb;
+                int sj=-1; for(int i=0;i<AMIX_STRK_N;i++) if(strk_buf[i]==sb){sj=i;break;}
+                uae_u32 f0=amix_kget2(sb), gp=amix_kget2(sb+0x50), gc=amix_kget2(sb+0x54);
+                z3660_printf("[STRK-SLP] buf=%08lX caller=%08lX B_DONE=%d stage=%ld t1=%lu t4=%lu genpar=%08lX gencnt=%ld\r\n",
+                  (unsigned long)sb,(unsigned long)amix_slpcaller[s],(f0&2)?1:0,(sj>=0?(long)strk_stg[sj]:-1L),
+                  (unsigned long)(sj>=0?strk_t1[sj]:0),(unsigned long)(sj>=0?strk_t4[sj]:0),(unsigned long)gp,(long)(int32_t)gc); } }
+            // [DONE-FN] for each biodone: buf, b_blkno, and the TRUE completion fn (iodone's caller). The fn that repeatedly biodones the wrong buf is the bug site.
+            z3660_printf("[D16E] a3091intr COMPLETE-arm-entry(0x700d16e) hits=%lu  ([DISPACT] COMPLETE=139ish; 0 here => jmp-target PC-hooks are blind)\r\n",(unsigned long)amix_d16e_n);
+            // [BIODONE] do gen children reach biodone with b_iodone(+0x48)+B_CALL(bit29) set? should_callback>0 but cbio(0x703ce28)=0 => the cbio HOOK is blind (children DO callback, guest fine). should_callback==0 => children never biodone'd with the callback (wrong-buf OR cleared flag = the bug). gen_iodone=0x0703D8CC.
+            z3660_printf("[BIODONE] total=%lu have_b_iodone=%lu should_callback(iod&&bit29)=%lu  cbio_hook(0x703ce28)=%lu  gen_iodone=0x0703D8CC\r\n",
+               (unsigned long)amix_bd_total,(unsigned long)amix_bd_haveiod,(unsigned long)amix_bd_shouldcb,(unsigned long)amix_cbio_n);
+            for(int k=0;k<12;k++){ int i=(amix_bd_h-12+k); while(i<0)i+=12; i%=12; if(amix_bd_bufr[i])
+               z3660_printf("[BD] buf=%08lX b_iodone=%08lX flags=%08lX B_CALL=%d\r\n",(unsigned long)amix_bd_bufr[i],(unsigned long)amix_bd_iodr[i],(unsigned long)amix_bd_flr[i],(amix_bd_flr[i]&0x20000000u)?1:0); }
+            // [PIOSU]/[PIOWT] does ufs_getapage's buf have b_iodone(gen_iodone=0703D8CC)+genparent AT pageio_setup return (stale) vs only at biowait (set by the strategy)?
+            z3660_printf("[PIOSU] pageio_setup-ret buf=%08lX b_iodone=%08lX genparent=%08lX flags=%08lX B_CALL=%d n=%lu\r\n",
+               (unsigned long)amix_pio_su_buf,(unsigned long)amix_pio_su_iod,(unsigned long)amix_pio_su_gp,(unsigned long)amix_pio_su_fl,(amix_pio_su_fl&0x20000000u)?1:0,(unsigned long)amix_pio_su_n);
+            z3660_printf("[PIOWT] pre-biowait    buf=%08lX b_iodone=%08lX genparent=%08lX flags=%08lX B_CALL=%d n=%lu\r\n",
+               (unsigned long)amix_pio_wt_buf,(unsigned long)amix_pio_wt_iod,(unsigned long)amix_pio_wt_gp,(unsigned long)amix_pio_wt_fl,(amix_pio_wt_fl&0x20000000u)?1:0,(unsigned long)amix_pio_wt_n);
+            for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15; if(!amix_donebuf[i]) continue;
+               z3660_printf("[DONE-FN] buf=%08lX lba=%lu fn=%08lX (iodone-ret=%08lX)\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_done_lba[i],(unsigned long)amix_done_fn[i],(unsigned long)amix_donecaller[i]); }
+            { uae_u32 seen2[8]={0}; int n2=0;
+              for(int s=0;s<8;s++){ uae_u32 sb=amix_slpchan[s]; if(sb<0x40000000u||sb>=0x42000000u) continue;
+                int dup=0; for(int q=0;q<n2;q++) if(seen2[q]==sb) dup=1; if(dup) continue; if(n2<8) seen2[n2++]=sb;
+                uae_u32 lba=amix_kget2(sb+0x28u); int dl=0; for(int k=0;k<16;k++) if(amix_done_lba[k]==lba && lba) dl=1;
+                z3660_printf("[STRK-LBA] strandbuf=%08lX lba=%lu thatLBA_biodone'd=%d\r\n",(unsigned long)sb,(unsigned long)lba,dl); } }
+            // [APPEND] does any ddstrategy append land on an ALREADY-DRAINED tail? (>0 => the IPL2-bypass strand) + the stranded TAIL's live linkage
+            z3660_printf("[APPEND] total=%lu onto-DRAINED-tail=%lu  last: old_tail=%08lX flags=%08lX buf=%08lX @tick=%lu\r\n",
+               (unsigned long)amix_app_n,(unsigned long)amix_app_drained_n,(unsigned long)amix_app_ot,(unsigned long)amix_app_otf,(unsigned long)amix_app_buf,(unsigned long)amix_app_tick);
+            { uae_u32 tail=amix_kget2(0x070EA8E0u);   // ddtab[tgt6].TAIL (runtime ddtab6=0x070EA8D8, +8=TAIL)
+              z3660_printf("[DDLINK] ddtab6 HEAD=%08lX TAIL=%08lX  TAIL->0(flags)=%08lX B_DONE=%d  TAIL->0xc(next)=%08lX\r\n",
+                 (unsigned long)amix_kget2(0x070EA8DCu),(unsigned long)tail,(unsigned long)amix_kget2(tail),(amix_kget2(tail)&2)?1:0,(unsigned long)amix_kget2(tail+0xcu)); }
+            { int n=0; for(int i=0;i<AMIX_STRK_N&&n<8;i++) if(strk_buf[i]&&strk_stg[i]==3){ z3660_printf("[STRK] s3-only(HBAcompl,NO-biodone) buf=%08lX t1=%lu t3=%lu\r\n",(unsigned long)strk_buf[i],(unsigned long)strk_t1[i],(unsigned long)strk_t3[i]); n++; } }
+            { int n=0; for(int i=0;i<AMIX_STRK_N&&n<8;i++) if(strk_buf[i]&&strk_stg[i]==1){ z3660_printf("[STRK] s1-only(ddstrat,NO-compl) buf=%08lX t1=%lu\r\n",(unsigned long)strk_buf[i],(unsigned long)strk_t1[i]); n++; } }
+            z3660_printf("[LOOP] selflink(bp->av_forw==bp)=%lu maxsame_biodone=%lu last=%08lX\r\n",
+               (unsigned long)amix_selflink,(unsigned long)amix_biodone_maxsame,(unsigned long)amix_biodone_last);
+            // Dump raw buf headers (bufs live at 0x40xxxxxx = MMU section 1, so amix_kget2 reads them reliably).
+            // Reverse-engineer: b_flags (B_DONE/B_READ/B_BUSY/B_ERROR), b_forw/av_forw (0x40xxxxxx links), b_blkno (=an [SDMA] lba).
+            { uae_u32 b=amix_pageinbuf; z3660_printf("[BUFHDR] pagein  %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
+            { uae_u32 b=amix_donebuf[(amix_donehead-1)&15]; z3660_printf("[BUFHDR] lastdone %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
+            for(int k=0;k<16;k++){ int i=(amix_scmd_head-16+k)&15;
+               z3660_printf("[SDMA] %c unit=%lu lba=%lu n=%lu\r\n",amix_scmd_w[i]?'W':'R',
+                  (unsigned long)amix_scmd_unit[i],(unsigned long)amix_scmd_lba[i],(unsigned long)amix_scmd_n[i]); }
+            z3660_printf("[PREEMPT] a3091intr-during-ddstrategy-IPL2 = %lu (last@%lu)  ddstrategy_n=%lu  ddcrit=%d\r\n",
+               (unsigned long)amix_preempt_n,(unsigned long)amix_preempt_tick,(unsigned long)amix_ddstrat_n,amix_ddcrit);
+            z3660_printf("[DDSREJ] sdvalid_reject_n=%lu reject_buf=%08lX   (ddstrategy drops buf with NO enqueue + NO biodone)\r\n",
+               (unsigned long)amix_dds_reject_n,(unsigned long)amix_dds_reject_buf);
+            for(int k=0;k<16;k++){ int i=(amix_dds_h-16+k)&15; const char*pn= amix_dds_path[i]==1?"startio":amix_dds_path[i]==2?"APPEND":amix_dds_path[i]==3?"REJECT":"pending";
+               z3660_printf("[DDS] buf=%08lX valid=%lu path=%s tick=%lu%s%s\r\n",(unsigned long)amix_dds_buf[i],(unsigned long)amix_dds_valid[i],pn,(unsigned long)amix_dds_tick[i],
+                  (amix_dds_buf[i]==amix_pageinbuf&&amix_pageinbuf)?" <==PAGEINBUF":"",(amix_dds_buf[i]==amix_stuckbuf&&amix_stuckbuf)?" <==STUCKBUF":""); }
+            // --- PARENT-COMPLETION accounting dump (verdict's experiment) ---
+            z3660_printf("[GIOCNT] gen_iodone=%lu orphan(child->+0x50==0)=%lu  child-biodone(callback)=%lu  parent-biodone(wakeprocs)=%lu\r\n",
+               (unsigned long)amix_gio_n,(unsigned long)amix_gio_orphan_n,(unsigned long)amix_cbio_n,(unsigned long)amix_pbio_n);
+            for(int k=0;k<16;k++){ int i=(amix_gio_h-16+k)&15; if(!amix_gio_par[i]) continue;
+               z3660_printf("[GIO] parent=%08lX cnt_after=%ld child=%08lX%s\r\n",(unsigned long)amix_gio_par[i],(long)(int32_t)amix_gio_cnt[i],(unsigned long)amix_gio_child[i],
+                  (amix_gio_par[i]==amix_pageinbuf&&amix_pageinbuf)?" <==PAGEINBUF":""); }
+            // For each buf the page-in process blocks on (biowait ring), dump its completion state + whether it was ever
+            // gen_iodone-parent'd / parent-biodone'd. cnt fields: +0x02(word,pageio cnt) +0x54(long,gen cnt); flags long@+0x00,
+            // B_DONE = bit1 of byte@+0x03; b_iodone@+0x48; pageio-parent@+0x4c; gen-parent@+0x50.
+            for(int k=0;k<8;k++){ int i=(amix_bw_h-8+k)&7; uae_u32 b=amix_bw_buf[i]; if(!b) continue;
+               uae_u32 f0=amix_kget2(b), iod=amix_kget2(b+0x48), pp=amix_kget2(b+0x4c), gp=amix_kget2(b+0x50), gc=amix_kget2(b+0x54), pc2=amix_kget2(b+0x00);
+               int bdone=(f0&0x2)?1:0;   // B_DONE = bit1 of the +0x00 long
+               int waspar=0,wasbio=0; for(int j=0;j<16;j++) if(amix_gio_par[j]==b) waspar=1; for(int j=0;j<16;j++) if(amix_pbio_buf[j]==b) wasbio=1;
+               z3660_printf("[PARENT] buf=%08lX flags=%08lX B_DONE=%d b_iodone=%08lX pageioparent(+4c)=%08lX genparent(+50)=%08lX gencnt(+54)=%ld  was_gioparent=%d was_parentbiodone=%d\r\n",
+                  (unsigned long)b,(unsigned long)f0,bdone,(unsigned long)iod,(unsigned long)pp,(unsigned long)gp,(long)(int32_t)gc,waspar,wasbio); (void)pc2; }
+            // --- 030-PMMU demand-paging FAULT tracker (re-fault detector) ---
+            { extern volatile uae_u32 amix_ftot,amix_fsamemax,amix_fsameva,amix_fring_va[16],amix_fring_pc[16],amix_fring_rw[16],amix_fhva[16],amix_fhcnt[16],amix_fhpc[16]; extern volatile int amix_fring_h;
+              z3660_printf("[FAULT] total=%lu  max_consecutive_same_VA=%lu @VA=%08lX\r\n",(unsigned long)amix_ftot,(unsigned long)amix_fsamemax,(unsigned long)amix_fsameva);
+              z3660_printf("[FAULT] last-16 fault VAs (the recent fault sequence -> re-fault if same VA repeats):\r\n");
+              for(int k=0;k<16;k++){ int i=(amix_fring_h-16+k)&15; if(!amix_fring_va[i]&&!amix_fring_pc[i]) continue;
+                 z3660_printf("   va=%08lX pc=%08lX %c\r\n",(unsigned long)amix_fring_va[i],(unsigned long)amix_fring_pc[i],amix_fring_rw[i]?'R':'W'); }
+              z3660_printf("[FAULT] top faulting VAs by count:\r\n");
+              for(int k=0;k<16;k++){ if(amix_fhcnt[k]>1) z3660_printf("   va=%08lX cnt=%lu pc=%08lX\r\n",(unsigned long)amix_fhva[k],(unsigned long)amix_fhcnt[k],(unsigned long)amix_fhpc[k]); } }
+            z3660_printf("[DISPACT] hist: a0(COMPLETE)=%lu a1(BADHW)=%lu a2=%lu a3=%lu a4=%lu a5=%lu a6=%lu a7(DISC)=%lu a8=%lu a9=%lu  badhw_n=%lu@%lu\r\n",
+               (unsigned long)amix_disp_acthist[0],(unsigned long)amix_disp_acthist[1],(unsigned long)amix_disp_acthist[2],
+               (unsigned long)amix_disp_acthist[3],(unsigned long)amix_disp_acthist[4],(unsigned long)amix_disp_acthist[5],
+               (unsigned long)amix_disp_acthist[6],(unsigned long)amix_disp_acthist[7],(unsigned long)amix_disp_acthist[8],
+               (unsigned long)amix_disp_acthist[9],(unsigned long)amix_badhw_n,(unsigned long)amix_badhw_tick);
+            for(int k=0;k<16;k++){ int i=(amix_disp_h-16+k)&15;
+               z3660_printf("[DISP] csr=%02lX act=%lu tick=%lu\r\n",(unsigned long)amix_disp_csr[i],(unsigned long)amix_disp_act[i],(unsigned long)amix_disp_tick[i]); }
+            a3000_scsi_dumpstate();   // why isn't the SCSI INT2 firing at the stall?
+            a3000_scsi_dumpqueue();   // dump the guest a3091 queue (istate/curunitp/units6 chain) directly
+            for(int k=0;k<16;k++){ int i=(amix_wcmd_head-16+k)&15;
+               z3660_printf("[WCMD] cmd=%02lX dest=%lu ph=%02lX\r\n",(unsigned long)amix_wcmd_cmd[i],
+                  (unsigned long)amix_wcmd_dest[i],(unsigned long)amix_wcmd_ph[i]); }
+         }
+      }
+   }
 #if INT_IPL_ON_THIS_CORE == 0
    if(shared->int_available)
    {
       shared->int_available=0;
       read_irq=shared->irq;
-      if(read_irq>regs.intmask || read_irq==7)
+      // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); gate on
+      // the effective level so a freshly-asserted SCSI INT2 latches SPCFLAG_DOINT.
+      int eff_irq=intlev();
+      if(eff_irq>regs.intmask || eff_irq==7)
          set_special(SPCFLAG_DOINT);
    }
 #else
-   if(read_irq>regs.intmask || read_irq==7)
+   // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); must gate on
+   // the effective level, not the bare physical read_irq, or the SCSI INT2 never latches.
+   int eff_irq=intlev();
+   if(eff_irq>regs.intmask || eff_irq==7)
    {
       set_special(SPCFLAG_DOINT);
       if(pissoff_int!=0)
@@ -2561,6 +3038,7 @@ static inline void check_uae_int_request(void)
       addrbank *ab;
 
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       ovl=1;
       m68k_reset_newcpu(1);
@@ -3793,6 +4271,254 @@ static void m68k_run_2_020(void)
    }
 }
 
+// UAE_030_MMU run loop. Fetches opcodes through the MMU (x_prefetch =
+// get_iword_mmu030) and dispatches the fault-restartable cpuemu_32 handlers
+// (op_smalltbl_32_ff). Adapted from WinUAE 4.4.0 m68k_run_mmu030 for the Z3660
+// (non-cycle-exact, non-compatible). On a page fault the cpummu030 engine THROWs;
+// we restore flags, build the 030 bus-error frame via Exception() and resume.
+// Instruction-START pc, saved each instruction before any handler runs. Several cpuemu_32 write handlers
+// (MOVES and regular (An)+/-(An) moves) advance the pc and overwrite regs.instruction_pc BEFORE the
+// faulting store; on a demand-page fault the CATCH below must build the 030 bus-error frame with the
+// instruction-START pc so the RTE/re-run restarts the whole instruction. Read-side and prefetch faults
+// already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
+uaecptr mmu030_insn_start_pc;   // not static: m68k_do_rte_mmu030() re-points it before its retry-access
+
+// ===== wip-030-mmu-buserror: catch the corruptor of the AMIX user-PC wild-jump =====
+// Symptom: under a fork/exec storm a freshly-exec'd USER process (AMIX user base 0x80000000;
+// e.g. in.telnetd entry 0x80001520) has its PC silently set to a kernel/low-region address
+// (observed CONSTANT 0x080012A0); the next instruction fetch faults and AMIX prints
+// "User BUS ERROR at <pc>, PC:<pc> FAULT:6". The corruption is UPSTREAM of the fault -- some
+// already-retired instruction (rts/jmp/jsr/rte/movem) wrote the bad value into the user PC.
+// Catch it: ring-buffer the last AMIX_RRING retired instructions and, the instant we are about
+// to fetch from a wild USER pc, dump the ring + register file ONCE. AMIX-gated, ~5 stores/insn,
+// one-shot serial -> negligible timing shift (and the bug repros ~100% under the storm anyway).
+extern "C" { extern volatile int amix_mmu_on; }
+// RTE-frame ring captured in cpummu030.cpp's m68k_do_rte_mmu030 (see there).
+extern "C" {
+extern volatile uae_u32 amix_rte_a7[16], amix_rte_pc[16], amix_rte_oc[16], amix_rte_fault[16];
+extern volatile uae_u32 amix_rte_ssw[16], amix_rte_frame[16], amix_rte_h;
+extern volatile int amix_wild_rte_pending; extern volatile uae_u32 amix_wild_rte_pc;
+}
+#define AMIX_RRING 32
+static uae_u32 amix_rring_pc[AMIX_RRING];   // retired instruction's start PC
+static uae_u16 amix_rring_op[AMIX_RRING];   // its opcode word
+static uae_u32 amix_rring_npc[AMIX_RRING];  // PC after it retired (= branch target for control transfers)
+static uae_u8  amix_rring_s[AMIX_RRING];    // supervisor flag at retire
+static uae_u32 amix_rring_h = 0;            // ring head (next slot to write)
+static int     amix_wild_latched = 0;       // one-shot dump guard
+
+static void amix_dump_wild(uae_u32 wildpc)
+{
+   z3660_printf("\r\n[WILD] AMIX user PC went wild: PC=%08lX  (user-mode ifetch below user-base 0x80000000 -> jumped into kernel/low region)\r\n",
+                (unsigned long)wildpc);
+   z3660_printf("[WILD] D0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[0],(unsigned long)regs.regs[1],(unsigned long)regs.regs[2],(unsigned long)regs.regs[3],
+      (unsigned long)regs.regs[4],(unsigned long)regs.regs[5],(unsigned long)regs.regs[6],(unsigned long)regs.regs[7]);
+   z3660_printf("[WILD] A0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[8],(unsigned long)regs.regs[9],(unsigned long)regs.regs[10],(unsigned long)regs.regs[11],
+      (unsigned long)regs.regs[12],(unsigned long)regs.regs[13],(unsigned long)regs.regs[14],(unsigned long)regs.regs[15]);
+   z3660_printf("[WILD] usp=%08lX isp=%08lX  s=%d intmask=%d sfc=%lu dfc=%lu vbr=%08lX\r\n",
+      (unsigned long)regs.usp,(unsigned long)regs.isp,(int)regs.s,(int)regs.intmask,
+      (unsigned long)regs.sfc,(unsigned long)regs.dfc,(unsigned long)regs.vbr);
+   z3660_printf("[WILD] last %d retired insns (oldest first):  startpc   op    -> nextpc    [s]\r\n", AMIX_RRING);
+   for (int i = 0; i < AMIX_RRING; i++) {
+      uae_u32 idx = (amix_rring_h + (uae_u32)i) & (AMIX_RRING - 1);
+      if (amix_rring_pc[idx] == 0 && amix_rring_npc[idx] == 0) continue;   // unused slot
+      z3660_printf("[WILD]  %08lX  %04X  -> %08lX  [%d]%s\r\n",
+         (unsigned long)amix_rring_pc[idx], (unsigned)amix_rring_op[idx], (unsigned long)amix_rring_npc[idx],
+         (int)amix_rring_s[idx], (amix_rring_npc[idx] == wildpc) ? "   <== CORRUPTOR" : "");
+   }
+   z3660_printf("[WILD] last 16 RTE-frame resumes (oldest first):  a7        pc        frame oc        ssw   fault\r\n");
+   for (int i = 0; i < 16; i++) {
+      uae_u32 idx = (amix_rte_h + (uae_u32)i) & 15;
+      if (amix_rte_a7[idx] == 0 && amix_rte_pc[idx] == 0) continue;
+      z3660_printf("[WILD]  %08lX  %08lX  %04lX  %08lX  %04lX  %08lX%s\r\n",
+         (unsigned long)amix_rte_a7[idx], (unsigned long)amix_rte_pc[idx], (unsigned long)amix_rte_frame[idx],
+         (unsigned long)amix_rte_oc[idx], (unsigned long)amix_rte_ssw[idx], (unsigned long)amix_rte_fault[idx],
+         (amix_rte_pc[idx] == wildpc) ? "   <== popped the wild PC" : "");
+   }
+   z3660_printf("[WILD] (one-shot latched; resets on reboot)\r\n\r\n");
+}
+
+// ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
+#include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
+static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
+static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
+static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
+{
+   int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // pick up the runtime knob (SERV)
+   static uae_u64 lastcnt = 0; static XTime last = 0;
+   XTime now; XTime_GetTime(&now);
+   XTime el = now - last;
+   if(el >= (XTime)COUNTS_PER_SECOND){           // ~1 Hz window
+      if(shared->perf_report && last != 0){
+         uae_u64 di = z3660_perf_count - lastcnt;
+         uint32_t kips = (uint32_t)(di * (uae_u64)COUNTS_PER_SECOND / (uae_u64)el / 1000u);
+         z3660_printf("[PERF] ~%lu kIPS (uncalibrated, use as relative) cadence=%d\r\n",(unsigned long)kips, z3660_service_cadence);
+      }
+      lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
+   }
+}
+
+static void m68k_run_mmu030(void)
+{
+   struct flag_struct f;
+   int halt = 0;
+
+   mmu030_opcode_stageb = -1;
+   mmu030_fake_prefetch = -1;
+   while (!halt) {
+      TRY(prb) {
+         for (;;) {
+            int cnt;
+insretry:
+            regs.instruction_pc = m68k_getpc();
+            mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
+            // wip-030-mmu-buserror: about to fetch from a wild USER pc (user mode + PC below the AMIX
+            // user base 0x80000000 = jumped into the kernel/low region). Dump the corruptor once,
+            // BEFORE the fetch faults, so the retired-insn ring still holds the instruction that did it.
+            if (amix_mmu_on && !regs.s && regs.instruction_pc < 0x80000000u && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild((uae_u32)regs.instruction_pc);
+            }
+            // RTE-source detector (any target mode): an RTE popped a wild PC -> dump at the source.
+            if (amix_wild_rte_pending && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild(amix_wild_rte_pc);
+            }
+            amix_wild_rte_pending = 0;
+            f = regs.ccrflags;
+
+            mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+            mmu030_opcode = -1;
+            if (mmu030_opcode_stageb < 0) {
+               regs.opcode = x_prefetch(0);
+            } else {
+               regs.opcode = mmu030_opcode_stageb;
+               mmu030_opcode_stageb = -1;
+            }
+            mmu030_opcode = regs.opcode;
+            mmu030_idx_done = 0;
+
+            cnt = 50;
+            for (;;) {
+               regs.opcode = regs.irc = mmu030_opcode;
+               mmu030_idx = 0;
+               mmu030_retry = false;
+
+               count_instr(regs.opcode);
+               do_cycles(cpu_cycles);
+               cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+
+               cnt--; // don't loop forever if things go wrong
+               if (!mmu030_retry)
+                  break;
+               if (cnt < 0) {
+                  cpu_halt(CPU_HALT_CPU_STUCK);
+                  break;
+               }
+               if (mmu030_retry && mmu030_opcode == -1)
+                  goto insretry;
+               // FIX (wip-030-mmu-buserror): a continuation resume — m68k_do_rte_mmu030 replaying a
+               // faulted instruction from its 030 bus-error frame (frame $A/$B), or a sub-access
+               // continue — re-runs the instruction at its OWN pc, which m68k_setpci(pc) has just set.
+               // Re-snapshot the instruction-start pc here so that if the RESUMED instruction faults
+               // AGAIN (e.g. MOVEM.L <regs>,-(SP) crossing into the next not-yet-resident user-stack
+               // page) the CATCH below builds the new bus-error frame from the resumed instruction's
+               // pc — NOT the stale outer-loop pc (the kernel's RTE epilogue). With the stale pc, the
+               // rebuilt frame carried a kernel pc; the next RTE then resumed the user process there in
+               // user mode -> wild PC -> "User BUS ERROR" (cron/in.telnetd etc.). For the common
+               // same-pc sub-access continue this is a no-op (m68k_getpc() == the current snapshot).
+               regs.instruction_pc = mmu030_insn_start_pc = m68k_getpc();
+            }
+
+            // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the
+            // PC it left behind = branch target for control transfers) so the wild-PC detector above
+            // can show what corrupted the user PC. AMIX-gated; mmu030_opcode still holds the opcode here.
+            if (amix_mmu_on) {
+               uae_u32 h = amix_rring_h & (AMIX_RRING - 1);
+               amix_rring_pc[h]  = (uae_u32)mmu030_insn_start_pc;
+               amix_rring_op[h]  = (uae_u16)mmu030_opcode;
+               amix_rring_npc[h] = (uae_u32)m68k_getpc();
+               amix_rring_s[h]   = (uae_u8)regs.s;
+               amix_rring_h++;
+            }
+
+            mmu030_opcode = -1;
+            cpu_cycles = adjust_cycles(cpu_cycles);
+            // perf investigation: instruction-rate benchmark + tunable IPL/cross-core poll cadence.
+            // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
+            // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
+            // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
+            z3660_perf_count++;
+            if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();
+            { static int serv_ctr = 0;
+              if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } }
+            if (regs.spcflags) {
+               if (do_specialties(cpu_cycles))
+                  return;
+            }
+         }
+      } CATCH(prb) {
+         bool lastwrite_norestart = false;
+         if (mmu030_opcode == -1) {
+            // fault during opcode prefetch
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
+            // Frame-$A (last-write) fault. Distinguish by whether the instruction's handler already
+            // ADVANCED the PC past itself before the faulting store (2026-06-15 gated fix, audit-refined):
+            //  * Handler ADVANCED the PC (regs.instruction_pc != insn-start): every RMW + plain-store
+            //    handler does `regs.instruction_pc = m68k_getpci()` before the put. The single buffered
+            //    store is replayed by m68k_do_rte_mmu030 and execution resumes at the NEXT instruction --
+            //    do NOT restart. Re-executing would re-READ a just-replayed value and DOUBLE a
+            //    read-modify-write: this is the addq #1,abs (ttymon counter 0->2 -> getty SIGBUS) AND
+            //    the addq #1,(a0)+ / bset #n,(a0)+ etc. case (audit "rmw-with-an"/"misaligned", HIGH).
+            //    Any (An)+/-(An) the handler applied STAYS applied (correct; no rollback) -- the store
+            //    replays to the saved fault address.
+            //  * Handler did NOT advance the PC (== insn-start): the fork's MOVES (An)/(An)+ move
+            //    handlers leave PC at the start. These RESTART the whole instruction, so roll the
+            //    auto-modified An back to its pre-increment value first -- else the re-run writes the
+            //    source longword to dest+size, DUPLICATING it (init icode copyout -> execve EFAULT ->
+            //    hang at 0x80800010). Guard the 2nd rollback against a same-register dual-autoinc move
+            //    (move (a0)+,(a0)+): mmufixup[0] holds the TRUE pre-instruction value (audit
+            //    "an-moves-regular", MEDIUM). The MOVES opcode (0x0Exx) is forced to restart belt-and-
+            //    suspenders in case a MOVES variant advances the PC.
+            if (regs.instruction_pc != mmu030_insn_start_pc
+                  && (mmu030_opcode & 0xFF00) != 0x0E00 /* never no-restart a MOVES */) {
+               lastwrite_norestart = true;   // PC already past the insn: replay-only, do not re-execute
+            } else {
+               if (mmufixup[0].reg >= 0)
+                  m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value;
+               if (mmufixup[1].reg >= 0
+                     && (mmufixup[0].reg < 0 || (mmufixup[1].reg & 7) != (mmufixup[0].reg & 7)))
+                  m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value;
+            }
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else {
+            regs.ccrflags = f;
+            cpu_restore_fixup();
+         }
+         // Frame-$B / prefetch / read faults RESTART the whole instruction -> rebuild the bus-error
+         // frame from the instruction-START pc. Same for a MOVES / (An)+ LASTWRITE write (case 1 above:
+         // rolled-back An + restart). ONLY a no-(An) same-address RMW LASTWRITE (case 2) keeps the
+         // handler-advanced PC so RTE resumes at the NEXT instruction (rewinding re-executed the RMW
+         // -> the addq 0->2 double that crashed ttymon/getty).
+         if (!lastwrite_norestart)
+            regs.instruction_pc = mmu030_insn_start_pc;
+         m68k_setpci(regs.instruction_pc);
+         TRY(prb2) {
+            Exception(prb);
+         } CATCH(prb2) {
+            // Fault while building the bus-error frame == double fault.
+            halt = CPU_HALT_BUS_ERROR_DOUBLE_FAULT;
+         } ENDTRY
+      } ENDTRY
+   }
+   cpu_halt(halt);
+}
+
 static int in_m68k_go = 0;
 
 static bool cpu_hardreset, cpu_keyboardreset;
@@ -4000,7 +4726,9 @@ void m68k_go (int may_quit)
          }
       }
 
-      run_func = currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
+      run_func =
+         currprefs.mmu_model == 68030 ? m68k_run_mmu030 :   // UAE_030_MMU
+         currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
          currprefs.cpu_compatible && currprefs.cpu_model <= 68010 ? m68k_run_1 :
 #ifdef JIT
          currprefs.cpu_model >= 68020 && currprefs.cachesize ? m68k_run_jit :
@@ -4629,6 +5357,40 @@ bool cpureset (void)
       custom_reset_cpu(false, false);
       return false;
    }
+
+   if (currprefs.mmu_model != 68030) {
+      /* Non-AMIX modes: verbatim upstream reset/jmp-(ax) path (merge-base 159b3b5).
+       * The full clean reset below is needed only for the real 030 PMMU (UAE_030_MMU),
+       * whose stale page tables / AMIX-cleared overlay would otherwise wreck a warm
+       * reboot.  Every other emulator mode keeps the original Z3660 behaviour. */
+      pc = m68k_getpc () + 2;
+      ab = &get_mem_bank (pc);
+      if (ab->check (pc, 2)) {
+         write_log (_T("CPU reset PC=%x\n"), pc - 2);
+         ins = get_word (pc);
+         custom_reset_cpu(false, false);
+         m68k_setpc_normal (ksboot);
+         cpu_emulator_reset_core0();
+         reset_autoconfig();
+         if ((ins & ~7) == 0x4ed0) {
+            int reg = ins & 7;
+            uae_u32 addr = m68k_areg (regs, reg);
+            if (addr < 0x80000)
+               addr += 0xf80000;
+            write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
+            m68k_setpc_normal (addr +2 - 2);
+            return false;
+         }
+      }
+      write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
+      custom_reset_cpu(false, false);
+      m68k_setpc_normal (ksboot);
+      cpu_emulator_reset_core0();
+      reset_autoconfig();
+      return false;
+   }
+
+   /* AMIX / UAE_030_MMU: full clean reset (overlay restore + m68k_reset_newcpu). */
    pc = m68k_getpc () + 2;
 
     ab = &get_mem_bank (pc);
@@ -4637,29 +5399,31 @@ bool cpureset (void)
       write_log (_T("CPU reset PC=%x\n"), pc - 2);
 
       ins = get_word (pc);
+      (void)ins; /* reset/jmp PC-hack removed below: do a full clean reset instead */
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       cpu_emulator_reset_core0();
+      /* The old reset/jmp PC-hack left the 68k mid-vector (0xF80002) with stale
+       * SR/SSP/MMU, so AMIX's warm (uadmin) reboot never actually restarted
+       * Kickstart -- only the EXTER storm (now fixed) had masked it.  Do the same
+       * full CPU reset the cold-boot and n040RSTI paths use: overlay ROM at 0
+       * (ovl=1, which AMIX had cleared) so get_long(4) returns the real reset
+       * vector, then m68k_reset_newcpu(1) sets PC=0xF800D2, SSP, SR(intmask=7),
+       * and resets MMU/caches. */
+      ovl = 1;
+      m68k_reset_newcpu(1);
       reset_autoconfig();
-      // did memory disappear under us?
-//      if (ab == &get_mem_bank (pc))
-//         return false;
-      // it did
-      if ((ins & ~7) == 0x4ed0) {
-         int reg = ins & 7;
-         uae_u32 addr = m68k_areg (regs, reg);
-         if (addr < 0x80000)
-            addr += 0xf80000;
-         write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
-         m68k_setpc_normal (addr +2 - 2);
-//         reset_loop_counter++;
-//         if(reset_loop_counter>=5)
-//         {
-//        	 printf("Emulator reset loop detected -> Hard reboot\n");
-//        	 hard_reboot();
-//         }
-         return false;
-      }
+      /* Pre-compensate for the caller's trailing m68k_incpc(2): the RESET opcode
+       * handler (op_4e70_*) does `cpureset(); m68k_incpc(2);`, unconditionally
+       * advancing PC by 2 after we return.  Leave PC at (reset PC - 2) so the +2
+       * restores Kickstart's entry 0xF800D2.  (The n040RSTI path has no trailing
+       * +2, hence it doesn't need this.) */
+      m68k_setpc_normal (m68k_getpc () - 2);
+      fill_prefetch_quick ();
+      set_cycles (start_cycles);
+      regs.stopped = false;
+      return false;
    }
 
    // the best we can do, jump directly to ROM entrypoint
@@ -4668,9 +5432,17 @@ bool cpureset (void)
 
    write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
    custom_reset_cpu(false, false);
+   z3660_quiesce_real_chipset_on_reset();
    m68k_setpc_normal (ksboot);
    cpu_emulator_reset_core0();
+   /* full clean reset, same as the main branch (see comments there) */
+   ovl = 1;
+   m68k_reset_newcpu(1);
    reset_autoconfig();
+   m68k_setpc_normal (m68k_getpc () - 2);
+   fill_prefetch_quick ();
+   set_cycles (start_cycles);
+   regs.stopped = false;
    return false;
 }
 

@@ -55,6 +55,9 @@ void init_shared(void)
    shared->nops_write=DEFAULT_NOPS_WRITE;
    shared->nops_read=DEFAULT_NOPS_READ;
 }
+/* Emulator-core debug spam gate (DEMU menu toggle). Accessor so the uae files
+ * (newcpu.cpp / cpummu030.cpp) can check it without pulling in the SHARED struct. */
+extern "C" int z3660_dbg_emu(void){ return shared ? (int)shared->debug_emu : 0; }
 XGpioPs GpioPs;
 XGpioPs_Config *GpioPsConfigPtr;
 /*
@@ -79,9 +82,18 @@ extern "C" void load_romext(void)
    printf("load romext emu %d\n",shared->load_romext_emu);
 }
 int read_irq=0;
+// AMIX A3000 SCSI: software-injected level-2 (Amiga INT2 / PORTS) for the
+// emulated WD33C93+SuperDMAC. Holds the asserted level (0 or 2). Written by
+// a3000_scsi.cpp (recomputed from SDMAC CNTR.INTEN && WD ASR_INT). It is a pure
+// software IPL into THIS core's CPU emulation, NOT the physical FPGA INT6 path
+// (amiga_interrupt_set), which is the wrong level and wrong route for A3000 SCSI.
+volatile int a3000_scsi_irq=0;
 extern "C" int intlev(void)
 {
-   return(read_irq);
+   int level=read_irq;
+   if(a3000_scsi_irq>level) // OR-in the emulated A3000 SCSI INT2 (max with physical IPL)
+      level=a3000_scsi_irq;
+   return(level);
 }
 #define NOP asm(" nop")
 
@@ -720,6 +732,10 @@ int main()
          {
             uae_emulator(1,68040);
          }
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
          else if(shared->cfg_emu==MUSASHI)
          {
             musashi_emulator();
@@ -743,9 +759,18 @@ int main()
          {
             uae_emulator(0,68040);
          }
-         else// if(shared->cfg_emu==UAEJIT_040)
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAEJIT_040)
          {
             uae_emulator(1,68040);
+         }
+         else // decision #8: was a bare 'else' meaning UAEJIT_040 -- an unknown
+         {    // mode silently booted JIT-040. Halt loudly instead.
+            z3660_printf("[Core1] No emulator selected!!!\nHALT!!!\n");
+            while(1);
          }
 #endif
 #else
