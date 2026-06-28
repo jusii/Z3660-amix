@@ -253,18 +253,36 @@ extern "C" { volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_c
 
 /* per-unit geometry cache (lazy cross-core fetch) */
 static struct { int valid, present; uae_u32 nblocks, bsize, cyls, heads, secs; } geo[8];
+static int amix_id6_drv = -1;   // cached id-6 -> backend-drive decision (see drvnum_for_target); reset each boot
 
 static void a3000_recompute_irq(void);
 
 /* ===================== cross-core disk backend (core0) ===================== */
 
-/* AMIX's kernel sd-driver opens its root disk at SCSI target id 6 (matches the working Amiberry
- * "scsi6_a3000" install — the AMIX root device is baked to controller 0 / target 6). The Z3660
- * config maps Amix.hdf to PISCSI drive 0, so the disk answers the Kickstart ROM autoboot at id 0
- * but AMIX's id-6 SELECT times out (CSR_TIMEOUT) -> s5mountroot VOP_OPEN EIO. Alias SCSI id 6 ->
- * PISCSI drive 0 so the SAME disk also answers at id 6: the ROM keeps booting via id 0 and AMIX
- * mounts root via id 6. AMIX-mode only; the geo[] cache stays indexed by the SCSI target id. */
-static int drvnum_for_target(int unit) { return (a3000_amix_mode && unit == 6) ? 0 : unit; }
+/* AMIX's kernel sd-driver opens its root disk at SCSI target id 6 (the AMIX root device is baked to
+ * controller 0 / target 6). Normally SCSI id N maps to PISCSI backend drive N (devs[N], populated from
+ * config.scsi_num[N]). For AMIX id 6 we PREFER the real id-6 backend when it exists (scsi6 -> Amix.hdf
+ * in devs[6]) so id 6 is a genuine, RDB-readable, Kickstart-bootable target -- this is what lets AMIX
+ * autoboot from id 6 ALONE (the Kickstart 3.1 RDB scan is ID-agnostic; it boots by BootPri, not id).
+ * Only when no id-6 backend exists (legacy configs with Amix.hdf on scsi0/devs[0] only) do we fall back
+ * to the old id-6 -> drive-0 alias, so those installs don't regress (their id-6 root-mount still lands on
+ * the disk). Decided once per boot (drvnum_for_target is also on the hot READ/WRITE path); amix_id6_drv
+ * is reset in a3000_scsi_init so a reconfigured reset re-probes. AMIX-mode only; legacy non-AMIX
+ * UAE_030_MMU keeps the plain identity map. */
+static int backend_drive_present(int drv)   // cross-core DRVNUM+DRVTYPE probe: does this PISCSI drive hold a disk?
+{
+   write_scsi_register(PISCSI_CMD_DRVNUM, drv, 2);
+   return read_scsi_register(PISCSI_CMD_DRVTYPE, 2) ? 1 : 0;
+}
+static int drvnum_for_target(int unit)
+{
+   if (a3000_amix_mode && unit == 6) {
+      if (amix_id6_drv < 0)
+         amix_id6_drv = backend_drive_present(6) ? 6 : 0;   // prefer the real id-6 disk; else legacy drive-0
+      return amix_id6_drv;
+   }
+   return unit;
+}
 
 static void fetch_geometry(int unit)
 {
@@ -1555,6 +1573,7 @@ void a3000_scsi_init(void)
    memset(&sd, 0, sizeof sd);
    memset(&cur, 0, sizeof cur);
    for (int i = 0; i < 8; i++) geo[i].valid = 0;
+   amix_id6_drv = -1;   // re-probe the id-6 backend mapping after a (possibly reconfigured) reset
    sense_key = sense_asc = sense_ascq = 0;
    a3000_scsi_irq = 0;
    a3000_amix_mode = 1;
