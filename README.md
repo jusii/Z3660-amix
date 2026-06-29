@@ -13,6 +13,8 @@
 > - **Emulated A3000 SCSI** — AMIX's kernel bootstrap path (SuperDMAC + WD33C93).
 > - **New config knobs** — `amix_mode` (AMIX memory contract) and `service_cadence` (emulator
 >   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating.
+> - **Guest-side AMIX drivers** — `amix-z3660scsi` / `amix-z3660net` (SCSI + ethernet inside AMIX)
+>   live in the companion **[amix-kerntools](https://github.com/jusii/amix-kerntools)** repo.
 >
 > ### Quick start — try a pre-built firmware
 > 1. Download `BOOT.BIN` from this repo's **Releases** (no build needed).
