@@ -62,6 +62,10 @@ static uint32_t t_ps_last=0, t_chip_last=0, t_cia_last=0, t_cust_last=0, t_oth_l
 #define PISCSI_CMD_READ_ADDR2   0x24   /* -> piscsi_u32_read[1] = byte count    */
 #define PISCSI_CMD_READ_ADDR3   0x28   /* -> piscsi_u32_read[2] = DMA target    */
 #define PISCSI_CMD_BLOCKSIZE    0x84
+#define PISCSI_CMD_PDT          0xA0   /* peripheral device type: 0x00 direct-access disk, 0x05 CD-ROM.
+                                        * LOCKSTEP: this local mirror MUST equal the firmware register value
+                                        * in Z3660/src/scsi/z3660_scsi_enums.h (0xA0, landed in 86c6fe8) --
+                                        * this .cpp does NOT include that header, so keep the two in sync. */
 #define PISCSI_CMD_WRITE_ADDR1  0x240  /* -> piscsi_u32_write[0] = block (LBA)  */
 #define PISCSI_CMD_WRITE_ADDR2  0x244  /* -> piscsi_u32_write[1] = byte count   */
 #define PISCSI_CMD_WRITE_ADDR3  0x248  /* -> piscsi_u32_write[2] = DMA source   */
@@ -251,8 +255,9 @@ volatile uae_u32 amix_statrd_pc[8], amix_statrd_c1[8], amix_statrd_c2[8]; volati
 /* TEMP: per-completion guest state filled from newcpu.cpp a3091intr hooks (head=curunit->head buf, unit=curunitp) */
 extern "C" { volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_compl_csr[16], amix_compl_unit[16], amix_compl_head[16]; volatile int amix_compl_h=0; }
 
-/* per-unit geometry cache (lazy cross-core fetch) */
-static struct { int valid, present; uae_u32 nblocks, bsize, cyls, heads, secs; } geo[8];
+/* per-unit geometry cache (lazy cross-core fetch). pdt = peripheral device type
+ * (0x00 direct-access disk, 0x05 CD-ROM) read from the PISCSI_CMD_PDT register. */
+static struct { int valid, present; uae_u32 nblocks, bsize, cyls, heads, secs, pdt; } geo[8];
 static int amix_id6_drv = -1;   // cached id-6 -> backend-drive decision (see drvnum_for_target); reset each boot
 
 static void a3000_recompute_irq(void);
@@ -298,6 +303,10 @@ static void fetch_geometry(int unit)
    geo[unit].cyls    = read_scsi_register(PISCSI_CMD_CYLS, 2);
    geo[unit].heads   = read_scsi_register(PISCSI_CMD_HEADS, 2);
    geo[unit].secs    = read_scsi_register(PISCSI_CMD_SECS, 2);
+   /* drive already selected (DRVNUM written above); read its peripheral device type.
+    * bsize is 2048 for a CD-ROM (returned by the mailbox), so the READ/WRITE length
+    * math below needs no change -- it already multiplies by geo[unit].bsize. */
+   geo[unit].pdt     = read_scsi_register(PISCSI_CMD_PDT, 2);
    dbg("[A3000SCSI] unit %d geom C=%lu H=%lu S=%lu blocks=%lu bsize=%lu\n",
        unit, (unsigned long)geo[unit].cyls, (unsigned long)geo[unit].heads,
        (unsigned long)geo[unit].secs, (unsigned long)geo[unit].nblocks,
@@ -429,6 +438,7 @@ static int scsi_emulate_analyze(void)
    switch (op) {
    case 0x00: /* TEST UNIT READY */
    case 0x1b: /* START STOP UNIT */
+   case 0x1e: /* PREVENT ALLOW MEDIUM REMOVAL (no-op: medium always present this phase) */
       cur.cmd_len = 6; cur.direction = 0; cur.data_len = 0; return 1;
    case 0x12: /* INQUIRY */
       cur.cmd_len = 6; cur.direction = -1;
@@ -458,8 +468,18 @@ static int scsi_emulate_analyze(void)
       cur.blocks = (cur.cmd[7] << 8) | cur.cmd[8];
    rw: {
       uae_u32 bsize = (cur.unit >= 0 && cur.unit < 8 && geo[cur.unit].bsize) ? geo[cur.unit].bsize : 512;
+      int is_write = (op == 0x0a || op == 0x2a);
+      /* Optical media is read-only: reject WRITE(6)/WRITE(10) to a CD-ROM with a
+       * CHECK CONDITION / DATA PROTECT sense (the drive is genuinely unwritable). */
+      if (is_write && cur.unit >= 0 && cur.unit < 8 && geo[cur.unit].pdt == 0x05) {
+         cur.is_block_io = 0;
+         cur.direction = 0; cur.data_len = 0;
+         cur.status = 0x02;                     /* CHECK CONDITION */
+         set_sense(0x07, 0x27, 0x00);           /* DATA PROTECT / write protected */
+         return 0;
+      }
       cur.is_block_io = 1;
-      cur.direction = (op == 0x0a || op == 0x2a) ? 1 : -1;
+      cur.direction = is_write ? 1 : -1;
       cur.data_len = cur.blocks * bsize;
       return 1;
    }
@@ -489,16 +509,28 @@ static void scsi_emulate_cmd(void)
    switch (op) {
    case 0x00: /* TEST UNIT READY */
    case 0x1b: /* START STOP UNIT */
+   case 0x1e: /* PREVENT ALLOW MEDIUM REMOVAL (no-op) */
       cur.status = 0; set_sense(0, 0, 0); break;
    case 0x12: /* INQUIRY */
-      b[0] = 0x00;            /* direct-access device, qualifier 0 */
-      b[1] = 0x00;            /* RMB = 0 (fixed disk) */
-      b[2] = 0x02;            /* ANSI version 2 */
-      b[3] = 0x02;            /* response data format 2 */
-      b[4] = 0x1f;            /* additional length = 31 (total 36) */
-      memcpy(b + 8,  "Z3660   ", 8);
-      memcpy(b + 16, "AMIX SCSI Disk  ", 16);
-      memcpy(b + 32, "0.1 ", 4);
+      if (geo[cur.unit].pdt == 0x05) {
+         b[0] = 0x05;         /* peripheral device type = CD-ROM */
+         b[1] = 0x80;         /* RMB = 1 (removable medium) */
+         b[2] = 0x02;         /* ANSI version 2 */
+         b[3] = 0x02;         /* response data format 2 */
+         b[4] = 0x1f;         /* additional length = 31 (total 36) */
+         memcpy(b + 8,  "Z3660   ", 8);
+         memcpy(b + 16, "AMIX CD-ROM     ", 16);
+         memcpy(b + 32, "0.1 ", 4);
+      } else {
+         b[0] = 0x00;         /* direct-access device, qualifier 0 */
+         b[1] = 0x00;         /* RMB = 0 (fixed disk) */
+         b[2] = 0x02;         /* ANSI version 2 */
+         b[3] = 0x02;         /* response data format 2 */
+         b[4] = 0x1f;         /* additional length = 31 (total 36) */
+         memcpy(b + 8,  "Z3660   ", 8);
+         memcpy(b + 16, "AMIX SCSI Disk  ", 16);
+         memcpy(b + 32, "0.1 ", 4);
+      }
       cur.status = 0; break;
    case 0x03: /* REQUEST SENSE (fixed format) */
       b[0] = 0x70;            /* response code, valid=0 */
@@ -514,17 +546,19 @@ static void scsi_emulate_cmd(void)
    case 0x1a: /* MODE SENSE (6) */
    case 0x5a: { /* MODE SENSE (10) */
       int ten = (op == 0x5a);
+      int is_cd = (geo[cur.unit].pdt == 0x05);   /* optical media: write-protected, no rigid geometry */
       uae_u8 page = cur.cmd[2] & 0x3f;
       uae_u8 *bd, *pg;
       int hdr, bdlen = 8;
       if (ten) {
          hdr = 8;
          /* b[0..1] data length filled below; b[2]=medium, b[3]=devspec, b[6..7]=bd len */
+         b[3] = is_cd ? 0x80 : 0;   /* device-specific: WP bit set for read-only optical media */
          b[6] = 0; b[7] = bdlen;
       } else {
          hdr = 4;
          b[1] = 0;             /* medium type */
-         b[2] = 0;             /* device-specific (WP=0) */
+         b[2] = is_cd ? 0x80 : 0;   /* device-specific: WP bit set for read-only optical media */
          b[3] = bdlen;         /* block descriptor length */
       }
       bd = b + hdr;
@@ -538,7 +572,10 @@ static void scsi_emulate_cmd(void)
       bd[7] = bsize & 0xff;
       pg = bd + bdlen;
       int pglen = 0;
-      if (page == 0x03 || page == 0x3f) {     /* Format Device */
+      /* Rigid-disk mode pages (Format Device 0x03, Rigid Drive Geometry 0x04) are
+       * meaningless for optical media -- omit them for a CD-ROM. A single-session
+       * data ISO needs only INQUIRY + READ CAPACITY(2048) + READ(10) + TUR. */
+      if (!is_cd && (page == 0x03 || page == 0x3f)) {     /* Format Device */
          pg[0] = 0x03; pg[1] = 0x16;
          pg[10] = (geo[cur.unit].secs >> 8) & 0xff;   /* sectors per track */
          pg[11] = geo[cur.unit].secs & 0xff;
@@ -548,7 +585,7 @@ static void scsi_emulate_cmd(void)
          pglen += 0x18;
          pg += 0x18;
       }
-      if (page == 0x04 || page == 0x3f) {     /* Rigid Drive Geometry */
+      if (!is_cd && (page == 0x04 || page == 0x3f)) {     /* Rigid Drive Geometry */
          pg[0] = 0x04; pg[1] = 0x16;
          pg[2] = (geo[cur.unit].cyls >> 16) & 0xff;   /* cylinders (24-bit) */
          pg[3] = (geo[cur.unit].cyls >> 8) & 0xff;
