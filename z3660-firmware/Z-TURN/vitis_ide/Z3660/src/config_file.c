@@ -100,6 +100,7 @@ const char *config_item_names[CONFITEM_NUM] = {
       "arm_frequency",
       "amix_mode",
       "service_cadence",
+      "cdrom_units",
 };
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
@@ -159,6 +160,8 @@ void load_default_config(void)
       config.hdf[i][0]=0;
    for(int i=0;i<7;i++)
       config.scsi_num[i]=-1;
+   for(int i=0;i<7;i++)
+      config.cd_target[i]=0;
    config.scsiboot=0;
    config.autoconfig_ram=0;
    config.autoconfig_rtg=0;
@@ -720,6 +723,15 @@ retry:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.service_cadence=get_int_type(cur_cmd);
          if(verbose) printf("[CFG] service_cadence %d\n", config.service_cadence);
+         break;
+
+      case CONFITEM_CDROM_UNITS:
+         // cdrom_units <id[,id...]>: comma/space list of SCSI target IDs (0..6) to
+         // expose as read-only 2048-byte CD-ROM units (pdt 0x05) instead of RDB disks.
+         for(int i=str_pos; parse_line[i]!=0; i++)
+            if(parse_line[i]>='0' && parse_line[i]<='6')
+               config.cd_target[parse_line[i]-'0']=1;
+         if(verbose) printf("[CFG] CD-ROM units: %s\n", &parse_line[str_pos]);
          break;
 
       case CONFITEM_MOUNT_SD_0x76:

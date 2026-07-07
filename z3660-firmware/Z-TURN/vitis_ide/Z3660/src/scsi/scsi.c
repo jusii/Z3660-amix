@@ -208,7 +208,7 @@ int piscsi_init() {
    {
       if(config.scsi_num[i]>=0 && config.scsi_num[i]<=19)
          if(config.hdf[config.scsi_num[i]][0]!=0)
-            piscsi_map_drive(config.hdf[config.scsi_num[i]], i, 0, 0);
+            piscsi_map_drive(config.hdf[config.scsi_num[i]], i, 0, 0, config.cd_target[i]);
    }
    uint32_t root_partition_length=-1L;
    // and now the SD partitions
@@ -235,7 +235,7 @@ int piscsi_init() {
             {
                if(config.mount_sd_0x76)
                {
-                  piscsi_map_drive("",11+i,p0_Start,p0_Len); // 10 reserved for the full SD
+                  piscsi_map_drive("",11+i,p0_Start,p0_Len,0); // 10 reserved for the full SD
                }
             }
          }
@@ -248,7 +248,7 @@ int piscsi_init() {
       if(root_partition_length!=(uint32_t)-1L)
       {
          printf("Full SD start 0, length 0x%08lx\n", root_partition_length);
-         piscsi_map_drive("",10,0,root_partition_length);
+         piscsi_map_drive("",10,0,root_partition_length,0);
       }
    }
    Xil_L1DCacheFlush();
@@ -678,7 +678,7 @@ PISCSI_DEV *piscsi_get_dev(uint8_t index) {
 
 FIL fd[8];
 
-int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t p0_Len) {
+int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t p0_Len, uint8_t is_cd) {
    if (index > NUM_SCSI_UNITS_MAX) {
       if(index<8)
          printf("[PISCSI] Drive index %d out of range.\nUnable to map file %s to drive.\n", index, filename);
@@ -692,7 +692,8 @@ int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t 
    FIL *tmp_fd=&fd[index];
    if(index<8)
    {
-      int ret = f_open(tmp_fd,filename, FA_READ|FA_WRITE|FA_OPEN_EXISTING);
+      // A CD-ROM is read-only media: open its backing image without write access.
+      int ret = f_open(tmp_fd,filename, is_cd ? (FA_READ|FA_OPEN_EXISTING) : (FA_READ|FA_WRITE|FA_OPEN_EXISTING));
       if (ret != FR_OK) {
          printf("[PISCSI] Failed to open file %s, could not map drive %d.\n", filename, index);
          return -1;
@@ -717,7 +718,22 @@ int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t 
       f_lseek(d->fd, 0);
       printf("[PISCSI] Map %d: [%s] - %llu bytes.\n", index, filename, file_size);
 
-      if (piscsi_parse_rdb(d) == -1) {
+      if (is_cd) {
+         // Raw ISO/UDF optical image: a bare CD image has no Amiga RDB, so bypass the
+         // RDB scan entirely. Report a read-only 2048-byte-block CD-ROM: the READ
+         // CAPACITY / BLOCKS path returns d->fs / d->block_size, and pdt 0x05 marks it
+         // optical for the CDB decoders. Benign non-zero CHS keeps the geometry maths
+         // (and any divide by heads*sectors) away from a divide-by-zero.
+         d->block_size = 2048;
+         d->pdt = 0x05;
+         d->h = 16;
+         d->s = 63;
+         d->c = (file_size / d->block_size) / (d->s * d->h);
+         if (d->c == 0)
+            d->c = 1;
+         printf("[PISCSI] Map %d is a CD-ROM: %llu blocks of %ld bytes.\n", index, file_size / d->block_size, d->block_size);
+      }
+      else if (piscsi_parse_rdb(d) == -1) {
          printf("[PISCSI] No RDB found on disk, making up some CHS values.\n");
          d->h = 16;
          d->s = 63;
@@ -1616,6 +1632,11 @@ uint32_t handle_piscsi_read(uint32_t addr, uint8_t type) {
       DEBUG("[PISCSI] %s Read from DRVTYPE %d, drive attached.\n", op_type_names[type], piscsi_cur_drive);
       ACTIVITY_LED_OFF; // OFF
       return 1;
+      break;
+   case PISCSI_CMD_PDT:
+      DEBUG("[PISCSI] %s Read from PDT %d: 0x%02X\n", op_type_names[type], piscsi_cur_drive, devs[piscsi_cur_drive].pdt);
+      ACTIVITY_LED_OFF; // OFF
+      return devs[piscsi_cur_drive].pdt;
       break;
    case PISCSI_CMD_DRVNUM:
       ACTIVITY_LED_OFF; // OFF

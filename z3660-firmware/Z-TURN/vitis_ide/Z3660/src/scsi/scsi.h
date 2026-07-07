@@ -84,6 +84,7 @@ typedef struct piscsi_dev_ {
     uint32_t num_partitions;
     uint32_t fshd_offs;
     uint32_t block_size;
+    uint8_t pdt;    // SCSI peripheral device type: 0x00 = direct-access disk, 0x05 = read-only CD-ROM
     struct PartitionBlock *pb[16];
     struct RigidDiskBlock *rdb;
     DWORD SeekTbl[64];
@@ -299,7 +300,7 @@ typedef enum {
 
 int piscsi_init();
 void piscsi_shutdown();
-int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t p0_Len);
+int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t p0_Len, uint8_t is_cd);
 void piscsi_unmap_drive(uint8_t index);
 PISCSI_DEV *piscsi_get_dev(uint8_t index);
 

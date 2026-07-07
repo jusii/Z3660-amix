@@ -69,6 +69,7 @@ typedef struct {
    int kickstart;
    int ext_kickstart;
    int scsi_num[7];
+   int cd_target[7];   // per-SCSI-target CD-ROM flag: cd_target[id]!=0 => target id is a read-only 2048-byte CD-ROM (pdt 0x05). Parsed from "cdrom_units".
    char hdf[20][150];
    int autoconfig_ram;
    int autoconfig_rtg;
@@ -223,6 +224,7 @@ enum CONFITEM {
    CONFITEM_ARM_FREQUENCY,
    CONFITEM_AMIX_MODE,
    CONFITEM_SERVICE_CADENCE,
+   CONFITEM_CDROM_UNITS,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50
