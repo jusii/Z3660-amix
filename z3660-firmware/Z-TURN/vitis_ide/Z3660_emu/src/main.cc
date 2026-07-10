@@ -167,6 +167,7 @@ enum piscsi_cmds {
    PISCSI_CMD_LOADFS       = 0x94,
    PISCSI_CMD_GET_FS_INFO  = 0x98,
    PISCSI_CMD_USED_DMA     = 0x9C,
+   PISCSI_CMD_PDT          = 0xA0, // read-only peripheral-device-type (T2.P1); handled on core0
    PISCSI_DBG_MSG          = 0x100,
    PISCSI_DBG_VAL1         = 0x110,
    PISCSI_DBG_VAL2         = 0x114,
@@ -277,6 +278,8 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       case PISCSI_CMD_READBYTES:
          Xil_L1DCacheInvalidate();
          break;
+      case PISCSI_CMD_PDT:
+         break; // read-only device-type register (forwarded to core0); no cache op -- silence the per-command log
       default:
          printf("SCSI read command %02x\n",zaddr);
       }
