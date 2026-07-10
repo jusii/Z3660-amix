@@ -63,6 +63,41 @@ static void amix_sb_crumb(const char *op, uint64_t start, uint32_t len, const ui
 #endif
 /* --- end AMIX root-superblock breadcrumb --- */
 
+/* --- TEMP diag (native-driver mountroot hunt; revert after capture) ------------------
+ * One serial line per piscsi data transfer, printed on core0 at the exact point the
+ * data is served: direction (R/W), branch taken (DIRECT guest-RAM DMA vs BOUNCE via
+ * board+0x80000), unit, guest buffer address (ADDR3 as the driver wrote it), byte
+ * offset on the backing store (lba*block_size), length, and the first 8 data bytes
+ * (reads: what core0 just read from the image; writes: what core0 is about to write).
+ * Budgeted so it can never flood: the first AMIX_CRUMB_ANY transfers of any kind per
+ * guest (re)start (piscsi_init() resets the counters -- it runs at cold boot AND on
+ * every guest reset), plus a reserve of AMIX_CRUMB_DDR lines for transfers whose
+ * ADDR3 lies in the AMIX DDR CPU-RAM window [0x08000000,0x10000000) -- the native
+ * z3660scsi driver's buffers -- so the kernel-load phase (many bounce reads via the
+ * emulated A3000 SCSI) cannot exhaust the budget before the native driver's first
+ * RDB reads. seq counts ALL transfers, printed or not, so gaps stay visible. */
+#define AMIX_CRUMB_ANY 64
+#define AMIX_CRUMB_DDR 64
+static uint32_t amix_crumb_seq=0, amix_crumb_any=0, amix_crumb_ddr=0;
+static void amix_cmd_crumb(char rw, const char *branch, uint32_t unit,
+                           uint32_t addr3, uint64_t off, uint32_t len,
+                           const uint8_t *data)
+{
+   uint32_t seq=++amix_crumb_seq;
+   int is_ddr=(addr3>=0x08000000u && addr3<0x10000000u);
+   if(amix_crumb_any<AMIX_CRUMB_ANY)
+      amix_crumb_any++;
+   else if(is_ddr && amix_crumb_ddr<AMIX_CRUMB_DDR)
+      amix_crumb_ddr++;
+   else
+      return;
+   printf("[CRUMB %03lu] %c %s u=%lu a3=%08lX off=%llu len=%lu d=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+      (unsigned long)seq, rw, branch, (unsigned long)unit, (unsigned long)addr3,
+      (unsigned long long)off, (unsigned long)len,
+      data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]);
+}
+/* --- end TEMP diag --- */
+
 #define MEMCPY memcpy
 //#define MEMCPY memcpy_neon
 //extern void *(memcpy_neon)(void * s1, const void * s2, u32 n);
@@ -251,6 +286,12 @@ int piscsi_init() {
          piscsi_map_drive("",10,0,root_partition_length,0);
       }
    }
+   /* TEMP diag: prove the direct-DMA gate inputs on the wire, and restart the
+    * transfer-crumb budget for this guest run (piscsi_init also runs on every
+    * guest reset via cpu_emulator.c, so each restart gets a fresh budget). */
+   printf("[PISCSI] DMA gate: cpu_ram=%d amix_mode=%d autoconfig_ram=%d\n",
+          config.cpu_ram, config.amix_mode, config.autoconfig_ram);
+   amix_crumb_seq=0; amix_crumb_any=0; amix_crumb_ddr=0;
    Xil_L1DCacheFlush();
    Xil_L2CacheFlush();
 
@@ -1123,6 +1164,8 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             uint32_t blocks_to_read=piscsi_u32_read[1]/ d->block_size;
             read_disk(d,(uint8_t *)map,blocks_to_read);
          }
+         amix_cmd_crumb('R',"DIRECT",val,piscsi_u32_read[2],
+                        (uint64_t)d->lba*d->block_size,piscsi_u32_read[1],(uint8_t *)map); /* TEMP diag */
       } else {
          DEBUG("[PISCSI-%ld] No mapped range found for read.\n", val);
          DEBUG("Begin data read from disk: 0x%08lX to 0x%08lX\n",piscsi_u32_read[0],piscsi_u32_read[2]);
@@ -1149,6 +1192,8 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             uint32_t blocks_to_read=piscsi_u32_read[1]/ d->block_size;
             read_disk(d,(uint8_t *)buffer,blocks_to_read);
          }
+         amix_cmd_crumb('R',"BOUNCE",val,piscsi_u32_read[2],
+                        (uint64_t)d->lba*d->block_size,piscsi_u32_read[1],buffer); /* TEMP diag */
       }
       Xil_L1DCacheFlush();
       break;
@@ -1209,6 +1254,8 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          if(map>=0x40000000) map-=0x20000000;
          DEBUG("[PISCSI-%ld] \"DMA\" Write comes from mapped range 0x%08lX.\n", val, map);
          used_dma=0;
+         amix_cmd_crumb('W',"DIRECT",val,piscsi_u32_write[2],
+                        (uint64_t)d->lba*d->block_size,piscsi_u32_write[1],(uint8_t *)map); /* TEMP diag */
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
@@ -1233,6 +1280,8 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             printf("ERROR SCSI write length>0x180000 (0x%08lX)\n",piscsi_u32_write[1]);
          uint8_t *buffer=(uint8_t *)SCSI_NO_DMA_ADDRESS;
          used_dma = piscsi_u32_write[2];
+         amix_cmd_crumb('W',"BOUNCE",val,piscsi_u32_write[2],
+                        (uint64_t)d->lba*d->block_size,piscsi_u32_write[1],buffer); /* TEMP diag */
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
