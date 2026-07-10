@@ -1084,7 +1084,17 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       }
 
       map = piscsi_u32_read[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_read[2]);
-      if ( (config.cpu_ram        && (map>=0x08000000) && (map<0x10000000))
+      // AMIX direct-DMA contract (LOCKSTEP with the driver, do not diverge):
+      // the native piscsi driver (amix-z3660scsi/src/z3660.c z3660_rw) and the AmigaOS
+      // bootrom driver (z3660-drivers/scsi/z3660_scsi.c) both key their bounce protocol on
+      // BOUNCE_THRESH=0x08000000: on a WRITE they stage into board+0x80000 ONLY when the
+      // buffer is < 0x08000000, and on a READ they copy back out of board+0x80000 ONLY when
+      // USED_DMA != 0 -- i.e. for a buffer at/above 0x08000000 they expect the ARM to DMA
+      // directly to/from it (no bounce). Since 22ce6f2 the AMIX kernel and all its DMA
+      // buffers live in Zynq-local DDR at $08000000 (drct_bank, guest==host 1:1), so honour
+      // that contract here. cpu_ram stays force-disabled for AMIX (no $08 autoconfig board);
+      // amix_mode alone re-enables the direct path for the drct_bank CPU-RAM window.
+      if ( ((config.cpu_ram || config.amix_mode) && (map>=0x08000000) && (map<0x10000000))
          ||(config.autoconfig_ram && (map>=0x40000000) && (map<0x50000000))
       )
       {
@@ -1188,7 +1198,11 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       }
 
       map = piscsi_u32_write[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_write[2]);
-      if ( ((map>=0x08000000) && (map<0x10000000) && config.cpu_ram)
+      // AMIX direct-DMA contract -- see the READ handler above. The driver stages a WRITE
+      // into board+0x80000 only for buffers < 0x08000000 (z3660.c:254 / z3660_scsi.c:402),
+      // so a buffer at/above $08000000 is NOT in the bounce and MUST be read directly from
+      // the drct_bank DDR CPU-RAM (guest==host 1:1); bouncing it would write stale bytes.
+      if ( ((map>=0x08000000) && (map<0x10000000) && (config.cpu_ram || config.amix_mode))
             ||((map>=0x40000000) && (map<0x50000000) && config.autoconfig_ram)
       )
       {
