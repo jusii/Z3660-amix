@@ -85,12 +85,19 @@ static void amix_cmd_crumb(char rw, const char *branch, uint32_t unit,
 {
    uint32_t seq=++amix_crumb_seq;
    int is_ddr=(addr3>=0x08000000u && addr3<0x10000000u);
-   if(amix_crumb_any<AMIX_CRUMB_ANY)
-      amix_crumb_any++;
-   else if(is_ddr && amix_crumb_ddr<AMIX_CRUMB_DDR)
-      amix_crumb_ddr++;
-   else
-      return;
+   /* TEMP diag (CD-mount panic hunt): transfers for any unit other than the root
+    * disk (6), and ALL writes, print unconditionally -- CD I/O is sparse (a mount
+    * is tens of transfers) and writes are rare, so neither can flood, and both are
+    * exactly the signal we need. Root READS stay under the boot-time budgets. */
+   if(unit==6 && rw!='W')
+   {
+      if(amix_crumb_any<AMIX_CRUMB_ANY)
+         amix_crumb_any++;
+      else if(is_ddr && amix_crumb_ddr<AMIX_CRUMB_DDR)
+         amix_crumb_ddr++;
+      else
+         return;
+   }
    printf("[CRUMB %03lu] %c %s u=%lu a3=%08lX off=%llu len=%lu d=%02X %02X %02X %02X %02X %02X %02X %02X\n",
       (unsigned long)seq, rw, branch, (unsigned long)unit, (unsigned long)addr3,
       (unsigned long long)off, (unsigned long)len,
@@ -1135,7 +1142,19 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       // buffers live in Zynq-local DDR at $08000000 (drct_bank, guest==host 1:1), so honour
       // that contract here. cpu_ram stays force-disabled for AMIX (no $08 autoconfig board);
       // amix_mode alone re-enables the direct path for the drct_bank CPU-RAM window.
-      if ( ((config.cpu_ram || config.amix_mode) && (map>=0x08000000) && (map<0x10000000))
+      // TEMP diag A/B (this build only): additionally gate the direct-DMA READ path on
+      // unit==6 (the root disk), so every OTHER unit -- the CD at unit 2 above all --
+      // is forced through the BOUNCE path regardless of ADDR3. Protocol-legal: the
+      // driver decides per transfer from USED_DMA (nonzero -> bcopy out of the bounce).
+      // One boot discriminates the CD-mount panic:
+      //   mount SUCCEEDS       -> the fault is in direct DMA into cdfs heap buffers
+      //                           (address/coherency on arbitrary kmem VAs);
+      //   mount panics as before -> the firmware transfer path is exonerated; the
+      //                           fault is guest-side (cdfs/driver logic).
+      // WRITES deliberately KEEP the normal gate: the driver does not stage buffers
+      // >=0x08000000 into the bounce, so a forced-bounce write would put stale bounce
+      // bytes on the media. The mount experiment is read-only I/O.
+      if ( ((config.cpu_ram || config.amix_mode) && (map>=0x08000000) && (map<0x10000000) && (val==6))
          ||(config.autoconfig_ram && (map>=0x40000000) && (map<0x50000000))
       )
       {
