@@ -1142,6 +1142,20 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          if(map>=0x40000000) map-=(0x40000000-0x20000000);
          DEBUG("[PISCSI-%ld] \"DMA\" Read goes to mapped range 0x%08lX.\n", val, map);
          used_dma=0;
+         /* Direct-DMA read coherency: the destination is guest RAM the 68k side may
+          * have written recently. Core1 cleans its whole L1 at trigger time (main.cc
+          * write_scsi_register READ case), which PARKS those stale dirty lines in the
+          * shared PL310 L2. The SD controller's DMA writes DRAM *below* the L2, and
+          * XSdPs_ReadPolled (sdps_v4_2) only invalidates the range AFTER the transfer
+          * -- so a stale dirty L2 line written back during the multi-ms transfer lands
+          * in DRAM ON TOP of the freshly DMA-ed bytes (observed on real HW: the UFS
+          * superblock read returning old guest-memory content, [CRUMB 3118]).
+          * Invalidate the range from L1+L2 BEFORE the transfer so nothing stale can be
+          * written back over it. Unaligned edge lines are clean+invalidated by the BSP
+          * (xil_cache.c), preserving neighbours of odd driver buffers; the sdps
+          * post-transfer invalidate then covers lines speculatively re-fetched while
+          * the DMA ran. */
+         Xil_DCacheInvalidateRange((INTPTR)map, piscsi_u32_read[1]);
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
@@ -1256,6 +1270,14 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          used_dma=0;
          amix_cmd_crumb('W',"DIRECT",val,piscsi_u32_write[2],
                         (uint64_t)d->lba*d->block_size,piscsi_u32_write[1],(uint8_t *)map); /* TEMP diag */
+         /* Direct-DMA write coherency: the guest's freshest bytes live in the cache
+          * hierarchy, not DRAM -- core1's trigger-time L1 clean (main.cc) moves them
+          * only as far as the shared PL310 L2. The SD controller's write DMA reads
+          * DRAM *below* the L2, and XSdPs_WritePolled (sdps_v4_2) performs NO cache
+          * maintenance at all -- without this clean, every direct write would put
+          * STALE DRAM bytes on the disk. Clean the range through L1+L2 to DRAM
+          * first so the DMA reads exactly what the guest wrote. */
+         Xil_DCacheFlushRange((INTPTR)map, piscsi_u32_write[1]);
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;

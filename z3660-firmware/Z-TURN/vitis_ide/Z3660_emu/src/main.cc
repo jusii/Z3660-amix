@@ -252,6 +252,13 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       switch(zaddr)
       {
       case PISCSI_CMD_BLOCKSIZE:
+      /* The USED_DMA clean+invalidate below is LOAD-BEARING for direct-DMA reads:
+       * every piscsi driver reads USED_DMA right after a READ trigger, and this
+       * whole-L1 flush evicts any stale buffer lines core1 acquired speculatively
+       * while core0 ran the transfer -- the guest's first data read then refills
+       * from the shared L2/DRAM, which core0 guarantees fresh (scsi.c pre-transfer
+       * Xil_DCacheInvalidateRange). Keep it a FLUSH (clean+invalidate): a pure
+       * invalidate would discard core1's own dirty emulator state. */
       case PISCSI_CMD_USED_DMA:
       case PISCSI_CMD_BLOCKS:
       case PISCSI_CMD_GETPART:
