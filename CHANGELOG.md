@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-11
+
+- **firmware boot menu: SD-card file manager (key 'E').** New self-contained
+  module `sd_fileops.c/.h` adds an interactive `SD>` command loop over the serial
+  console, reachable from `show_options()`/`main_thread()` in mobotest.c. Mounts
+  both SD volumes (0: FAT boot, 1: exFAT data) and offers DIR, COPY, REN, DEL,
+  MKDIR, CRC, FREE, HELP and EXIT, with explicit `vol:/path` arguments. COPY
+  generalizes the fixed BOOT.bin/FAILSAFE.bin/Z3660.bin copy shortcuts: streamed
+  through a 4 MB→64 KB fallback buffer (so multi-GB hdf images work), progress
+  every ~10%, read-total vs write-total verify, overwrite confirm and ESC-abort.
+  CRC is a zlib-compatible CRC-32. Upstream-clean (mobotest.c + the new pair
+  only); +8 KB core0 text, no BOOT.BIN size change. Verified on the board
+  2026-07-11: CRC matches host zlib byte-exact (incl. the freshly TFTP'd
+  Z3660.bin), 943 MB image copy in 101 s with verify green. Also on branch
+  `pr-sd-fileops` (same two commits on upstream 5e216af) for an eventual
+  upstream PR.
+
 ## 2026-07-07
 
 - **piscsi: read-only 2048-byte CD-ROM units.** Expose a SCSI target as a
