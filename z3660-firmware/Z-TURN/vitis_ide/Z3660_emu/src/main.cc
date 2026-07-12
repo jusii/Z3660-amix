@@ -183,6 +183,12 @@ uint32_t addr2=0;
 uint32_t addr3=0;
 extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 {
+   /* READ-descriptor stashes for the post-spin core1 L1 invalidate below. The
+    * guest programs the descriptor across separate register-write calls before
+    * the trigger, so these must persist between calls: ADDR2 -> byte length
+    * (core0 piscsi_u32_read[1]), ADDR3 -> DMA target address (piscsi_u32_read[2]). */
+   static uint32_t piscsi_len_stash=0;
+   static uint32_t piscsi_addr_stash=0;
    if(zaddr < PISCSI_DBG_MSG)
    {
       switch(zaddr)
@@ -203,6 +209,10 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
          //    			Xil_DCacheFlush();
          break;
       case PISCSI_CMD_ADDR2:
+         piscsi_len_stash=zdata; // transfer byte length (core0 piscsi_u32_read[1])
+         break;
+      case PISCSI_CMD_ADDR3:
+         piscsi_addr_stash=zdata; // DMA target address (core0 piscsi_u32_read[2]); no cache op, matching the prior fall-through no-op
          break;
       case PISCSI_CMD_WRITE64:
       case PISCSI_CMD_WRITE:
@@ -233,6 +243,26 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 
 
    while(shared->write_scsi==1){NOP;}
+
+   /* AMP READ cache-coherence fix. Core0 has now DMAed sector data into DRAM
+    * below the caches (scsi.c pre-invalidates L1+L2 for the target range, then
+    * XSdPs writes DRAM directly). While core1 was parked in the spin above, this
+    * still-live Cortex-A9 can speculatively refill L1D lines covering the DMA
+    * target, leaving stale lines over the fresh DRAM; the guest then reads a mix
+    * of fresh DRAM and stale cache. The consuming core must invalidate its own
+    * L1 AFTER the producer's DMA, so do the target range here for the three READ
+    * triggers only (WRITE never reads the buffer back, and its trigger-time flush
+    * stays). Xil_L1DCacheInvalidateRange clean+invalidates only the unaligned
+    * edge lines (preserving neighbours) and pure-invalidates the interior, which
+    * is what we want: the buffer holds only stale speculative lines. By-MVA
+    * maintenance on an uncached/foreign address is a harmless no-op, so an
+    * unconditional range (incl. the bounce path, where core1 fills the guest
+    * buffer itself afterwards) is safe; guard only on nonzero stashes. */
+   if((zaddr==PISCSI_CMD_READ || zaddr==PISCSI_CMD_READ64 || zaddr==PISCSI_CMD_READBYTES)
+      && piscsi_addr_stash!=0 && piscsi_len_stash!=0)
+   {
+      Xil_L1DCacheInvalidateRange(piscsi_addr_stash,piscsi_len_stash);
+   }
 }
 
 extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
