@@ -34,3 +34,21 @@ z3660-firmware/z3660_vivado/z3660/z3660.sdk/z3660/Debug/
 z3660-firmware/z3660_vivado/z3660/z3660.sdk/z3660/Release/
 /.project
 .DS_Store
+
+# Docker build environment — host-staged Xilinx installer (not redistributable)
+docker/xilinx/
+
+# Local AMIX hdf working copies + scratch (large, machine-local — survive reboot but never commit)
+/tmp/
+/hdf/
+/adf/
+
+# AI-agent / assistant config — kept local, never published
+/.claude/
+/CLAUDE.md
+
+# Local AMIX debug-session investigations — kept local, never published
+/docs/investigations/
+
+# Untracked benchmark archive (rebuilt on demand by tools/amix-bench)
+/tools/amix-bench.tar
