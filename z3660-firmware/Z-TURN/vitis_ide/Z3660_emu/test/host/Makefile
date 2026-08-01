@@ -36,12 +36,22 @@ OBJS      := $(UAE_OBJS) $(HOST_OBJS)
 
 BIN := $(BUILD)/mmu_harness
 
-.PHONY: all clean objs run
-all: $(BIN)
+# Standalone SCSI CD-ROM CDB unit test. Self-contained: scsi_cd_test.cpp compiles
+# a3000_scsi.cpp in directly (to reach its static CDB decoders + geo[]) and stubs
+# the board seams, so it links WITHOUT the UAE core objects or board_stubs.cpp.
+SCSI_CD_BIN := $(BUILD)/scsi_cd_test
+
+.PHONY: all clean objs run run-scsi
+all: $(BIN) $(SCSI_CD_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
 	@$(CXX) $(CXXFLAGS) $(OBJS) -o $@
+
+$(SCSI_CD_BIN): scsi_cd_test.cpp $(UAE)/a3000_scsi.cpp
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  scsi_cd_test.cpp"
+	@$(CXX) $(CXXFLAGS) scsi_cd_test.cpp -o $@
 
 # Just compile every object (no link) — shakes out compile errors per-file.
 objs: $(OBJS)
@@ -56,8 +66,12 @@ $(BUILD)/host/%.o: %.cpp
 	@echo "  CXX   host/$*.cpp"
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
-run: $(BIN)
+run: $(BIN) $(SCSI_CD_BIN)
 	@$(BIN)
+	@$(SCSI_CD_BIN)
+
+run-scsi: $(SCSI_CD_BIN)
+	@$(SCSI_CD_BIN)
 
 clean:
 	rm -rf $(BUILD)

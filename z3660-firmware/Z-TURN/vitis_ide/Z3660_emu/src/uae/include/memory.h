@@ -798,8 +798,13 @@ bool real_address_allowed(void);
 uae_u8 *memory_get_real_address(uaecptr);
 int memory_valid_address(uaecptr, uae_u32);
 
+extern "C" volatile int a3000_amix_mode;
 STATIC_INLINE uae_u8 *get_real_address (uaecptr addr)
 {
+	// AMIX a3000mem: guest $07000000-$07FFFFFF is host-DDR-backed at $09000000+.
+	// The rest of the map is guest==host 1:1, so only translate that one window.
+	if (a3000_amix_mode && (addr & 0xFF000000u) == 0x07000000u)
+		return((uae_u8 *)(addr + 0x02000000u));   // +($09000000-$07000000)
 	return((uae_u8 *)addr);
 //	return memory_get_real_address(addr);
 }
