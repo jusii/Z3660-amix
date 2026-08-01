@@ -69,7 +69,10 @@ typedef struct {
    int kickstart;
    int ext_kickstart;
    int scsi_num[7];
-   int cd_target[7];   // per-SCSI-target CD-ROM flag: cd_target[id]!=0 => target id is a read-only 2048-byte CD-ROM (pdt 0x05). Parsed from "cdrom_units".
+   int cd_target[7];   // per-SCSI-target CD-ROM flag: cd_target[id]!=0 => target id is a read-only 2048-byte CD-ROM (pdt 0x05).
+                       // Set by the "isoN" config key, which indexes this by IMAGE SLOT N while piscsi_init() reads it by
+                       // SCSI TARGET -- so a config only works when the iso slot number equals the target number (isoN + "scsiN N").
+                       // Only slots 0..6 are representable here; see z3660cfg.txt and docs/AMIX.md.
    int adf_num[8];
    char hdf[20][150];
    char adf[20][150];
