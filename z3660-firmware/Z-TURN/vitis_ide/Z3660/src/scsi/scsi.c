@@ -27,6 +27,42 @@ extern CONFIG config;
 // Uncomment the line below to enable debug output
 //#define PISCSI_DEBUG
 uint32_t used_dma=0;
+
+/* --- AMIX root-superblock breadcrumb (diagnostic; define AMIX_SB_TRACE to enable) -----
+ * Traces every HDF transfer that carries the AMIX root UFS PRIMARY superblock so
+ * we can see, in order, whether the kernel WRITEs fs_state=FSACTIVE before
+ * bcheckrc's fsck -m READs it (mount-re-dirty), or the READ returns a clean value
+ * that the 68k still treats as dirty (driver/bounce).  Root SB is at HDF byte
+ * 73728 (fs_fsmnt='/'); fs_time(BE u32)@73760, fs_state(BE u32)@73860.  Clean iff
+ * fs_state+fs_time==FSOKAY(0x7c269d38); FSACTIVE(0x5e72d81a)=mounted.  AMIX uses
+ * block READ(0x04)/WRITE(0x00), so HDF offset = d->lba*d->block_size exactly.
+ * Off by default; flip on if the fsck-every-boot loop ever resurfaces. */
+//#define AMIX_SB_TRACE
+#ifdef AMIX_SB_TRACE
+#define AMIX_SB_FSSTATE_BYTE 73860ULL
+#define AMIX_SB_FSTIME_BYTE  73760ULL
+#define AMIX_FSOKAY          0x7c269d38u
+static uint32_t amix_sb_seq=0;
+static inline uint32_t amix_be32(const uint8_t *p){
+   return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|(uint32_t)p[3];
+}
+static void amix_sb_crumb(const char *op, uint64_t start, uint32_t len, const uint8_t *buf){
+   if(!(start<=AMIX_SB_FSSTATE_BYTE && (AMIX_SB_FSSTATE_BYTE+4)<=(start+(uint64_t)len)))
+      return; /* this transfer does not carry the SB fs_state */
+   uint32_t fs_state=amix_be32(buf+(uint32_t)(AMIX_SB_FSSTATE_BYTE-start));
+   int have_time=(start<=AMIX_SB_FSTIME_BYTE && (AMIX_SB_FSTIME_BYTE+4)<=(start+(uint64_t)len));
+   uint32_t fs_time=have_time?amix_be32(buf+(uint32_t)(AMIX_SB_FSTIME_BYTE-start)):0;
+   int clean=have_time && ((fs_state+fs_time)==AMIX_FSOKAY);
+   printf("[AMIX-SB #%lu] %s start=%lu len=%lu lba=%lu fs_state=%08lX fs_time=%08lX clean=%s%s\n",
+      (unsigned long)(++amix_sb_seq), op, (unsigned long)start, (unsigned long)len,
+      (unsigned long)(start/512ULL), (unsigned long)fs_state, (unsigned long)fs_time,
+      clean?"YES":"NO", have_time?"":" (no fs_time in buf)");
+}
+#else
+#define amix_sb_crumb(op,start,len,buf) ((void)0)
+#endif
+/* --- end AMIX root-superblock breadcrumb --- */
+
 #define MEMCPY memcpy
 //#define MEMCPY memcpy_neon
 //extern void *(memcpy_neon)(void * dst, const void * src, u32 n);
@@ -362,13 +398,32 @@ int piscsi_parse_rdb(PISCSI_DEV *d) {
    int i = 0;
    uint8_t *block = malloc(PISCSI_MAX_BLOCK_SIZE);
 
-   if(fd>(FIL *)1)
+   /* non-AMIX path = byte-identical upstream: single seek-to-0, then 64K-stride reads below. */
+   if(!config.amix_mode && fd>(FIL *)1)
       f_lseek(fd, 0);
    for (i = 0; i < RDB_BLOCK_LIMIT; i++) {
       if(fd>(FIL *)1)
       {
          unsigned int n_bytes;
-         f_read(fd, block, PISCSI_MAX_BLOCK_SIZE,&n_bytes);
+         if(config.amix_mode)
+         {
+            /* AMIX root RDB is at sector 2 (byte 1024).  The upstream 64K-stride scan only
+             * tested the first 4 bytes of each 64K read -> sampled offsets 0,64K,128K,... ->
+             * NEVER saw the sub-64K RDB -> "No RDB found" -> AMIX booted the no-RDB fallback,
+             * mounted root R/W, stamped fs_state=FSACTIVE before bcheckrc's fsck -m -> fsck-
+             * every-boot loop.  Read one 512-byte block per index so the RDB is found.
+             * AMIX-ONLY: a hybrid AmigaOS HDF (MBR at sector 0, Amiga RDB at sector 2 - like
+             * this card's Workbench image) has its sector-2 RDB FOUND by this per-sector scan
+             * and is then given RDB geometry it was never used with on stock (whose 64K scan
+             * misses it -> synthetic fallback) -> Kickstart can't read DH0 (insert-disk) + a
+             * downstream [Core0] DataAbort in the PISCSI debug-msg path.  So gate the scan. */
+            f_lseek(fd, (FSIZE_t)i * 512);
+            f_read(fd, block, 512, &n_bytes);
+         }
+         else
+         {
+            f_read(fd, block, PISCSI_MAX_BLOCK_SIZE,&n_bytes);
+         }
       }
       else
       {
@@ -1028,7 +1083,17 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       }
 
       map = piscsi_u32_read[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_read[2]);
-      if ( (config.cpu_ram        && (map>=0x08000000) && (map<0x10000000))
+      // AMIX direct-DMA contract (LOCKSTEP with the driver, do not diverge):
+      // the native piscsi driver (amix-z3660scsi/src/z3660.c z3660_rw) and the AmigaOS
+      // bootrom driver (z3660-drivers/scsi/z3660_scsi.c) both key their bounce protocol on
+      // BOUNCE_THRESH=0x08000000: on a WRITE they stage into board+0x80000 ONLY when the
+      // buffer is < 0x08000000, and on a READ they copy back out of board+0x80000 ONLY when
+      // USED_DMA != 0 -- i.e. for a buffer at/above 0x08000000 they expect the ARM to DMA
+      // directly to/from it (no bounce). Since 22ce6f2 the AMIX kernel and all its DMA
+      // buffers live in Zynq-local DDR at $08000000 (drct_bank, guest==host 1:1), so honour
+      // that contract here. cpu_ram stays force-disabled for AMIX (no $08 autoconfig board);
+      // amix_mode alone re-enables the direct path for the drct_bank CPU-RAM window.
+      if ( ((config.cpu_ram || config.amix_mode) && (map>=0x08000000) && (map<0x10000000))
          ||(config.autoconfig_ram && (map>=0x40000000) && (map<0x50000000))
       )
       {
@@ -1053,6 +1118,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          {
             unsigned int n_bytes;
             FRESULT res=f_read(d->fd, (uint8_t *)map, piscsi_u32_read[1],&n_bytes);
+            amix_sb_crumb("READ", (uint64_t)d->lba * d->block_size, piscsi_u32_read[1], (uint8_t *)map);
             if(res!=FR_OK)
             {
                printf("SCSI ERROR!!! f_read result=%d\n",res);
@@ -1081,6 +1147,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          {
             unsigned int n_bytes;
             FRESULT res=f_read(d->fd, buffer, piscsi_u32_read[1], &n_bytes);
+            amix_sb_crumb("READ", (uint64_t)d->lba * d->block_size, piscsi_u32_read[1], buffer);
             if(res!=FR_OK)
                printf("SCSI ERROR!!! f_read result=%d\n",res);
             DEBUG("            Bytes read %d\n",n_bytes);
@@ -1104,8 +1171,10 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       d = &devs[val];
       if(val != piscsi_cur_drive)
       {
-         printf("[PISCSI] Warning val=%ld piscsi_cur_drive=%d\n",val,piscsi_cur_drive);
-         printf("[PISCSI] Command cmd=%d\n",cmd);
+         if(debug_console.debug_scsi){   // idle-poll flood -> behind the SCSI debug toggle
+            printf("[PISCSI] Warning val=%ld piscsi_cur_drive=%d\n",val,piscsi_cur_drive);
+            printf("[PISCSI] Command cmd=%d\n",cmd);
+         }
       }
       if (d->fd == 0) {
          DEBUG("[!!!PISCSI] BUG: Attempted write to unmapped drive %ld.\n", val);
@@ -1142,7 +1211,11 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
       }
 
       map = piscsi_u32_write[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_write[2]);
-      if ( ((map>=0x08000000) && (map<0x10000000) && config.cpu_ram)
+      // AMIX direct-DMA contract -- see the READ handler above. The driver stages a WRITE
+      // into board+0x80000 only for buffers < 0x08000000 (z3660.c:254 / z3660_scsi.c:402),
+      // so a buffer at/above $08000000 is NOT in the bounce and MUST be read directly from
+      // the drct_bank DDR CPU-RAM (guest==host 1:1); bouncing it would write stale bytes.
+      if ( ((map>=0x08000000) && (map<0x10000000) && (config.cpu_ram || config.amix_mode))
             ||((map>=0x40000000) && (map<0x50000000) && config.autoconfig_ram)
       )
       {
@@ -1161,6 +1234,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          {
             unsigned int n_bytes;
             f_write(d->fd, (uint8_t *)map, piscsi_u32_write[1],&n_bytes);
+            amix_sb_crumb("WRITE", (uint64_t)d->lba * d->block_size, piscsi_u32_write[1], (uint8_t *)map);
             DEBUG("             Bytes written %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_write[1])
             {
@@ -1184,6 +1258,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          {
             unsigned int n_bytes;
             f_write(d->fd, buffer, piscsi_u32_write[1], &n_bytes);
+            amix_sb_crumb("WRITE", (uint64_t)d->lba * d->block_size, piscsi_u32_write[1], buffer);
             DEBUG("             Bytes written %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_write[1])
             {
