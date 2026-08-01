@@ -76,6 +76,8 @@ typedef struct {
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
    float resistor;
@@ -121,6 +123,8 @@ typedef struct {
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
    int kickstart;
