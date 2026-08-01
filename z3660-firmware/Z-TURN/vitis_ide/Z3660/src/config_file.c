@@ -793,6 +793,10 @@ retry:
       case CONFITEM_ISO18:
       case CONFITEM_ISO19: {
          int index=item-CONFITEM_ISO0;
+         if(index>=7){ // cd_target[] is 7 deep: iso7..iso19 would write past it into adf_num/hdf[0]
+            printf("[CFG] iso%d ignored -- CD-capable slots are iso0..iso6 (cd_target[7])\n", index);
+            break;
+         }
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          sprintf(config.hdf[index],"%s%s", DEFAULT_ROOT, cur_cmd);
          if(verbose) printf("[CFG] iso%d file %s\n", index, config.hdf[index]);

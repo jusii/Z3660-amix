@@ -72,23 +72,24 @@ scsiboot YES
 # Get it wrong and it fails quietly, in both directions: the image is mounted as
 # a plain read-write RDB hard disk (its ISO filesystem will not be found), AND any
 # unrelated image that happens to sit on target N is presented as a CD-ROM.
-# The iso6 / scsi4 pair further down is upstream's shipped example and hits exactly
-# this - slot 6 flagged, target 4 assigned - so it does NOT produce a working CD.
-# Only slots 0-6 can carry the flag at all; iso7 and above set nothing usable.
+# The iso4 / scsi4 pair below shows the CORRECT form: the ISO's slot number and
+# its scsiN target are the SAME (4). Upstream's shipped example paired iso6 with
+# scsi4 6 - slot 6 flagged, target 4 assigned - which does NOT produce a working
+# CD. Only slots 0-6 can carry the flag at all; iso7 and above are refused.
 hdf0 hdf/a4000.hdf
 hdf1 hdf/Daten5_PFS3.hdf
 hdf2 hdf/Work.hdf
 hdf3 hdf/temp_1G_PFS3.hdf
-hdf4 hdf/hd0.hda
+#hdf4 hdf/hd0.hda
 hdf5 hdf/Programs.hdf
-iso6 iso/AmigaOS39.iso
+iso4 iso/AmigaOS39.iso
 
 # Select the scsi number (scsi0 to scsi6) to assign one of the above hdf files
 scsi0 0
 scsi1 1
 #scsi2 2
 scsi3 3
-scsi4 6
+scsi4 4
 #scsi5 0
 #scsi6 0
 
