@@ -62,6 +62,9 @@ typedef enum {
    PHD,     PRINT_HIST_DATAABORT,
    VMR,     VIDEO_MODE_RESET,
    OVL,     TOGGLE_OVERLAY,
+   DEMU,    DEBUG_EMU,
+   PERF,    PERF_REPORT,
+   SERV,    SERVICE_CADENCE,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -106,6 +109,9 @@ const char *command_names[NUM_COMMANDS] = {
       "PHD",     "PRINT_HIST_DATAABORT",
       "VMR",     "VIDEO_MODE_RESET",
       "OVL",     "TOGGLE_OVERLAY",
+      "DEMU",    "DEBUG EMU",
+      "PERF",    "PERF REPORT",
+      "SERV",    "SERVICE CADENCE",
 };
 extern clock_data cd[];
 extern CONFIG config;
@@ -121,6 +127,8 @@ void debug_console_init(void)
    debug_console.debug_ethernet=0;
    debug_console.debug_soft3d=0;
    debug_console.debug_i2c=0;
+   shared->debug_emu=0;         // emulator-core debug spam default OFF (DEMU menu cmd toggles)
+   shared->perf_report=0;       // 030-MMU instruction-rate readout default OFF (PERF menu cmd)
    debug_console.stop_i2c=0;
    debug_console.step=0;
    debug_console.hist_pointer=0;
@@ -340,6 +348,27 @@ int debug_thread(struct pt *pt)
                         xil_printf("DEBUG SCSI ON\r\n");
                      else
                         xil_printf("DEBUG SCSI OFF\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case DEMU:
+                  case DEBUG_EMU:
+                     shared->debug_emu=!shared->debug_emu;   // emulator-core debug spam: [PC]/[RTE-B-IF]/fixup (+ AMIX strand trace)
+                     xil_printf("DEBUG EMU %s\r\n", shared->debug_emu?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case PERF:
+                  case PERF_REPORT:
+                     shared->perf_report=!shared->perf_report;   // 030-MMU instruction-rate readout (~1Hz) to serial
+                     xil_printf("PERF REPORT %s\r\n", shared->perf_report?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case SERV:
+                  case SERVICE_CADENCE:
+                     {  // cycle the 030-MMU IPL/cross-core poll cadence: 1->2->4->8->16->32->64->1
+                        uint32_t c=shared->service_cadence; c=(c<1)?1:c*2; if(c>64) c=1;
+                        shared->service_cadence=c;
+                        xil_printf("SERVICE CADENCE %lu (instr between IPL/task polls; 1=every instr)\r\n",(unsigned long)c);
+                     }
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:
@@ -787,7 +816,8 @@ int debug_thread(struct pt *pt)
                   || config.boot_mode==UAE_030
                   || config.boot_mode==UAEJIT_030
                   || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+                  || config.boot_mode==UAEJIT_040
+                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                   emu=1;
                else
                   emu=0;
@@ -851,7 +881,8 @@ int debug_thread(struct pt *pt)
                   || config.boot_mode==UAE_030
                   || config.boot_mode==UAEJIT_030
                   || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+                  || config.boot_mode==UAEJIT_040
+                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                   emu=1;
                else
                   emu=0;
@@ -895,7 +926,8 @@ int debug_thread(struct pt *pt)
                || config.boot_mode==UAE_030
                || config.boot_mode==UAEJIT_030
                || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040)
+               || config.boot_mode==UAEJIT_040
+               || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                emu=1;
             else
                emu=0;
@@ -915,7 +947,8 @@ int debug_thread(struct pt *pt)
                || config.boot_mode==UAE_030
                || config.boot_mode==UAEJIT_030
                || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040)
+               || config.boot_mode==UAEJIT_040
+               || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                emu=1;
             else
                emu=0;
@@ -975,7 +1008,8 @@ int debug_thread(struct pt *pt)
                   || config.boot_mode==UAE_030
                   || config.boot_mode==UAEJIT_030
                   || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+                  || config.boot_mode==UAEJIT_040
+                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                   emu=1;
                else
                   emu=0;
@@ -1031,7 +1065,8 @@ int debug_thread(struct pt *pt)
                   || config.boot_mode==UAE_030
                   || config.boot_mode==UAEJIT_030
                   || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+                  || config.boot_mode==UAEJIT_040
+                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
                   emu=1;
                else
                   emu=0;
@@ -1088,5 +1123,8 @@ void debug_console_help(void)
    xil_printf("'PHD'     or 'PRINT_HIST_DATAABORT' for printing the data abort histogram (EMU only)\r\n");
    xil_printf("'VMR'     or 'VIDEO_MODE_RESET' for reseting vdma\r\n");
    xil_printf("'OVL'     or 'TOGGLE_OVERLAY' for toggling the debug overlay\r\n");
+   xil_printf("'DEMU'    or 'DEBUG EMU' toggles emulator-core debug spam + AMIX strand trace\r\n");
+   xil_printf("'PERF'    or 'PERF REPORT' toggles the 030-MMU instr/sec readout (~1Hz, EMU)\r\n");
+   xil_printf("'SERV'    or 'SERVICE CADENCE' cycles 030-MMU IPL/task poll cadence 1->2->4..64 (EMU)\r\n");
 }
 #endif
