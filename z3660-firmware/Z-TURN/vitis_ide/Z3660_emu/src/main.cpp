@@ -55,6 +55,9 @@ void init_shared(void)
    shared->nops_write=DEFAULT_NOPS_WRITE;
    shared->nops_read=DEFAULT_NOPS_READ;
 }
+/* Emulator-core debug spam gate (DEMU menu toggle). Accessor so the uae files
+ * (newcpu.cpp / cpummu030.cpp) can check it without pulling in the SHARED struct. */
+extern "C" int z3660_dbg_emu(void){ return shared ? (int)shared->debug_emu : 0; }
 XGpioPs GpioPs;
 XGpioPs_Config *GpioPsConfigPtr;
 /*
@@ -79,9 +82,18 @@ extern "C" void load_romext(void)
    printf("load romext emu %d\n",shared->load_romext_emu);
 }
 int read_irq=0;
+// AMIX A3000 SCSI: software-injected level-2 (Amiga INT2 / PORTS) for the
+// emulated WD33C93+SuperDMAC. Holds the asserted level (0 or 2). Written by
+// a3000_scsi.cpp (recomputed from SDMAC CNTR.INTEN && WD ASR_INT). It is a pure
+// software IPL into THIS core's CPU emulation, NOT the physical FPGA INT6 path
+// (amiga_interrupt_set), which is the wrong level and wrong route for A3000 SCSI.
+volatile int a3000_scsi_irq=0;
 extern "C" int intlev(void)
 {
-   return(read_irq);
+   int level=read_irq;
+   if(a3000_scsi_irq>level) // OR-in the emulated A3000 SCSI INT2 (max with physical IPL)
+      level=a3000_scsi_irq;
+   return(level);
 }
 #define NOP asm(" nop")
 
@@ -155,6 +167,7 @@ enum piscsi_cmds {
    PISCSI_CMD_LOADFS       = 0x94,
    PISCSI_CMD_GET_FS_INFO  = 0x98,
    PISCSI_CMD_USED_DMA     = 0x9C,
+   PISCSI_CMD_PDT          = 0xA0, // read-only peripheral-device-type (T2.P1); handled on core0
    PISCSI_DBG_MSG          = 0x100,
    PISCSI_DBG_VAL1         = 0x110,
    PISCSI_DBG_VAL2         = 0x114,
@@ -236,6 +249,12 @@ uint32_t addr2=0;
 uint32_t addr3=0;
 extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 {
+   /* READ-descriptor stashes for the post-spin core1 L1 invalidate below. The
+    * guest programs the descriptor across separate register-write calls before
+    * the trigger, so these must persist between calls: ADDR2 -> byte length
+    * (core0 piscsi_u32_read[1]), ADDR3 -> DMA target address (piscsi_u32_read[2]). */
+   static uint32_t piscsi_len_stash=0;
+   static uint32_t piscsi_addr_stash=0;
    if(zaddr < PISCSI_DBG_MSG)
    {
       switch(zaddr)
@@ -256,6 +275,10 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 //         Xil_DCacheFlush();
          break;
       case PISCSI_CMD_ADDR2:
+         piscsi_len_stash=zdata; // transfer byte length (core0 piscsi_u32_read[1])
+         break;
+      case PISCSI_CMD_ADDR3:
+         piscsi_addr_stash=zdata; // DMA target address (core0 piscsi_u32_read[2]); no cache op, matching the prior fall-through no-op
          break;
       case PISCSI_CMD_WRITE64:
       case PISCSI_CMD_WRITE:
@@ -286,6 +309,26 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 
 
    while(shared->write_scsi==1){NOP;}
+
+   /* AMP READ cache-coherence fix. Core0 has now DMAed sector data into DRAM
+    * below the caches (scsi.c pre-invalidates L1+L2 for the target range, then
+    * XSdPs writes DRAM directly). While core1 was parked in the spin above, this
+    * still-live Cortex-A9 can speculatively refill L1D lines covering the DMA
+    * target, leaving stale lines over the fresh DRAM; the guest then reads a mix
+    * of fresh DRAM and stale cache. The consuming core must invalidate its own
+    * L1 AFTER the producer's DMA, so do the target range here for the three READ
+    * triggers only (WRITE never reads the buffer back, and its trigger-time flush
+    * stays). Xil_L1DCacheInvalidateRange clean+invalidates only the unaligned
+    * edge lines (preserving neighbours) and pure-invalidates the interior, which
+    * is what we want: the buffer holds only stale speculative lines. By-MVA
+    * maintenance on an uncached/foreign address is a harmless no-op, so an
+    * unconditional range (incl. the bounce path, where core1 fills the guest
+    * buffer itself afterwards) is safe; guard only on nonzero stashes. */
+   if((zaddr==PISCSI_CMD_READ || zaddr==PISCSI_CMD_READ64 || zaddr==PISCSI_CMD_READBYTES)
+      && piscsi_addr_stash!=0 && piscsi_len_stash!=0)
+   {
+      Xil_L1DCacheInvalidateRange(piscsi_addr_stash,piscsi_len_stash);
+   }
 }
 
 extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
@@ -305,6 +348,13 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       switch(zaddr)
       {
       case PISCSI_CMD_BLOCKSIZE:
+      /* The USED_DMA clean+invalidate below is LOAD-BEARING for direct-DMA reads:
+       * every piscsi driver reads USED_DMA right after a READ trigger, and this
+       * whole-L1 flush evicts any stale buffer lines core1 acquired speculatively
+       * while core0 ran the transfer -- the guest's first data read then refills
+       * from the shared L2/DRAM, which core0 guarantees fresh (scsi.c pre-transfer
+       * Xil_DCacheInvalidateRange). Keep it a FLUSH (clean+invalidate): a pure
+       * invalidate would discard core1's own dirty emulator state. */
       case PISCSI_CMD_USED_DMA:
       case PISCSI_CMD_BLOCKS:
       case PISCSI_CMD_GETPART:
@@ -331,6 +381,8 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       case PISCSI_CMD_READBYTES:
          Xil_L1DCacheInvalidate();
          break;
+      case PISCSI_CMD_PDT:
+         break; // read-only device-type register (forwarded to core0); no cache op -- silence the per-command log
       default:
          printf("SCSI read command %02x\n",zaddr);
       }
@@ -910,6 +962,10 @@ int main()
          {
             uae_emulator(1,68040);
          }
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
          else if(shared->cfg_emu==MUSASHI)
          {
             musashi_emulator();
@@ -933,7 +989,11 @@ int main()
          {
             uae_emulator(0,68040);
          }
-         else// if(shared->cfg_emu==UAEJIT_040)
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAEJIT_040)
          {
             uae_emulator(1,68040);
          }
