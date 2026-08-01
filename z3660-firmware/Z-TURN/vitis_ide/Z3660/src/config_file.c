@@ -145,6 +145,8 @@ const char *config_item_names[CONFITEM_NUM] = {
       "test_range6",
       "test_range7",
       "arm_frequency",
+      "amix_mode",
+      "service_cadence",
 };
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
@@ -154,6 +156,7 @@ const char *bootmode_names[BOOTMODE_NUM] = {
       "UAEJIT_030",
       "UAE_040",
       "UAEJIT_040",
+      "UAE_030_MMU",
 };
 const char *yesno_names[YESNO_NUM] = {
       "NO",
