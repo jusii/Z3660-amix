@@ -236,6 +236,14 @@ static inline int cctrue(int cc)
 /*
  * Machine dependent structure for holding the 68k CCR flags
  */
+
+/* Z3660: this header is included twice per translation unit -- once before
+ * regs exists and once after (REGS_DEFINED). The declaration half must appear
+ * only on the first pass and the regs-using half only on the second. The ARM
+ * branch below still does this; this x86 arm lost the split, which makes any
+ * x86-64 build (our host MMU test harness) fail with a redefinition of
+ * flag_struct/cctrue and a use of regs before it is declared. Restore it. */
+#ifndef REGS_DEFINED
 struct flag_struct {
    uae_u32 cznv;
    uae_u32 x;
@@ -269,6 +277,8 @@ struct flag_struct {
 #define FLAGVAL_V (1 << FLAGBIT_V)
 #define FLAGVAL_X (1 << FLAGBIT_X)
 
+
+#else /* REGS_DEFINED */
 #define SET_ZFLG(y) (regs.ccrflags.cznv = (((uae_u32)regs.ccrflags.cznv) & ~FLAGVAL_Z) | (((y) & 1) << FLAGBIT_Z))
 #define SET_CFLG(y) (regs.ccrflags.cznv = (((uae_u32)regs.ccrflags.cznv) & ~FLAGVAL_C) | (((y) & 1) << FLAGBIT_C))
 #define SET_VFLG(y) (regs.ccrflags.cznv = (((uae_u32)regs.ccrflags.cznv) & ~FLAGVAL_V) | (((y) & 1) << FLAGBIT_V))
@@ -447,6 +457,8 @@ static inline int cctrue(int cc)
          "movb %%ah,regs.ccrflags+1\n\t" \
          : : "qmi" (s), "q" (d) : "%eax","cc","memory")
 
+
+#endif /* REGS_DEFINED */
 #endif /* SAHF_SETO_PROFITABLE */
 
 #elif defined(CPU_riscv64) || defined(CPU_arm) || defined(CPU_AARCH64)
