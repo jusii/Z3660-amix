@@ -263,7 +263,7 @@ anyone who wants to push emulation fidelity further.
 
 ## Defects found in upstream beta 21 (candidates to report)
 
-The beta-21 resync turned up four upstream defects. All four are fixed or worked around on this
+The beta-21 resync turned up six upstream defects. All four are fixed or worked around on this
 branch; none has been reported upstream yet. They are recorded here so the reports can be written
 from the evidence rather than from memory.
 
@@ -296,7 +296,28 @@ from the evidence rather than from memory.
 
 4. **`isoN` slot/target mismatch**, described in detail above. Beta 21's shipped example config
    demonstrates the bug. Not fixed here: adopting upstream's parser unmodified was a deliberate
-   choice, so this fork documents the constraint instead of diverging from it.
+   choice, so this fork documents the constraint instead of diverging from it. **The same parser
+   also wrote out of bounds** — `config.cd_target[index]` is indexed 0..19 against a 7-element
+   array, so `iso7`..`iso19` scribbled into `adf_num[]` and the head of `hdf[0]`. That half *is*
+   fixed here (`8dad55a`): the keys are refused with a console line naming the 0–6 limit.
+
+5. **`httpd` sends a malformed 200 header** (`Z3660/src/lwip/httpd.c`, `send_http_header`). Each
+   line of the status/header block ends with a bare `\r` instead of `\r\n`, so the response
+   arrives as one run-on line with no blank line before the body:
+   `HTTP/1.1 200 OKContent-Type: text/htmlConnection: close`. The file itself is transmitted
+   intact — a raw socket read returns every byte — but a conforming client discards the body, so
+   the web UI renders empty. Observed on real hardware 2026-08-02. `http_send_404()` two functions
+   later already spells `\r\n`, which is what identifies this as a typo rather than a convention.
+   Fixed here; `.json` was also added to `mime_type()`, since the shipped UI fetches
+   `web/locales/*.json` and they were going out as `application/octet-stream`.
+
+6. **The web UI's own files are not installed anywhere.** `httpd` serves from `1:/web`, but beta 21
+   ships those files only under `Z3660/src/web/` in the source tree — nothing copies them to the
+   card, so a freshly updated board answers every request with `f_open failed for
+   1:/web/index.html: 5` (FatFs `FR_NO_PATH`) and a 404. Fixed here by vendoring them into
+   `z3660-zturn_SD_content/DATA Second Partition (exFat)/web/` so they travel with the card image.
+   Note the firmware's own `PUT /upload/<name>?path=<dest>` endpoint can populate a running board
+   without touching the boot menu — it creates the destination directory if missing.
 
 ---
 
