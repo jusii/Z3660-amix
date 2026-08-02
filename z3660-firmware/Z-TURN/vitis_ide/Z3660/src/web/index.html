@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Z3660 SD Manager</title>
@@ -11,13 +11,13 @@
 
 <div class="header">
     <h1 id="title">Z3660 SD Manager</h1>
-    <p id="subtitle">Servidor Web - Gestión de archivos de la tarjeta SD</p>
+    <p id="subtitle">Web Server - SD card file management</p>
 </div>
 
 <div class="container">
 
     <div class="card">
-        <h2 id="info_title">Información del sistema</h2>
+        <h2 id="info_title">System information</h2>
 
         <table>
             <tr>
@@ -26,12 +26,12 @@
             </tr>
 
             <tr>
-                <td id="lbl_ip">Dirección IP</td>
+                <td id="lbl_ip">IP address</td>
                 <td id="ip">192.168.1.100</td>
             </tr>
 
             <tr>
-                <td id="lbl_free">Espacio libre</td>
+                <td id="lbl_free">Free space</td>
                 <td id="free">245 MB</td>
             </tr>
 
@@ -40,32 +40,32 @@
 
     <div class="card">
 
-        <h2 id="files_title">Archivos</h2>
+        <h2 id="files_title">Files</h2>
 
         <table class="files">
 
             <tr>
-                <th id="th_name">Nombre</th>
-                <th id="th_size">Tamaño</th>
-                <th id="th_action">Acción</th>
+                <th id="th_name">Name</th>
+                <th id="th_size">Size</th>
+                <th id="th_action">Action</th>
             </tr>
 
             <tr>
                 <td>core.bin</td>
                 <td>3.2 MB</td>
-                <td><button data-i18n="btn_download">Descargar</button></td>
+                <td><button data-i18n="btn_download">Download</button></td>
             </tr>
 
             <tr>
                 <td>config.ini</td>
                 <td>2 KB</td>
-                <td><button data-i18n="btn_download">Descargar</button></td>
+                <td><button data-i18n="btn_download">Download</button></td>
             </tr>
 
             <tr>
                 <td>logo.png</td>
                 <td>58 KB</td>
-                <td><button data-i18n="btn_download">Descargar</button></td>
+                <td><button data-i18n="btn_download">Download</button></td>
             </tr>
 
         </table>
@@ -74,7 +74,7 @@
 
     <div class="card">
 
-        <h2 id="upload_title">Subir archivo</h2>
+        <h2 id="upload_title">Upload file</h2>
 
         <input type="file" id="file_input">
 
@@ -85,20 +85,20 @@
             <option value="1:/web">1:/web</option>
         </select>
 
-        <button class="primary" id="btn_upload" data-i18n="btn_upload">Subir a la SD</button>
+        <button class="primary" id="btn_upload" data-i18n="btn_upload">Upload to SD</button>
         <span id="upload_status" style="margin-left: 10px; font-size: 0.9em; color: #666;"></span>
 
     </div>
 
     <div class="card">
 
-        <h2 id="actions_title">Acciones</h2>
+        <h2 id="actions_title">Actions</h2>
 
-        <button class="primary" id="btn_update" data-i18n="btn_update">Actualizar Firmware</button>
+        <button class="primary" id="btn_update" data-i18n="btn_update">Update Firmware</button>
 
-        <button id="btn_reboot" data-i18n="btn_reboot">Reiniciar</button>
+        <button id="btn_reboot" data-i18n="btn_reboot">Reboot</button>
 
-        <button id="btn_reload" data-i18n="btn_reload">Recargar Lista</button>
+        <button id="btn_reload" data-i18n="btn_reload">Reload list</button>
 
     </div>
 
