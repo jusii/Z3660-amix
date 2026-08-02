@@ -502,9 +502,9 @@ void send_http_header(struct tcp_pcb *pcb, const char *filename)
     const char *type = mime_type(filename);
     char header[256];
     int len = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r"
-        "Content-Type: %s\r"
-        "Connection: close\r"
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Connection: close\r\n"
         "\r\n",
         type);
     if (len < 0 || len >= (int)sizeof(header)) {
@@ -566,6 +566,13 @@ const char *mime_type(const char *name)
     if (!strcmp(ext, ".js")) {
         printf2(64,"[httpd] %s: .js -> application/javascript", __func__);
         return "application/javascript";
+    }
+
+    /* the shipped UI fetches web/locales/*.json; without this they go out as
+       octet-stream and a strict client refuses to parse them */
+    if (!strcmp(ext, ".json")) {
+        printf2(64,"[httpd] %s: .json -> application/json", __func__);
+        return "application/json";
     }
 
     if (!strcmp(ext, ".png")) {
