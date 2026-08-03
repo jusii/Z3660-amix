@@ -310,6 +310,11 @@ from the evidence rather than from memory.
    later already spells `\r\n`, which is what identifies this as a typo rather than a convention.
    Fixed here; `.json` was also added to `mime_type()`, since the shipped UI fetches
    `web/locales/*.json` and they were going out as `application/octet-stream`.
+   **Both fixes flashed and verified on the board 2026-08-03** (firmware crc32 `59FAE8CA`): a
+   strict client now receives `HTTP/1.1 200 OK` / `Content-Type: text/html` / `Connection: close`
+   on three separate lines and gets the full 7,410-byte body — it received **zero** bytes before —
+   and `locales/en.json` arrives as `application/json` and parses, which is what makes the UI's
+   forced-English path actually apply instead of falling through to the Spanish markup.
 
 6. **The web UI's own files are not installed anywhere.** `httpd` serves from `1:/web`, but beta 21
    ships those files only under `Z3660/src/web/` in the source tree — nothing copies them to the
