@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-08-02/03 — the web UI, the httpd defects, and the metal validation
+
+- **`httpd` sends a well-formed response header now (`2f4e58a`).** Beta 21's 200-response ended
+  every header line with a bare `\r` instead of `\r\n`, so the whole block arrived as one run-on
+  status line with no blank line before the body: `HTTP/1.1 200 OKContent-Type: text/htmlConnection:
+  close`. The file was transmitted intact — a raw socket read got every byte — but a conforming
+  client discarded the body, which read as an empty page. `http_send_404()` two functions later
+  already spelled `\r\n`, which is what identified it as a typo. `.json` was also added to
+  `mime_type()`; the shipped UI fetches `web/locales/*.json` and they were going out as
+  `application/octet-stream`.
+- **The web UI's own files are now shipped (`2f4e58a`, `7b9b874`).** `httpd` serves from `1:/web`,
+  but beta 21 ships those files only under `Z3660/src/web/` — nothing installs them, so an updated
+  board answers every request with `f_open failed … 5` and a 404. Vendored into
+  `z3660-zturn_SD_content/…/web/` so they travel with the card image. The markup's fallback text is
+  also translated: the loader hardcodes `lang='en'` and fetches only `/locales/en.json`, but every
+  literal in the HTML was Spanish — so whenever that fetch failed (i.e. always, given the header
+  defect) the page silently rendered in a language the code never selected.
+- **Both fixes flashed and verified on hardware 2026-08-03** (firmware crc32 `59FAE8CA`, flashed
+  through the rewritten `deploy-kvm.sh`): a strict client now receives the three header lines
+  separately and the full 7,410-byte body — it received **zero** before — and `locales/en.json`
+  arrives as `application/json` and parses. Post-flash gates all green: `BETA 21`,
+  `Emulation mode 4`, `68030 MMU enabled`, A3000 SCSI initialised, Amix to multiuser on the LAN,
+  and `validate-metal.sh --cycles 5` PASS on the CD stack.
+- **`docs/http-vs-tftp-upload.md` (new)** — measurements behind the workspace's move off TFTP,
+  including the correction that HTTP uploads do *not* run while the guest does.
+- **Defect catalogue in `docs/AMIX.md` now lists seven beta-21 defects**, none reported upstream:
+  the L1-only cache maintenance, the `else`-after-`else`, the `machdep/m68k.h` include guard, the
+  `isoN` slot/target trap **and its out-of-bounds write**, the malformed HTTP header, the
+  uninstalled web UI, and the UI's fake file rows (`core.bin`/`config.ini`/`logo.png`) with dead
+  action buttons.
+
 ## 2026-08-01 — beta-21 resync complete (branch `amix-main-2`)
 
 Rebased the Amix fork onto upstream firmware v1.03 beta 21 (`upstream/main` `1dddf79`) on a
