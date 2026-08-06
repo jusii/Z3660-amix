@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-08-06 — new carrier revision: bring-up findings and the 060 rule
+
+- **`docs/carrier-bringup-checklist.md` (`849a4bd`).** Two findings from the new carrier
+  revision's bring-up, A/B-proven against the old carrier with the same Zynq module, SD card,
+  firmware (`59FAE8CA`) and A4000: **the 68060 must be physically fitted even in pure-emulation
+  boot modes** — an empty socket leaves the interrupt//BERR/arbitration lines floating, which
+  the boot-time memory test never drives, so the test passes while Kickstart dies 3–13 s in
+  (the auto-clicker acknowledges the alert → RESET at ROM `f80de8`, endless reboot loop); and
+  **`enable_test`/`test_range` as the carrier-fault discriminator** — its failure pattern
+  isolated a CPLD solder bridge (32-bit chip-RAM cycles all garbage while 8-bit CIA cycles
+  passed) and a stuck-high D23 (the A4000 Fast-RAM SIMM unseated during the board swaps), plus
+  the operational gotchas (region prompts drain buffered `C` keys before the countdown;
+  re-disable the test for unattended boots). The new carrier was validated on metal 2026-08-06:
+  full stress battery — CD/DMA canaries, disk, CPU, network, warm reboot — PASS.
+
 ## 2026-08-02/03 — the web UI, the httpd defects, and the metal validation
 
 - **`httpd` sends a well-formed response header now (`2f4e58a`).** Beta 21's 200-response ended
