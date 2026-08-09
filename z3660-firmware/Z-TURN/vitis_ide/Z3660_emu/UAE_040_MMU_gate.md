@@ -7,9 +7,13 @@
 > exact unknown). `UAE_040_MMU` is now **runnable**: the run loop, the
 > `set_x_funcs` 040 accessor arm and the `main.cpp` dispatch are wired, the six
 > compile bridges are faithful, and a host smoke executes the 68040 interpreter.
-> Validated only in the **MMU-off / transparent** path (no 68040 AMIX kernel
-> exists yet); real 040 table-walk/TTR translation is the 3.3 harness and the
-> faithful 68040 bus-error stack frame is the still-parked 3.4 task.
+> **MMU-ON address translation is now validated on the host harness (90/90):**
+> the real 040 table walk (4K/8K), TTR matching, protection and U/M-bit updates
+> all check against the 68040 spec (§6). The 040 MMU semantics this core does
+> NOT model faithfully — where a real 68040 OS would exercise unmodelled paths —
+> are listed in §7; the faithful 68040 bus-error stack frame is the still-parked
+> 3.4 task and is the first place a real 040 kernel would break. A metal MMU-off
+> AmigaOS smoke is still queued.
 
 This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
 mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
@@ -154,3 +158,68 @@ tidier if the image grows a lot later: (1) share one MMU table across 030/040 vi
 the `set_x_funcs` accessor indirection; (2) load the 040 table on demand as an SD
 overlay; (3) drop the mode (AMIX runs on `UAE_030_MMU`; `UAEJIT_040` covers
 non-MMU 040); (4) reclaim space by auditing which boot-mode tables are reachable.
+
+## 6. 68040 MMU translation — validated on the host harness (P3.3)
+
+`test/host/harness_main.cpp` drives the real 040 table walk in `cpummu.cpp`
+(`mmu_translate` / `mmu_fill_atc`) with hand-built root→pointer→page descriptor
+tables in the flat buffer, plus `mmu_match_ttr` for transparent windows. Total
+harness **90/90** (64 pre-existing 030 + 5 P3.2 040 interp + 21 new P3.3 040
+translation). Coverage, in 68040 terms, of the cases the 030 harness covered:
+
+| behavior | test | asserted |
+|---|---|---|
+| TTR transparent match / no-match / S-field | `test_mmu040_ttr` | `mmu_match_ttr` = OK / NO_MATCH for in/out-of-window, super+user |
+| TTR write-protect | `test_mmu040_ttr` | WP window → `TTR_NO_WRITE` |
+| TTR end-to-end bypass | `test_mmu040_ttr` | in-window `get_long_mmu040` returns physical value, no table, no fault |
+| 3-level walk, 4K (single-translation smoke) | `test_mmu040_translate_4k` | VA 0x00408678 → PA 0x0A000678 |
+| 3-level walk, 8K | `test_mmu040_translate_8k` | VA 0x00408678 → PA 0x0A002678 (13-bit offset) |
+| ATC hit | `test_mmu040_translate_4k` | 2nd translate of the page base → frame base, no fault |
+| U (used) bit update | `test_mmu040_translate_4k` | page descriptor U set after read |
+| miss / invalid page | `test_mmu040_protection` | non-resident descriptor → bus fault (THROW) |
+| write-protect (page) | `test_mmu040_protection` | read OK, write → fault |
+| supervisor-only page | `test_mmu040_protection` | super read OK, user read → fault |
+| M (modified) bit update | `test_mmu040_modified_bit` | U+M set in descriptor after write |
+
+The harness bottoms descriptor and physical accesses out at the same flat buffer
+the 030 vectors use (`desc_get/put_long` → `x_phys_*`), so these exercise the
+genuine engine, not stubs. Reproduce: `make -C test/host && ./test/host/build/mmu_harness`.
+
+## 7. 68040 MMU behaviors NOT modelled / not yet validated (gap list)
+
+Surfaced now so they are a written list, not a surprise when a real 68040 kernel
+(or a 68040 AMIX port) lands. In rough order of how likely a booting 040 OS is to
+hit them:
+
+1. **Faithful 68040 bus-error stack frame (format $7)** — *the first thing a real
+   040 fault handler needs.* On a page fault `mmu_translate`/`mmu_bus_error`
+   THROW and the run loop restarts, but `Exception()` does not yet build the
+   68040 format-$7 frame (SSW, fault address, writeback status/data). This is the
+   parked **3.4** task; a demand-paging 040 kernel would RTE off a wrong frame.
+   The host harness cannot cover it (it asserts the translation result / that a
+   fault is raised, not the frame the guest OS would read).
+2. **Cache model / copyback + cache-inhibit coherency** — the walk decodes the
+   descriptor/TTR CM bits into `mmu_cache_state`, but this bare-metal emulator has
+   **no data/instruction cache model** (the Z3660 uses the real bus / a direct
+   pointer). CINV/CPUSH/`MOVE16` and cache-inhibited-DMA coherency are therefore
+   not emulated; an 040 OS relying on copyback semantics or cache-push for DMA
+   would not see faithful behavior. (On the 030 path this class of bug is what the
+   real hardware AMP-cache fix addressed; the 040 path has no equivalent model.)
+3. **MMU-management instructions PFLUSH/PTEST/PLPA** — `mmu_op_real()` implements
+   them and the `cpuemu_31` handlers dispatch them, but the harness does **not**
+   exercise them (it tests translation, not the ops). PTEST-sets-MMUSR and the
+   PFLUSH variants (by-ASID/global/single-page) are unverified here.
+4. **Indirect page descriptors** — the walk handles one level of indirection and
+   flags double-indirect as illegal, but no vector exercises the indirect path.
+5. **Misaligned / page-crossing accesses** — `mmu_get_word_unaligned` etc. handle
+   an access that straddles a page boundary (second-page fault); the vectors use
+   aligned longwords only, so the cross-page fault path is unverified for 040.
+6. **ATC set-associativity / replacement** — modelled (`mmu_atc_array[data]
+   [index][way]`, `ATC_WAYS`) and one hit is checked, but eviction/replacement
+   and the G (global) bit's flush exemption are not stress-tested.
+7. **68040 vs 68060 divergence** — shared code paths are `cpu_model`-guarded and
+   only 68040 is tested; 68060 (`cpuemu_33`, not built) is out of scope.
+
+None of 1–7 block the queued metal MMU-off AmigaOS smoke (that path enables no
+translation). They become live the moment a 68040 OS turns the MMU on; #1 and #2
+are the ones most likely to bite first.

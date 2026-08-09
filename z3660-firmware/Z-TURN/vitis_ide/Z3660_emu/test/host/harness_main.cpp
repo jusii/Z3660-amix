@@ -16,6 +16,7 @@
 #include "memory.h"
 #include "newcpu.h"
 #include "cpummu030.h"
+#include "cpummu.h"        /* 68040 MMU: mmu_translate, mmu_set_tc, mmu_match_ttr, TTR/descriptor defines */
 #include "harness.h"
 
 /* 68030 TT-register bits (#defined privately in cpummu030.cpp). */
@@ -544,6 +545,218 @@ static void test_mmu040_interp_exec(void)
 }
 
 /* ==================================================================
+ * 68040 MMU ADDRESS TRANSLATION vectors (MMU ON). These drive the real 040
+ * table walk in cpummu.cpp (mmu_translate / mmu_fill_atc) with hand-built root
+ * -> pointer -> page descriptor tables in the flat buffer, plus TTR matching,
+ * and assert physical addresses / faults / U+M bit updates against the 68040
+ * spec. This is the MMU-ON counterpart to test_mmu040_interp_exec (which was
+ * MMU-off/transparent) and the 040 analog of the test_mmu030_* vectors.
+ *
+ * 4K layout: VA[31:25]=root idx, VA[24:18]=ptr idx, VA[17:12]=page idx, [11:0]
+ * offset. 8K: page idx = VA[17:13], offset [12:0]. Descriptor validity: root/ptr
+ * need bit1 (UDT valid); page needs bit0 (resident). Fixed scratch tables:
+ * ================================================================== */
+#define M4_ROOT 0x00100000u   /* root table  (512-byte aligned) */
+#define M4_PTR  0x00101000u   /* pointer table                  */
+#define M4_PAGE 0x00102000u   /* page table  (256/128-byte aligned) */
+
+/* Build one VA->PA mapping and enable the 040 MMU. page_extra ORs bits into the
+ * page descriptor (MMU_DES_WP / MMU_DES_SUPER). Returns the page-descriptor
+ * flat-buffer address so a test can inspect U/M bits afterwards. */
+static uae_u32 mmu040_map1(uae_u32 va, uae_u32 pa, uae_u32 page_extra, bool page8k)
+{
+	harness_mem_reset();
+	currprefs.cpu_model = 68040;
+	currprefs.mmu_model = 68040;
+	currprefs.mmu_ec    = 0;
+	changed_prefs = currprefs;
+	mmu_set_tc((uae_u16)(0x8000 | (page8k ? 0x4000 : 0)));   /* enable + page size */
+	regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;       /* no transparent windows */
+	mmu_tt_modified();
+	regs.srp = regs.urp = M4_ROOT;
+
+	uae_u32 ri = (va >> 23) & 0x1fc;
+	uae_u32 pi = (va >> 16) & 0x1fc;
+	uae_u32 gi = page8k ? ((va >> 11) & 0x7c) : ((va >> 10) & 0xfc);
+	uae_u32 ptr_mask  = page8k ? MMU_PTR_PAGE_ADDR_MASK_8 : MMU_PTR_PAGE_ADDR_MASK_4;
+	uae_u32 page_mask = page8k ? MMU_PAGE_ADDR_MASK_8      : MMU_PAGE_ADDR_MASK_4;
+	uae_u32 pg_desc_addr = M4_PAGE + gi;
+
+	hram_poke32(M4_ROOT + ri, (M4_PTR  & MMU_ROOT_PTR_ADDR_MASK) | 2);   /* root -> ptr table  */
+	hram_poke32(M4_PTR  + pi, (M4_PAGE & ptr_mask)               | 2);   /* ptr  -> page table */
+	hram_poke32(pg_desc_addr, (pa & page_mask) | 1 | page_extra);        /* page (resident)    */
+	mmu_flush_atc_all(true);
+	return pg_desc_addr;
+}
+
+static void mmu040_off(void)   /* disable + flush + back to non-MMU cpufunctbl */
+{
+	regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+	mmu_set_tc(0);
+	mmu_flush_atc_all(true);
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* --- TTR transparent-translation matching (bypasses the table walk) --- */
+static void test_mmu040_ttr(void)
+{
+	printf("[test] MMU040 TTR transparent match / no-match / write-protect\n");
+	harness_mem_reset();
+	currprefs.cpu_model = 68040; currprefs.mmu_model = 68040; currprefs.mmu_ec = 0;
+	changed_prefs = currprefs;
+	mmu_set_tc(0x8000);                       /* MMU enabled, 4K */
+	regs.s = 1;
+
+	/* DTT0: transparent window over 0x0A000000..0x0AFFFFFF (base byte 0x0A, mask 0),
+	 * S-field enabled so it matches both supervisor and user. */
+	regs.dtt0 = 0x0A000000 | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED;
+	regs.dtt1 = 0;
+	mmu_tt_modified();
+	CHECK(mmu_match_ttr(0x0A123456, true,  true) == TTR_OK_MATCH, "DTT0 matches in-window (super)\n");
+	CHECK(mmu_match_ttr(0x0A800000, false, true) == TTR_OK_MATCH, "DTT0 matches in-window (user, S-field)\n");
+	CHECK(mmu_match_ttr(0x0B000000, true,  true) == TTR_NO_MATCH, "DTT0 no-match out-of-window\n");
+
+	/* End-to-end bypass: no page tables at all, but an in-window read returns the
+	 * physical value via TTR (no fault, no table walk). */
+	hram_poke32(0x0A001000, 0xCAFEF00D);
+	bool faulted = false; uae_u32 v = 0;
+	SAVE_EXCEPTION;
+	TRY(p) { v = get_long_mmu040(0x0A001000); } CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "TTR bypass read did not fault (no page table needed)\n");
+	CHECK_EQ32(v, 0xCAFEF00D, "TTR transparent read returns physical value");
+
+	/* Write-protected TTR window -> writes report TTR_NO_WRITE. */
+	regs.dtt0 = 0x0C000000 | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED | MMU_TTR_BIT_WRITE_PROTECT;
+	mmu_tt_modified();
+	CHECK(mmu_match_ttr(0x0C000000, true, true) == TTR_NO_WRITE, "write-protected TTR reports NO_WRITE\n");
+
+	mmu040_off();
+}
+
+/* --- 4K page-table walk: the single-translation smoke (hit + U bit) --- */
+static void test_mmu040_translate_4k(void)
+{
+	printf("[test] MMU040 single translation: 4K root->ptr->page walk\n");
+	const uae_u32 VA = 0x00408678, PA = 0x0A000000;
+	uae_u32 pd = mmu040_map1(VA, PA, 0, false);
+	regs.s = 1;
+
+	uae_u32 phys = 0; bool faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p) { phys = mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "4K walk completed without fault\n");
+	CHECK_EQ32(phys, PA | (VA & 0xFFF), "VA 0x00408678 -> PA 0x0A000678 (4K)");
+	CHECK((hram_peek32(pd) & MMU_DES_USED) != 0, "page descriptor U (used) bit set after read\n");
+
+	/* ATC hit: re-translate the page base returns the frame base, no fault. */
+	faulted = false; uae_u32 phys2 = 0;
+	SAVE_EXCEPTION;
+	TRY(p2) { phys2 = mmu_translate(VA & ~0xFFFu, 0, true, true, false, sz_long); }
+	CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "ATC re-access no fault\n");
+	CHECK_EQ32(phys2, PA, "ATC hit: page base -> frame base");
+
+	mmu040_off();
+}
+
+/* --- 8K page-table walk --- */
+static void test_mmu040_translate_8k(void)
+{
+	printf("[test] MMU040 single translation: 8K root->ptr->page walk\n");
+	const uae_u32 VA = 0x00408678, PA = 0x0A002000;
+	mmu040_map1(VA, PA, 0, true);
+	regs.s = 1;
+
+	uae_u32 phys = 0; bool faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p) { phys = mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "8K walk completed without fault\n");
+	CHECK_EQ32(phys, PA | (VA & 0x1FFF), "VA 0x00408678 -> PA 0x0A002678 (8K)");
+
+	mmu040_off();
+}
+
+/* --- protection & fault: invalid page, write-protect, supervisor-only --- */
+static void test_mmu040_protection(void)
+{
+	printf("[test] MMU040 protection: miss/fault, write-protect, supervisor-only\n");
+	const uae_u32 VA = 0x00408678, PA = 0x0A000000;
+	bool faulted;
+
+	/* (a) invalid page descriptor (resident bit clear) -> bus fault */
+	uae_u32 pd = mmu040_map1(VA, PA, 0, false);
+	hram_poke32(pd, 0);                       /* clear the page descriptor -> not resident */
+	mmu_flush_atc_all(true);
+	regs.s = 1; faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p) { (void)mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(faulted, "invalid page descriptor faults (miss)\n");
+
+	/* (b) write-protected page: read OK, write faults */
+	mmu040_map1(VA, PA, MMU_DES_WP, false);
+	regs.s = 1; faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p) { (void)mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "write-protected page allows read\n");
+	faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p2) { (void)mmu_translate(VA, 0, true, true, true, sz_long); }
+	CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(faulted, "write to write-protected page faults\n");
+
+	/* (c) supervisor-only page: super read OK, user read faults */
+	mmu040_map1(VA, PA, MMU_DES_SUPER, false);
+	regs.s = 1; faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p3) { (void)mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p3) { faulted = true; (void)p3; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "supervisor page allows supervisor read\n");
+	faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p4) { (void)mmu_translate(VA, 0, false, true, false, sz_long); }
+	CATCH(p4) { faulted = true; (void)p4; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(faulted, "user read of supervisor-only page faults\n");
+
+	mmu040_off();
+}
+
+/* --- modified (M) bit is set on the first write --- */
+static void test_mmu040_modified_bit(void)
+{
+	printf("[test] MMU040 modified (M) bit set on first write\n");
+	const uae_u32 VA = 0x00408678, PA = 0x0A000000;
+	uae_u32 pd = mmu040_map1(VA, PA, 0, false);
+	regs.s = 1;
+
+	CHECK((hram_peek32(pd) & MMU_DES_MODIFIED) == 0, "M bit clear before write\n");
+	bool faulted = false;
+	SAVE_EXCEPTION;
+	TRY(p) { (void)mmu_translate(VA, 0, true, true, true, sz_long); }
+	CATCH(p) { faulted = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "write translation no fault\n");
+	CHECK((hram_peek32(pd) & (MMU_DES_USED|MMU_DES_MODIFIED)) == (MMU_DES_USED|MMU_DES_MODIFIED),
+	      "U and M bits set in page descriptor after write\n");
+
+	mmu040_off();
+}
+
+/* ==================================================================
  * MMU030 demand-paging END TO END (the path AMIX actually depends on).
  * Earlier MMU tests stop at the THROW; this one drives the WHOLE loop:
  *   fault -> (run-loop CATCH) Exception(2) builds the 030 bus-error frame
@@ -858,6 +1071,11 @@ int main(int argc, char **argv)
 	test_mmu030_pflush();
 	test_mmu030_interp_exec();
 	test_mmu040_interp_exec();
+	test_mmu040_ttr();
+	test_mmu040_translate_4k();
+	test_mmu040_translate_8k();
+	test_mmu040_protection();
+	test_mmu040_modified_bit();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
