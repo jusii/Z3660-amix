@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-09 — P3 040-MMU lane, build-ahead (3.1–3.3 done; 3.4 parked)
+
+Scoped build-ahead of a 68040-MMU emulation mode, ahead of the external 68040 AMIX
+kernel that will eventually consume it (no 040 kernel exists to boot yet — every step
+here is validated only as far as is possible without one). Four commits, unpushed
+(fork, local-only):
+
+- **`704b549` → `6ec08f6` — the 12 MiB `BOOT.BIN` cap is a ghost, and the 68040-MMU
+  table is generated + linked.** The size gate first read NO-GO (a sibling opcode table
+  overshoots the conventional ~12 MiB line), but that line proved to be a dead TFTP-era
+  rule of thumb: the real cpuemu_31 (id 31 = 68040 MMU) + cpustbl_mmu040 tables were
+  generated via the WinUAE-4.4.0 gencpu flow, linked in (+291 KB), and the resulting
+  **12.156 MiB image booted on real metal** (cap test 2026-08-09: `[SD Init] Done
+  (Z3660.BIN)`, not FAILSAFE; production `59FAE8CA` restored after). The ~12 MiB gate in
+  CLAUDE.md/port-ledger is advisory, not a boot-load wall.
+- **`6848894` — `UAE_040_MMU` is runnable.** `m68k_run_mmu040()` run loop, the
+  `set_x_funcs()` 040 accessor arm (mmu_get/put, distinct from the 030 bank), `main.cpp`
+  dispatch, and the six link-only compile bridges made faithful (the non-obvious ones —
+  `do_cycles_stop`, `MakeFromSR_STOP`, `op_unimpl` — reasoned in the gate doc). Append-only
+  bootmode enum (index 8, both copies). Host smoke 69/69 (runs moveq/add/move.l through the
+  id-31 table, MMU off). Metal MMU-off AmigaOS boot smoke QUEUED in next-metal-session
+  (crc `92E1473F`).
+- **`5ebae16` — 68040 MMU address translation validated on the host, 90/90.** The 040
+  analog of the 030 MMU vectors, driving the real `cpummu.cpp` engine (which turned out
+  already complete — no core file needed touching): root→pointer→page table walks (4K/8K),
+  TTR transparent windows, protection (invalid/write-protect/supervisor), U+M bit updates,
+  ATC hit; a single-translation smoke asserts VA 0x00408678 → PA 0x0A000678 against the
+  hand-computed frame.
+
+`UAE_040_MMU_gate.md` carries the measured GO verdict (§ gate), the coverage table (§6),
+and — most usefully — a written **gap list (§7)** of 68040 MMU behaviors not yet modelled,
+ordered by when a booting 040 OS would hit them: #1 the format-$7 bus-error stack frame
+(the parked 3.4; its frame *builder* is host-assertable ahead of a kernel, its *integration*
+is not), #2 no cache model (CINV/CPUSH/MOVE16, cache-inhibit coherency), then PFLUSH/PTEST,
+indirect descriptors, page-crossing faults, ATC eviction. **3.4 stays parked pending an
+external 68040 kernel** (user decision); the lane is otherwise as far advanced as build-ahead
+allows.
+
 ## 2026-08-06 — new carrier revision: bring-up findings and the 060 rule
 
 - **`docs/carrier-bringup-checklist.md` (`849a4bd`).** Two findings from the new carrier
