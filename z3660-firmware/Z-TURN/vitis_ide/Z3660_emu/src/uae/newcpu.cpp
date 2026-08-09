@@ -731,6 +731,27 @@ static void set_x_funcs (void)
       write_data_030_bput = uae_mmu030_put_byte;
       write_data_030_wput = uae_mmu030_put_word;
       write_data_030_lput = uae_mmu030_put_long;
+   } else if (currprefs.mmu_model == 68040) {
+      // UAE_040_MMU: route every CPU memory access through the 68040 MMU
+      // accessors (cpummu.h) -- distinct from the 030 pointer bank above (the
+      // 68040 uses its own TTR + table-walk/descriptor format). The generated
+      // cpuemu_31 table (op_smalltbl_31_ff) fetches operands through these; the
+      // run loop m68k_run_mmu040 fetches opcodes via x_prefetch=get_iword_mmu040.
+      // With the MMU disabled (TC.E=0) these are transparent (TTR/identity) --
+      // the validatable build-ahead path today (no 68040 AMIX kernel yet).
+      x_prefetch = get_iword_mmu040;     // opcode fetch in m68k_run_mmu040
+      x_get_iword = get_iword_mmu040;
+      x_next_iword = next_iword_mmu040;
+      x_next_ilong = next_ilong_mmu040;
+      x_put_long = put_long_mmu040;
+      x_put_word = put_word_mmu040;
+      x_put_byte = put_byte_mmu040;
+      x_get_long = get_long_mmu040;
+      x_get_word = get_word_mmu040;
+      x_get_byte = get_byte_mmu040;
+      x_do_cycles = do_cycles;
+      x_do_cycles_pre = do_cycles;
+      x_do_cycles_post = do_cycles_post;
    } else {
       // 68020+ no ce
       set_x_ifetches();
@@ -4366,6 +4387,64 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
    }
 }
 
+// UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
+// (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
+// generated cpuemu_31 handlers (op_smalltbl_31_ff, cputbls[4][4]). Adapted from
+// WinUAE 4.4.0 m68k_run_mmu040: the 68040 uses FULL instruction restart
+// (regs.instruction_pc + the mmu_restart flag the cpuemu_31 handlers manage),
+// so this loop is far simpler than m68k_run_mmu030's 030 sub-access-replay path.
+// On a fault the CATCH restores flags, rewinds pc to the instruction start and
+// re-raises via Exception().
+// BUILD-AHEAD SCOPE: with the MMU disabled (TC.E=0) the *_mmu040 accessors are
+// transparent (TTR/identity), so no page faults occur -- that MMU-off path is
+// what is validatable today (there is no 68040 AMIX kernel yet). The faithful
+// 68040 bus-error STACK FRAME (format $7) that Exception() must build on a real
+// 040 page fault is the separate, still-parked bus-error-frame task; this loop
+// only provides the correct restart/dispatch structure around it.
+static void m68k_run_mmu040(void)
+{
+   struct flag_struct f;
+   int halt = 0;
+
+   while (!halt) {
+      TRY(prb) {
+         for (;;) {
+            f = regs.ccrflags;               // snapshot flags for instruction restart
+            mmu_restart = true;
+            regs.instruction_pc = m68k_getpc();
+
+            do_cycles(cpu_cycles);
+
+            mmu_opcode = -1;
+            mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
+            count_instr(regs.opcode);
+            cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+            cpu_cycles = adjust_cycles(cpu_cycles);
+
+            check_uae_int_request();
+            if (regs.spcflags) {
+               if (do_specialties(cpu_cycles))
+                  return;
+            }
+         }
+      } CATCH(prb) {
+         if (mmu_restart) {
+            // instruction restart: undo partial effects by rewinding to its start
+            regs.ccrflags = f;
+            m68k_setpci(regs.instruction_pc);
+         }
+         cpu_restore_fixup();
+         TRY(prb2) {
+            Exception(prb);
+         } CATCH(prb2) {
+            // fault while building the frame == double fault
+            halt = CPU_HALT_BUS_ERROR_DOUBLE_FAULT;
+         } ENDTRY
+      } ENDTRY
+   }
+   cpu_halt(halt);
+}
+
 static void m68k_run_mmu030(void)
 {
    struct flag_struct f;
@@ -4734,6 +4813,7 @@ void m68k_go (int may_quit)
       }
 
       run_func =
+         currprefs.mmu_model == 68040 ? m68k_run_mmu040 :   // UAE_040_MMU
          currprefs.mmu_model == 68030 ? m68k_run_mmu030 :   // UAE_030_MMU
          currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
          currprefs.cpu_compatible && currprefs.cpu_model <= 68010 ? m68k_run_1 :

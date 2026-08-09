@@ -11,17 +11,16 @@
 #include "debug.h"   /* Z3660: debugmem_trace / branch_stack_* (inert stubs) */
 #define SET_ALWAYS_CFLG(x) SET_CFLG(x)
 #define SET_ALWAYS_NFLG(x) SET_NFLG(x)
-/* Z3660 compile-bridges for the 68040-MMU table (id 31). The UAE_040_MMU run
- * loop and the set_x_funcs 040 accessor arm are NOT wired yet -- this table is
- * built in only so its size and linkage are real. These map the WinUAE
- * 68040-MMU codegen onto this tree's (Amiberry 5.6.0) API so cpuemu_31.cpp
- * compiles and links; revisit each when UAE_040_MMU is actually executed. */
-#define x_get_disp_ea_020(base, idx) x_get_disp_ea_020(base)  /* idx vestigial (0) */
-#define m68k_setstopped(level)       m68k_setstopped()         /* tree's is arg-less */
-#define do_cycles_stop(c)            ((void)(c))               /* no cycle accounting (matches 030 STOP path) */
-#define MakeFromSR_STOP()            MakeFromSR()
-#define checkint()                   doint()
-#define op_unimpl(op)                op_illg(op)                /* 040 unimpl trap -> illegal (stub) */
+/* Z3660 API bridges for the 68040-MMU table (id 31): the WinUAE 68040 codegen
+ * calls a few helpers this tree (Amiberry 5.6.0 lineage) spells differently.
+ * Each maps to the faithful 68040 behavior on this non-cycle-exact, chipset-less
+ * interpreter; the non-obvious ones are explained in UAE_040_MMU_gate.md. */
+#define x_get_disp_ea_020(base, idx) x_get_disp_ea_020(base)  /* 2nd arg vestigial (always 0) in this lineage */
+#define m68k_setstopped(level)       m68k_setstopped()         /* arg-less; sets stopped + SPCFLAG_STOP, DOTRACE-aware */
+#define do_cycles_stop(c)            ((void)(c))               /* non-CE + no chipset: STOP wait is driven by do_specialties' poll */
+#define MakeFromSR_STOP()            MakeFromSR()              /* full SR rebuild (non-CE); same call the 030 STOP path uses */
+#define checkint()                   doint()                   /* raise SPCFLAG_INT for a pending interrupt (wakes STOP) */
+#define op_unimpl(op)                Exception(61)             /* 68060 unimplemented-integer vector; unreachable on 68040 (m68k_mull/divl always succeed) */
 /* OR.B #<data>.B,Dn */
 uae_u32 REGPARAM2 op_0000_31_ff(uae_u32 opcode)
 {

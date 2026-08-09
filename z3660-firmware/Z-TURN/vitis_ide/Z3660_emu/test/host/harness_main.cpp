@@ -493,6 +493,57 @@ static void test_mmu030_interp_exec(void)
 }
 
 /* ==================================================================
+ * 68040-MMU interpreter smoke (MMU OFF / transparent). Proves the P3.2 wiring
+ * end to end on the host: build_cpufunctbl(mmu_model==68040 -> mode 4 ->
+ * cputbls[4][4] = op_smalltbl_31_ff) + set_x_funcs(040 arm,
+ * x_prefetch=get_iword_mmu040) dispatch the generated cpuemu_31 table and it
+ * executes. With regs.mmu_enabled==0 (TC.E off) the *_mmu040 accessors are
+ * transparent (identity), so opcode fetch + register ops run against the flat
+ * buffer -- the validatable build-ahead path (no 68040 AMIX kernel yet; real
+ * 040 table-walk/TTR translation is the separate 3.3 harness). Also exercises a
+ * memory operand (move.l Dn,(An)+ / read-back) through put/get_long_mmu040.
+ * ================================================================== */
+static void test_mmu040_interp_exec(void)
+{
+	printf("[test] MMU040 interpreter executes (MMU off / transparent) via op_smalltbl_31_ff\n");
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040;
+	currprefs.mmu_model = 68040;         /* select the 040 MMU column */
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();                  /* mmu_model=68040 -> mode 4 -> op_smalltbl_31_ff */
+	harness_set_x_funcs();               /* 040 arm: x_prefetch = get_iword_mmu040 */
+	regs.mmu_enabled = 0;                /* TC.E off -> *_mmu040 accessors are transparent */
+
+	cpu_set_context(0x2000);
+	m68k_dreg(regs, 0) = 0;
+	m68k_dreg(regs, 1) = 0;
+	m68k_areg(regs, 0) = 0x3000;         /* scratch data address */
+	hram_poke16(0x2000, 0x7042);         /* moveq #$42,d0            */
+	hram_poke16(0x2002, 0x7207);         /* moveq #7,d1             */
+	hram_poke16(0x2004, 0xd280);         /* add.l d0,d1  -> d1=0x49 */
+	hram_poke16(0x2006, 0x2081);         /* move.l d1,(a0) -> [0x3000]=0x49 (put_long_mmu040) */
+
+	bool faulted = false;
+	TRY(p) {
+		for (int i = 0; i < 4; i++) {
+			regs.instruction_pc = m68k_getpc();
+			regs.opcode = x_prefetch(0);              /* 040 MMU opcode fetch (transparent) */
+			(*cpufunctbl[regs.opcode])(regs.opcode);
+		}
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	CHECK(!faulted, "040 interpreter steps did not fault\n");
+	CHECK_EQ32(m68k_dreg(regs, 0), 0x42, "moveq #$42,d0 via cpuemu_31 (op_smalltbl_31_ff)");
+	CHECK_EQ32(m68k_dreg(regs, 1), 0x49, "moveq #7,d1; add.l d0,d1 via cpuemu_31");
+	CHECK_EQ32(hram_peek32(0x3000), 0x49, "move.l d1,(a0) stored via put_long_mmu040");
+	CHECK_EQ32(m68k_getpc(), 0x2008, "pc advanced past 4 insns via 040 MMU fetch");
+
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);                  /* restore a clean non-MMU cpufunctbl */
+}
+
+/* ==================================================================
  * MMU030 demand-paging END TO END (the path AMIX actually depends on).
  * Earlier MMU tests stop at the THROW; this one drives the WHOLE loop:
  *   fault -> (run-loop CATCH) Exception(2) builds the 030 bus-error frame
@@ -806,6 +857,7 @@ int main(int argc, char **argv)
 	test_mmu030_lrmw();
 	test_mmu030_pflush();
 	test_mmu030_interp_exec();
+	test_mmu040_interp_exec();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
