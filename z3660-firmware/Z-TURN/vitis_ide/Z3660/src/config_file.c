@@ -157,6 +157,7 @@ const char *bootmode_names[BOOTMODE_NUM] = {
       "UAE_040",
       "UAEJIT_040",
       "UAE_030_MMU",
+      "UAE_040_MMU",
 };
 const char *yesno_names[YESNO_NUM] = {
       "NO",

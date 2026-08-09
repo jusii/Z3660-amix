@@ -17,6 +17,7 @@ enum BOOTMODE{
    UAE_040,
    UAEJIT_040,
    UAE_030_MMU,        // real 68030 PMMU (AMIX). Append-only; index-aligned with
+   UAE_040_MMU,        // real 68040 MMU. Append-only; index-aligned with
    BOOTMODE_NUM        // ../Z3660_emu/src/main.h, ZTop/Ztop.c, ARM_ztop.
 };
 

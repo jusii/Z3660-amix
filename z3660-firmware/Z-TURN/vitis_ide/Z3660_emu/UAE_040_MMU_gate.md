@@ -1,15 +1,28 @@
-# 68040-MMU boot mode — size-feasibility gate
+# 68040-MMU boot mode — size gate, now built and measured
 
-> **Status: gate MEASURED — verdict NO-GO under the current `-Os` + `--gc-sections`
-> regime. A `UAE_040_MMU` boot mode built as a *second, sibling* full 68040-MMU
-> opcode table linked into `BOOT.BIN` does not fit under the ~12 MiB SD/TFTP write
-> cap. Adding it is now a design decision (share the table / load on demand /
-> drop the mode / free headroom elsewhere), not a mechanical port.**
+> **Status: the 68040-MMU opcode table is GENERATED and LINKED IN, and a real
+> oversized `BOOT.BIN` has been built and measured. It is 12 745 900 B
+> (12.156 MiB) — about 159 KiB over the conventional ~12 MiB line. That line is
+> an unproven TFTP-era rule of thumb (see below); this image exists so a
+> hardware flash-and-boot test can decide whether the line is real. Only the
+> table + linkage + the append-only `UAE_040_MMU` enum slot are wired — the
+> run loop and the `set_x_funcs` 040 accessor arm are deliberately NOT wired
+> yet (selecting `UAE_040_MMU` is not functional).**
 
-This is the opening analysis for a 68040-MMU interpreter as a sibling to the
-existing `UAE_030_MMU` mode (the real 68030 PMMU interpreter — "Emulation mode 4",
-see `UAE_030_MMU_plan.md` and `docs/AMIX.md`). Before generating a ~40 000-line
-opcode table, we answer one question: **does it fit in `BOOT.BIN`?**
+This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
+mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
+`UAE_030_MMU_plan.md` and `docs/AMIX.md`).
+
+## The ~12 MiB line
+
+`BOOT.BIN` deployment has historically been kept under ~12 MiB (12 × 1024 × 1024
+= 12 582 912 B). The figure originated as a **TFTP-write rule of thumb**: above
+it the TFTP path was observed to fail silently and fall back to 040-JIT. It was
+never established as a hard boot-loader limit — HTTP upload moves far larger
+images without trouble, and the loader has simply never been asked to read and
+start a `BOOT.BIN` above ~12 MiB. So the line is treated here as **empirical and
+unproven**, and this oversized image is the test of it. The board keeps a
+`FAILSAFE.bin`, so an image that fails to boot is recoverable.
 
 ## 1. How the CPU/MMU opcode tables are generated and built in
 
@@ -19,138 +32,134 @@ generator, one C++ file per (CPU model, execution style) combination.
 
 **Generator toolchain** — `test/gencpu/`:
 
-- `build_gencpu.sh <amiberry-or-winuae-src-dir> [out]` builds a host `gencpu`
-  from the upstream checkout's `gencpu.cpp` against **this tree's** `cpudefs.cpp`,
-  `readcpu.cpp` and headers, so generated tables match this tree's opcode set.
-  The only external symbol is Amiberry's `ua()`, stubbed by `charset_stub.cpp`.
-- `baseline_diff.sh <amiberry-v5.6.0/src>` is the correctness gate: this tree's
-  checked-in non-MMU `cpuemu_{4,11,13,44}` are byte-identical to Amiberry v5.6.0's
-  pre-generated files; `cpuemu_0` (14), `cpuemu_40` (104) and `cpustbl` (1712,
-  cosmetic) are the only known local edits. `test/gencpu/README.md` has the detail.
-- **`gencpu` version caveat:** Amiberry v5.6.0's *repo* `gencpu.cpp` aborts on the
-  68060 `HALT`/`PULSE`/`LPSTOP` opcodes and omits the `(uae_s16)` `cpustbl` cast
-  this tree carries. The MMU tables were produced by a **WinUAE 4.4.0-lineage
-  `gencpu`** whose output pairs cleanly with the pristine `cpuemu_13`.
+- `build_gencpu.sh <winuae-src-dir> [out]` builds a host `gencpu` from an upstream
+  checkout's `gencpu.cpp` against **this tree's** `cpudefs.cpp`, `readcpu.cpp` and
+  headers, so generated tables match this tree's opcode set. The only external
+  symbol is Amiberry's `ua()`, stubbed by `charset_stub.cpp`.
+- `baseline_diff.sh` is the non-MMU correctness gate (see `test/gencpu/README.md`).
 
-**File-number caveat (important):** the generator, not the plan, assigns the file
-id. The 68030-MMU table landed as **`cpuemu_32.cpp` (id 32)** — *not* the
-`cpuemu_31` the original plan assumed. The 68040-MMU table's id is likewise
-whatever `gencpu` emits for the 040-MMU combination; do not assume `cpuemu_31`.
+**Generator used for the MMU tables:** WinUAE **4.4.0** `gencpu` (tag `4400`,
+commit `c7b24b37`). Its `generate_cpu()` assigns the MMU file ids: **id 31 =
+68040 MMU**, id 32 = 68030 MMU, id 33 = 68060 MMU. So the 68040 table is
+`cpuemu_31.cpp` with dispatch table `op_smalltbl_31_ff` — do not assume the id;
+the generator picks it. (The 68030 table is `cpuemu_32.cpp`, *not* the `cpuemu_31`
+the original plan guessed — a caution that the id belongs to the generator.)
 
-**Build-in path** (no Makefile edit needed to add a table):
+**A newer `gencpu` does not match this tree.** The WinUAE 6.1.0 `gencpu` builds
+and generates, but its 68040 output diverges from this tree's Amiberry-5.6.0
+headers (a 2-arg `x_get_disp_ea_020`, `real_opcode` intermediates, `_ff` vs
+`CPUFUNC` form). The 4.4.0 `gencpu` matches — same lineage that produced the
+checked-in `cpuemu_32`.
 
-1. Any `*.cpp` under `src/` is auto-globbed by the emulator `Makefile`
-   (`find $(SRCDIR) -type f -name '*.cpp'`), compiled `-Os -ffunction-sections
-   -fdata-sections`, and linked with `--gc-sections`.
-2. The 030-MMU handlers live in `cpuemu_32.cpp`; their dispatch table
-   `op_smalltbl_32_ff[]` lives in the standalone `cpustbl_mmu030.cpp` (keeps the
-   stock `cpustbl.cpp`/`cputbl.h` untouched).
-3. `newcpu.cpp` references `op_smalltbl_32_ff` from the dispatch matrix
-   `cputbls[5][5]` — column 4 (the MMU column), row 3 (68030). `build_cpufunctbl()`
-   selects column 4 when `currprefs.mmu_model == 68030`. The 68040 row already has
-   a reserved-but-`NULL` MMU cell (`cputbls[4][4]`) awaiting an 040 table.
+**Standalone dispatch table.** As with `cpustbl_mmu030.cpp`, the generator's
+`cpustbl.cpp` `CPUEMU_31` block is lifted into a standalone `cpustbl_mmu040.cpp`
+and converted from the generator's 6-field `struct cputbl` (`{func, NULL, …}`) to
+this tree's 5-field one (`{func, opcode, len, {d,d}, br}`), with per-handler
+externs added, so the stock `cpustbl.cpp`/`cputbl.h` stay untouched.
 
-Because a table is reachable through `cputbls[][]`, **`--gc-sections` cannot drop
-it** — every handler it names is retained. That retention is exactly the size cost
-this gate measures.
+**Compile bridges.** The 68040 table is the first MMU table this tree has built,
+and a few WinUAE-040 codegen symbols differ from this tree's (Amiberry 5.6.0) API.
+`cpuemu_31.cpp` carries a small local `#define` block mapping them onto existing
+tree symbols so it compiles and links (all inert until the 040 run loop exists):
 
-## 2. The size gate — measured numbers
+| generated call | mapped to | note |
+|---|---|---|
+| `x_get_disp_ea_020(base, idx)` | `x_get_disp_ea_020(base)` | idx is vestigial (always 0) |
+| `m68k_setstopped(level)` | `m68k_setstopped()` | tree's is arg-less |
+| `do_cycles_stop(c)` | `((void)(c))` | no cycle accounting (matches the 030 STOP path) |
+| `MakeFromSR_STOP()` | `MakeFromSR()` | |
+| `checkint()` | `doint()` | |
+| `op_unimpl(op)` | `op_illg(op)` | 040 unimplemented-instruction trap → illegal (stub) |
 
-Cap: **`BOOT.BIN` must stay < ~12 MiB** (12 × 1024 × 1024 = 12 582 912 B). Above
-it the SD/TFTP write silently fails and the board falls back to 040-JIT.
-(`CLAUDE.md`, `CHANGELOG.md`, `docs/port-ledger-beta21.md`.)
+**Build-in path** (no Makefile edit): any `*.cpp` under `src/` is auto-globbed,
+compiled `-Os -ffunction-sections -fdata-sections`, linked with `--gc-sections`.
+`newcpu.cpp` puts `op_smalltbl_31_ff` in the dispatch matrix `cputbls[4][4]` (the
+68040 row, MMU column) and `build_cpufunctbl()` selects that column when
+`currprefs.mmu_model == 68040`. Because the table is reachable through `cputbls`,
+`--gc-sections` retains all of it — its full size lands in `BOOT.BIN`.
 
-Baseline: a clean container build (`./docker/run.sh make build` → `make bootbin`)
-at the current tree.
+## 2. Measured numbers
+
+Clean container build (`./docker/run.sh make build` → `make bootbin`), both cores
+green, 040 table linked in.
 
 | quantity | bytes | note |
 |---|---:|---|
-| Cap (12 MiB) | 12 582 912 | SD/TFTP write threshold |
-| Baseline `BOOT.BIN` | 12 428 476 | 11.853 MiB — freshly built, matches the shipped figure |
-| **Headroom under cap** | **154 436** | **150.8 KiB** |
+| Conventional line (12 MiB) | 12 582 912 | TFTP-era rule of thumb, under test |
+| Baseline `BOOT.BIN` (no 040 table) | 12 428 476 | 11.853 MiB |
+| **Oversized `BOOT.BIN` (040 table linked)** | **12 745 900** | **12.156 MiB** |
+| Delta added by the 040 table | 317 424 | 310.0 KiB |
+| Over the 12 MiB line by | 162 988 | 159.2 KiB |
 
-Cost of **one** MMU opcode table, taken from the linked contribution of the
-existing 030-MMU table in the same image (the best proxy — the 040-MMU table is
-generated the same way and, like the 030 one, reaches memory through out-of-line
-`*_mmu*_state` accessors rather than inlined direct pointers, so its handlers are
-the same *compact* shape, not the ~1.4 MB shape of the inlined `cpuemu_13`):
+040-table linked contribution (from `Z3660_emu/build/mapfile.txt`):
 
 | object | linked contribution | role |
 |---|---:|---|
-| `cpuemu_32.o` | 468 848 | 030-MMU opcode handlers |
-| `cpustbl_mmu030.o` | 22 116 | 030-MMU dispatch table |
-| **one MMU table** | **490 964** | **479.5 KiB** |
+| `cpuemu_31.o` | 268 364 | 68040-MMU opcode handlers |
+| `cpustbl_mmu040.o` | 22 488 | 68040-MMU dispatch table |
+| **040 table total** | **290 852** | 284.0 KiB |
 
-Projection with a sibling 040-MMU table linked in:
+For reference the 030 table is larger (`cpuemu_32.o` 468 848 + `cpustbl_mmu030.o`
+22 116 = 490 964 B): the 68040 handlers generate more compactly than the 68030-MMU
+ones. An earlier estimate that used the 030 table as a proxy over-predicted the
+image at ~12.32 MiB; the built number is 12.156 MiB.
 
-```
-projected BOOT.BIN = 12 428 476 + 490 964 = 12 919 440 B (12.321 MiB)
-overshoot vs cap   = 12 919 440 − 12 582 912 = 336 528 B (328.6 KiB OVER)
-table / headroom   = 490 964 / 154 436 = 3.18x   (must be <= 1.00 to fit)
-```
+**Oversized image for the metal test:**
 
-Sensitivity — even an unrealistically small 040 table still overshoots:
+- path: `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
+- size: 12 745 900 B
+- zlib crc32 (matches the board's SD `E`→CRC): `0x95e2020c`
 
-| assumed 040 handler size | + dispatch tbl | projected `BOOT.BIN` | over cap by |
-|---|---:|---:|---:|
-| 324 884 (68060 non-MMU, absolute floor) | 22 116 | 12 775 476 | 192 564 B |
-| 365 352 (68040 non-MMU) | 22 116 | 12 815 944 | 233 032 B |
-| 468 848 (030-MMU proxy, expected) | 22 116 | 12 919 440 | 336 528 B |
-
-**Reproduce the per-object contribution** (GNU ld map; sums every retained input
-section attributed to the object):
+Reproduce a per-object contribution:
 
 ```sh
 cd Z3660_emu/build
-awk '$NF ~ /\/cpuemu_32.o$/     && $(NF-1) ~ /^0x/ {s+=strtonum($(NF-1))} END{print s}' mapfile.txt
-awk '$NF ~ /\/cpustbl_mmu030.o$/ && $(NF-1) ~ /^0x/ {s+=strtonum($(NF-1))} END{print s}' mapfile.txt
+awk '$NF ~ /\/cpuemu_31.o$/      && $(NF-1) ~ /^0x/ {s+=strtonum($(NF-1))} END{print s}' mapfile.txt
+awk '$NF ~ /\/cpustbl_mmu040.o$/ && $(NF-1) ~ /^0x/ {s+=strtonum($(NF-1))} END{print s}' mapfile.txt
 ```
 
-## 3. Verdict
+## 3. What the metal test decides
 
-**NO-GO.** With the current `-Os` + `--gc-sections` regime and the current
-baseline, a second full 68040-MMU opcode table overshoots the 12 MiB cap by
-~330 KiB (best estimate) and by ~190 KiB even in the most optimistic case. There
-is no headroom-only path: the table is 3.18× the available 150.8 KiB. Generating
-and linking it as-is would push `BOOT.BIN` over the write cap and silently break
-deployment (fallback to 040-JIT).
+The image is 159 KiB over the conventional line. The flash-and-boot test answers:
+does the boot loader read and start a `BOOT.BIN` of this size, with the firmware
+coming up normally (in its existing default mode — `UAE_040_MMU` itself is not yet
+runnable)?
 
-The 68030-MMU mode (`UAE_030_MMU`) is unaffected and AMIX (a 68030 OS) boots on
-it today; nothing here regresses the shipping path.
+- **Boots** → the ~12 MiB figure was a TFTP-transfer artifact, not a boot limit;
+  the 040-MMU lane can proceed to wire the run loop (below) within a larger budget.
+- **Does not boot / silent SD-write fail** → the line is real; enabling 040-MMU
+  then requires one of the size strategies in §5. `FAILSAFE.bin` recovers the board.
 
-## 4. Options for enabling a 040-MMU mode (design decision)
+The 68030-MMU mode (`UAE_030_MMU`) is unchanged and AMIX (a 68030 OS) boots on it
+as before; nothing here regresses the shipping path.
 
-Each is a real design change beyond a mechanical table port; pick before spending
-generation effort.
+## 4. What is wired, and what is not
 
-1. **Share one MMU table across 030 and 040.** The 030 and 040 user-mode
-   instruction sets overlap heavily; the generated handlers differ mainly in the
-   memory-accessor calls (`*_mmu030_state` vs the 040 `*_mmu` accessors) and a few
-   model-specific MMU/cache ops. Routing the accessor through the existing per-mode
-   `x_*` function pointers (already the indirection point in `set_x_funcs()`) could
-   let one table serve both models — no second 470 KB. Highest engineering effort;
-   also the cleanest long-term.
-2. **Load the 040 table on demand (overlay).** Keep the ~470 KB table off
-   `BOOT.BIN`; ship it as a separate SD blob loaded into DDR only when 040-MMU is
-   selected. `BOOT.BIN` stays under cap and DDR has room to spare. Cost: a loader
-   plus position-consistent code/relocatable function-pointer table on bare metal
-   — non-trivial.
-3. **Drop the mode.** AMIX targets the 68030 and boots under `UAE_030_MMU`;
-   `UAEJIT_040` already covers non-MMU 040 workloads. If no near-term OS needs a
-   faithful 040 PMMU on this board, dropping the faithful 040-MMU interpreter is
-   the cheapest outcome and costs nothing today.
-4. **Free ~470 KB elsewhere first.** The largest retained objects are `cpuemu_13`
-   (1.44 MB, needed by `UAE_030`) and `cpuemu_11` (1.40 MB, 68020 cycle-exact).
-   Reclaiming space would mean auditing which boot modes/tables are actually
-   reachable and dropping an unused one — trades one mode for another, needs a
-   usage audit, and the tree is already `-Os`. No clean 470 KB win in sight.
+Wired (this change):
+- `cpuemu_31.cpp` + `cpustbl_mmu040.cpp` generated, compile-clean, linked in.
+- `op_smalltbl_31_ff` in `cputbls[4][4]`; `build_cpufunctbl()` selects it for
+  `mmu_model == 68040` (so the table is retained past `--gc-sections`).
+- Append-only `UAE_040_MMU` value in both `BOOTMODE` enums —
+  `Z3660/src/config_file.h` (+ `config_file.c bootmode_names[]`) and
+  `Z3660_emu/src/main.h` (`static_assert` bumped to 9). No existing index moved.
 
-## 5. What was deliberately NOT done
+NOT wired (next step — do not assume `UAE_040_MMU` runs):
+- the `m68k_run_mmu*` run loop for 68040 and the `m68k_go` selection arm;
+- the `set_x_funcs()` 040 arm (point `x_*` at the `*_mmu040` accessors) and the
+  `uae_emulator()` config that sets `mmu_model = 68040`, JIT off;
+- the `main.cpp` dispatch arm (selecting `UAE_040_MMU` currently falls through to
+  the existing default);
+- the compile bridges in §1 are stubs, correct only for a non-executing table;
+- the Amiga-side ZTop and on-board ARM ZTop UI lists still show the old modes
+  (their `NUM_BOOT_MODE_LABELS` is separate; unchanged here).
 
-Per the gate outcome, no tables were generated, no `BOOTMODE` enum slot was added,
-and no build files were changed — those belong to the "fits" branch, which this
-gate closed as NO-GO. When a direction above is chosen, the reserved 68040 MMU
-cell is `cputbls[4][4]` in `newcpu.cpp` and the append point for a `UAE_040_MMU`
-enum value is after `UAE_030_MMU` in both `Z3660/src/config_file.h` (with the
-matching name in `config_file.c bootmode_names[]`) and `Z3660_emu/src/main.h`
-(bump its `static_assert(BOOTMODE_NUM == …)`).
+## 5. Size strategies if the line proves real
+
+1. **Share one MMU table across 030 and 040** via the `set_x_funcs()` accessor
+   indirection — no second table. Cleanest long-term, most work.
+2. **Load the 040 table on demand** as an SD overlay into DDR — keeps `BOOT.BIN`
+   small; needs a bare-metal loader + relocatable dispatch table.
+3. **Drop the mode** — AMIX boots under `UAE_030_MMU`; `UAEJIT_040` covers non-MMU
+   040 workloads. Cheapest.
+4. **Free headroom elsewhere** — the biggest retained objects (`cpuemu_13` 1.44 MB,
+   `cpuemu_11` 1.40 MB) are both in use; no clean win without a boot-mode audit.
