@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-08-12 — Investigation: how `amix_mode` presents RAM to AMIX, and what more than 16 MB would cost (07cecf8, docs-only)
+
+`docs/amix-ram-presentation.md`, doc-only — no code or config touched. The 16 MB
+is a **compile-time emulator memory-map decision**, not a config knob and not a
+kernel limit: `amix_mode` is a boolean the whole way through (config key →
+`SHARED` `0xFFFF00C0` → `uae_emulator()`'s fourth argument), and the size is the
+literal in `RANGE_MAP(0x0800, 0x0900, drct_bank)` (`uae_emulator.cpp:1141`)
+ended by the `dmmy_bank` line after it. Under `amix_mode` the firmware never
+publishes a memory-list entry at all — it makes a range behave like RAM and
+everything above it behave like nothing, and the guest discovers the extent.
+
+- **Two independent 128 MB ceilings, and they agree**: the RTG board at guest
+  `$10000000` (where `z3660eth`'s board window lives) and core 1's `RESERVED`
+  (fault) page-table entry for host `0x10000000`–`0x17FFFFFF` — both inherited
+  from upstream unchanged. Host DDR is free `0x08000000`–`0x18000000`, so DDR is
+  not the constraint. The change surface is two `RANGE_MAP` lines plus retiring
+  the vestigial `a3000mem` window whose host backing sits at `0x09000000`; the
+  sharpest hazard is `get_real_address()` (`memory.h:801-810`), which aliases
+  guest `$07xxxxxx` → host `$09xxxxxx` and must be dropped with the bank. Both
+  page tables already cover 128 MB, the piscsi direct-DMA gate already spans
+  `[0x08000000, 0x10000000)`, and `z3660eth` never DMAs into guest RAM.
+- **`amix_mode` forces `cpu_ram` off but not `autoconfig_ram`**, while the
+  shipped defaults and all four shipped presets set `autoconfig_ram YES` — a
+  second, 256 MB pool-linked Zorro III region. Source-level observation, not a
+  reproduced failure; reading the metal card's active preset resolves it.
+- Risk register puts the safe cap at **64 MB** (2× margin under the ~128 MB
+  describable-RAM ceiling, never bisected, and it moves as the kernel grows);
+  the staged plan opens with one cheap flash whose single serial line decides
+  whether the approach works at all.
+
 ## 2026-08-09 — P3 040-MMU lane, build-ahead (3.1–3.3 done; 3.4 parked)
 
 Scoped build-ahead of a 68040-MMU emulation mode, ahead of the external 68040 AMIX
