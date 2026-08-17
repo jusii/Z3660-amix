@@ -21,6 +21,10 @@ void disable_overlay(void);
 DEBUG_CONSOLE debug_console;
 extern SHARED *shared;
 extern int eth_backlog_nag_counter_max;
+/* piscsi service-rate/latency instrumentation (scsi/scsi.c; also in scsi/scsi.h,
+ * declared locally to avoid pulling the FatFs-dependent header in here). */
+void piscsi_stats_toggle(void);
+void piscsi_stats_dump(void);
 typedef enum {
    A,
 
@@ -65,6 +69,8 @@ typedef enum {
    DEMU,    DEBUG_EMU,
    PERF,    PERF_REPORT,
    SERV,    SERVICE_CADENCE,
+   PSTAT,   PISCSI_STATS_REPORT,
+   PSTATR,  PISCSI_STATS_RESET,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -112,6 +118,8 @@ const char *command_names[NUM_COMMANDS] = {
       "DEMU",    "DEBUG EMU",
       "PERF",    "PERF REPORT",
       "SERV",    "SERVICE CADENCE",
+      "PSTAT",   "PISCSI STATS REPORT",
+      "PSTATR",  "PISCSI STATS RESET",
 };
 extern clock_data cd[];
 extern CONFIG config;
@@ -369,6 +377,16 @@ int debug_thread(struct pt *pt)
                         shared->service_cadence=c;
                         xil_printf("SERVICE CADENCE %lu (instr between IPL/task polls; 1=every instr)\r\n",(unsigned long)c);
                      }
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTAT:
+                  case PISCSI_STATS_REPORT:
+                     piscsi_stats_toggle();      // periodic piscsi service-rate/latency summary
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATR:
+                  case PISCSI_STATS_RESET:
+                     piscsi_stats_dump();        // cumulative totals + per-unit CLMT state, then reset
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:

@@ -63,6 +63,203 @@ static void amix_sb_crumb(const char *op, uint64_t start, uint32_t len, const ui
 #endif
 /* --- end AMIX root-superblock breadcrumb --- */
 
+/* --- piscsi service-rate / request-latency instrumentation (PISCSI_STATS) -----
+ * Why spans and not a single elapsed time: a 2 KB guest request costs TEN
+ * cross-core round trips, only one of which moves data (docs/piscsi-service-path.md).
+ * So "piscsi got slow" can mean the SD transaction itself got slow (card
+ * FTL/erase-block state), or core0's cooperative main loop got slow (something
+ * else in the loop lengthened, and every request pays it ten times), or the
+ * FatFs seek got slow (cluster-chain re-walk -- refuted in the doc, but measured
+ * here so the refutation is falsifiable on metal). Those are different spans and
+ * only separate measurements can tell them apart:
+ *
+ *   seek   f_lseek alone            -- expected ~0; a chain re-walk shows here
+ *   io     f_read / f_write alone   -- FatFs + disk_* + XSdPs_*Polled
+ *   cache  Xil_DCache*Range + Xil_L1DCacheFlush maintenance
+ *   gap    end of one serviced request -> start of the next; this is core0 loop
+ *          latency plus the nine payload-free round trips
+ *
+ * Safe to leave on. The hot path gains a few XTime_GetTime() reads and 64-bit
+ * adds; output is at most one 3-line summary per PISCSI_STATS_PERIOD_S seconds,
+ * and only when at least one request was served in that window -- an idle box
+ * prints nothing, and the window is only advanced from the completion path, so
+ * there is no timer thread and no output after I/O stops. Set PISCSI_STATS to 0
+ * to compile it out entirely. Serial: PSTAT toggles the periodic report, PSTATR
+ * dumps cumulative totals and resets them.
+ *
+ * Timebase caveat: the Cortex-A9 global timer runs at CPU_CLK/2 and this board
+ * retunes its ARM clock at runtime, so microseconds are derived from the global
+ * `counts_per_second` (main.c, updated alongside the clock). Treat the absolute
+ * numbers as uncalibrated -- ratios between spans, and step changes across runs,
+ * are what discriminate the candidates. */
+#define PISCSI_STATS          1
+#define PISCSI_STATS_PERIOD_S 5
+
+#if PISCSI_STATS
+#include "xtime_l.h"
+extern uint32_t counts_per_second;   /* tracks the live ARM clock (main.c) */
+extern PISCSI_DEV devs[];            /* defined further down this file       */
+
+#define PS_RD 0
+#define PS_WR 1
+
+typedef struct {
+   uint32_t reqs;
+   uint32_t shrt;                        /* short transfers (n_bytes != asked)  */
+   uint32_t errs;                        /* f_read/f_write FRESULT != FR_OK     */
+   uint64_t bytes;
+   uint64_t seek_t,   io_t,   cache_t;   /* summed spans, raw timer ticks       */
+   uint64_t seek_max, io_max, cache_max;
+} PS_DIR;
+
+static PS_DIR   ps_win[2], ps_tot[2];    /* current window / cumulative         */
+static uint64_t ps_gap_t, ps_gap_max, ps_gap_t_tot, ps_gap_max_tot;
+static uint32_t ps_gap_n, ps_gap_n_tot;
+static XTime    ps_win_start, ps_last_end, ps_mark;
+static uint64_t ps_req_seek, ps_req_io, ps_req_cache;
+static int      ps_dir = -1;             /* -1 = no request in flight           */
+static int      ps_req_err, ps_req_short;
+int piscsi_stats_report = 1;             /* PSTAT toggles this                  */
+
+static uint32_t ps_us(uint64_t ticks)
+{
+   uint32_t cps = counts_per_second;
+   if(cps < 2u) cps = 1u;                /* never divide by zero */
+   return (uint32_t)(ticks * 1000000ULL / (uint64_t)cps);
+}
+
+static void ps_line(const char *tag, PS_DIR *s, uint32_t win_us)
+{
+   uint32_t kb, rps, kbps;
+   if(s->reqs == 0) return;              /* silent for an unused direction */
+   kb   = (uint32_t)(s->bytes >> 10);
+   rps  = win_us ? (uint32_t)((uint64_t)s->reqs * 1000000ULL / (uint64_t)win_us) : 0;
+   kbps = win_us ? (uint32_t)((uint64_t)kb      * 1000000ULL / (uint64_t)win_us) : 0;
+   printf("[PSTAT] %s %lureq %luKB %lur/s %luKB/s  seek %lu/%luus  io %lu/%luus  cache %lu/%luus  short=%lu err=%lu\n",
+      tag, (unsigned long)s->reqs, (unsigned long)kb, (unsigned long)rps, (unsigned long)kbps,
+      (unsigned long)ps_us(s->seek_t  / s->reqs), (unsigned long)ps_us(s->seek_max),
+      (unsigned long)ps_us(s->io_t    / s->reqs), (unsigned long)ps_us(s->io_max),
+      (unsigned long)ps_us(s->cache_t / s->reqs), (unsigned long)ps_us(s->cache_max),
+      (unsigned long)s->shrt, (unsigned long)s->errs);
+}
+
+static void piscsi_stats_tick(XTime now)
+{
+   uint64_t el;
+   if(ps_win_start == 0) { ps_win_start = now; return; }
+   el = (uint64_t)(now - ps_win_start);
+   if(el < (uint64_t)counts_per_second * (uint64_t)PISCSI_STATS_PERIOD_S)
+      return;                            /* window not up yet */
+   if(piscsi_stats_report && (ps_win[PS_RD].reqs || ps_win[PS_WR].reqs))
+   {
+      uint32_t win_us = ps_us(el);
+      ps_line("R", &ps_win[PS_RD], win_us);
+      ps_line("W", &ps_win[PS_WR], win_us);
+      if(ps_gap_n)
+         printf("[PSTAT] gap %lu/%luus n=%lu  (core0 loop latency + the 9 payload-free round trips)\n",
+            (unsigned long)ps_us(ps_gap_t / ps_gap_n), (unsigned long)ps_us(ps_gap_max),
+            (unsigned long)ps_gap_n);
+   }
+   memset(ps_win, 0, sizeof ps_win);
+   ps_gap_t = ps_gap_max = 0; ps_gap_n = 0;
+   ps_win_start = now;
+}
+
+static void piscsi_stats_begin(int dir)
+{
+   XTime now;
+   XTime_GetTime(&now);
+   if(ps_last_end != 0)                  /* gap = idle between serviced requests */
+   {
+      uint64_t g = (uint64_t)(now - ps_last_end);
+      ps_gap_t     += g; ps_gap_n++;     if(g > ps_gap_max)     ps_gap_max     = g;
+      ps_gap_t_tot += g; ps_gap_n_tot++; if(g > ps_gap_max_tot) ps_gap_max_tot = g;
+   }
+   ps_dir = dir;
+   ps_req_seek = ps_req_io = ps_req_cache = 0;
+   ps_req_err  = ps_req_short = 0;
+   if(ps_win_start == 0) ps_win_start = now;
+}
+
+static void piscsi_stats_end(uint32_t bytes)
+{
+   XTime now;
+   XTime_GetTime(&now);
+   if(ps_dir >= 0)
+   {
+      int i;
+      for(i = 0; i < 2; i++)             /* fold into the window and the totals */
+      {
+         PS_DIR *s = i ? &ps_tot[ps_dir] : &ps_win[ps_dir];
+         s->reqs++;
+         s->bytes += (uint64_t)bytes;
+         s->shrt  += (uint32_t)ps_req_short;
+         s->errs  += (uint32_t)ps_req_err;
+         s->seek_t  += ps_req_seek;  if(ps_req_seek  > s->seek_max)  s->seek_max  = ps_req_seek;
+         s->io_t    += ps_req_io;    if(ps_req_io    > s->io_max)    s->io_max    = ps_req_io;
+         s->cache_t += ps_req_cache; if(ps_req_cache > s->cache_max) s->cache_max = ps_req_cache;
+      }
+      ps_dir = -1;
+   }
+   ps_last_end = now;
+   piscsi_stats_tick(now);
+}
+
+#define PS_BEGIN(dir)  piscsi_stats_begin(dir)
+#define PS_END(bytes)  piscsi_stats_end((uint32_t)(bytes))
+#define PS_M()         XTime_GetTime(&ps_mark)
+#define PS_ADD(acc)    do{ XTime e_; XTime_GetTime(&e_); (acc) += (uint64_t)(e_ - ps_mark); }while(0)
+#define PS_SEEK()      PS_ADD(ps_req_seek)
+#define PS_IO()        PS_ADD(ps_req_io)
+#define PS_CACHE()     PS_ADD(ps_req_cache)
+#define PS_ERR()       do{ ps_req_err   = 1; }while(0)
+#define PS_SHORT()     do{ ps_req_short = 1; }while(0)
+
+void piscsi_stats_toggle(void)
+{
+   piscsi_stats_report = !piscsi_stats_report;
+   printf("[PSTAT] periodic report %s (window %ds)\n",
+      piscsi_stats_report ? "ON" : "OFF", PISCSI_STATS_PERIOD_S);
+}
+
+void piscsi_stats_dump(void)
+{
+   int i;
+   printf("[PSTAT] --- cumulative totals ---\n");
+   ps_line("R total", &ps_tot[PS_RD], 0);
+   ps_line("W total", &ps_tot[PS_WR], 0);
+   if(ps_gap_n_tot)
+      printf("[PSTAT] gap total %lu/%luus n=%lu\n",
+         (unsigned long)ps_us(ps_gap_t_tot / ps_gap_n_tot),
+         (unsigned long)ps_us(ps_gap_max_tot), (unsigned long)ps_gap_n_tot);
+   for(i = 0; i < 8; i++)                /* CLMT state per mapped unit (see doc 4.5) */
+   {
+      PISCSI_DEV *d = &devs[i];
+      if(d->fd > (FIL *)1)
+         printf("[PSTAT] unit %d: cltbl=%s items=%lu (%s)\n", i,
+            d->fd->cltbl ? "SET" : "NULL", (unsigned long)d->SeekTbl[0],
+            (!d->fd->cltbl) ? "generic chain walk"
+               : (d->SeekTbl[0] <= (sizeof d->SeekTbl / sizeof d->SeekTbl[0])
+                  ? (d->SeekTbl[0] > 4 ? "fast seek, fragmented" : "fast seek, contiguous")
+                  : "!! TABLE TOO SMALL -- unterminated, see docs/piscsi-service-path.md 4.5"));
+   }
+   memset(ps_tot, 0, sizeof ps_tot);
+   ps_gap_t_tot = ps_gap_max_tot = 0; ps_gap_n_tot = 0;
+}
+#else
+#define PS_BEGIN(dir)  ((void)0)
+#define PS_END(bytes)  ((void)0)
+#define PS_M()         ((void)0)
+#define PS_SEEK()      ((void)0)
+#define PS_IO()        ((void)0)
+#define PS_CACHE()     ((void)0)
+#define PS_ERR()       ((void)0)
+#define PS_SHORT()     ((void)0)
+void piscsi_stats_toggle(void) { printf("[PSTAT] not compiled in (PISCSI_STATS=0)\n"); }
+void piscsi_stats_dump(void)   { printf("[PSTAT] not compiled in (PISCSI_STATS=0)\n"); }
+#endif
+/* --- end piscsi instrumentation --- */
+
 #define MEMCPY memcpy
 //#define MEMCPY memcpy_neon
 //extern void *(memcpy_neon)(void * dst, const void * src, u32 n);
@@ -1059,19 +1256,20 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          break;
       }
 
+      PS_BEGIN(PS_RD);
       if (cmd == PISCSI_CMD_READBYTES) {
          DEBUG("[PISCSI-%ld] %ld byte READBYTES from block %ld to address %.8lX\n", val, piscsi_u32_read[1], piscsi_u32_read[0] / d->block_size, piscsi_u32_read[2]);
          uint32_t src = piscsi_u32_read[0];
          d->lba = (src / d->block_size);
          if(d->fd>(FIL *)1)
-            f_lseek(d->fd, src);
+            { PS_M(); f_lseek(d->fd, src); PS_SEEK(); }
       }
       else if (cmd == PISCSI_CMD_READ) {
          DEBUG("[PISCSI-%ld] %ld byte READ from block %ld to address %.8lX\n", val, piscsi_u32_read[1], piscsi_u32_read[0], piscsi_u32_read[2]);
          uint32_t src = piscsi_u32_read[0];
          d->lba = src;
          if(d->fd>(FIL *)1)
-            f_lseek(d->fd, (((FSIZE_t)src) * d->block_size));
+            { PS_M(); f_lseek(d->fd, (((FSIZE_t)src) * d->block_size)); PS_SEEK(); }
       }
       else {
          FSIZE_t src = piscsi_u32_read[3];
@@ -1079,7 +1277,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          DEBUG("[PISCSI-%ld] %ld byte READ64 from block %lld to address %.8lX\n", val, piscsi_u32_read[1], (src / d->block_size), piscsi_u32_read[2]);
          d->lba = (src / d->block_size);
          if(d->fd>(FIL *)1)
-            f_lseek(d->fd, src);
+            { PS_M(); f_lseek(d->fd, src); PS_SEEK(); }
       }
 
       map = piscsi_u32_read[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_read[2]);
@@ -1113,20 +1311,27 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
           * (xil_cache.c), preserving neighbours of odd driver buffers; the sdps
           * post-transfer invalidate then covers lines speculatively re-fetched while
           * the DMA ran. */
+         PS_M();
          Xil_DCacheInvalidateRange((INTPTR)map, piscsi_u32_read[1]);
+         PS_CACHE();
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
-            FRESULT res=f_read(d->fd, (uint8_t *)map, piscsi_u32_read[1],&n_bytes);
+            FRESULT res;
+            PS_M();
+            res=f_read(d->fd, (uint8_t *)map, piscsi_u32_read[1],&n_bytes);
+            PS_IO();
             amix_sb_crumb("READ", (uint64_t)d->lba * d->block_size, piscsi_u32_read[1], (uint8_t *)map);
             if(res!=FR_OK)
             {
+               PS_ERR();
                printf("SCSI ERROR!!! f_read result=%d\n",res);
                printf("SCSI ERROR!!! d->fd->obj=%ld\n",(uint32_t)&d->fd->obj);
             }
             DEBUG("            Bytes read %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_read[1])
             {
+               PS_SHORT();
                printf("SCSI ERROR!!! bytes_to_read=%ld, bytes_read=%d\n",piscsi_u32_read[1],n_bytes);
                printf("SCSI ERROR!!! d->fd=%ld\n",(uint32_t)d->fd);
             }
@@ -1146,13 +1351,20 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
-            FRESULT res=f_read(d->fd, buffer, piscsi_u32_read[1], &n_bytes);
+            FRESULT res;
+            PS_M();
+            res=f_read(d->fd, buffer, piscsi_u32_read[1], &n_bytes);
+            PS_IO();
             amix_sb_crumb("READ", (uint64_t)d->lba * d->block_size, piscsi_u32_read[1], buffer);
             if(res!=FR_OK)
+            {
+               PS_ERR();
                printf("SCSI ERROR!!! f_read result=%d\n",res);
+            }
             DEBUG("            Bytes read %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_read[1])
             {
+               PS_SHORT();
                printf("SCSI ERROR!!! bytes_to_read=%ld, bytes_read=%d\n",piscsi_u32_read[1],n_bytes);
                printf("SCSI ERROR!!! d->fd=%ld\n",(uint32_t)d->fd);
             }
@@ -1163,7 +1375,10 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             read_disk(d,(uint8_t *)buffer,blocks_to_read);
          }
       }
+      PS_M();
       Xil_L1DCacheFlush();
+      PS_CACHE();
+      PS_END(piscsi_u32_read[1]);
       break;
    case PISCSI_CMD_WRITE64:
    case PISCSI_CMD_WRITE:
@@ -1181,12 +1396,13 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          break;
       }
 
+      PS_BEGIN(PS_WR);
       if (cmd == PISCSI_CMD_WRITEBYTES) {
          DEBUG("[PISCSI-%ld] %ld byte WRITEBYTES to block %ld from address %.8lX\n", val, piscsi_u32_write[1], piscsi_u32_write[0] / d->block_size, piscsi_u32_write[2]);
          uint32_t src = piscsi_u32_write[0];
          d->lba = (src / d->block_size);
          if(d->fd>(FIL *)1)
-            f_lseek(d->fd, src);
+            { PS_M(); f_lseek(d->fd, src); PS_SEEK(); }
       }
       else if (cmd == PISCSI_CMD_WRITE) {
          DEBUG("[PISCSI-%ld] %ld byte WRITE to block %ld from address %.8lX\n", val, piscsi_u32_write[1], piscsi_u32_write[0], piscsi_u32_write[2]);
@@ -1198,7 +1414,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             {
                printf("Error on File Offset: %016llX (File size %016llX)\n",fpos,d->fd->obj.objsize);
             }
-            f_lseek(d->fd, fpos);
+            PS_M(); f_lseek(d->fd, fpos); PS_SEEK();
          }
       }
       else {
@@ -1207,7 +1423,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          DEBUG("[PISCSI-%ld] %ld byte WRITE64 to block %lld from address %.8lX\n", val, piscsi_u32_write[1], (src / d->block_size), piscsi_u32_write[2]);
          d->lba = (src / d->block_size);
          if(d->fd>(FIL *)1)
-            f_lseek(d->fd, src);
+            { PS_M(); f_lseek(d->fd, src); PS_SEEK(); }
       }
 
       map = piscsi_u32_write[2];//get_mapped_data_pointer_by_address(cfg, piscsi_u32_write[2]);
@@ -1229,15 +1445,22 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
           * maintenance at all -- without this clean, every direct write would put
           * STALE DRAM bytes on the disk. Clean the range through L1+L2 to DRAM
           * first so the DMA reads exactly what the guest wrote. */
+         PS_M();
          Xil_DCacheFlushRange((INTPTR)map, piscsi_u32_write[1]);
+         PS_CACHE();
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
-            f_write(d->fd, (uint8_t *)map, piscsi_u32_write[1],&n_bytes);
+            FRESULT res;
+            PS_M();
+            res=f_write(d->fd, (uint8_t *)map, piscsi_u32_write[1],&n_bytes);
+            PS_IO();
+            if(res!=FR_OK) PS_ERR();
             amix_sb_crumb("WRITE", (uint64_t)d->lba * d->block_size, piscsi_u32_write[1], (uint8_t *)map);
             DEBUG("             Bytes written %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_write[1])
             {
+               PS_SHORT();
                printf("SCSI ERROR!!! bytes_to_write=%ld, bytes_written=%d\n",piscsi_u32_write[1],n_bytes);
             }
          }
@@ -1257,11 +1480,16 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          if(d->fd>(FIL *)1)
          {
             unsigned int n_bytes;
-            f_write(d->fd, buffer, piscsi_u32_write[1], &n_bytes);
+            FRESULT res;
+            PS_M();
+            res=f_write(d->fd, buffer, piscsi_u32_write[1], &n_bytes);
+            PS_IO();
+            if(res!=FR_OK) PS_ERR();
             amix_sb_crumb("WRITE", (uint64_t)d->lba * d->block_size, piscsi_u32_write[1], buffer);
             DEBUG("             Bytes written %d\n",n_bytes);
             if(n_bytes!=piscsi_u32_write[1])
             {
+               PS_SHORT();
                printf("SCSI ERROR!!! bytes_to_write=%ld, bytes_written=%d dma=0x%08lX\n",piscsi_u32_write[1],n_bytes,used_dma);
             }
          }
@@ -1271,7 +1499,10 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             write_disk(d,(uint8_t *)buffer,blocks_to_write);
          }
       }
+      PS_M();
       Xil_L1DCacheFlush();
+      PS_CACHE();
+      PS_END(piscsi_u32_write[1]);
       break;
    case PISCSI_CMD_READ_ADDR1:
    case PISCSI_CMD_READ_ADDR2:
