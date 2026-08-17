@@ -146,7 +146,7 @@ that scales with the amount of data moved.
    (:1075 for `PISCSI_CMD_READ`; :1068 / :1083 for `READBYTES` / `READ64`). The guest supplies an
    absolute LBA every time and the firmware keeps no per-unit sequential position (`../amix-z3660scsi/src/z3660.c`
    :383, `block += chunk`). **The return value of `f_lseek` is not checked at any of the six call sites**
-   (:1068, :1075, :1083, :1190, :1202, :1211).
+   (:1068, :1075, :1083, :1190, :1202, :1211). *(Fixed on this branch — §7.6.)*
 2. The direct-DMA gate (:1097-1099): `(config.cpu_ram || config.amix_mode) && map>=0x08000000 && map<0x10000000`.
    With `amix_mode YES` and the AMIX kernel in Zynq-local DDR at `$08000000` this is the taken branch.
 3. `Xil_DCacheInvalidateRange((INTPTR)map, len)` — L1+L2, pre-transfer (:1117).
@@ -155,6 +155,7 @@ that scales with the amount of data moved.
 
 The WRITE path (:1169-1276) mirrors it with `Xil_DCacheFlushRange` (:1233) and `f_write` (:1237).
 Note `f_write`'s return value is **also unchecked** (:1237, :1261) — only the short-count is reported.
+*(Fixed on this branch — §7.6.)*
 
 Below FatFs, `disk_read`/`disk_write` (BSP `xilffs_v5_1/src/diskio.c`) each call `disk_status(pdrv)`
 first. Because `XPAR_PS7_SD_0_HAS_CD` is **1**, `disk_status()` enters its card-detect branch and reads
@@ -402,7 +403,7 @@ monotonically as the workload progressed through the file. E3 reports a *uniform
 SD activity. And E4 is decisive on its own: the firmware's `COPY` uses the same FatFs, the same volume,
 and the same fragmentation, and stayed fast.
 
-### 4.5 Latent defect found while checking this (real, unrelated to the crawl)
+### 4.5 Latent defect found while checking this (real, unrelated to the crawl) — FIXED, see §7.6
 
 `d->SeekTbl` is `DWORD SeekTbl[64]` (`scsi/scsi.h` :90). A FatFs CLMT is `[size][ncl,tcl]...[0]`, so 64
 entries hold **at most 31 fragments**. At 32 or more fragments, `f_lseek(CREATE_LINKMAP)` returns
@@ -430,6 +431,10 @@ table**. `clmt_clust()` then walks off the end of `SeekTbl[64]` into adjacent `P
 Both are hard/loud/corrupting rather than slow, which is precisely why this is *not* the crawl. It is
 still a defect worth fixing, and it is aggravated by the same six unchecked `f_lseek` call sites noted
 in §1.4. It is also a plausible upstream report: the same code path exists in `shanshe/Z3660`.
+
+**Fixed on this branch** (§7.6), and a minimal upstream-facing version of the fix — uninstall the
+table on failure, plus the `SeekTbl` size bump — has been prepared as a separate patch series against
+`upstream/main`.
 
 ---
 
@@ -493,16 +498,23 @@ re-port acceptance criterion, not a porting detail.
 
 ## 7. Fix candidates
 
-Ordered by expected benefit per unit of risk. None of these are implemented on this branch — it ships
-measurement only.
+Ordered by expected benefit per unit of risk. Status is marked per item: this branch shipped as
+measurement-only, and §7.1 and §7.6 have since landed.
 
-### 7.1 Cache the per-unit static geometry in the guest driver (removes 4 of 10 round trips)
+### 7.1 Cache the per-unit static geometry in the guest driver (removes 4 of 10 round trips) — IMPLEMENTED
 
 Accesses 2-5 in §1.1 — `BLOCKSIZE0`, `PDT`, `BLOCKS0`, and the redundant second `DRVNUMX` — fetch
 values that cannot change while a unit is mapped. Caching them per unit at first use removes **4 of
 the 10 round trips**, a ~1.7x reduction in handshakes per 2 KB with no protocol change. **This is a
 guest-driver change (`amix-z3660scsi`), out of scope for this repo**, but it is the single largest
 cheap win and it is listed here because this repo owns the contract the driver is coding against.
+
+**Landed** in `../amix-z3660scsi` as `29b2482` ("z3660: cache per-unit static geometry -- 10 -> 6
+round trips per 2KB READ"). Nothing on the wire changed and no firmware change was needed, so the
+contract this repo owns is unaffected — but note the one thing the driver now relies on: a mapped
+unit's `block_size`, `pdt` and block count are written *only* by `piscsi_map_drive()`, and every
+remap is bracketed by a guest reset. A future firmware that gains a live remap or a media change
+would have to announce it on the wire, which would be a protocol change owned by this repo.
 
 ### 7.2 Batch the descriptor: one round trip instead of four (protocol change)
 
@@ -534,7 +546,7 @@ is kept. With the CLMT in place the seek is already cheap (§4.3), so this is **
 win — §5's `seek` figure should confirm it is ~0 before anyone spends effort here. Recording it as
 evaluated-and-deprioritised.
 
-### 7.6 CLMT robustness (correctness, from §4.5)
+### 7.6 CLMT robustness (correctness, from §4.5) — IMPLEMENTED
 
 Three small fixes, all inside this repo:
 
@@ -544,6 +556,21 @@ Three small fixes, all inside this repo:
    `.hdf` that outgrows the table is visible rather than silent.
 3. Check the return value of all six `f_lseek` call sites (:1068, :1075, :1083, :1190, :1202, :1211)
    and both `f_write` sites (:1237, :1261), and fail the request instead of proceeding.
+
+**Landed on this branch.** (1) `piscsi_map_drive()` now uninstalls the table on any non-`FR_OK`
+result, and the `[FASTSEEK n]` lines became unconditional `printf`s that say whether fast seek is ON
+or OFF and why — so the fallback is visible at boot instead of hiding behind the `DSCSI` toggle.
+(2) `SeekTbl` grew from 64 to 256 items, i.e. from 31 to 127 fragments; the cost is BSS only. Every
+consumer derives its bounds from `sizeof SeekTbl`, so no separate constant was needed.
+(3) All six seeks are checked and a failure now **refuses** the request — a refused READ issues no
+`f_read` and leaves `used_dma` at 0 so the guest copies nothing out of the bounce window; a refused
+WRITE writes nothing. Both `f_write` sites report failure rather than only counting it. Reporting is
+rate limited (first eight, then every 1024th) because this path is non-preemptible on core0.
+
+The limit worth recording: **the mailbox has no per-request status register.** `SCSIERR_*` exists in
+`z3660_scsi_enums.h` and the AmigaOS driver decodes it, but nothing on the wire supplies it and the
+guest's only readback is `USED_DMA`. So "fail the request" means refuse-and-log; giving the drivers a
+real status channel is a protocol change, and it belongs with §7.2 if that is ever taken up.
 
 ### 7.7 Reduce whole-cache flushes to range operations
 
