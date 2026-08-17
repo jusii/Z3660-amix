@@ -1869,6 +1869,28 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
 
 #define PIB 0x00
 
+/* Block count for a unit, as reported by the BLOCKS / BLOCKS0+4n / BLOCKS10+4n
+ * registers.
+ *
+ * An UNMAPPED unit has block_size == 0: devs[] lives in BSS, piscsi_init() never
+ * assigns block_size (only piscsi_map_drive() does) and piscsi_shutdown() zeroes
+ * it again. The guest's boot bus scan reads BLOCKS0+4n for EVERY unit before it
+ * knows which ones are attached -- that is how it decides -- so `fs / block_size`
+ * is reached with a zero divisor on every single boot. On this Cortex-A9 there is
+ * no hardware integer divide, so it lands in the libgcc/EABI 64-bit divide helper
+ * with a zero divisor: no trap, no diagnostic, an unspecified quotient.
+ *
+ * Report 0 blocks instead, which is exactly the "no drive mapped here" answer the
+ * guest drivers already test for (amix-z3660scsi treats a zero block count as an
+ * absent unit). */
+static uint32_t piscsi_unit_blocks(uint8_t unit)
+{
+   PISCSI_DEV *d = &devs[unit];
+   if (d->block_size == 0)
+      return 0;
+   return (uint32_t)(d->fs / d->block_size);
+}
+
 uint32_t handle_piscsi_read(uint32_t addr, uint8_t type) {
    ACTIVITY_LED_ON; // ON
    if (type) {}
@@ -1958,7 +1980,7 @@ uint32_t handle_piscsi_read(uint32_t addr, uint8_t type) {
       return devs[piscsi_cur_drive].s;
       break;
    case PISCSI_CMD_BLOCKS: {
-      uint32_t blox = devs[piscsi_cur_drive].fs / devs[piscsi_cur_drive].block_size;
+      uint32_t blox = piscsi_unit_blocks(piscsi_cur_drive);   // 0 if the unit is unmapped
       DEBUG("[PISCSI] %s Read from BLOCKS [drive %d]: %ld\n", op_type_names[type], piscsi_cur_drive, blox);
       DEBUG("filesize: %lld (%lld blocks*block_size)\n", devs[piscsi_cur_drive].fs, ((FSIZE_t)blox)*devs[piscsi_cur_drive].block_size);
       ACTIVITY_LED_OFF; // OFF
@@ -1975,7 +1997,9 @@ uint32_t handle_piscsi_read(uint32_t addr, uint8_t type) {
    case PISCSI_CMD_BLOCKS6:
    case PISCSI_CMD_BLOCKS7: {
       piscsi_cur_drive=(addr-PISCSI_CMD_BLOCKS0) / 4;
-      uint32_t blox = devs[piscsi_cur_drive].fs / devs[piscsi_cur_drive].block_size;
+      /* The boot bus scan reads this for every unit, mapped or not -- see
+       * piscsi_unit_blocks(): an unmapped unit has block_size 0. */
+      uint32_t blox = piscsi_unit_blocks(piscsi_cur_drive);
       DEBUG("[PISCSI] %s Read from BLOCKS [drive %d]: %ld\n", op_type_names[type], piscsi_cur_drive, blox);
       DEBUG("filesize: %lld (%lld blocks*block_size)\n", devs[piscsi_cur_drive].fs, ((FSIZE_t)blox)*devs[piscsi_cur_drive].block_size);
       ACTIVITY_LED_OFF; // OFF
@@ -1991,7 +2015,9 @@ uint32_t handle_piscsi_read(uint32_t addr, uint8_t type) {
    case PISCSI_CMD_BLOCKS16:
    case PISCSI_CMD_BLOCKS17: {
       piscsi_cur_drive=10+(addr-PISCSI_CMD_BLOCKS10) / 4;
-      uint32_t blox = devs[piscsi_cur_drive].fs / devs[piscsi_cur_drive].block_size;
+      /* Same divisor guard as the BLOCKS0+4n group; the SD-partition units are
+       * unmapped unless mount_sd_0x76 / mount_sd_root is set. */
+      uint32_t blox = piscsi_unit_blocks(piscsi_cur_drive);
       DEBUG("[PISCSI] %s Read from BLOCKS [drive %d]: %ld\n", op_type_names[type], piscsi_cur_drive, blox);
       DEBUG("filesize: %lld (%lld blocks*block_size)\n", devs[piscsi_cur_drive].fs, ((FSIZE_t)blox)*devs[piscsi_cur_drive].block_size);
       ACTIVITY_LED_OFF; // OFF
