@@ -236,12 +236,19 @@ void piscsi_stats_dump(void)
    {
       PISCSI_DEV *d = &devs[i];
       if(d->fd > (FIL *)1)
-         printf("[PSTAT] unit %d: cltbl=%s items=%lu (%s)\n", i,
-            d->fd->cltbl ? "SET" : "NULL", (unsigned long)d->SeekTbl[0],
-            (!d->fd->cltbl) ? "generic chain walk"
-               : (d->SeekTbl[0] <= (sizeof d->SeekTbl / sizeof d->SeekTbl[0])
-                  ? (d->SeekTbl[0] > 4 ? "fast seek, fragmented" : "fast seek, contiguous")
-                  : "!! TABLE TOO SMALL -- unterminated, see docs/piscsi-service-path.md 4.5"));
+      {
+         /* A refused CLMT is uninstalled at map time (piscsi_map_drive), so cltbl
+          * SET always means a well-formed table; cltbl NULL with items > capacity
+          * means the .hdf outgrew the table and the unit is on the chain walk. */
+         unsigned long cap = (unsigned long)(sizeof d->SeekTbl / sizeof d->SeekTbl[0]);
+         printf("[PSTAT] unit %d: cltbl=%s items=%lu/%lu (%s)\n", i,
+            d->fd->cltbl ? "SET" : "NULL", (unsigned long)d->SeekTbl[0], cap,
+            d->fd->cltbl
+               ? (d->SeekTbl[0] > 4 ? "fast seek, fragmented" : "fast seek, contiguous")
+               : ((unsigned long)d->SeekTbl[0] > cap
+                  ? "generic chain walk -- CLMT refused, table too small"
+                  : "generic chain walk"));
+      }
    }
    memset(ps_tot, 0, sizeof ps_tot);
    ps_gap_t_tot = ps_gap_max_tot = 0; ps_gap_n_tot = 0;
@@ -966,15 +973,42 @@ int piscsi_map_drive(char *filename, uint8_t index, uint64_t p0_Start, uint64_t 
       DEBUG("Enabling fast seek.\n");
       d->fd->cltbl = d->SeekTbl;         // Enable fast seek (set address of buffer)
 
-      d->SeekTbl[0] = sizeof d->SeekTbl / sizeof d->SeekTbl[0];   // Buffer size
+      /* A FatFs CLMT is [size][ncl,tcl]...[0] -- two items of overhead plus two per
+       * fragment. FatFs writes the terminating zero ONLY in the success branch of
+       * f_lseek(CREATE_LINKMAP) (BSP xilffs ff.c); on FR_NOT_ENOUGH_CORE it stores the
+       * REQUIRED item count in cltbl[0] and returns leaving the table truncated and
+       * UNTERMINATED. Keeping such a table installed is not a slow path, it is a
+       * corrupting one: clmt_clust() walks off the end of SeekTbl into the neighbouring
+       * PISCSI_DEV fields and either eventually reads a zero -> clst2sect() returns 0 ->
+       * ABORT(fs, FR_INT_ERR), which sets the STICKY fp->err so every later f_read /
+       * f_write / f_lseek on the handle short-circuits and the unit is dead for the rest
+       * of the boot -- or reads in-range garbage and returns a wrong but VALID cluster,
+       * i.e. silent I/O to the wrong SD sector. So on ANY result other than FR_OK,
+       * uninstall the table: cltbl == NULL sends every later seek and transfer down
+       * FatFs' generic cluster-chain walk, which is slower but always correct. */
+      DWORD clmt_items = sizeof d->SeekTbl / sizeof d->SeekTbl[0];
+      d->SeekTbl[0] = clmt_items;                 // Buffer size
       int res = f_lseek(d->fd, CREATE_LINKMAP);   // Create link map table
       if (res == FR_OK) {
-         DEBUG("[FASTSEEK %d] %lu clusters, ",index, (d->fd->obj.fs->n_fatent - 1) );
-         DEBUG((d->SeekTbl[0] > 4) ? "fragmented in %ld.\n" : "contiguous.\n", d->SeekTbl[0] / 2 - 1);
-         DEBUG("[FASTSEEK %d] %lu items used.\n",index, d->SeekTbl[0]);
+         /* printf, not DEBUG: this line is the only boot-time evidence of whether a
+          * mapped .hdf actually got a CLMT and how close it sits to the table limit,
+          * and DEBUG() is behind the DSCSI console toggle (invisible at boot). One
+          * line per mapped hdf unit, eight at most. */
+         printf("[FASTSEEK %d] fast seek ON: %lu/%lu CLMT items, %lu fragment(s).\n",
+            index, (unsigned long)d->SeekTbl[0], (unsigned long)clmt_items,
+            (unsigned long)(d->SeekTbl[0] / 2 - 1));
+         DEBUG("[FASTSEEK %d] %lu clusters.\n",index, (d->fd->obj.fs->n_fatent - 1) );
       }
-      if (res == FR_NOT_ENOUGH_CORE) {
-         printf("[FASTSEEK %d] %lu items required to create the link map table.\n",index, d->SeekTbl[0]);
+      else {
+         d->fd->cltbl = NULL;   // uninstall the malformed table -> generic chain walk
+         if (res == FR_NOT_ENOUGH_CORE)
+            printf("[FASTSEEK %d] fast seek OFF: CLMT needs %lu items, table holds %lu "
+                   "(more than %lu fragments) -- generic cluster-chain walk.\n",
+               index, (unsigned long)d->SeekTbl[0], (unsigned long)clmt_items,
+               (unsigned long)(clmt_items / 2 - 1));
+         else
+            printf("[FASTSEEK %d] fast seek OFF: f_lseek(CREATE_LINKMAP) failed res=%d "
+                   "-- generic cluster-chain walk.\n", index, res);
       }
    }
    DEBUG("Done partitions.\n");
