@@ -1,6 +1,9 @@
 # The piscsi service path: mechanism map, cost model, and the 13x crawl candidates
 
-**Status:** code analysis, no hardware run. Nothing here has been flashed or measured on metal.
+**Status:** §1-§8 are code analysis written before any hardware run. **§9 records the first
+metal measurement (2026-08-17) and it settles several of §3's candidates — read §9 before
+acting on the §3 verdict table.** §10 documents the core0 instrumentation added in response;
+the static-analysis follow-up it exists to test is `docs/core0-loop-blocking-audit.md`.
 **Date:** 2026-08-17
 **Branch:** `piscsi-crawl` (off `amix-main`)
 **Firmware under analysis:** `amix-main` — the tree that produced the prod `Z3660.bin` CRC-32 `59FAE8CA`
@@ -248,6 +251,10 @@ preset `service_cadence 1`, `amix_mode YES`, `bootmode UAE_030_MMU`, KS slot 6, 
 
 ### Verdicts
 
+> **Superseded in part by §9.** The table below is the pre-measurement, code-only ranking, kept
+> as written. The 2026-08-17 metal run refuted **C5** and **C9** outright and demoted **C4**;
+> what survives is a sharpened form of **C3**. Read §9 for the current state.
+
 | # | Candidate | Verdict | Basis |
 |---|---|---|---|
 | C1 | FatFs cluster-chain re-walk on a fragmented `.hdf` (the stated hypothesis) | **REFUTED** | §4 — code-level |
@@ -469,6 +476,11 @@ Reading the output against the ranking:
 | `seek` mean non-trivial or growing with offset | **C1** would be resurrected — expected ~0 |
 | `cache` a large fraction of the total | **C8** worth attacking |
 
+What this instrumentation **cannot** do, and why §10 exists: `gap` is one number for "everything
+that happened between two serviced requests". It cannot name the callee that consumed it, and it
+cannot even tell a core0 block from the guest going quiet. §9 is the run that made that limitation
+the whole problem.
+
 ---
 
 ## 6. Beta-21 delta on this loop
@@ -533,6 +545,12 @@ servicing one, before returning to the outer loop. Either turns ten loop-latency
 roughly one. **Lowest-risk, highest-leverage change inside this repo.** Needs care: the loop must
 remain bounded so RTG and the reset thread cannot be starved.
 
+**Do not implement this yet — see §9.** Drain amortises loop *latency* across a burst of round
+trips. It cannot shorten a single 118-second blocking call, and on the 08-17 evidence that single
+call is where the time went. Landing drain first would improve the 18.4 ms mean, muddy the
+before/after comparison, and leave the actual defect in place. Measure with §10, name the callee,
+then decide.
+
 ### 7.4 Gate the per-iteration core0 work
 
 `other_tasks()` calls `pl_mpeg_arm_decode_progressive()` unconditionally on **every** iteration, and
@@ -591,9 +609,173 @@ install target is written. The operational mitigation — full-card erase / rewr
 
 ## 8. Open questions for the next metal session
 
+**Executed on 2026-08-17. Items 1, 3 and 4 are answered — see §9.** Item 2 (`[FASTSEEK n]`) was
+not captured and should be next time.
+
 1. Flash this branch's build, run the install workload, capture the `PSTAT` stream. The `io`-vs-`gap`
    split alone separates C5 from C3/C4.
 2. Note the `[FASTSEEK n]` lines at boot for both mapped units — they say whether each `.hdf` is
    contiguous, how many fragments it has, and whether the CLMT actually built (§4.5).
 3. `PSTATR` before and after an idle period, to see whether the crawl is load-dependent.
 4. If `io` is inflated in 10 ms quanta, suspect C9 and reseat the card before assuming wear.
+
+---
+
+## 9. The 2026-08-17 metal measurement: what it settled
+
+First fully-instrumented install run on real hardware (A4000 + Z3660, `amix_mode YES`,
+`bootmode UAE_030_MMU`, guest = Amix miniroot installer, no guest networking up, mostly-static
+80x25 console, serial terminal attached throughout). `PSTATR` at the end of the run:
+
+| Figure | Value |
+|---|---|
+| requests serviced | **228 278** |
+| `gap` mean | **18 384 µs** |
+| `gap` **max** | **118 019 148 µs** — *118 seconds, one gap* |
+| second-largest gap observed | ~29 s |
+| `io` READ mean | **338 µs** |
+| `io` WRITE mean | **1 382 µs** |
+
+The `io` figures are the crux: that span brackets *exactly* `f_read` / `f_write`, i.e. FatFs plus
+`disk_read`/`disk_write` plus `XSdPs_*Polled` plus `disk_status()`. It stayed **flat, in the
+hundreds of microseconds to low milliseconds, for the entire run**.
+
+### What that refutes
+
+- **C5 (SD card FTL / erase-block wear) — REFUTED.** C5's discriminating prediction (§3.2) was
+  "WRITE latency inflated far more than READ, concentrated in the `f_write`/`disk_write` span."
+  The span is flat. The card is not the crawl.
+- **C9 (`disk_status()` card-detect stall) — REFUTED.** Its signature was "`io` inflated in 10 ms
+  quanta." `disk_status()` is *inside* the `io` span; the span never inflated. No card-detect
+  bounce occurred.
+- **C1 (FatFs cluster-chain re-walk) — REFUTED by measurement as well as by code (§4).** The one
+  caveat: the `seek` span was **not** captured from this run, so a chain walk inside `f_lseek`
+  remains formally unexcluded. Capture `seek` next time; §4 predicts ~0.
+
+### What that leaves
+
+Nearly all of the wall time is `gap` — 228 278 x 18.4 ms is ~70 minutes, i.e. essentially the
+whole run. `gap` is measured end-of-one-serviced-request to start-of-the-next, so it contains the
+nine payload-free round trips of §1.1 *and* every core0 loop iteration in between *and* the
+guest's own thinking time. **This is a refinement of C3, not a confirmation of it:** the ten-round-trip
+cost model explains the 18.4 ms *mean*, but a constant cost model cannot produce a **single 118-second
+gap**. That is one thing blocking, once.
+
+### The ambiguity that forced the next instrumentation
+
+`gap` cannot distinguish two very different worlds:
+
+1. **Core0 blocked.** Some callee in the main loop failed to return for 118 s. Then the guest's
+   store instruction was stalled in the mailbox handshake the whole time (§1.2), and this is a
+   firmware bug.
+2. **The guest went quiet.** The guest simply issued no piscsi request for 118 s — computing,
+   waiting on something else, or wedged on its own account. Then core0 was healthy and the
+   investigation belongs on core1 or in the guest.
+
+Nothing in PISCSI_STATS separates these, and they lead to opposite fixes. §10 is built to
+separate them, and `docs/core0-loop-blocking-audit.md` pre-ranks the candidates for world 1 with
+file:line evidence so that a named row converts straight into a code site.
+
+**Do not implement §7.3 (mailbox drain) on the strength of these numbers.** Drain amortises loop
+latency across a burst of round trips; it cannot shorten a single 118-second blocking call. If
+world 1 is confirmed, the fix is whatever the named callee needs; §7.3 is a separate, smaller win
+against the 18.4 ms mean.
+
+---
+
+## 10. Core0 loop instrumentation (C0STAT)
+
+`Z3660/src/core0_stats.[ch]`, gated on `CORE0_STATS` (default **on**; set to 0 to compile out
+entirely). Wired into the `CPU_EMULATOR` main loop at `Z3660/src/main.c` :1803-1834, with nested
+spans inside `emulator_thread()` (`cpu_emulator.c`) and `other_tasks()` (`rtg/rtg.c`).
+
+### What it measures
+
+Every callee in the loop's dispatch chain is timed individually, and the RTG-first priority chain
+is split into its arms so an RTG blit is never confused with an SD transfer. Per span: **call
+count, cumulative time, and worst single call** — each kept twice, once per reporting window and
+once cumulatively. Seventeen spans; `docs/core0-loop-blocking-audit.md` has the callee-to-row map.
+
+Three design points carry the requirement from §9:
+
+- **Measured around each call, never sampled.** The max is written the instant the call returns,
+  so a 118-second block is recorded even though the reporting window was stalled for the whole of
+  it.
+- **A single call at or above `CORE0_STATS_BLOCK_US` (default 100 ms) prints its own line
+  immediately.** Naming the offender does not wait for the window. Rate limited to the first 32
+  then every 16th, because this path is non-preemptible on core0.
+- **Chained stamps.** The end timestamp of callee N is the start timestamp of callee N+1, so a
+  loop iteration costs one `XTime_GetTime()` per timed callee rather than two.
+
+### Output
+
+Rate-limited to one report per `CORE0_STATS_PERIOD_S` (default 5 s), and **idle-silent**: a
+window is printed only if the guest moved piscsi traffic in it, or the window's worst single call
+reached `CORE0_STATS_NOTABLE_US` (default 2 ms). A healthy idle box prints nothing; a blocked
+idle box still prints.
+
+```
+[C0STAT] core0 loop accounting ON: 17 spans, window 5s, block>=100000us; cost/boundary 291ns (timer read 78ns) -- PSTAT/PSTATC/PSTATZ
+[C0STAT] win 5013ms it=241930 (48261/s) iter avg 20us max 118019148us ovh=0.4% worst=DEBUG 118019148us
+[C0STAT]  DEBUG            1c cum   118019ms max  118019148us 99.9%
+[C0STAT]  EMU>SCSIW     1187c cum        1204ms max     4123us  0.0%
+[C0STAT]  OTHER       241930c cum         901ms max       38us  0.0%
+[C0STAT] *BLOCK* #1 DEBUG 118019148us (loop iter 18442213, call 922110 of that task)
+```
+
+`A>B` rows are **contained in** the `A` row above them (`EMU>SCSIW` is inside `EMU`), so parent
+and child both appear and their times overlap by design. The worst-call scan walks the table
+backwards, so the most specific row wins a tie with its parent — the report names the leaf.
+
+### Console commands
+
+| Command | Effect |
+|---|---|
+| `PSTAT` | toggles the periodic reports — **both** the piscsi one and the core0 one, in lockstep |
+| `PSTATC` | dumps core0 per-task cumulative totals, the whole-iteration row, the worst-single-call-ever latch, and the measured overhead. **Non-destructive** — safe to poll |
+| `PSTATZ` | zeroes the core0 cumulative totals and the worst-ever latch, for scoping a measurement to one phase |
+| `PSTATR` | unchanged: piscsi cumulative totals + per-unit CLMT state, then reset |
+
+### Overhead, and how it is reported honestly
+
+The instrumentation **measures its own cost on the metal at init** and prints it. Two numbers,
+both from `c0_calibrate()`: one `XTime_GetTime()` (three reads of the SCU global timer), and one
+**complete span boundary** — the timer read plus everything `c0stat_acc()` does — obtained by
+running 256 real boundaries and dividing. The `ovh=` field on every window line is
+`boundaries x measured-boundary-cost / window`, so it is evidence rather than an estimate, and
+the very first window of a run tells the operator whether the instrumentation is material.
+
+Two things were done to keep that number small, both verified in the disassembly: the reporting
+helpers and `c0_recalc()` are `noinline` (at `-O3` gcc inlines them into the two hot functions,
+and the inlined `printf` machinery then costs every boundary a 52-156 byte stack frame and a
+`vpush`/`vpop` of `d8-d9`), and blocking console output is bracketed so it is charged to no span
+at all — otherwise C0STAT's own report, and PISCSI_STATS' report (which is emitted from inside
+`handle_piscsi_reg_write()`, i.e. inside the `EMU>SCSIW` span), would each fake a stall in
+whatever ran next.
+
+### Known attribution limits — read these before believing a row
+
+- **Interrupt time is not separated.** `isr_video` (~60 Hz) and `isr_audio_tx` land in whichever
+  span happens to be open. That is a small error spread evenly across all spans; it cannot
+  manufacture a multi-second max, which is why the ISRs were deliberately left untouched.
+- **Only the `CPU_EMULATOR` loop is instrumented.** The real-CPU loop (`main.c` :1871+) is not:
+  the crawl is an emulated-guest workload, and that loop's `M68K_RESET` arm would need its own
+  re-arming to avoid charging a whole reset episode to whichever callee was stamped next.
+  `PSTATC` says so explicitly rather than printing zeros.
+- **A skipped gated callee emits no stamp.** `debug_thread` (1 in 20) and
+  `emulator_reset_thread` (1 in 40) are only stamped on the iterations they actually run, so
+  their call counts stay honest; the few instructions of counter bookkeeping on the skipped
+  iterations are charged to the next span.
+- **The timebase caveat from §5 applies unchanged.** The Cortex-A9 global timer runs at CPU_CLK/2
+  and this board retunes its ARM clock at runtime, so microseconds derive from the live
+  `counts_per_second`. Ratios and step changes discriminate; absolute values are uncalibrated.
+
+### Reading the output against §9's two worlds
+
+| Observation | Conclusion |
+|---|---|
+| a `*BLOCK*` line names a row, and its max ~= the `gap` max | **world 1**: core0 blocked. Go to that row's entry in `core0-loop-blocking-audit.md` |
+| `gap` max is large but **no** row's max is large, and the `ITERATION` max is small | **world 2**: the guest went quiet. Core0 was healthy; move to core1 |
+| `EMU>SCSIW` cumulative inflated with a *small* max | the un-rate-limited error printf amplifier (audit B11), not a block |
+| `EMURESET` shows multi-second calls | expected and legitimate — `piscsi_init()` rebuilds 7 CLMTs (audit B7) |
+| `ovh=` is more than a percent or two | the instrumentation is perturbing the thing it measures; trim spans or set `CORE0_STATS 0` |
