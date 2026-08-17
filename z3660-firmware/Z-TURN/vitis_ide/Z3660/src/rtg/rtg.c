@@ -35,6 +35,7 @@
 #include "../mpg/libmpeg_arm/mpeg2dec_arm_comm_arm.h"
 #include "xtime_l.h"
 #include "usb_proxy.h"
+#include "../core0_stats.h"
 
 extern arm_decoder_shared_arm_t *bridge_state_arm;
 extern uint32_t fifo_read_index;
@@ -432,24 +433,35 @@ void other_tasks(void)
 //   static int debug_call_count = 0;
 //   debug_call_count++;
 //   if (debug_call_count % 2 == 0)
+   /* Nested C0STAT spans (core0_stats.h). The MPEG decode is the only thing in
+    * here that runs on EVERY iteration, so it is on the critical path of every
+    * one of the ten cross-core round trips a 2 KB guest READ costs; the other two
+    * are rare but each reaches hardware that can wait. All three are inside the
+    * enclosing C0T_OTHER stamp -- reported as OTHER>* rows. */
    {
 //      printf("[RTG DEBUG] Calling pl_mpeg_arm_decode_progressive #%d\n", debug_call_count);
       int pl_mpeg_arm_decode_progressive(void);
+      C0_SPAN(sp);
       pl_mpeg_arm_decode_progressive();
+      C0_SPAN_END(sp,C0T_OT_MPEG);
    }
 
    if(idle_task_count++> idle_task_count_max)
    {
+      C0_SPAN(sp);
       idle_task_count=0;
       ethernet_task();
+      C0_SPAN_END(sp,C0T_OT_ETHTASK);
    }
 
    if(audio_request_init) {
+      C0_SPAN(sp);
       audio_debug_timer(0);
       audio_silence();
       audio_init_i2s();
       audio_request_init = 0;
       audio_debug_timer(1);
+      C0_SPAN_END(sp,C0T_OT_AUDIO);
    }
 
    if(interrupt_enabled_ethernet && ethernet_get_backlog()>0)

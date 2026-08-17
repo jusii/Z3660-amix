@@ -15,6 +15,7 @@
 #include "xscuwdt.h"
 #include "scsi/scsi.h"
 #include "floppy/floppy.h"
+#include "core0_stats.h"
 
 void write_rtg_register(uint16_t zaddr,uint32_t zdata);
 uint32_t read_rtg_register(uint16_t zaddr);
@@ -294,18 +295,27 @@ int emulator_thread(struct pt *pt)
    {
       PT_WAIT_UNTIL(pt,shared->shared_data==1);
       shared->shared_data=0;
+      /* Nested C0STAT spans: the enclosing C0T_EMULATOR stamp in main.c cannot
+       * tell an RTG blit from an SD transfer, and the whole point of this
+       * instrumentation is to name the offender. Each span brackets only the
+       * handler call, so the flag/dsb bookkeeping stays with the parent. */
       if(shared->write_rtg==1)
       {
          uint32_t addr=shared->write_rtg_addr;
          uint32_t data=shared->write_rtg_data;
+         C0_SPAN(sp);
          write_rtg_register(addr,data);
+         C0_SPAN_END(sp,C0T_EMU_RTG_WR);
          dsb();
          shared->write_rtg=0;
       }
       else if(shared->read_rtg==1)
       {
          uint32_t addr=shared->read_rtg_addr;
-         uint32_t data=read_rtg_register(addr);
+         uint32_t data;
+         C0_SPAN(sp);
+         data=read_rtg_register(addr);
+         C0_SPAN_END(sp,C0T_EMU_RTG_RD);
          shared->read_rtg_data=data;
          dsb();
          shared->read_rtg=0;
@@ -315,7 +325,9 @@ int emulator_thread(struct pt *pt)
          int type=shared->write_scsi_type;
          uint32_t addr=shared->write_scsi_addr;
          uint32_t data=shared->write_scsi_data;
+         C0_SPAN(sp);
          handle_piscsi_reg_write(addr,data,type);
+         C0_SPAN_END(sp,C0T_EMU_SCSI_WR);
          dsb();
          shared->write_scsi=0;
 //         shared->write_scsi_in_progress=1;
@@ -327,7 +339,9 @@ int emulator_thread(struct pt *pt)
       {
          int type=shared->read_scsi_type;
          uint32_t addr=shared->read_scsi_addr;
+         C0_SPAN(sp);
          shared->read_scsi_data=handle_piscsi_read(addr,type);
+         C0_SPAN_END(sp,C0T_EMU_SCSI_RD);
          dsb();
          shared->read_scsi=0;
       }
@@ -350,17 +364,21 @@ int emulator_thread(struct pt *pt)
       }
       else if(shared->reset_emulator==1)
       {
+         C0_SPAN(sp);
          cpu_emulator_reset();
+         C0_SPAN_END(sp,C0T_EMU_RSTE);
          dsb();
          shared->reset_emulator=0;
       }
       else if(shared->core0_hold==1)
       {
+         C0_SPAN(sp);
          shared->core0_hold_ack=1;
          do
          {
             usleep(1000);
          }while(shared->core0_hold==1);
+         C0_SPAN_END(sp,C0T_EMU_HOLD);
          dsb();
          shared->core0_hold_ack=0;
       }

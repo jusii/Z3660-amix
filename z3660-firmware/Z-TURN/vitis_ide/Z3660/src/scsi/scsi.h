@@ -312,9 +312,11 @@ uint32_t handle_piscsi_read(uint32_t addr, uint8_t type);
 
 /* piscsi service-rate / latency instrumentation (scsi.c, PISCSI_STATS).
  * PSTAT toggles the periodic summary; PSTATR dumps cumulative totals + CLMT
- * state per unit and resets. See docs/piscsi-service-path.md. */
+ * state per unit and resets. The core0-loop half of the same measurement lives
+ * in core0_stats.[ch] (PSTATC/PSTATZ). See docs/piscsi-service-path.md. */
 void piscsi_stats_toggle(void);
 void piscsi_stats_dump(void);
+int  piscsi_stats_reporting(void);   /* current state of the periodic report */
 
 void piscsi_find_filesystems(PISCSI_DEV *d);
 void piscsi_refresh_drives();

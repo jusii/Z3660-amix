@@ -19,6 +19,7 @@
 #include "../config_file.h"
 #include "../debug_console.h"
 #include "../cpu_emulator.h"
+#include "../core0_stats.h"
 
 extern CONFIG config;
 #define BE(val) be32toh(val)
@@ -153,12 +154,18 @@ static void piscsi_stats_tick(XTime now)
    if(piscsi_stats_report && (ps_win[PS_RD].reqs || ps_win[PS_WR].reqs))
    {
       uint32_t win_us = ps_us(el);
+      /* This report is emitted from inside handle_piscsi_reg_write(), i.e. from
+       * inside the core0 loop's EMU>SCSIW span. Tens of milliseconds of blocking
+       * UART would otherwise be charged to the piscsi service and look like a
+       * stall; bracket it so C0STAT charges it to nobody (core0_stats.h). */
+      C0_EXCL(g);
       ps_line("R", &ps_win[PS_RD], win_us);
       ps_line("W", &ps_win[PS_WR], win_us);
       if(ps_gap_n)
          printf("[PSTAT] gap %lu/%luus n=%lu  (core0 loop latency + the 9 payload-free round trips)\n",
             (unsigned long)ps_us(ps_gap_t / ps_gap_n), (unsigned long)ps_us(ps_gap_max),
             (unsigned long)ps_gap_n);
+      C0_EXCL_END(g);
    }
    memset(ps_win, 0, sizeof ps_win);
    ps_gap_t = ps_gap_max = 0; ps_gap_n = 0;
@@ -222,6 +229,8 @@ void piscsi_stats_toggle(void)
       piscsi_stats_report ? "ON" : "OFF", PISCSI_STATS_PERIOD_S);
 }
 
+int piscsi_stats_reporting(void) { return piscsi_stats_report; }
+
 void piscsi_stats_dump(void)
 {
    int i;
@@ -264,6 +273,7 @@ void piscsi_stats_dump(void)
 #define PS_SHORT()     ((void)0)
 void piscsi_stats_toggle(void) { printf("[PSTAT] not compiled in (PISCSI_STATS=0)\n"); }
 void piscsi_stats_dump(void)   { printf("[PSTAT] not compiled in (PISCSI_STATS=0)\n"); }
+int  piscsi_stats_reporting(void) { return 0; }
 #endif
 /* --- end piscsi instrumentation --- */
 

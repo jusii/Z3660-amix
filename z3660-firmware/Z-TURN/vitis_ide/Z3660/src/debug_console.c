@@ -25,6 +25,9 @@ extern int eth_backlog_nag_counter_max;
  * declared locally to avoid pulling the FatFs-dependent header in here). */
 void piscsi_stats_toggle(void);
 void piscsi_stats_dump(void);
+int  piscsi_stats_reporting(void);
+/* core0 cooperative-loop per-task duration accounting */
+#include "core0_stats.h"
 typedef enum {
    A,
 
@@ -71,6 +74,8 @@ typedef enum {
    SERV,    SERVICE_CADENCE,
    PSTAT,   PISCSI_STATS_REPORT,
    PSTATR,  PISCSI_STATS_RESET,
+   PSTATC,  CORE0_LOOP_DUMP,
+   PSTATZ,  CORE0_LOOP_ZERO,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -120,6 +125,8 @@ const char *command_names[NUM_COMMANDS] = {
       "SERV",    "SERVICE CADENCE",
       "PSTAT",   "PISCSI STATS REPORT",
       "PSTATR",  "PISCSI STATS RESET",
+      "PSTATC",  "CORE0 LOOP DUMP",
+      "PSTATZ",  "CORE0 LOOP ZERO",
 };
 extern clock_data cd[];
 extern CONFIG config;
@@ -382,11 +389,25 @@ int debug_thread(struct pt *pt)
                   case PSTAT:
                   case PISCSI_STATS_REPORT:
                      piscsi_stats_toggle();      // periodic piscsi service-rate/latency summary
+                     // ...and the core0 loop report with it: the two halves of the
+                     // same measurement (request cost vs. who starved the loop) are
+                     // only useful side by side, so one switch drives both.
+                     core0_stats_set_report(piscsi_stats_reporting());
                      debug_console.subcmd=0;
                      break;
                   case PSTATR:
                   case PISCSI_STATS_RESET:
                      piscsi_stats_dump();        // cumulative totals + per-unit CLMT state, then reset
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATC:
+                  case CORE0_LOOP_DUMP:
+                     core0_stats_dump();         // core0 per-task cumulative totals (non-destructive)
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATZ:
+                  case CORE0_LOOP_ZERO:
+                     core0_stats_zero();         // zero core0 cumulative totals + worst-ever latch
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:
@@ -1144,5 +1165,9 @@ void debug_console_help(void)
    xil_printf("'DEMU'    or 'DEBUG EMU' toggles emulator-core debug spam + AMIX strand trace\r\n");
    xil_printf("'PERF'    or 'PERF REPORT' toggles the 030-MMU instr/sec readout (~1Hz, EMU)\r\n");
    xil_printf("'SERV'    or 'SERVICE CADENCE' cycles 030-MMU IPL/task poll cadence 1->2->4..64 (EMU)\r\n");
+   xil_printf("'PSTAT'   or 'PISCSI STATS REPORT' toggles the periodic piscsi + core0-loop reports\r\n");
+   xil_printf("'PSTATR'  or 'PISCSI STATS RESET' dumps piscsi cumulative totals + CLMT state, resets\r\n");
+   xil_printf("'PSTATC'  or 'CORE0 LOOP DUMP' dumps per-task core0 loop totals (who blocks, how long)\r\n");
+   xil_printf("'PSTATZ'  or 'CORE0 LOOP ZERO' zeroes the core0 loop totals and worst-call latch\r\n");
 }
 #endif

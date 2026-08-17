@@ -55,6 +55,7 @@ extern ENV_FILE_VARS env_file_vars_temp[9]; // really size 8
 #include "pt/pt.h"
 #include "ethernet.h"
 #include <xtime_l.h>
+#include "core0_stats.h"
 
 #include "usb_proxy.h"
 
@@ -1802,6 +1803,19 @@ int main()
       PT_INIT(&pt_emulator_reset);
       PT_INIT(&pt_ethernet);
       PT_INIT(&pt_usb);
+      /* Per-task duration accounting for this loop (core0_stats.h). Every C0_STAMP
+       * closes the span that started at the previous stamp, so one loop iteration
+       * costs one timer read per timed callee -- not two. A skipped gated callee
+       * emits no stamp, so its call count stays honest and the few instructions of
+       * counter bookkeeping are charged to the next span. C0_ITER() closes the
+       * iteration and drives the rate-limited report; it costs no timer read at
+       * all, because the last stamp already read the clock.
+       *
+       * Instrumented here and NOT in the real-CPU loop below: the crawl under
+       * investigation is an emulated-guest workload, and the real-CPU loop's
+       * M68K_RESET arm would need its own re-arming to avoid charging a whole
+       * reset episode to whichever callee happened to be stamped next. */
+      C0_INIT();
       while(1)
       {
          {
@@ -1810,26 +1824,29 @@ int main()
             if(debug_thread_counter==20)
             {
                debug_thread(&pt_debug);
+               C0_STAMP(C0T_DEBUG);
                debug_thread_counter=0;
             }
          }
-         measures_thread(&pt_measures);
-         interrupt_thread(&pt_interrupt);
+         measures_thread(&pt_measures);   C0_STAMP(C0T_MEASURES);
+         interrupt_thread(&pt_interrupt); C0_STAMP(C0T_INTERRUPT);
 
-         emulator_thread(&pt_emulator);
+         emulator_thread(&pt_emulator);   C0_STAMP(C0T_EMULATOR);
          {
             static int reset_thread_counter=0;
             reset_thread_counter++;
             if(reset_thread_counter==40)
             {
                emulator_reset_thread(&pt_emulator_reset);
+               C0_STAMP(C0T_EMURESET);
                reset_thread_counter=0;
             }
          }
-         ethernet_thread(&pt_ethernet);
-         usb_thread(&pt_usb);
-         other_tasks();
+         ethernet_thread(&pt_ethernet);   C0_STAMP(C0T_ETHERNET);
+         usb_thread(&pt_usb);             C0_STAMP(C0T_USB);
+         other_tasks();                   C0_STAMP(C0T_OTHER);
          task_counter++;
+         C0_ITER();
       }
 
    }
