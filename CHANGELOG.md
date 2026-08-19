@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-08-19 — Beta-21 consolidation FLASHED + METAL-VALIDATED (CEEC4984 live)
+
+Same-day follow-up to the consolidation entry: `BOOT.BIN` crc32 `CEEC4984`
+(from `1e47b77`; clean containerized build with the FSBL rebuilt — it reproduces
+byte-identical to the committed `fsbl.elf`) was flashed to the card's
+`0:/Z3660.bin` through both deploy CRC gates and validated on the A4000+Z3660:
+
+- Cold boot verified: banner `1.03 (BETA 21)`, boot-menu `P` = HTTP server,
+  file-version report `Z3660.bin v1.03 BETA 21`.
+- Guest validation: the production golden (030 kernel r3 `sum -r` 55482) boots
+  to multiuser with **working ethernet** (.39 answers) — piscsi, 030 MMU, eth,
+  C0STAT/PSTAT all live. The B1 boot2-040 test image also booted to login
+  (its zen0 stayed down — an image-lineage delta vs the live golden, not a
+  firmware issue: the same firmware brought the live golden's network up).
+- **Warm-reset restoration proven on metal**: guest `shutdown -i6` →
+  `custom_reset` → Core0 reset → full reboot to login (the pre-restoration
+  post-fsck hang class).
+- The legacy "keep BOOT.BIN under ~12 MB" SD-write warning is retired: the
+  12,762,340-byte image staged (TFTP), copied (`read == write, verified`) and
+  CRC-matched on-card.
+- cdfs/CD checks were NOT exercised (current card cfg has no `isoN` unit);
+  DMA canary sums unchanged across the attempts. CD validation queued for a
+  session with the golden cfg.
+- Rollback set left on 1:: `Z3660-b21-CEEC4984.bin`, `Z3660-bak-BF1805DB.bin`
+  (the instrumented crawl build this flash replaced), `Z3660-prod-59FAE8CA.bin`;
+  `0:/FAILSAFE.bin` (`7E03DA03`) untouched.
+
 ## 2026-08-19 — Beta-21 consolidation: amix-main-2 is the single firmware line (203f108..cc54084)
 
 `amix-main-2` is now the going-forward firmware line; `piscsi-crawl` is frozen
