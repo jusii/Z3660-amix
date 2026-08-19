@@ -350,7 +350,9 @@ int emulator_thread(struct pt *pt)
          int type=shared->write_floppy_type;
          uint32_t addr=shared->write_floppy_addr;
          uint32_t data=shared->write_floppy_data;
+         C0_SPAN(sp);
          handle_pifloppy_reg_write(addr,data,type);
+         C0_SPAN_END(sp,C0T_EMU_FLOP_WR);
          dsb();
          shared->write_floppy=0;
       }
@@ -358,7 +360,9 @@ int emulator_thread(struct pt *pt)
       {
          int type=shared->read_floppy_type;
          uint32_t addr=shared->read_floppy_addr;
+         C0_SPAN(sp);
          shared->read_floppy_data=handle_pifloppy_read(addr,type);
+         C0_SPAN_END(sp,C0T_EMU_FLOP_RD);
          dsb();
          shared->read_floppy=0;
       }

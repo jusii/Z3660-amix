@@ -21,6 +21,8 @@ static const char * const c0_name[C0T_NUM] = {
    "EMU>RTGR",
    "EMU>SCSIW",
    "EMU>SCSIR",
+   "EMU>FLOPW",
+   "EMU>FLOPR",
    "EMU>RSTE",
    "EMU>HOLD",
    "EMURESET",

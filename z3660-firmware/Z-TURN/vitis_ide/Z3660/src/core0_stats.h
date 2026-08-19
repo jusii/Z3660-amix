@@ -93,6 +93,8 @@ typedef enum {
    C0T_EMU_RTG_RD,    /*    read_rtg_register()                               */
    C0T_EMU_SCSI_WR,   /*    handle_piscsi_reg_write()  -- f_read/f_write       */
    C0T_EMU_SCSI_RD,   /*    handle_piscsi_read()                              */
+   C0T_EMU_FLOP_WR,   /*    handle_pifloppy_reg_write() -- ADF f_read/f_write  */
+   C0T_EMU_FLOP_RD,   /*    handle_pifloppy_read()                            */
    C0T_EMU_RSTE,      /*    cpu_emulator_reset()                              */
    C0T_EMU_HOLD,      /*    the core0_hold usleep(1000) spin                  */
    C0T_EMURESET,      /* emulator_reset_thread()    -- 1 iteration in 40       */
