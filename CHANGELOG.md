@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-08-19 — Beta-21 consolidation: amix-main-2 is the single firmware line (203f108..cc54084)
+
+`amix-main-2` is now the going-forward firmware line; `piscsi-crawl` is frozen
+as reference. Content-level audit of both lines (they share **no** git ancestor
+— the beta-21 resync was a re-port, so commit identity proves nothing;
+`docs/port-audit-beta21-consolidation.md` holds the full table) ported the six
+post-resync fixes: CLMT uninstall on `f_lseek(CREATE_LINKMAP)` failure
+(d182e41), 256-item fast-seek link map (aea93bf), zero-block-size divide guard
+(c0510a7), request-path `f_lseek`/`f_write` error handling (dc81392), PSTAT
+per-span latency counters (9b56883), C0STAT per-task accounting (b4c2789,
+extended to beta 21's floppy mailbox arms in cc54084), plus their service-path
+and blocking-audit docs.
+
+- **The audit caught a re-port regression the changelogs had hidden:** the
+  core0 half of the warm-reset chain — `piscsi_init()` re-run on guest reset
+  and the stale-`FPGA_INT6` clear — had been dropped while the CORE1 half
+  survived, so a soft reboot (notably fsck's post-repair reboot) would hang at
+  `0x00F81212`. Restored as 1f3521f + dc38a02.
+- Everything else spot-checked PRESENT (030-MMU fix set, CD-ROM units,
+  direct-DMA + SD-DMA + AMP core-1 coherence, RDB 512-byte scan, JIT -Os fix);
+  two legitimate N/A (superseded warm-reset variant; `cdrom_units` key replaced
+  by upstream's `isoN`).
+- Containerized build verified twice from clean, byte-identical: `BOOT.BIN`
+  12 680 420 bytes, CRC32 `E64FA66D`. Note: this exceeds the legacy ~12 MB
+  SD-write warning (already exceeded pre-port) — flash procedure CRC-gates
+  every hop and creates FAILSAFE.bin first.
+- Trap for future line switches: `build/` survives branch switches and the
+  Makefile has no header deps — wipe `Z3660/build` and `Z3660_emu/build` when
+  moving between lines, or stale objects produce phantom link errors.
+
 ## 2026-08-12 — Investigation: how `amix_mode` presents RAM to AMIX, and what more than 16 MB would cost (07cecf8, docs-only)
 
 `docs/amix-ram-presentation.md`, doc-only — no code or config touched. The 16 MB
