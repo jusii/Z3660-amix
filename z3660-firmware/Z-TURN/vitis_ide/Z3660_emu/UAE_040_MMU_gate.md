@@ -14,9 +14,11 @@
 > 3.4 task, and the first thing a demand-paging 040 kernel needs (§8). The AMIX
 > contract now travels onto the 040 core with the mode (§8). Remaining unmodelled
 > 040 semantics are listed in §7. A metal MMU-off AmigaOS smoke is still queued,
-> The first AMIX-040 metal attempt (2026-08-20) never reached the emulator at all —
-> core0 did not recognise `UAE_040_MMU` as an emulated mode and so never started core1;
-> fixed and host-guarded in §8.3, not yet re-tried on metal.
+> Two metal attempts on 2026-08-20 both stopped short of the emulator: core0 did not
+> recognise `UAE_040_MMU` as an emulated mode and never started core1 (§8.3), and then the
+> core1 breadcrumb added alongside that fix called `z3660_printf` before `init_shared()`,
+> wedging core1 on every mode (§8.4). Both fixed; neither the 040 access-error frame nor
+> the `amix_mmu_on` latch has yet executed on hardware.
 
 This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
 mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
@@ -92,7 +94,8 @@ green, 040 table linked in.
 | Runnable image (P3.2 wiring) | 12 745 956 | 12.156 MiB, zlib crc32 `0x92E1473F` (+56 B: run loop + dispatch) |
 | AMIX-contract image (§8 wiring) | 12 762 340 | 12.171 MiB, zlib crc32 `0x76FBA34C` — same byte size as the flashed `455A7D12` production image |
 | AMIX-040 fault-path image (§8.1 + §8.2) | 12 762 340 | 12.171 MiB, zlib crc32 `0x2CFA9216` — format-$7 frame + the 040 `amix_mmu_on` latch. **Never emulated anything on metal: core0 did not start core1 (§8.3)** |
-| **core1-launch fix image (§8.3)** | **12 762 340** | **12.171 MiB, zlib crc32 `0xBBD5C14F`** — `boot_mode_is_emulated()` + the core1 breadcrumbs |
+| core1-launch fix image (§8.3) | 12 762 340 | 12.171 MiB, zlib crc32 `0xBBD5C14F` — `boot_mode_is_emulated()` + the core1 breadcrumbs. **Core1 wedged on every mode: the breadcrumb called `z3660_printf` pre-`init_shared()` (§8.4)** |
+| **NULL-safe `z3660_printf` image (§8.4)** | **12 762 340** | **12.171 MiB, zlib crc32 `0x806C76AE`** |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -101,7 +104,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 340 B, zlib crc32 `0xBBD5C14F` — compare against the board's SD `E`→CRC).
+(12 762 340 B, zlib crc32 `0x806C76AE` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -458,6 +461,76 @@ the first line is now an unambiguous "core0 never started core1"; the second pin
 `UAE_030_MMU`. Opening ZTop while the card runs `UAE_040_MMU` (index 8) reads
 `bootmode_names[8]` out of bounds, and ZTop cannot select the mode. Driver-side, not
 touched here.
+
+#### 4. Second metal attempt (2026-08-20): the breadcrumb itself killed core1
+
+`BBD5C14F` proved the §8.3 fix: core0 printed `Starting CPU emulator on Core1` and
+`060 starting now...` was gone. But core1 then died on **every** boot mode — the golden
+030 path included, which had been multiuser-green on `455A7D12` hours earlier — with core0
+parked on `Waiting ack from core1...` forever and not one byte from core1, not even the
+new `[Core1] alive` breadcrumb.
+
+**The breadcrumb was the bug.** `z3660_printf()` takes a UART semaphore that lives in the
+SHARED struct:
+
+```c
+extern "C" void z3660_printf(const TCHAR *format, ...)
+{
+   ...
+   while(shared->uart_semaphore!=0);   // <-- dereferences `shared`
+   shared->uart_semaphore=1;
+```
+
+`shared` is assigned in `init_shared()`, called at `main.cpp:886`. The breadcrumb sat at
+`main.cpp:852`, **34 lines earlier**, so the very first statement core1 executed was
+`while(((SHARED*)0)->uart_semaphore != 0);` — a spin on DDR `0x0000001C`
+(`uart_semaphore` is at SHARED offset `$1C`). Nothing faults: core1 has not yet poked
+`MMUTable[0]=0` (that is line 882, *after* the breadcrumb), so address 0 is still ordinary
+mapped DDR. The word there was non-zero and never changed, so core1 spun there forever,
+emitting nothing and never acking.
+
+Mode-independent by construction — it is the first statement of `main()`, long before any
+mode dispatch — which is precisely why the proven 030 path broke too. That total silence
+plus a hung ack is the signature of this class, and it is worth recognising on sight.
+
+I had noted in the original comment that `shared` was NULL at that point and that the line
+"must not dereference it" — then called a helper that dereferences it internally. Checking
+the arguments and not the callee is the whole mistake.
+
+**Fix.** `z3660_printf()` is now NULL-safe: it takes the semaphore when `shared` exists and
+falls back to a bare `vprintf` before that — which is exactly what core1's long-proven
+pre-init prints (`printf("MMUL2Table = ...")` at line 892, and the silicon-version line)
+have always done. The helper is therefore safe to call from anywhere, so the breadcrumb
+keeps its earliest-possible placement and the trap cannot bite the next caller either.
+
+*Considered and rejected:* statically initialising `SHARED *shared = (SHARED *)0xFFFF0000`
+to remove the NULL window for every user. It is tempting and more general, but it changes
+the timing of core1's first OCM access and turns the existing deliberate NULL check in
+`z3660_dbg_emu()` into dead code — two speculative changes riding along in an image whose
+whole job is to prove one fix. The local guard is the minimal provably-correct change.
+
+**The other suspect was refuted by measurement, not argument.** A C++ static initializer
+introduced by the night's emulator commits would produce the same total silence (a crash
+before `main()`). It did not happen: no object touched that night carries a global
+constructor, and `.init_array` is unchanged at four pre-existing entries.
+
+```
+$ arm-none-eabi-nm build/{main,uae/uae_emulator,uae/cpummu,uae/newcpu,uae/newcpu_common,uae/a3000_scsi}.o | grep -c _GLOBAL__sub_I_
+0            # every one of them
+$ arm-none-eabi-readelf -S Z3660_emu.elf | grep init_array
+  [60] .init_array  INIT_ARRAY  3062ea50 63ea50 000010 04  WA  0  0  4     # 0x10 = 4 entries
+```
+
+That is a one-command check worth repeating whenever core1 goes silent.
+
+**Not host-checkable, and this is not a gap that can be closed.** `Z3660_emu/src/main.cpp`
+is board code — Xilinx cache/GPIO/PLL calls, FPGA registers, the SHARED struct at a fixed
+physical address — and the host harness compiles none of it. Worse, `board_stubs.cpp`
+*fakes the exact seam that broke*: it defines inert stand-ins for the board globals and has
+no `shared` pointer and no UART semaphore at all, so a host build cannot even represent
+"helper dereferences a not-yet-initialised shared pointer during core1 bring-up". The
+defence here is the structural one — the helper no longer has an unsafe window — plus the
+pre-init contract now written at both the definition and the call site.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
