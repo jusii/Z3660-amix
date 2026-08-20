@@ -18,8 +18,20 @@ void print_hdmi_ln(int xpos, char *message, int line_inc);
      printf("%s\n",message); print_hdmi_ln(0,message,1); } while(0)
 
 static struct tcp_pcb *http_pcb;
-static FATFS fatfs;
+static FATFS fatfs;              /* volume 1: -- exFAT data partition (read/write) */
 static int fatfs_mounted = 0;
+static FATFS fatfs0;             /* volume 0: -- FAT boot partition (READ ONLY here) */
+static int fatfs0_mounted = 0;
+
+/* Mount helper from main.c, declared here so this module stays self-contained --
+   same extern that sd_fileops.c uses. It is f_mount() plus a (currently
+   disabled) SD clock retune, so behaviour is identical to a plain f_mount(). */
+extern FRESULT f_clk_mount(FATFS* fs, const TCHAR* path, BYTE opt);
+
+/* Bytes read from the card per refill of the per-connection send buffer. A
+   multiple of the 512-byte sector keeps f_read() on FatFs' direct-transfer
+   path; lwIP repacks it into MSS-sized segments. */
+#define HTTPD_SEND_CHUNK 4096
 
 struct http_conn_state {
     int close_pending;
@@ -27,6 +39,16 @@ struct http_conn_state {
     FIL upload_file;   /* file being written */
     uint32_t upload_remaining; /* bytes left to receive */
     char upload_path[128];
+    /* --- send engine (see http_send_pump) -------------------------------
+       A response body is streamed across many tcp_sent() callbacks, so the
+       open file and the not-yet-accepted bytes have to outlive the request
+       handler. Uploads and downloads never overlap on one connection. */
+    int send_active;            /* 1 while a body is still being streamed */
+    FIL send_file;              /* open source file, at its own read offset */
+    FSIZE_t send_remaining;     /* bytes of the file not yet read into send_buf */
+    UINT send_buf_len;          /* valid bytes in send_buf */
+    UINT send_buf_pos;          /* of those, how many tcp_write() has taken */
+    BYTE send_buf[HTTPD_SEND_CHUNK];
 };
 
 #ifndef HTTPD_TRACE
@@ -37,10 +59,16 @@ const char *mime_type(const char *name);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *state);
 void http_send_404(struct tcp_pcb *pcb);
-void send_http_header(struct tcp_pcb *pcb, const char *filename);
-void extract_filename(char *request, char *filename);
+static err_t send_http_header(struct tcp_pcb *pcb, const char *filename,
+                              FSIZE_t size, const char *attach_name);
+void extract_filename(char *request, char *filename, size_t size);
 void http_send_json_system(struct tcp_pcb *pcb, struct http_conn_state *state);
 void http_send_json_dirs(struct tcp_pcb *pcb, struct http_conn_state *state);
+static void http_send_pump(struct tcp_pcb *pcb, struct http_conn_state *state);
+static void http_send_download(struct tcp_pcb *pcb, const char *query,
+                               struct http_conn_state *state);
+static err_t http_poll(void *arg, struct tcp_pcb *pcb);
+static void http_err(void *arg, err_t err);
 
 /* URL-decode in-place into dst, returns dst. Simple implementation. */
 static char *url_decode(char *dst, const char *src)
@@ -62,16 +90,155 @@ static char *url_decode(char *dst, const char *src)
     return dst;
 }
 
+/* Pull one percent-decoded value out of a query string ("a=1&path=1:/x&b=2").
+   Same ?path= convention the PUT /upload handler uses, parsed on '&'
+   boundaries so a key is not matched inside another key's name.
+   Returns 1 if the key was present. */
+static int query_get(const char *query, const char *key, char *out, size_t outlen)
+{
+    size_t keylen = strlen(key);
+    const char *p = query;
+
+    out[0] = '\0';
+    if (!query)
+        return 0;
+
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t seglen = amp ? (size_t)(amp - p) : strlen(p);
+        if (seglen > keylen && p[keylen] == '=' && !strncmp(p, key, keylen)) {
+            char raw[256], decoded[256];
+            size_t vlen = seglen - keylen - 1;
+            if (vlen >= sizeof(raw)) vlen = sizeof(raw) - 1;
+            memcpy(raw, p + keylen + 1, vlen);
+            raw[vlen] = '\0';
+            url_decode(decoded, raw);   /* never grows, so raw's size bounds it */
+            size_t dlen = strlen(decoded);
+            if (dlen > outlen - 1) dlen = outlen - 1;
+            memcpy(out, decoded, dlen);
+            out[dlen] = '\0';
+            return 1;
+        }
+        if (!amp)
+            break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+/* Download policy for GET /download. Reads are allowed from both volumes; the
+   path must name one explicitly and must not try to walk out of it.
+
+   Note the asymmetry with PUT /upload, which is deliberate: 0: is the boot
+   volume and stays read-only over HTTP. It is written only through the boot
+   menu's E -> COPY path, which has FAILSAFE.bin and two CRC gates behind it. */
+static int http_download_path_ok(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+    if (path[1] != ':')
+        return 0;
+    if (path[0] != '0' && path[0] != '1')
+        return 0;
+    /* Reject ".." outright rather than per segment. FatFs here is built with
+       FF_FS_RPATH 0, so "." and ".." are not valid path items anyway, and a
+       real file on this card never has them in its name. */
+    if (strstr(path, "..") != NULL)
+        return 0;
+    return 1;
+}
+
+/* Hand as much of the open file to lwIP as the send window will take, then
+   return. Called once from the request handler to prime the connection and
+   again from every tcp_sent() callback until the body is fully queued.
+
+   This is what makes a response bigger than TCP_SND_BUF (8 KB here) possible:
+   nothing pumps lwIP while a callback runs, so no ACK can arrive and no send
+   buffer can free up inside this function. The old single-pass loop wrote
+   until tcp_write() said ERR_MEM and then *broke out and closed the file*, so
+   every response was truncated at roughly one send-buffer's worth. Here a
+   refusal only ends this pass -- the unaccepted bytes stay in send_buf, the
+   file stays open at its own offset, and the next ACK resumes exactly where
+   this pass stopped. */
+static void http_send_pump(struct tcp_pcb *pcb, struct http_conn_state *state)
+{
+    int stalled = 0;
+
+    if (!state || !state->send_active)
+        return;
+
+    while (!stalled) {
+        /* 1. drain whatever is still sitting in the chunk buffer */
+        while (state->send_buf_pos < state->send_buf_len) {
+            u16_t space = tcp_sndbuf(pcb);
+            if (space == 0) {            /* window full: wait for an ACK */
+                stalled = 1;
+                break;
+            }
+            UINT n = state->send_buf_len - state->send_buf_pos;
+            if (n > space) n = space;
+            if (tcp_write(pcb, state->send_buf + state->send_buf_pos, (u16_t)n,
+                          TCP_WRITE_FLAG_COPY) != ERR_OK) {
+                /* out of pbufs/segments right now -- keep the bytes and retry */
+                stalled = 1;
+                break;
+            }
+            state->send_buf_pos += n;
+        }
+        if (stalled)
+            break;
+
+        /* 2. buffer empty: either the body is fully queued, or refill it */
+        if (state->send_remaining == 0)
+            break;
+        if (tcp_sndbuf(pcb) == 0) {
+            stalled = 1;
+            break;
+        }
+
+        UINT want = HTTPD_SEND_CHUNK;
+        if ((FSIZE_t)want > state->send_remaining)
+            want = (UINT)state->send_remaining;
+        UINT br = 0;
+        FRESULT fres = f_read(&state->send_file, state->send_buf, want, &br);
+        if (fres != FR_OK || br == 0) {
+            /* The Content-Length we already sent lets the client see the
+               short body, which is the whole point of announcing it. */
+            printf2(100,"[httpd] %s: f_read failed (%d, %u bytes)", __func__, (int)fres, br);
+            state->send_remaining = 0;
+            state->send_buf_len = 0;
+            state->send_buf_pos = 0;
+            break;
+        }
+        state->send_buf_len = br;
+        state->send_buf_pos = 0;
+        state->send_remaining -= br;
+    }
+
+    tcp_output(pcb);
+
+    if (state->send_remaining == 0 && state->send_buf_pos >= state->send_buf_len) {
+        f_close(&state->send_file);
+        state->send_active = 0;
+        state->close_pending = 1;
+        printf2(64,"[httpd] %s: body fully queued, pending close", __func__);
+    }
+}
+
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
     (void)len;
     struct http_conn_state *state = (struct http_conn_state *)arg;
     if (!state) {
-        printf2(64,"[httpd] %s: no state", __func__);
         return ERR_OK;
     }
-    printf2(64,"[httpd] %s: called, close_pending=%d", __func__, state->close_pending);
-    if (state->close_pending) {
+    /* Resume a streamed body. No logging here: this fires once per ACK, and
+       printf2() also paints the HDMI console -- logging per ACK would dominate
+       the transfer time on a multi-megabyte download. */
+    if (state->send_active)
+        http_send_pump(pcb, state);
+
+    if (!state->send_active && state->close_pending) {
         err_t err = tcp_close(pcb);
         if (err == ERR_OK) {
             printf2(64,"[httpd] %s: tcp_close succeeded", __func__);
@@ -82,6 +249,49 @@ static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
         }
     }
     return ERR_OK;
+}
+
+/* Safety net for the send engine. http_send_pump() normally resumes from
+   tcp_sent(), which needs an ACK to fire -- and an ACK only comes if something
+   is still unacknowledged. If a pass ever ends having queued nothing at all
+   (pbufs momentarily exhausted) there would be no ACK left to wake it, so the
+   coarse timer retries too. Same reason lwIP's own httpd registers a poll. */
+static err_t http_poll(void *arg, struct tcp_pcb *pcb)
+{
+    struct http_conn_state *state = (struct http_conn_state *)arg;
+    if (!state)
+        return ERR_OK;
+    if (state->send_active) {
+        http_send_pump(pcb, state);
+        return ERR_OK;
+    }
+    if (state->close_pending) {
+        if (tcp_close(pcb) == ERR_OK) {
+            tcp_arg(pcb, NULL);
+            free(state);
+        }
+    }
+    return ERR_OK;
+}
+
+/* The connection died under us (RST / abort). lwIP has already freed the pcb,
+   so only our own state is ours to release -- including any file left open by
+   an interrupted transfer. */
+static void http_err(void *arg, err_t err)
+{
+    struct http_conn_state *state = (struct http_conn_state *)arg;
+    if (!state)
+        return;
+    printf2(64,"[httpd] %s: connection error %d", __func__, err);
+    if (state->send_active) {
+        f_close(&state->send_file);
+        state->send_active = 0;
+    }
+    if (state->upload_active) {
+        f_close(&state->upload_file);
+        state->upload_active = 0;
+    }
+    free(state);
 }
 
 err_t http_recv(void *arg,
@@ -96,10 +306,29 @@ err_t http_recv(void *arg,
     {
         printf2(64,"[httpd] %s: p == NULL, cleaning up state", __func__);
         if (state) {
+            /* the peer went away mid-transfer: don't leak the open file */
+            if (state->send_active) {
+                f_close(&state->send_file);
+                state->send_active = 0;
+            }
+            if (state->upload_active) {
+                f_close(&state->upload_file);
+                state->upload_active = 0;
+            }
             free(state);
             tcp_arg(pcb, NULL);
         }
         printf2(64,"[httpd] %s: return ERR_OK", __func__);
+        return ERR_OK;
+    }
+
+    /* A body is still streaming out on this connection. Every response says
+       "Connection: close", so a second request here is not a pipelined one to
+       honour -- and acting on it would clobber the in-flight send_file. */
+    if (state && state->send_active) {
+        printf2(64,"[httpd] %s: request while sending, ignored", __func__);
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
         return ERR_OK;
     }
 
@@ -155,7 +384,7 @@ err_t http_recv(void *arg,
         printf2(64,"[httpd] %s: PUT request", __func__);
         /* extract path */
         char filename[256];
-        extract_filename(data, filename);
+        extract_filename(data, filename, sizeof(filename));
         /* If there is a query string, split it off */
         char *q = strchr(filename, '?');
         char query[256] = {0};
@@ -189,9 +418,19 @@ err_t http_recv(void *arg,
                 /* default destination if none provided */
                 if (dest[0] == '\0') strncpy(dest, "1:/web", sizeof(dest)-1);
 
-                /* validate dest: must start with '0:' or '1:' */
-                if (!(dest[0] == '0' && dest[1] == ':') && !(dest[0] == '1' && dest[1] == ':')) {
-                    printf2(64,"[httpd] %s: invalid destination %s", __func__, dest);
+                /* Validate dest: uploads go to '1:' only.
+                   0: is refused explicitly. It used to be refused by accident
+                   -- the destination check accepted "0:" and the f_open then
+                   failed because this server had never mounted that volume.
+                   GET /download does mount 0: now, so the refusal has to be
+                   stated or the boot volume would silently become writable
+                   over HTTP. It must not be: Z3660.bin/FAILSAFE.bin are
+                   replaced only through the boot menu's E -> COPY step, which
+                   is CRC-verified on both sides and keeps a failsafe image.
+                   The response is a 404 either way, so nothing a client sees
+                   has changed. */
+                if (!(dest[0] == '1' && dest[1] == ':')) {
+                    printf2(1000,"[httpd] %s: invalid destination %s (uploads are 1: only)", __func__, dest);
                     http_send_404(pcb);
                 } else {
                     /* ensure directory exists */
@@ -271,14 +510,20 @@ err_t http_recv(void *arg,
 }
 
 void extract_filename(char *request,
-                      char *filename)
+                      char *filename,
+                      size_t size)
 {
     HTTPD_TRACE();
     char *start = request + 4;
 
     char *end = strchr(start, ' ');
 
-    int len = end - start;
+    /* A request line with no space after the target, or a target longer than
+       the caller's buffer, used to run straight off the end of it (end == NULL
+       made len negative and memcpy() took it as huge). Bounded both ways now. */
+    size_t len = end ? (size_t)(end - start) : strnlen(start, size - 1);
+    if (len > size - 1)
+        len = size - 1;
 
     memcpy(filename, start, len);
 
@@ -286,7 +531,8 @@ void extract_filename(char *request,
 
     if (!strcmp(filename, "/")) {
         printf2(64,"[httpd] %s: root request, using /index.html", __func__);
-        strcpy(filename, "/index.html");
+        strncpy(filename, "/index.html", size - 1);
+        filename[size - 1] = 0;
     }
 }
 char ip_address[30]={0};
@@ -352,13 +598,18 @@ void http_send_json_system(struct tcp_pcb *pcb, struct http_conn_state *state)
 void http_send_json_dirs(struct tcp_pcb *pcb, struct http_conn_state *state)
 {
     HTTPD_TRACE();
-    /* Candidate paths we expose to the user. Adjust as needed. */
+    /* Candidate paths we expose to the user. The shipped web UI feeds this
+       list straight into the upload destination selector, so it must only
+       name places an upload can actually land -- i.e. volume 1:. "0:" was in
+       the list upstream but never reached the client, because f_stat() failed
+       on an unmounted volume; now that GET /download mounts 0: it would start
+       showing up as an upload target that always 404s. Dropped, so the UI
+       behaves exactly as before with no change to its JavaScript. */
     const char *candidates[] = { "1:/web",
                                  "1:/web/locales",
                                  "1:/hdf",
                                  "1:/kicks",
                                  "1:/presets",
-                                 "0:",
                                  "1:" };
     const int ncand = sizeof(candidates)/sizeof(candidates[0]);
 
@@ -420,15 +671,29 @@ const char *mime_type(const char *name)
 void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *state)
 {
     HTTPD_TRACE();
-    if (!fatfs_mounted) {
+    /* Either volume is enough to serve something: the web assets need 1:, but
+       a download off 0: should still work if 1: failed to mount. Whichever
+       volume a request actually needs is re-checked where it is opened. */
+    if (!fatfs_mounted && !fatfs0_mounted) {
         printf2(64,"[httpd] %s: fatfs not mounted", __func__);
         http_send_404(pcb);
         return;
     }
 
-    char filename[128];
-    extract_filename(request, filename);
-    
+    char filename[256];
+    extract_filename(request, filename, sizeof(filename));
+
+    /* Split off the query string before routing, so "/download?path=..." (and
+       an /api endpoint carrying a cache-buster) match on the path alone. */
+    char query[256];
+    char *q = strchr(filename, '?');
+    query[0] = '\0';
+    if (q) {
+        strncpy(query, q + 1, sizeof(query) - 1);
+        query[sizeof(query) - 1] = '\0';
+        *q = '\0';
+    }
+
     /* Check for API endpoints */
     if (!strcmp(filename, "/api/system")) {
         printf2(64,"[httpd] %s: api/system request", __func__);
@@ -440,11 +705,20 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
         http_send_json_dirs(pcb, state);
         return;
     }
-    
-    char fullpath[256];
-    sprintf(fullpath, "1:/web%s", filename);
-    FIL file;
-    FRESULT fres = f_open(&file, fullpath, FA_READ);
+    if (!strcmp(filename, "/download")) {
+        http_send_download(pcb, q ? query : NULL, state);
+        return;
+    }
+
+    if (!state) {
+        printf2(64,"[httpd] %s: no connection state", __func__);
+        http_send_404(pcb);
+        return;
+    }
+
+    char fullpath[sizeof(filename) + 8];   /* "1:/web" + the longest filename */
+    snprintf(fullpath, sizeof(fullpath), "1:/web%s", filename);
+    FRESULT fres = f_open(&state->send_file, fullpath, FA_READ);
     if (fres != FR_OK)
     {
         printf2(1000,"[httpd] %s: f_open failed for %s: %d", __func__, fullpath, (int)fres);
@@ -455,61 +729,110 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
     else {
         printf2(1000,"[httpd] %s: f_open succeeded for %s", __func__, fullpath);
     }
-    /* Enviar cabecera HTTP */
-    send_http_header(pcb, fullpath);
-    err_t out_err = tcp_output(pcb);
-    if (out_err != ERR_OK) {
-        printf2(64,"[httpd] %s: tcp_output returned %d after header", __func__, out_err);
-    }
-    BYTE buffer[1024];
-    UINT br;
-    while (1)
-    {
-        if (f_read(&file, buffer, sizeof(buffer), &br) != FR_OK)
-        {
-            printf2(64,"[httpd] %s: f_read error", __func__);
-            break;
-        }
-        if (br == 0)
-            break;
-        err_t write_err = tcp_write(pcb, buffer, br, TCP_WRITE_FLAG_COPY);
-        if (write_err != ERR_OK) {
-            printf2(64,"[httpd] %s: tcp_write failed (%d) for %u bytes", __func__, write_err, br);
-            break;
-        }
-        printf2(64,"[httpd] %s: tcp_write ok %u bytes", __func__, br);
-        err_t out_err1 = tcp_output(pcb);
-        if (out_err1 != ERR_OK) {
-            printf2(100,"[httpd] %s: tcp_output returned %d after body chunk", __func__, out_err1);
-        }
-    }
 
-    f_close(&file);
-
-    printf2(1000,"[httpd] %s: finished sending file %s", __func__, fullpath);
-    if (state) {
-        state->close_pending = 1;
-        printf2(64,"[httpd] %s: marked connection pending close", __func__);
+    /* Same drain-aware send engine as /download: a web asset larger than the
+       send buffer used to be truncated here too. */
+    FSIZE_t size = f_size(&state->send_file);
+    if (send_http_header(pcb, fullpath, size, NULL) != ERR_OK) {
+        f_close(&state->send_file);
+        http_send_404(pcb);
+        return;
     }
-    err_t out_err2 = tcp_output(pcb);
-    if (out_err2 != ERR_OK) {
-        printf2(64,"[httpd] %s: tcp_output returned %d", __func__, out_err2);
-    }
+    state->send_active = 1;
+    state->send_remaining = size;
+    state->send_buf_len = 0;
+    state->send_buf_pos = 0;
+    http_send_pump(pcb, state);
 }
-void send_http_header(struct tcp_pcb *pcb, const char *filename)
+
+/* GET /download?path=<vol>:/<file> -- read any file on 0: or 1: back to the
+   host. Same ?path= query convention as PUT /upload/<name>?path=..., but this
+   one accepts both volumes because reading 0: is harmless; only writing it is
+   gated (see http_download_path_ok). */
+static void http_send_download(struct tcp_pcb *pcb, const char *query,
+                               struct http_conn_state *state)
+{
+    HTTPD_TRACE();
+    char path[256];
+
+    if (!state) {
+        printf2(64,"[httpd] %s: no connection state", __func__);
+        http_send_404(pcb);
+        return;
+    }
+    if (!query_get(query, "path", path, sizeof(path)) || path[0] == '\0') {
+        printf2(64,"[httpd] %s: no path= in query", __func__);
+        http_send_404(pcb);
+        return;
+    }
+    if (!http_download_path_ok(path)) {
+        printf2(1000,"[httpd] %s: rejected path %s", __func__, path);
+        http_send_404(pcb);
+        return;
+    }
+    if ((path[0] == '0' && !fatfs0_mounted) || (path[0] == '1' && !fatfs_mounted)) {
+        printf2(1000,"[httpd] %s: volume not mounted for %s", __func__, path);
+        http_send_404(pcb);
+        return;
+    }
+
+    FRESULT fres = f_open(&state->send_file, path, FA_READ);
+    if (fres != FR_OK) {
+        printf2(1000,"[httpd] %s: f_open failed for %s: %d", __func__, path, (int)fres);
+        http_send_404(pcb);
+        return;
+    }
+
+    FSIZE_t size = f_size(&state->send_file);
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    if (send_http_header(pcb, path, size, base) != ERR_OK) {
+        f_close(&state->send_file);
+        http_send_404(pcb);
+        return;
+    }
+    state->send_active = 1;
+    state->send_remaining = size;
+    state->send_buf_len = 0;
+    state->send_buf_pos = 0;
+    printf2(1000,"[httpd] %s: download start %s (%llu bytes)", __func__, path,
+            (unsigned long long)size);
+    http_send_pump(pcb, state);
+}
+
+/* 200 header for a file body. Content-Length is what lets the host tell a
+   complete transfer from a truncated one, so it is always sent; attach_name,
+   when given, additionally offers the file as a download in a browser. */
+static err_t send_http_header(struct tcp_pcb *pcb, const char *filename,
+                              FSIZE_t size, const char *attach_name)
 {
     HTTPD_TRACE();
     const char *type = mime_type(filename);
-    char header[256];
-    int len = snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: %s\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        type);
+    char header[512];
+    int len;
+
+    if (attach_name)
+        len = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %llu\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            type, (unsigned long long)size, attach_name);
+    else
+        len = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %llu\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            type, (unsigned long long)size);
+
     if (len < 0 || len >= (int)sizeof(header)) {
         printf2(64,"[httpd] %s: header snprintf failed", __func__);
-        return;
+        return ERR_VAL;
     }
 
     err_t header_err = tcp_write(pcb,
@@ -521,6 +844,7 @@ void send_http_header(struct tcp_pcb *pcb, const char *filename)
     } else {
         printf2(64,"[httpd] %s: tcp_write(header) ok %d", __func__, len);
     }
+    return header_err;
 }
 
 void http_send_404(struct tcp_pcb *pcb)
@@ -568,8 +892,8 @@ const char *mime_type(const char *name)
         return "application/javascript";
     }
 
-    /* the shipped UI fetches web/locales/*.json; without this they go out as
-       octet-stream and a strict client refuses to parse them */
+    /* the shipped UI fetches the .json files under web/locales; without this
+       they go out as octet-stream and a strict client refuses to parse them */
     if (!strcmp(ext, ".json")) {
         printf2(64,"[httpd] %s: .json -> application/json", __func__);
         return "application/json";
@@ -619,6 +943,8 @@ err_t http_accept(void *arg,
     tcp_arg(newpcb, state);
     tcp_sent(newpcb, http_sent);
     tcp_recv(newpcb, http_recv);
+    tcp_err(newpcb, http_err);
+    tcp_poll(newpcb, http_poll, 4);   /* 4 coarse ticks == ~2 s */
 
     printf2(64,"[httpd] %s: return ERR_OK", __func__);
     return ERR_OK;
@@ -635,6 +961,20 @@ void http_server_init(void)
         } else {
             fatfs_mounted = 1;
             printf2(64, "[httpd] FATFS mounted on 1:");
+        }
+    }
+
+    /* Volume 0: is mounted too, but only so GET /download can read it (the
+       firmware images and the boot config live there). Nothing in this server
+       opens 0: for writing -- see the note on http_download_path_ok. Same
+       both-volumes mount the SD file manager does in sd_fileops.c. */
+    if (!fatfs0_mounted) {
+        FRESULT res = f_clk_mount(&fatfs0, "0:", 1);
+        if (res != FR_OK) {
+            printf2(64,"[httpd] f_mount 0: failed: %d", (int)res);
+        } else {
+            fatfs0_mounted = 1;
+            printf2(64, "[httpd] FATFS mounted on 0: (read only)");
         }
     }
 
