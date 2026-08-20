@@ -103,7 +103,8 @@ green, 040 table linked in.
 | NULL-safe `z3660_printf` image (§8.4) | 12 762 340 | 12.171 MiB, zlib crc32 `0x806C76AE` — **first image to run the 040 core; AmigaOS wedged on its first `STOP` (§8.5)** |
 | `STOP` pc-advance image (§8.5) | 12 762 340 | 12.171 MiB, zlib crc32 `0x6FDBDA40` — **ran the whole 040 chain; kernel panicked because the 040 MMU was never enabled (§8.6)** |
 | `MOVEC`->TC MMU-enable image (§8.6/§8.7) | 12 762 356 | 12.171 MiB, zlib crc32 `0xD910C41A` — **MMU enable + preload speedup both proven; kernel then died on a no-op `PFLUSH` (§8.8)** |
-| **`PFLUSH`/`PTEST` dispatch image (§8.8)** | **12 762 364** | **12.171 MiB, zlib crc32 `0x095356E9`** |
+| `PFLUSH`/`PTEST` dispatch image (§8.8) | 12 762 364 | 12.171 MiB, zlib crc32 `0x095356E9` — **panicked byte-identically to D910C41A: real bugs, not this panic's cause (§8.9)** |
+| **exception-trace instrumentation image (§8.10)** | **12 762 364** | **12.171 MiB, zlib crc32 `0xF4782D71`** — diagnostic build, no behaviour change |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -112,7 +113,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 364 B, zlib crc32 `0x095356E9` — compare against the board's SD `E`→CRC).
+(12 762 364 B, zlib crc32 `0xF4782D71` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -861,6 +862,103 @@ from the outside. With `PFLUSH` real it holds, and the URP/SRP site is right as 
    but which had never run on metal until `D910C41A`.
 4. **Cache model** (§7.2) — the 040 copyback/CINV/CPUSH semantics this core does not model at
    all. Unchanged in rank; would show as data-visibility oddities rather than a clean panic.
+
+#### 9. Sixth metal attempt: `page_free` is BOOT-STACK EXHAUSTION (static diagnosis)
+
+`095356E9` enabled the MMU cleanly again and panicked **byte-identically** to
+`D910C41A` — same addresses, two images, fully deterministic. So `PFLUSH`/`PTEST` were
+real bugs but not this panic's cause. This section is the static read-out of the kernel
+binary; no boot was needed for any of it.
+
+**Provenance.** The kernel is the `unix-040` brel in slice 3 of
+`amix-installng/work/metal-040-source/metal-040-source-20260819.hdf`. Slice layout is
+`boot1 @+0x000 (1 KiB)`, `IBLK @+0x400`, `boot2 @+0x600 (8 KiB)`, `kernel IBLK @+0x2600`,
+**kernel ELF @+0x2800** (`0x7f454c46`, big-endian, `EM_68K`, `e_type=0xff00`, one
+anonymous `VMA 0` blob of `0x10b930`). It is stripped, but the port repo's
+`build/unix-040-z3660` (2026-08-19, 16109 symbols) is the same link with symbols.
+
+**Load base proven, not assumed.** `movec %d0,%tc` sits at `.text+0xd7550` in the
+symbolised build, and the serial reported the MMU enable at `PC=080d7550`. So the blob
+loads at exactly **`0x08000000`** and kernel VA − `0x08000000` = blob offset. The
+enclosing symbol is **`pstart`** (`.text+0xd71a8`, size `0x2d4`).
+
+**What `pstart` programs, in order** (`.text+0xd751a`..`0xd7550`):
+
+```
+movec %d0,%srp / %urp      root pointers
+movel #0x003FC000,%d0 -> %itt0      instr, 0x00000000-0x3FFFFFFF, S-field=both
+clrl  %d0             -> %itt1      disabled
+movel #0x003FC060,%d0 -> %dtt0      data,  0x00000000-0x3FFFFFFF, both, noncacheable
+movel #0x807FA060,%d0 -> %dtt1      data,  0x80000000-0xFFFFFFFF, SUPERVISOR only, noncacheable
+cpusha bc ; pflusha
+movel #0x00008000,%d0 -> %tc        E=1, 4 KiB pages
+```
+
+Every one of those seven writes was inert before §8.6/§8.8.
+
+**The panic is stack exhaustion.** `.data` begins at VA `0x080F45BC` (`.text` is
+`0xf45bc`), and its first two symbols are `bugvbr` at `+0x0` and **`pstackt` at `+0x4`**,
+with **`pstack` at `+0x1f44`** — an 8000-byte boot stack growing down from
+`0x080F6500` to a limit of `0x080F45C0`. The kernel's own printer is
+`kstack 0x%x!` (the `!` is literal in the format string). Both panics:
+
+| | reported `kstack` | bytes used of 8000 | left above `pstackt` |
+|---|---|---:|---:|
+| `page_sub` (D910C41A) | `0x080F47F8` | 7432 | 568 |
+| `page_free` (095356E9) | `0x080F4874` | 7308 | 692 |
+
+Both sit ~92% down an 8 KiB stack. `page_sub` and `page_free` are neighbours in the
+page allocator; they are **where the runaway happened to be standing**, not the bug.
+The `Backtrace:` value (`0x080F48E0`) is likewise inside `pstack`, and in the first
+panic it was **odd** (`0x080F485B`) — a corrupted frame, which is why the follow-on
+double fault was an Address Error.
+
+**Mechanism.** A deterministic way to eat a boot stack in VM init is nested unresolved
+faults: a 68040 access-error frame is 60 bytes by itself, so ~7300 bytes is on the order
+of 40–50 nested faults. Deterministic to the byte across two images fits a systematic
+bad translation far better than the probabilistic write-back class.
+
+**What the TTRs rule in and out.** `ITT0`/`DTT0` cover `0x00000000-0x3FFFFFFF`
+transparently, so the kernel image at `0x08000000` **and the Kickstart ROM at
+`0x00F80000` need no page tables at all** — the double-fault `pc = 0xF80B4C` is
+therefore a legitimately executable address here, not evidence of a wild jump through
+unmapped memory. `DTT1` covers `0x80000000+` for supervisor data. What is left to the
+real table walk is **`0x40000000-0x7FFFFFFF`** — and the first panic's wild
+`pc = 0x40080000` sits exactly there. So the fault chain lives in the page-table-walked
+kernel window, not in the transparent ones.
+
+**TTR decoding verified against these exact values, and it is correct.**
+`mmu_do_match_ttr()` was checked line by line against the three live TTRs: base/mask
+(`msb = ((addr ^ ttr) & 0xff000000) >> 24`, `mask = (ttr & 0x00ff0000) >> 16`,
+match iff `!(msb & ~mask)`) gives `0x00000000-0x3FFFFFFF` for `0x003FC000` and
+`0x80000000-0xFFFFFFFF` for `0x807FA060`; the S-field logic (bit 14 set = match both,
+else bit 13 selects supervisor/user) gives "both" for `ITT0`/`DTT0` and
+"supervisor only" for `DTT1`, which is what the encodings say. **The TTR class is
+eliminated.**
+
+**What static analysis cannot decide:** *which* fault repeats. That is a runtime fact,
+and guessing it is how the earlier metal cycles were spent.
+
+#### 10. Bounded exception trace (shipped instrumentation, not a fix)
+
+`amix_xtrace()` in `Exception_normal()` prints the first 64 non-interrupt exceptions
+once the AMIX 040 MMU is up:
+
+```
+[XT01] vec=2  ipc=080D8A12 pc=080D8A12 fa=40080000 ssw=0405 sr=2708 a7=080F6480
+```
+
+Self-arming (`amix_mmu_on` + `mmu_model == 68040`), self-closing after 64 lines, skips
+interrupt vectors 24–31 because ISRs fire throughout and are not the fault chain, and
+costs one comparison per exception thereafter. `a7` is included deliberately: a
+repeating unresolved fault appears as the same `vec`/`fa` with `a7` stepping down toward
+`0x080F45C0`, which converts "the stack was exhausted" into "*this* address faulted N
+times and never resolved". 68030 and non-AMIX 040 boots are untouched by the
+`mmu_model` gate.
+
+One boot of this image answers, in order: is it one address or many; is it a read or a
+write (`ssw` RW bit); does the kernel's handler run at all between faults (`ipc` moving);
+and how many faults fit before `pstack` runs out.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 

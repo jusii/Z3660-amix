@@ -1892,8 +1892,46 @@ static void add_approximate_exception_cycles(int nr)
    x_do_cycles(cycles);
 }
 
+/* ---------------------------------------------------------------------------
+ * AMIX-040 exception trace (bounded, self-arming, one boot's worth).
+ *
+ * Static analysis of the unix-040 kernel (see UAE_040_MMU_gate.md 8.9) put the
+ * page_sub/page_free panics at BOOT-STACK EXHAUSTION: `pstack` is 8000 bytes
+ * (.data+0x4 .. .data+0x1f44 => VA 0x080F45C0..0x080F6500) and both panics landed
+ * with ~92% of it consumed. Nested unresolved faults are the obvious way to eat a
+ * boot stack deterministically -- each 68040 access-error frame alone is 60 bytes --
+ * but WHICH fault repeats cannot be read out of the binary. This prints it.
+ *
+ * Arms itself when the AMIX 040 MMU comes up (amix_mmu_on, mmu_model 68040) and
+ * stops after AMIX_XTRACE_MAX lines, so it costs one comparison per exception for
+ * the rest of the boot and cannot flood. Interrupt vectors are skipped -- ISRs fire
+ * throughout and are not the fault chain. a7 is included precisely so the stack
+ * march is visible: a repeating fault shows as the same vec/fa with a7 stepping
+ * down toward 0x080F45C0.
+ *
+ * 030 is untouched (mmu_model gate), and so is any non-AMIX 040 boot.
+ * ------------------------------------------------------------------------- */
+extern "C" { extern volatile int amix_mmu_on; }
+#define AMIX_XTRACE_MAX 64
+static int amix_xtrace_n = 0;
+static void amix_xtrace(int nr)
+{
+   if (!amix_mmu_on || currprefs.mmu_model != 68040) return;
+   if (nr >= 24 && nr < 32) return;              /* interrupts: not the fault chain */
+   if (amix_xtrace_n >= AMIX_XTRACE_MAX) return;
+   amix_xtrace_n++;
+   z3660_printf("[XT%02d] vec=%-2d ipc=%08lX pc=%08lX fa=%08lX ssw=%04lX sr=%04lX a7=%08lX\r\n",
+                amix_xtrace_n, nr,
+                (unsigned long)regs.instruction_pc, (unsigned long)m68k_getpc(),
+                (unsigned long)regs.mmu_fault_addr, (unsigned long)(regs.mmu_ssw & 0xffff),
+                (unsigned long)regs.sr, (unsigned long)m68k_areg(regs, 7));
+   if (amix_xtrace_n == AMIX_XTRACE_MAX)
+      z3660_printf("[XT] %d exceptions traced -- trace closed\r\n", AMIX_XTRACE_MAX);
+}
+
 static void Exception_normal (int nr)
 {
+   amix_xtrace(nr);
    uae_u32 newpc;
    uae_u32 currpc = m68k_getpc();
    uae_u32 nextpc;
