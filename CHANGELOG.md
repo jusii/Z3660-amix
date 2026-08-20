@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-21 — bus watchdog on the pipe-empty wait (1e6178f)
+
+Front 1's wedge (core1 executing no guest instructions, `ps_count` frozen, last access
+chip RAM `0x001D6BC0`) needed naming without touching timing. Reading the three bus
+waits narrowed the target to one: `wait_read_ack()` and `wait_write_ack()` are both
+already bounded with recovery paths, so the bare `while(read_reg(REG4)&(1<<4));`
+pipe-empty wait — six sites, no bound at all — is the only place a permanent stall can
+park core1.
+
+- All six sites now use `WAIT_PIPE_EMPTY(tag, address)`: spins as before, counts, and on
+  crossing N prints **one** line (`[BUSWD] STALL <tag> addr= REG4= REG5= nbg= ps_count=
+  ps_last=`) then keeps spinning. `REG4`/`REG5`/`nbg` discriminate bus-never-granted vs
+  pipe-never-drained vs cycle-never-acked.
+- **N = 20,000,000** ≈ 2–6 s (the loop body is one ~100–300 ns GP-AXI register read).
+  The worst *legitimate* lockout — a blitter-nasty blit, 10–20 ms — is ~100k–200k
+  iterations, so N is 100–200× above it. A healthy boot cannot reach it.
+- Zero behaviour change in practice: the compiler hoists the counting path out of line,
+  leaving the fast path `ldr`/`ands`/`bne` as before plus one `mov`. Global one-shot,
+  not `mmu_model`-gated.
+- `BOOT.BIN` 12,762,372 B, zlib crc32 `FF261896` — carries all six emulator fixes, the
+  reset-state fix and the watchdog. Harness 167/167. Warning-free.
+
 ## 2026-08-21 — 040: guest reset now clears the MMU state (27664e2, 87310e9)
 
 **ISSUE-48 resolution recorded:** the port lane confirmed the page database was
