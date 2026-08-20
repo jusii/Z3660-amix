@@ -1604,6 +1604,70 @@ identical to the original bare `while`, with one extra `mov r6,#0` to seed the c
 report is global one-shot, so a permanent wedge prints once and can never flood the serial. Not
 `mmu_model`-gated: this is the bus path, and any guest that wedges here benefits.
 
+### 10.4 The watchdog fired, and the register decode names the wedge
+
+`FF261896` — 030 canary green, and one line six seconds after MMU-enable:
+
+```
+[BUSWD] STALL R32 addr=001D69E0 REG4=00000015 REG5=80000000 nbg=0 ps_count=21603813 ps_last=001D69E0
+```
+
+**The stalled thing is not the read.** Decoding `REG4` against the command encoding in
+`main.h` — bit 0 valid, bit 1 `READ_`(1)/`WRITE_`(0), bits 2-3 size (`0`=LONG, `1`=BYTE,
+`2`=WORD), bit 4 pipe-not-empty:
+
+| `REG4 = 0x15` | bit 0 | bit 1 | bits 2-3 | bit 4 |
+|---|---|---|---|---|
+| | valid | **0 → WRITE** | **01 → BYTE** | pipe not empty |
+
+So the command sitting in the pipe is a **pending byte WRITE**, and the `R32` in the
+watchdog line is merely the next access, blocked behind it. `REG5 = 0x80000000` closes it:
+that is exactly the value `wait_write_ack()` spins on — *"previous write not yet
+acknowledged"*. With `nbg = 0` the bus is granted. **A byte write entered the pipe and was
+never acknowledged.**
+
+**The firmware bug is an ordering deadlock.** `arm_write_amiga_byte()` issues its write
+**fire-and-forget** — it never calls `wait_write_ack()` at all — and relinquishes. The
+following access absorbs the latency in its pipe-empty wait. So the recovery for a stuck
+write (set `REG4` bit 31, then restore, kicking the ARM state machine out) lives in the
+**write** path, after that path's own pipe wait, and is **unreachable from the read that is
+actually stuck**. The escape hatch sat behind the thing it would rescue. That is also why
+`wait_read_ack()`/`wait_write_ack()` never helped: neither is on the blocked path.
+
+**Fixed** by applying the same already-proven poke from the place that can reach it —
+`bus_wd_recover()` in the pipe-empty wait, retried every `BUS_WD_N`, with the report still
+one-shot. Safe by the watchdog's own margin argument: it cannot fire until the pipe has been
+stuck for *seconds*, 100-200× longer than the worst legitimate lockout, so a healthy boot
+never executes it. A permanent wedge becomes a recovered — possibly lossy — cycle instead of
+a dead core1, which is strictly better than spinning forever.
+
+### 10.5 The 040-vs-030 delta candidates, judged
+
+- **(a) Cache modes — NOT the delta.** `DTT0 = 0x003FC060`: the CM field is bits 6-5 =
+  `0x60 >> 5 = 3 = 0b11` = **cache-inhibited, nonserialized**. `mmu_do_match_ttr()` turns
+  that into `mmu_cache_state = CACHE_DISABLE_MMU` and nothing else — this core has **no
+  cache model at all** (§7.2), so CM changes no access pattern, no size, no burst. It cannot
+  be the cause.
+- **(b) Access rhythm — the live candidate, and it is 040-only by construction.** The kernel
+  contains **four `move16` instructions** (`.text+0xe07da`, `0xe2f8e`, `0xe9d12`, `0xead42`).
+  `mmu_get_move16()`/the move16 path issues the 16-byte line as **four back-to-back
+  `x_phys_get_long`/`x_phys_put_long` calls**, i.e. four bus cycles with no gap. The 68030
+  has no `MOVE16`, so the 030 boot can never produce that burst on this hardware. A pipe
+  that mis-handles back-to-back cycles is exactly consistent with "a write entered and never
+  acked".
+- **(c) Display/DMA interaction — not needed to explain it.** The bus was **granted**
+  (`nbg = 0`), so this is not arbitration starvation. The repaint correlation is real but is
+  most simply read as *when* the burst-heavy code runs, not as a separate mechanism.
+
+**Is the underlying stall firmware-fixable?** Probably not: why the FPGA/CPLD accepts a byte
+write and never returns its ack is below the firmware, and the honest position is that this
+change is a **workaround, not a cure** — it unblocks core1 and keeps the machine alive, and
+the one-shot line keeps the event visible every time it happens. If the `[BUSWD]` line now
+appears repeatedly with the boot continuing past it, that is the signature of a real
+FPGA-level ack fault and belongs to the CPLD/FPGA lane, with the MOVE16 burst as the
+suspected trigger to reproduce.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

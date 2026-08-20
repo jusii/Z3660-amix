@@ -1552,9 +1552,39 @@ static void bus_wd_report(const char *what, uint32_t address)
                 (unsigned long)read_reg(REG4), (unsigned long)read_reg(REG5),
                 nbg_arm, (unsigned long)ps_count, (unsigned long)ps_lastaddr);
 }
+/* Recovery, and why it belongs HERE.
+ *
+ * Metal, image FF261896: [BUSWD] STALL R32 addr=001D69E0 REG4=00000015 REG5=80000000 nbg=0.
+ * Decoded against the command encoding above -- bit0 valid, bit1 READ_(1)/WRITE_(0),
+ * bits2-3 size (0=LONG,1=BYTE,2=WORD), bit4 pipe-not-empty -- REG4=0x15 is a pending
+ * BYTE WRITE, not the long read we were about to issue. And REG5==0x80000000 is exactly
+ * the value wait_write_ack() spins on: "previous write not yet acknowledged".
+ *
+ * So the wedge is a byte write that entered the pipe and never acked, blocking the next
+ * access. The ordering is the bug: arm_write_amiga_byte() issues its write
+ * FIRE-AND-FORGET (no wait_write_ack() call at all) and relinquishes; the following
+ * access absorbs the latency in the pipe-empty wait. wait_write_ack()'s recovery -- set
+ * REG4 bit 31, then restore, to kick the ARM state machine out -- therefore sits in the
+ * WRITE path, after its own pipe wait, and is unreachable from the READ that is actually
+ * stuck. The escape hatch was behind the thing it would rescue.
+ *
+ * This applies the same, already-proven poke from the place that can reach it, then keeps
+ * spinning and retries every BUS_WD_N. Safe by the same margin argument as the watchdog:
+ * it cannot fire until the pipe has been stuck for seconds, which is 100-200x longer than
+ * the worst legitimate lockout (a blitter-nasty blit), so a healthy boot never executes
+ * it. A permanent wedge becomes a recovered -- possibly lossy -- cycle instead of a dead
+ * core1, which is strictly better than spinning forever. */
+static void bus_wd_recover(void)
+{
+   uint32_t reg4 = read_reg(REG4);
+   write_reg(REG4, 0x80000000 | reg4);   /* force the ARM state machine out (as wait_write_ack) */
+   write_reg(REG4, reg4);
+}
 #define WAIT_PIPE_EMPTY(tag, addr) \
    do { uint32_t _wd = 0; \
-        while(read_reg(REG4)&(1<<4)) { if(++_wd == BUS_WD_N) bus_wd_report((tag), (addr)); } \
+        while(read_reg(REG4)&(1<<4)) { \
+           if(++_wd >= BUS_WD_N) { bus_wd_report((tag), (addr)); bus_wd_recover(); _wd = 0; } \
+        } \
    } while(0)
 
 extern "C" void arm_write_amiga_long(uint32_t address, uint32_t data)
