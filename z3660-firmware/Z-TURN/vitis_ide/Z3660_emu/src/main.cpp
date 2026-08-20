@@ -956,11 +956,11 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040)
          {
-            uae_emulator(0,68040);
+            uae_emulator(0,68040); // MMU off -> never amix_mode: AMIX is demand-paged (same rule as UAE_030)
          }
          else if(shared->cfg_emu==UAEJIT_040)
          {
-            uae_emulator(1,68040);
+            uae_emulator(1,68040); // JIT excludes the MMU (no fault restart) -> never amix_mode (same rule as UAEJIT_030)
          }
          else if(shared->cfg_emu==UAE_030_MMU)
          {
@@ -968,7 +968,7 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040_MMU)
          {
-            uae_emulator(0,68040,1); // real 68040 MMU, JIT off (amix_mode off: no 68040 AMIX kernel yet)
+            uae_emulator(0,68040,1,shared->amix_mode); // real 68040 MMU, JIT off; amix_mode = AMIX memory contract
          }
          else if(shared->cfg_emu==MUSASHI)
          {
@@ -991,7 +991,7 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040)
          {
-            uae_emulator(0,68040);
+            uae_emulator(0,68040); // MMU off -> never amix_mode: AMIX is demand-paged (same rule as UAE_030)
          }
          else if(shared->cfg_emu==UAE_030_MMU)
          {
@@ -999,11 +999,11 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040_MMU)
          {
-            uae_emulator(0,68040,1); // real 68040 MMU, JIT off (amix_mode off: no 68040 AMIX kernel yet)
+            uae_emulator(0,68040,1,shared->amix_mode); // real 68040 MMU, JIT off; amix_mode = AMIX memory contract
          }
          else if(shared->cfg_emu==UAEJIT_040)
          {
-            uae_emulator(1,68040);
+            uae_emulator(1,68040); // JIT excludes the MMU (no fault restart) -> never amix_mode (same rule as UAEJIT_030)
          }
          else // decision #8: was a bare 'else' meaning UAEJIT_040 -- an unknown
          {    // mode silently booted JIT-040. Halt loudly instead.

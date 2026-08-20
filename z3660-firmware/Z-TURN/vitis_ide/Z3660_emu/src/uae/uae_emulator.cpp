@@ -1036,10 +1036,25 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
    currprefs.cpu_cycle_exact        = changed_prefs.cpu_cycle_exact=false;
    currprefs.cpu_memory_cycle_exact = changed_prefs.cpu_memory_cycle_exact=false;
    currprefs.int_no_unimplemented   = changed_prefs.int_no_unimplemented=false;
-   // 68881/68882 implement ALL FPU opcodes (incl transcendentals) in hardware -> fpu_no_unimplemented=1
-   // so they are NOT treated as 68040/060-style unimplemented (which fires Line-F). Matches Amiberry's
-   // AmigaUnix.uae (fpu_no_unimplemented=true for its 68882). Keep 0 for the 68040 (AmigaOS emulates).
-   currprefs.fpu_no_unimplemented   = changed_prefs.fpu_no_unimplemented=(changed_prefs.fpu_model==68881 || changed_prefs.fpu_model==68882);
+   // fpu_no_unimplemented reads backwards: it means "this FPU does NOT implement the whole opcode set
+   // in the emulator", i.e. SET it and fpp.cpp raises the real silicon traps instead of quietly
+   // computing the result (fault_if_nonexisting_opmode / fault_if_unimplemented_680x0 /
+   // fault_if_unimplemented_6888x / fault_if_no_packed_support).
+   //  - 68881/68882: implement ALL FPU opcodes (incl transcendentals) in hardware, so only the
+   //    non-existent opmodes (>=0x40) must fire Line-F -- not the 68040/060-style unimplemented set.
+   //    Matches Amiberry's AmigaUnix.uae (fpu_no_unimplemented=true for its 68882).
+   //  - 68040 under AMIX: the 040 FPU implements only the base set in silicon; the AMIX 68040 kernel
+   //    links Motorola's FPSP and expects the genuine unimplemented-instruction (vector 11, frame
+   //    format $2 -- Exception_build_stack_frame_common) and unimplemented-data-type traps to reach
+   //    it. Left 0, the emulator would compute FSIN/FINTRZ/packed-decimal itself and FPSP would never
+   //    execute -- silently diverging from the silicon the kernel was built for.
+   //  - 68040 WITHOUT amix_mode (plain AmigaOS): unchanged, stays 0 -- the emulator keeps computing
+   //    the unimplemented opcodes itself. That is the behaviour UAE_040/UAEJIT_040 have always had
+   //    and the one UAE_040_MMU's AmigaOS smoke recipe was written against; not touched here.
+   currprefs.fpu_no_unimplemented   = changed_prefs.fpu_no_unimplemented=
+         (   changed_prefs.fpu_model==68881
+          || changed_prefs.fpu_model==68882
+          || (changed_prefs.fpu_model==68040 && amix_mode!=0));
    currprefs.crash_auto_reset       = changed_prefs.crash_auto_reset=true;
 //   currprefs.blitter_cycle_exact    = changed_prefs.blitter_cycle_exact=false;
    currprefs.m68k_speed             = changed_prefs.m68k_speed=-1;//M68K_SPEED_25MHZ_CYCLES;

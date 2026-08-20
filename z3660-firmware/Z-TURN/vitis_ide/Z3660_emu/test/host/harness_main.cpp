@@ -757,6 +757,73 @@ static void test_mmu040_modified_bit(void)
 }
 
 /* ==================================================================
+ * 68040 FPU unimplemented-instruction trap delivery.
+ *
+ * currprefs.fpu_no_unimplemented reads backwards: SET means "this FPU does NOT
+ * implement the whole opcode set inside the emulator", so fpp.cpp raises the
+ * genuine silicon trap (fault_if_unimplemented_680x0 -> fp_unimp_instruction ->
+ * Exception(11), stack frame format $2) instead of quietly computing the result.
+ * The AMIX 68040 kernel links Motorola's FPSP and only works if that trap
+ * arrives; uae_emulator() therefore sets the pref for fpu_model==68040 when
+ * amix_mode is on, and leaves it clear for a plain AmigaOS 040 (which has no
+ * FPSP of its own here and relies on the emulator doing the arithmetic).
+ * This vector pins BOTH directions so the pref cannot be flipped unnoticed.
+ * ================================================================== */
+#define FPU040_VEC11_HANDLER 0x00009000u
+
+static void fpu040_bringup(int no_unimplemented)
+{
+	harness_mem_reset();
+	cpu_bringup(68040);
+	currprefs.cpu_model            = 68040;
+	currprefs.fpu_model            = 68040;
+	currprefs.fpu_strict           = true;
+	currprefs.fpu_no_unimplemented = (no_unimplemented != 0);
+	currprefs.mmu_model            = 0;      /* MMU off: this is about the FPU trap, not translation */
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+	fpu_reset();
+	regs.address_space_mask = 0xffffffff;
+
+	cpu_set_context(0x2000);
+	regs.vbr = 0;
+	hram_poke32(11 * 4, FPU040_VEC11_HANDLER);  /* vector 11 = F-line / FP unimplemented */
+	hram_poke16(0x2000, 0xf200);                /* FSIN fp0,fp0 -- opcode $F200 ...      */
+	hram_poke16(0x2002, 0x000e);                /* ... ext: R/M=0, src=fp0, dst=fp0, opmode $0E */
+	hram_poke16(0x2004, 0x4e71);                /* nop (reached only if no trap is taken) */
+}
+
+static void test_fpu040_unimplemented_trap(void)
+{
+	printf("[test] FPU040 unimplemented FP instruction: trap delivery follows fpu_no_unimplemented\n");
+
+	/* amix_mode ON: FSIN is unimplemented in 040 silicon -> vector 11, format $2, FPSP's entry. */
+	fpu040_bringup(1);
+	bool faulted = false;
+	TRY(p) { step(); } CATCH(p) { faulted = true; (void)p; } ENDTRY
+	CHECK(!faulted, "FSIN with fpu_no_unimplemented=1 raised no bus fault\n");
+	CHECK_EQ32(m68k_getpc(), FPU040_VEC11_HANDLER, "FSIN trapped into the vector-11 handler");
+	{
+		uae_u32 sp = m68k_areg(regs, 7);
+		CHECK_EQ32(hram_peek16(sp + 6), 0x202c, "68040 stack frame is format $2, vector offset $02C");
+		CHECK_EQ32(hram_peek32(sp + 2), 0x00002004, "stacked PC is the instruction after FSIN");
+	}
+
+	/* amix_mode OFF (plain AmigaOS on this 040 mode): unchanged -- emulator computes FSIN. */
+	fpu040_bringup(0);
+	faulted = false;
+	TRY(p2) { step(); } CATCH(p2) { faulted = true; (void)p2; } ENDTRY
+	CHECK(!faulted, "FSIN with fpu_no_unimplemented=0 raised no fault\n");
+	CHECK_EQ32(m68k_getpc(), 0x00002004, "FSIN executed in-emulator, no trap (AmigaOS path unchanged)");
+
+	currprefs.fpu_model = 0;
+	changed_prefs = currprefs;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * MMU030 demand-paging END TO END (the path AMIX actually depends on).
  * Earlier MMU tests stop at the THROW; this one drives the WHOLE loop:
  *   fault -> (run-loop CATCH) Exception(2) builds the 030 bus-error frame
@@ -1076,6 +1143,7 @@ int main(int argc, char **argv)
 	test_mmu040_translate_8k();
 	test_mmu040_protection();
 	test_mmu040_modified_bit();
+	test_fpu040_unimplemented_trap();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
