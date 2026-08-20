@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-08-20 — 040: page_free is the bug; the ROM chain is the double panic (078f256)
+
+`8C51370A` captured the transfer in one line and closed the case, with the framing
+inverted.
+
+- `from=0x0805D24E` = **`sync+0x34`**; `xpanic` (`.text+0x3e668`) relocates to `sync`
+  at `0x3e6a2` → the path is **`panic()` → `xpanic()` → `sync()`**.
+- `sync()` loops `i = 1..nfstype-1` over `vfssw` (`.data+0x913c`) calling
+  `vfssw[i].vsw_vfsops->vfs_sync`. Relocations prove **only entry 0 has a static
+  `vsw_vfsops`** (`vfs_strayops`); entries 1+ are filled by `vfsinit()`. The loop
+  **starts at 1**, so panicking before `vfsinit()` dereferences NULL.
+- `NULL+16` = absolute `0x10` = **CPU vector 4**, holding exec's stub `0x00F80A62` —
+  which **self-identifies as vector 4** (`(0xF80A64−0xF80A5C)>>1 = 4`). Two independent
+  derivations agree.
+- exec's tail walks AMIX's pseudo-ExecBase (`@4 = 0x080007F0`) → `tc_TrapCode` =
+  `0xFFFFFFFE` → `rts` to −2 → Address Error → **DOUBLE PANIC**.
+- **The cascade is environment-independent; the bench boots green because `page_free`
+  never panics there.** The ROM/ExecBase chain is a dead end for root-causing.
+- A software panic is not a CPU exception — which is why no exception trace could ever
+  see the primary event.
+- `UAE_040_MMU_gate.md` §9 is the self-contained port-lane handover (candidates:
+  A sync() NULL guard, B the real page_free condition, C memory geometry). Firmware
+  cleared; memory-contract change proposed, not implemented.
+
 ## 2026-08-20 — 040: fault named, case handed to the port lane (37cb2aa)
 
 `F87F6FA7` returned outcome 2: **zero interrupts** (storm dead, IPL7 edge question moot)
