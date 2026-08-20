@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-20 — UAE_040_MMU carries the AMIX contract (f7b2167, 970b33a)
+
+`bootmode UAE_040_MMU` can now run the native AMIX 040 boot chain. Two defects
+closed and the mode's gate doc brought up to date.
+
+- **`main.cpp`**: the `UAE_040_MMU` branch passes `shared->amix_mode` into
+  `uae_emulator()` (both the `MUSASHI_EMULATOR` and the plain dispatch block),
+  exactly as `UAE_030_MMU` does. The whole existing AMIX contract then applies
+  model-independently: single ≤16 MB window at `$08000000`, `a3000mem` at
+  `$07000000`, emulated A3000 SCSI at `$00DD0000`, `a3000_scsi_init()`, and the
+  `UAE_040_MMU_AMIX` banner. `UAE_040`/`UAEJIT_040` deliberately keep it off —
+  no MMU / JIT-excludes-MMU, the same rule the 030 modes follow.
+- **`uae_emulator.cpp`**: `fpu_no_unimplemented` is set for the 68040 iff
+  `amix_mode`. The pref reads backwards — set means "the emulator does not
+  implement the whole opcode set", so `fpp.cpp` raises the real 040 traps. The
+  AMIX 040 kernel links Motorola FPSP and only executes it if the
+  unimplemented-instruction trap (vector 11, frame format `$2`) and the
+  unimplemented-data-type trap arrive. 68881/68882 and non-AMIX 040 unchanged.
+- Host harness **96/96** (was 90/90): new `test_fpu040_unimplemented_trap` pins
+  both directions — pref set → `FSIN` traps to vector 11 with a format `$2` /
+  `$02C` frame; pref clear → same instruction executes in-emulator.
+- **Operator note: `amix_mode` is NOT implied by `bootmode UAE_040_MMU`** — the
+  config default resolves YES only for UAE_030_MMU. An AMIX-040 preset must
+  carry `amix_mode YES` explicitly; the serial banner confirming it took is
+  `UAE_040_MMU_AMIX`.
+- `BOOT.BIN` 12,762,340 B, zlib crc32 `76FBA34C` (warning-free build). NOT
+  flashed — see the audit below.
+- **Audit (documented in `UAE_040_MMU_gate.md` §8, deliberately not fixed
+  here):** two emulator-side blockers still gate an AMIX-040 boot —
+  `Exception_normal()`'s `if (currprefs.mmu_model && nr == 2)` branch is truthy
+  for `mmu_model == 68040` and builds a 68030 frame `$A`/`$B` for a 68040 fault
+  (shadowing the `cpu_model >= 68040` arm — the first demand-paging fault gets
+  a wrong-format frame), and `amix_mmu_on` — the A3000-SCSI "AMIX runtime
+  timing" latch — can only be set by the 030 TC write (2 KB page gate), so the
+  controller would stay in Kickstart-load timing for an entire 040 boot. The
+  latch also arms hard-coded 030-kernel-image address pokes that must never
+  fire against a 040 image.
+
 ## 2026-08-20 — httpd work FLASHED + METAL-VALIDATED (455A7D12 live)
 
 `BOOT.BIN` crc32 `455A7D12` (from `7952863`) flashed to `0:/Z3660.bin` through
