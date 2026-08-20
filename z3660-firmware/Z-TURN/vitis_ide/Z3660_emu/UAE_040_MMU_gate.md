@@ -98,7 +98,8 @@ green, 040 table linked in.
 | AMIX-040 fault-path image (§8.1 + §8.2) | 12 762 340 | 12.171 MiB, zlib crc32 `0x2CFA9216` — format-$7 frame + the 040 `amix_mmu_on` latch. **Never emulated anything on metal: core0 did not start core1 (§8.3)** |
 | core1-launch fix image (§8.3) | 12 762 340 | 12.171 MiB, zlib crc32 `0xBBD5C14F` — `boot_mode_is_emulated()` + the core1 breadcrumbs. **Core1 wedged on every mode: the breadcrumb called `z3660_printf` pre-`init_shared()` (§8.4)** |
 | NULL-safe `z3660_printf` image (§8.4) | 12 762 340 | 12.171 MiB, zlib crc32 `0x806C76AE` — **first image to run the 040 core; AmigaOS wedged on its first `STOP` (§8.5)** |
-| **`STOP` pc-advance image (§8.5)** | **12 762 340** | **12.171 MiB, zlib crc32 `0x6FDBDA40`** |
+| `STOP` pc-advance image (§8.5) | 12 762 340 | 12.171 MiB, zlib crc32 `0x6FDBDA40` — **ran the whole 040 chain; kernel panicked because the 040 MMU was never enabled (§8.6)** |
+| **`MOVEC`->TC MMU-enable image (§8.6/§8.7)** | **12 762 356** | **12.171 MiB, zlib crc32 `0xD910C41A`** |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -107,7 +108,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 340 B, zlib crc32 `0x6FDBDA40` — compare against the board's SD `E`→CRC).
+(12 762 356 B, zlib crc32 `0xD910C41A` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -605,6 +606,155 @@ table does `m68k_incpci(2); op_illg(opcode);` and the 040 table only `op_illg(op
 lineages genuinely disagree about whether an illegal-instruction frame should stack the
 faulting or the following pc, and changing an exception's stacked pc on a hunch is not
 worth a metal cycle. Recorded here so it is a known difference rather than a surprise.
+
+#### 6. Fourth metal attempt (2026-08-20): the 040 MMU was never actually enabled
+
+`6FDBDA40` ran the whole 040 chain for the first time — piscsi strap → boot1 → boot2-040 →
+~31 MB miniroot preload → bootstrap warm reset → kernel start →
+`[A3000SCSI] WD33C93+SuperDMAC emulation initialised` → VM init → kernel panic:
+
+```
+PANIC: page_sub / 4.0 ?   Backtrace: 80F485B: / kstack 0x80F47F8!
+TRAP proc = 0 (pid 524295,) psw = 2400 / pc = 40080000
+DOUBLE PANIC: KERNEL FAULT psw=0x2400, pc=0x40080000, fmt=0x0, vector=0xB (Line-F Emulator)
+```
+
+**`MOVEC` to TC only stored the register.** `m68k_move2c()` (`newcpu_common.cpp`) had:
+
+```c
+/* 68040 only */
+case 3:
+        regs.tcr = *regp & 0xc000;
+        break;
+```
+
+and `mmu_set_tc()` — which is where `regs.mmu_enabled`, the page size and its masks/shifts,
+the ATC flush and the default cache modes are all set — **had no caller anywhere in the
+tree**. Every `*_mmu040` accessor gates translation on `regs.mmu_enabled`:
+
+```c
+if ((!mmu_ttr_enabled || mmu_match_ttr(...) == TTR_NO_MATCH) && regs.mmu_enabled) { addr = mmu_translate(...); }
+```
+
+so the guest's MMU never engaged. The kernel built its tables, wrote TC with E=1, believed
+it was running in virtual space — and the emulator kept every access transparent. Kernel VAs
+at `0x40000000+` are not RAM on this board; they fall in `RANGE_MAP(0x4000,0x8000,slow_bank)`,
+the Z3 expansion window. The cases 4–7 (`ITT0`/`ITT1`/`DTT0`/`DTT1`) had the same shape: the
+registers were stored but `mmu_tt_modified()` was never called, so the transparent windows
+were dead too.
+
+**The 68030 never comes through here.** It enables its PMMU with `PMOVE` to TC, handled in
+`cpummu030.cpp` — which is also where the `68030 MMU enabled. Page size = 2048` line is
+printed. That is why `UAE_030_MMU` was completely unaffected and this stayed invisible.
+
+One cause accounts for every observation of the night:
+
+| observation | explanation |
+|---|---|
+| `PANIC: page_sub` in VM init | first walk of the kernel's own structures through kernel VAs, which are untranslated |
+| `pc = 40080000` | a kernel VA executed as a physical address — garbage instruction stream |
+| `vector=0xB` (Line-F) | garbage decodes to an F-line opcode readily |
+| `fmt=0x0` | correct for a *plain* F-line — see below; it is evidence of garbage, not of an FPU trap |
+| no MMU-enable line on serial | the only place that prints one was never called |
+| `amix_mmu_on` never latched | it hangs off `mmu_set_tc()`, so the SCSI pacing regime never engaged |
+| `[CLICK] e48` runaway | the clicker's disarm signals both depend on the kernel getting somewhere |
+| no serial console output | the kernel died in VM init, before console init |
+
+Fixed by calling `mmu_set_tc()` from case 3 and `mmu_tt_modified()` from cases 4–7, both
+guarded on `mmu_model` 68040/68060 so the non-MMU 040 modes are untouched. Host guard
+`test_mmu040_movec_tc_enables_mmu` executes a real `movec d0,tc` through the 040 dispatch
+table and asserts translation actually turns on, the page size is derived, and a VA then
+walks the guest's tables to the right frame; plus a `movec d0,dtt0` arm for the TTR path.
+Proven non-vacuous: against the pre-fix code it fails with
+`MOVEC to TC turned translation ON: got 0x00000000 want 0x00000001`.
+
+##### The F-line frame-format question, answered
+
+The suspicion was that the card core pushes `fmt $0` where a 68040 should push `fmt $2`.
+It does not — and the `$0` is a *clue*, not a bug. `Exception_build_stack_frame_common()`:
+
+```c
+} else if (nr == 11 && regs.fp_unimp_ins) {
+        ... Exception_build_stack_frame(..., nr, 0x2);      /* FPU-unimplemented F-line */
+} else {
+        Exception_build_stack_frame(oldpc, currpc, 0, nr, 0x0);   /* plain F-line */
+}
+```
+
+Format `$2` is pushed only when the F-line came from the FPU unimplemented-instruction path
+(`regs.fp_unimp_ins`), which is correct 68040 behaviour; a plain F-line gets format `$0`,
+also correct. The panic reporting `fmt=0x0` therefore says the CPU hit a **plain** F-line —
+i.e. it was executing something that merely decoded as F-line — rather than a real
+FP instruction bound for FPSP. That is corroboration of the wild-pc reading, not a
+frame-format defect.
+
+##### Ranked hypotheses for `page_sub` (formed before the fix, kept for the record)
+
+1. **The 040 MMU was never enabled** — confirmed above; explains all seven observations with
+   one cause, and is fixed. Everything below is what to look at *if page_sub survives it*.
+2. **Deferred write-back fabrication** (the bench ISSUE-10 class). Only reachable once
+   translation genuinely runs; §8.1's format-`$7` frame now supplies real WB3S/WB3A/WB3D, and
+   none of it has executed on hardware yet.
+3. **Page size** — if the 040 kernel chose 8 K pages, `mmu_pagesize_8k` is exercised for the
+   first time. Now trivially observable: the new TC line spells the page size out.
+4. **URP/SRP without an ATC flush** — `movec` to `0x806`/`0x807` stores the root pointer but
+   flushes nothing. AMIX should `PFLUSH` on context switch; if it relies on the write alone
+   it would see stale translations. Examined and deliberately left alone (a behaviour change
+   that cannot be justified without evidence) — first thing to check next.
+5. **The 030-shaped assumptions in the AMIX memory contract** — the single ≤16 MB window at
+   `$08000000` and the `$07000000` `a3000mem` window were sized for the 030 kernel's SCN1.
+   A 040 kernel with a different `MAINSTORE`/`VSIZOFMEM` would fault differently.
+
+#### 7. Observability and iteration-cost work landed alongside
+
+**AMIX console → serial, under 040.** No gating bug was found, and the report should say so
+plainly: `a3000_amix_mode` *was* engaged (it is set by `a3000_scsi_init()`, the same function
+that printed the `[A3000SCSI] …initialised` banner seen on the night), and the kernel writes
+SERDAT as `movew d0,a0@(0x30)` with `a0 = $00DFF000` (`amix-040-060-port` `src/serdbg.s`,
+`btrace.s`, `mainmarks.s`) — a word write, exactly what the hook caught. The silence was a
+*consequence* of the kernel dying in VM init before console init. Hardened anyway, cheaply:
+the mirror now also covers byte writes to `$00DFF031` and long writes to `$00DFF030`, so
+access width can never be the reason for silence, and the first mirrored character prints
+`[SERMIRROR] AMIX console -> serial` once — which is the line that will *prove* the mirror is
+live rather than leaving it to be inferred from absence. On the 030 path only the word arm
+ever fires, so nothing there changes.
+
+**MMU-enable print.** `mmu_set_tc()` now emits one line per TC write, shaped like the 030's:
+`68040 MMU enabled. TC=8000 Page size = 4096 amix_mmu_on=1 PC=…`. Page size is spelled out
+(the 68040 has no 2 K page, so this is the quickest way to see 4 K vs 8 K) and the latch state
+is echoed so the SCSI pacing regime is visible at the moment it engages.
+
+**Auto-click disarm.** The clicker had one disarm, `amix_kernel_loaded`, set from an
+`lba > 1700000` read heuristic that cannot trip on an 85 MB disk — hence `[CLICK] e48
+spin=9.4M` clicking into the running kernel and across the panic screen. Two more were added:
+`amix_mmu_on`, which is the exact signal (once the AMIX kernel's MMU is up the loader is long
+gone and every later prompt is AMIX's own, which must be left for a real click) and is now
+disk-size independent *and* latches on both cores; and `amix_click_done`, a hard session-wide
+budget of four full episodes that never resets, so neither signal being available can let the
+clicker escalate. 030-safe: on the golden path the loader prompt is dismissed long before the
+kernel enables its MMU, the per-episode cap of 64 is untouched, and AMIX's bootstrap warm
+reset needs two episodes against a budget of four.
+
+**Preload cost — verdict: no fix tonight, and why.** `docs/piscsi-service-path.md` already
+models it: a guest block request costs one cross-core handshake *per emulated register
+access*, ten of them, only one carrying data. The strap reads 512 B at a time, so it pays
+that fixed overhead four times more often than the AMIX driver's 2 KB steady state. The
+firmware cannot batch — the guest chooses both the granularity and the register sequence —
+and changing the mailbox protocol is excluded and would break the proven 030 path and both
+driver repos. One real firmware-side cost is visible in the doc (three of the ten round trips
+do a *whole-L1D* `Xil_L1DCacheFlush()`, replaceable with range-limited maintenance) but cache
+maintenance is precisely the class that produced the cdfs page-crossing wild write, it sits on
+the proven 030 path, and it needs its own bench proof — a dedicated dispatch, not a rider.
+
+What was taken instead is free: `m68k_run_mmu040()` now honours `z3660_service_cadence` exactly
+as the 030 loop does. At cadence 1 (today's env) it is byte-for-byte the old behaviour; it
+simply makes the existing `SERV` knob reach the 040 path. **No throughput gain is claimed** —
+PSTAT's own split (gap 9678–9692 µs of a ~10 ms request) is not decomposed by the current
+instrumentation into guest-side time versus handshake latency, and 9.7 ms is far more than
+nine handshakes at core0's measured ~1 µs loop iteration, so something else dominates and
+guessing at it is how metal cycles get burned. The cheap next step, if the preload cost
+matters more than the boot: add a cross-core handshake counter and latency span to PSTAT and
+let one boot decide it.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
