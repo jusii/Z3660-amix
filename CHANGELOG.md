@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-08-20 — httpd work FLASHED + METAL-VALIDATED (455A7D12 live)
+
+`BOOT.BIN` crc32 `455A7D12` (from `7952863`) flashed to `0:/Z3660.bin` through
+both deploy-kvm.sh CRC gates (staged + on-card both `455A7D12`, `COPY OK:
+12762340 bytes (read == write, verified)`; `0:/FAILSAFE.bin` `7E03DA03`
+untouched) and validated on the A4000+Z3660:
+
+- New-build proof at `P`: `[httpd] FATFS mounted on 0: (read only)` — a string
+  that exists only in this image.
+- **`GET /download?path=0:/Z3660.bin`: 12,762,340 bytes byte-exact in 7.0 s —
+  1.81 MB/s**, ~4× the measured upload rate (TCP streaming with a real window;
+  upload remains ~457 kB/s).
+- 1 MB round-trip on `1:` byte-identical; 80 KB asset through the static
+  `1:/web` path byte-identical (the old engine truncated at 8 KB).
+- `PUT ?path=0:/` with a small body: clean `404`, graceful close (curl rc=0).
+  With a 1 MB body the 404 status still arrives but curl reports rc=56 — the
+  server closes without draining the remaining request body, so TCP resets the
+  in-flight tail. Inherent to answer-then-close; the status code is still a
+  usable gate, and deliberately NOT "fixed" (draining a huge misdirected PUT
+  before answering would stall the refusal for minutes).
+- Traversal (`1:/../0:/…`) and unknown volume → 404.
+- **40×-404 hammer then a full download on connection #41** — the CLOSE_WAIT
+  pcb-strand class (server death after ~32 client-closed connections) is gone.
+- Guest regression: production 030 UFS box boots to multiuser (run-level 2,
+  `z3660amix`, `zen0` up at `.39`, 214 s from `R` including the normal AMIX
+  bootstrap warm-reset double-cycle); boot log clean (`Emulation mode 4`,
+  `68030 MMU enabled`, no SD FAIL, no panic). Clean `shutdown -i0`, box parked
+  OFF.
+
 ## 2026-08-20 — httpd: single connection-teardown path (state + pcb lifetime) (7952863)
 
 Follow-up to the streaming/download change: every way a connection could end
