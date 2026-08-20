@@ -1304,6 +1304,135 @@ what the bench (Amiberry) presents versus the contract in §8.
 > the 040 kernel needs a different geometry, say what it needs and it can be built and
 > A/B'd against the 030 golden.
 
+### 9.6 Candidate C (memory geometry): EXONERATED, with a latent landmine found
+
+Checked statically, three ways. **C is not the cause** — but the pass turned up a real
+hazard that the port lane should fix anyway, and it narrowed `page_free` to three named
+assertions.
+
+#### The three memory maps
+
+| | chip | main Fast RAM (in the AmigaOS memlist) | other |
+|---|---|---|---|
+| **Bench** (`i10t-bench-040.uae`) | `chipmem_size=4` | **`a3000mem_size=16` → 16 MB at `0x07000000`** | `fastmem_size=0`, `z3mem_size=0`, `mbresmem_size=0` |
+| **Card** (`uae_emulator.cpp`, `amix_mode`) | real A4000 chip | **16 MB at `0x08000000`** (`drct_bank`, added by ext-kickstart autoconfig) | vestigial 16 MB at `0x07000000` (`a3000mem_bank`) **not in the memlist**; `dmmy_bank` above `0x09000000` |
+
+The bench base is confirmed from Amiberry's own code, not inferred:
+`src/memory.cpp:2806` sets `a3000lmem_bank.start = 0x08000000 - a3000lmem_bank.reserved_size`,
+so 16 MB of `a3000mem` lands at exactly `0x07000000`–`0x07FFFFFF`.
+
+**So the kernel's main RAM is at a different base in the two environments — `0x07000000`
+on the bench, `0x08000000` on the card.** That is the one substantive difference, and it is
+exactly the kind of thing that could drive a page-database bug. It does not, and here is why.
+
+#### How the 040 kernel actually derives MAINSTORE/VSIZOFMEM
+
+`config()` is `.text+0x18f5c`. It seeds `MAINSTORE = end` (the linker symbol) and
+`VSIZOFMEM = 0`, then runs a fixpoint over `bootinfo.memory[]` (16 records of 32 bytes,
+`start` at `+0x14`, `end` at `+0x18`), repeating while anything changed:
+
+```
+19178:  movel %a0@(0x14,%d0:l),%d1     ; rec.start
+1917c:  movel %a0@(0x18,%d0:l),%d2     ; rec.end
+19180:  cmpl  MAINSTORE,%d1 / bcc skip ; skip if rec.start >= MAINSTORE
+1918a:  cmpl  MAINSTORE,%d2 / bcs skip ; skip if rec.end   <  MAINSTORE
+19196:  movel %d1,MAINSTORE            ; LOWER MAINSTORE through a record containing it
+1919c:  MAINSTORE + VSIZOFMEM -> %d0   ; the current top
+191a8:  cmpl %d1,%d0 / bcs skip        ; skip if top <  rec.start
+191ae:  cmpl %d2,%d0 / bcc skip        ; skip if top >= rec.end
+191b6:  subl MAINSTORE,%d2 / movel %d2,VSIZOFMEM  ; EXTEND through a record containing the top
+```
+
+This is exactly the algorithm `amix-kernel-analysis/vm-map/RAM-BEYOND-16MB-ANALYSIS.md`
+describes. Walk it for both environments, with the single memlist record each presents:
+
+- **Card**, record `[0x08000000, 0x09000000)`, `end ≈ 0x0810B930`: the record contains
+  `MAINSTORE`, so `MAINSTORE` is lowered to `0x08000000`; the top `0x08000000` lies inside
+  the record, so `VSIZOFMEM = 0x09000000 - 0x08000000 = 16 MB`. **Correct.**
+- **Bench**, record `[0x07000000, 0x08000000)`, `end ≈ 0x0710B930`: same two rules give
+  `MAINSTORE = 0x07000000`, `VSIZOFMEM = 16 MB`. **Correct.**
+
+Chip RAM never lowers `MAINSTORE` (its `end` is below it, so the second test skips it) and
+never extends the top. `maxclick = btopr(MAINSTORE) + physmem` therefore covers
+`[0, 0x09000000)` on the card and `[0, 0x08000000)` on the bench — in both cases **every page
+of real RAM is inside the page-frame database**. There is no geometry-driven out-of-range
+page pointer, and the different base is absorbed correctly by the derivation.
+
+**Candidate C is exonerated as the cause of the panic.**
+
+#### The landmine: the fallback path is `0x07000000`-shaped and silently wrong at `0x08000000`
+
+Immediately after the fixpoint, `config()` has a fallback that runs **only if `VSIZOFMEM` is
+still zero** (i.e. `bootinfo.memory[]` yielded nothing usable):
+
+```
+191d2:  tstl  VSIZOFMEM / bne  skip     ; only when nothing was derived
+191dc:  movel #0x07000000,%d5           ; hardcoded
+191e2:  cmpil #end,%d5 / bcc skip       ; only if 0x07000000 < end
+191ec:  movel #end,%d5
+191f2:  andil #0xF7C00000,%d5           ; round down -- mask CLEARS bit 27 (0x08000000)
+191f8:  movel %d5,MAINSTORE
+191fe:  movel #0x08000000,%d5
+19204:  subl  MAINSTORE,%d5
+1920a:  movel %d5,VSIZOFMEM             ; VSIZOFMEM = 0x08000000 - MAINSTORE
+```
+
+This is the `QUICK_KLUDGE`, and it encodes "the kernel lives in the A3000 motherboard-RAM
+window `[0x07000000, 0x08000000)`". The mask `0xF7C00000` keeps bits 31–28 and 26–22 and
+**clears bit 27** — the `0x08000000` bit. Consequently:
+
+| kernel load base | `end` | `MAINSTORE = end & 0xF7C00000` | `VSIZOFMEM = 0x08000000 - MAINSTORE` |
+|---|---|---|---|
+| `0x07000000` (bench) | `0x0710B930` | `0x07000000` ✔ | 16 MB ✔ |
+| **`0x08000000` (card)** | `0x0810B930` | **`0x00000000`** �’ | **`0x08000000` = 128 MB** ✗ |
+
+On the card the fallback would declare main memory to be 128 MB starting at zero, sizing the
+page database for `[0, 0x08000000)` — which **excludes every byte of the card's actual RAM at
+`0x08000000`+**, and would make exactly the `pages`/`epages` assertion below fail on the
+first free. It is not what is happening today (the fixpoint succeeds, so the fallback is
+skipped), but it is a live trap: **any boot where `bootinfo.memory[]` arrives empty or
+unusable on this card fails in precisely the observed way.** Worth fixing in the port lane
+independently — the mask and the `0x08000000` terminus both need to come from the memlist
+rather than from a 1991 assumption.
+
+#### What `page_free` actually asserts (narrowing candidate B)
+
+`page_free` is `.text+0xaf9ea`. Its prologue is three assertions, all calling **`assfail`**
+(SVR4's assertion handler) — so the screen's `PANIC: page_free` is an *assertion failure*,
+not a hand-written panic:
+
+| site | test | line | meaning |
+|---|---|---|---|
+| `0xafa0a` | `pp >= pages && pp < epages` | 622 | the page-struct pointer is inside the page-frame database |
+| `0xafa2c` | `btst #5, pp@(0)` clear | 623 | a `p_flags` bit must be clear (free/locked class) |
+| `0xafa4e` | `pp@(56) == 0` | 624 | a field at `+56` must be zero |
+
+`page_abort` (`.text+0xaf8d6`) opens with the identical `pages`/`epages` check. **Which of
+the three fired is not determinable from the panic text**, and that is the remaining gap.
+
+### 9.7 What candidate B needs that statics cannot supply
+
+With C exonerated, the case rests entirely on the port lane, and the missing facts are all
+runtime:
+
+1. **Which assertion fired** — line 622, 623 or 624 (`assfail` prints file and line, so the
+   existing printer already carries it).
+2. **The offending `pp` value**, and whether it is outside `[pages, epages)` or merely in a
+   bad state.
+3. **The caller of `page_free`** — the kernel's `Backtrace:` already attempts this.
+
+All three are in the panic output that **candidate A unblocks**: today `assfail` → `panic` →
+`xpanic` → `sync()` dereferences a NULL `vsw_vfsops` and double-faults before the message is
+usable. A NULL guard in `sync()`'s loop turns this single boot into all three answers at
+once. That remains the recommended first move, and nothing further is needed from this repo
+to get it.
+
+**No firmware change is proposed.** The contract variant floated in §9.4C is withdrawn as a
+fix for this panic — the geometry is correct on both sides — and should not be built. If the
+port lane later wants the card's RAM at `0x07000000` to match the bench bit-for-bit (which
+would also sidestep the landmine above), that is a separate, deliberate decision with a 030
+regression plan, not a fix for `page_free`.
+
 ### 9.5 Corrections to the record
 
 Kept because the wrong turns are informative:
