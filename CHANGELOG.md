@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-20 — 040: candidate C exonerated; QUICK_KLUDGE landmine found (d6d0df8)
+
+Static three-way diff of kernel expectation vs card vs bench.
+
+- **Maps differ as suspected:** bench main RAM at `0x07000000` (Amiberry
+  `a3000lmem_bank.start = 0x08000000 - size`), card at `0x08000000`. But `config()`
+  (`.text+0x18f5c`) derives `MAINSTORE`/`VSIZOFMEM` by a fixpoint over
+  `bootinfo.memory[]` and gets **both right** (16 MB at the correct base each side);
+  `maxclick` covers all real RAM in both. **C is not the cause.**
+- **Landmine:** `config()`'s fallback (runs only if `VSIZOFMEM == 0`) hardcodes
+  `0x07000000` and masks `end` with `0xF7C00000`, which **clears bit 27**. At the card's
+  load base that yields `MAINSTORE = 0` and `VSIZOFMEM = 128 MB` — excluding all real
+  RAM and failing the `pages`/`epages` assert. Skipped today; fires on any boot where
+  `bootinfo.memory[]` is empty/unusable. Port-lane fix, independent of this bug.
+- **`PANIC: page_free` is an `assfail`**, one of three asserts: `pp ∈ [pages, epages)`
+  (line 622), a `p_flags` bit (623), `pp@(56) == 0` (624). Which one is not in the text.
+- **B needs**: the line, the `pp`, the caller — all delivered by one boot once candidate
+  A (the `sync()` NULL guard) stops the double fault.
+- Firmware contract variant **withdrawn**; no firmware change proposed.
+
 ## 2026-08-20 — 040: page_free is the bug; the ROM chain is the double panic (078f256)
 
 `8C51370A` captured the transfer in one line and closed the case, with the framing
