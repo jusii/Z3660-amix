@@ -14,7 +14,9 @@
 > 3.4 task, and the first thing a demand-paging 040 kernel needs (§8). The AMIX
 > contract now travels onto the 040 core with the mode (§8). Remaining unmodelled
 > 040 semantics are listed in §7. A metal MMU-off AmigaOS smoke is still queued,
-> and no AMIX-040 boot has been attempted on metal yet.
+> The first AMIX-040 metal attempt (2026-08-20) never reached the emulator at all —
+> core0 did not recognise `UAE_040_MMU` as an emulated mode and so never started core1;
+> fixed and host-guarded in §8.3, not yet re-tried on metal.
 
 This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
 mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
@@ -89,7 +91,8 @@ green, 040 table linked in.
 | Metal-proven image (table linked, pre-run-loop) | 12 745 900 | 12.156 MiB, zlib crc32 `0x95E2020C` — the image booted on metal |
 | Runnable image (P3.2 wiring) | 12 745 956 | 12.156 MiB, zlib crc32 `0x92E1473F` (+56 B: run loop + dispatch) |
 | AMIX-contract image (§8 wiring) | 12 762 340 | 12.171 MiB, zlib crc32 `0x76FBA34C` — same byte size as the flashed `455A7D12` production image |
-| **AMIX-040 fault-path image (§8.1 + §8.2)** | **12 762 340** | **12.171 MiB, zlib crc32 `0x2CFA9216`** — format-$7 frame + the 040 `amix_mmu_on` latch |
+| AMIX-040 fault-path image (§8.1 + §8.2) | 12 762 340 | 12.171 MiB, zlib crc32 `0x2CFA9216` — format-$7 frame + the 040 `amix_mmu_on` latch. **Never emulated anything on metal: core0 did not start core1 (§8.3)** |
+| **core1-launch fix image (§8.3)** | **12 762 340** | **12.171 MiB, zlib crc32 `0xBBD5C14F`** — `boot_mode_is_emulated()` + the core1 breadcrumbs |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -98,7 +101,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 340 B, zlib crc32 `0x2CFA9216` — compare against the board's SD `E`→CRC).
+(12 762 340 B, zlib crc32 `0xBBD5C14F` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -388,6 +391,73 @@ instead of a page of garbage.
 
 **Rule for anyone adding to `a3000_scsi.cpp`:** a new hard-coded `0x07xxxxxx`
 guest-image read must test `amix_kimage_030`, never `amix_mmu_on`.
+
+#### 3. First metal attempt (2026-08-20): core0 never started core1
+
+Firmware `2CFA9216` was flashed and `UAE_040_MMU` selected for the first time on real
+hardware. The card never emulated anything: **not one line of core1 output**, and the
+Amiga reset line cycled every ~3 s forever.
+
+The cause was not in the emulator, and nothing in §8.1/§8.2 was reached. **Core1 was
+never started.** `Z3660/src/main.c` classified the boot mode with a copy-pasted list of
+the *emulator* modes:
+
+```c
+else if(   config.boot_mode==MUSASHI  || config.boot_mode==UAE_030
+        || config.boot_mode==UAEJIT_030 || config.boot_mode==UAE_040
+        || config.boot_mode==UAEJIT_040 || config.boot_mode==UAE_030_MMU)
+   emu=1;
+else
+   emu=0;
+```
+
+`UAE_040_MMU` is absent, so `emu` was 0 — the *real 68060* setting. `emu==1` gates the
+only site that starts core1 (entry address → `0xFFFFFFF0`, `sev`, the `shared_data`
+handshake, `main.c` ~line 1780), so core0 skipped it entirely, fell through to its
+"exclusive for real CPU" path, and did `CPLD_RESET_ARM(1); NBR_ARM(1)` — relinquishing
+the bus to a 68060 that is not fitted on this board. With no CPU driving it, the Amiga
+watchdog-resets forever.
+
+The serial log proves which path ran, with no inference required:
+
+| message | this boot | whole serial history |
+|---|---:|---:|
+| `Starting CPU emulator on Core1` (emulator path) | **0** | 648 |
+| `060 starting now...` (real-CPU path) | **1** | **1** |
+
+That single lifetime occurrence of `060 starting now...` is this boot. Core1's own first
+line (`MMUL2Table = ...`, printed before any emulator work) is absent too, which is what
+distinguishes "never launched" from "launched and crashed".
+
+**The predicate was replicated eight times** — `main.c` ×1, `debug_console.c` ×6,
+`rtg/rtg.c` ×1 — and all eight omitted `UAE_040_MMU`. They are now one shared
+`boot_mode_is_emulated()` in `Z3660/src/config_file.h`, written as a **closed list of the
+two real-CPU modes** (`MOBOCPU`, `CPU`) so that a mode appended to `BOOTMODE` defaults to
+*emulated*. That is the safe direction: core1's own dispatch halts loudly with
+`No emulator selected!!!` if it has not been taught a mode, whereas the old default handed
+the bus to absent silicon.
+
+**Host guard.** `test/host/bootmode_test.cpp` (new, 26 checks) compiles
+`Z3660/src/config_file.h` — self-contained, no BSP — and asserts that every index in
+`[0, BOOTMODE_NUM)` except `MOBOCPU`/`CPU` classifies as emulated, plus the literal enum
+indices the replicas depend on. Verified non-vacuous: rebuilt against the pre-fix
+predicate it fails on index 8 with
+`boot mode index 8 is not classified as emulated`. The rest of core0 (`main.c`,
+`debug_console.c`, `rtg.c`) is **not** host-compilable — Xilinx BSP, FatFs, FPGA register
+access — so the *symptom* cannot be reproduced host-side; only the invariant behind it.
+
+**Breadcrumbs added** (`Z3660_emu/src/main.cpp`), both permanent and one-shot:
+`[Core1] alive` as the first statement of core1's `main()` (before any risky init;
+`shared` is still NULL there, so it prints nothing else), and
+`[Core1] dispatch: cfg_emu=N amix_mode=N` when core0 hands core1 a job. The *absence* of
+the first line is now an unambiguous "core0 never started core1"; the second pins
+`cfg_emu` against the `BOOTMODE` replicas and shows the AMIX flag core1 actually received.
+
+**Still open after this fix:** the Amiga-side `z3660-drivers/ZTop/Ztop.c` keeps its own
+8-entry `BOOTMODE` enum and a `bootmode_names[NUM_BOOTMODES][25]` label table that stop at
+`UAE_030_MMU`. Opening ZTop while the card runs `UAE_040_MMU` (index 8) reads
+`bootmode_names[8]` out of bounds, and ZTop cannot select the mode. Driver-side, not
+touched here.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
