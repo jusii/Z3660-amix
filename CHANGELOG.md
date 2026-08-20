@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-20 — UAE_040_MMU: the 68040 fault path (10587eb, d25b073)
+
+The two blockers the 040-readiness audit found, closed.
+
+- **Access-error frame.** `Exception_normal()` tested `currprefs.mmu_model && nr == 2`
+  — truthy for `mmu_model == 68040` — so every 68040 access error was handed the
+  68030 PMMU's frame `$A`/`$B` builder and never reached the `cpu_model >= 68040`
+  arm. Guarded to `== 68030`; the 040 arm now builds a real **format `$7`** frame.
+  The contents were the actual defect: `case 0x7:` had the right field order but
+  stacked **zeros** for every write-back slot, and the 68040 does not re-run a
+  faulted write on `rte` — the store travels to the OS in WB3 for the kernel to
+  complete, so zeroed slots dropped it. Now stacked from the real fault record:
+  SSW, FA, EA, WB3S/WB3A/WB3D, WB2S/WB2A, PD0–PD3. `mmu_bus_error()` also now
+  initialises `regs.mmu_effective_addr` (only MOVE16/MOVEM ever assigned it, so EA
+  and `wb2_address` carried stale values). Field order and encodings cross-checked
+  read-only against the port repo's `wb040.s` consumer offsets — exact agreement,
+  including its metal-captured `WB3S=0x0081` for a user-data long write.
+- **`amix_mmu_on` under 040.** Latched only in `cpummu030.cpp` on a 2 KB page size
+  the 68040 does not have, so the emulated A3000 SCSI stayed in ROM-load timing for
+  the whole boot. `mmu_set_tc()` now latches on `amix_mode` + the TC E-bit.
+  `amix_mmu_on` = *when* (timing, both cores); new `amix_kimage_030` = *which guest*,
+  gating every hard-coded `0x07xxxxxx` 68030-image read, derived from the CPU model
+  in `a3000_scsi_init()` so the 040 path can never arm them.
+- Host harness **126/126** (was 96) — `test_mmu040_access_error_frame` (24 checks,
+  write + read fault: WB3D carries the real store value, write faults continue,
+  read faults restart) and `test_amix_mmu040_latch` (6). `scsi_cd_test` 34/34.
+- **Consequence worth naming: the emulator's 040 fault path is now behaviourally
+  equivalent to silicon for `wb040.s`'s purposes** — deferred-write-back work
+  (ISSUE-10/-22 class) should reproduce under `UAE_040_MMU`, not only on metal.
+- Flagged, deliberately untouched: `a3000_scsi_init()` does not reset
+  `amix_mmu_on`, so after an AMIX warm reboot the next Kickstart ROM load runs
+  with runtime pacing instead of the proven immediate-completion timing — fixing
+  it changes proven 030 behaviour, so it needs its own decision + metal 030
+  regression. And `mmu_model == 68060` now lands on the synthesized MMU-off
+  frame (inert today; a future 060 lane needs its own arm).
+- `BOOT.BIN` 12,762,340 B, zlib crc32 `2CFA9216`. Build warning-free. Metal
+  still untried for AMIX-040 — bench/harness-proven only.
+
 ## 2026-08-20 — UAE_040_MMU carries the AMIX contract (f7b2167, 970b33a)
 
 `bootmode UAE_040_MMU` can now run the native AMIX 040 boot chain. Two defects
