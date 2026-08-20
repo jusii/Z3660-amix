@@ -39,10 +39,27 @@ extern "C" void z3660_printf(const TCHAR *format, ...)
 {
    va_list args{};
    va_start(args, format);
-   while(shared->uart_semaphore!=0);
-   shared->uart_semaphore=1;
-   vprintf(format, args);
-   shared->uart_semaphore=0;
+   // The UART semaphore lives in the SHARED struct, so it can only be taken once `shared`
+   // points at it -- init_shared() does that well inside main(). Calling this helper before
+   // then used to spin forever on ((SHARED*)0)->uart_semaphore, i.e. a read of DDR
+   // 0x0000001C (uart_semaphore's offset), which is ordinary mapped memory at that point in
+   // core1's bring-up and so faults nothing and never changes: core1 wedged in this loop
+   // with not one byte emitted, and core0 waited on the ack forever. That is exactly how
+   // image BBD5C14F killed core1 on EVERY boot mode. Fall back to a bare vprintf until the
+   // struct exists -- the same thing core1's long-proven pre-init prints (the
+   // "MMUL2Table = ..." line) have always done -- and start honouring the semaphore the
+   // moment it is real, so the helper is safe to call from anywhere.
+   if(shared)
+   {
+      while(shared->uart_semaphore!=0);
+      shared->uart_semaphore=1;
+      vprintf(format, args);
+      shared->uart_semaphore=0;
+   }
+   else
+   {
+      vprintf(format, args);
+   }
    va_end(args);
 }
 extern uint32_t MMUTable;
@@ -847,8 +864,12 @@ int main()
    // launched and then died in its own bring-up. Distinguishing those two cost the first
    // AMIX-040 metal boot (2026-08-20): UAE_040_MMU was missing from core0's emulator-mode
    // predicate, so there was no core1 to hear from and every later print was absent too.
-   // Note `shared` is still NULL here (init_shared() runs much further down), so this line
-   // must not dereference it; the mode values are printed at the dispatch instead.
+   //
+   // PRE-INIT CONTRACT, learned the hard way one image later: `shared` is NULL here
+   // (init_shared() runs ~30 lines down), so nothing on this line may touch it -- and that
+   // includes the callee. z3660_printf() itself dereferences `shared` for the UART
+   // semaphore; it is now NULL-safe (see above), which is what makes this call legal. Any
+   // print added above init_shared() must keep that property.
    z3660_printf("[Core1] alive\n");
 
    //    Xil_L1DCacheDisable();
