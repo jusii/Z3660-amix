@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-08-20 — 040: extended exception trace (c086aa7)
+
+`F4782D71` returned a one-line trace and falsified the prediction:
+`[XT01] vec=3 ipc=00F80B4C pc=00F80B4C fa=00000000 ssw=0000 sr=2700 a7=080F48C0`.
+No `vec=2` chain. The first non-interrupt exception after MMU-on *is* the Address
+Error, and `pstack` was already ~92% consumed (7232/8000) before it — so the consumer
+is ordinary execution or the interrupts the tracer skipped. That filter was the mistake.
+
+- **`vec=3` at an even pc explained from the code:** `Exception_normal()` raises
+  exception 3 via `exception3_notinstruction()` when the longword at `vbr + 4*nr` is
+  **odd**. An odd vector-table entry for an earlier (possibly interrupt) exception
+  presents exactly this way.
+- **Noted, not changed:** `check_uae_int_request()` treats IPL7 as level-triggered
+  (`|| eff_irq == 7`) where silicon is edge-triggered — a stuck IPL7 would be taken
+  repeatedly regardless of `intmask`, stacking a frame each time. Shared with the proven
+  030 path; the trace decides before anything is touched.
+- Ships: per-level interrupt counts + stack high-water, first 12 logged in full with
+  `vbr` and the fetched vector, periodic capped summary; `fault=`/`vec3@` on vec 2/3;
+  `a7`+`vbr` on the MMU-enable line as the "before" stack sample.
+- Instrumentation only. `BOOT.BIN` 12,762,372 B, zlib crc32 `F87F6FA7`. Warning-free.
+
 ## 2026-08-20 — 040: page_free is boot-stack exhaustion (9143d5a)
 
 `095356E9` panicked byte-identically to `D910C41A`, so PFLUSH/PTEST were real bugs but
