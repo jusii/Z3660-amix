@@ -1668,7 +1668,25 @@ volatile uint32_t cia_hist[16];     // accesses per CIA register ((addr>>8)&0xF)
 extern "C" volatile int a3000_scsi_irq;
 extern "C" volatile int a3000_amix_mode;   // set once the emulated A3000 SCSI (AMIX) is active
 extern "C" volatile int amix_kernel_loaded; // set once the kernel image starts loading (UNIX_Boot)
+extern "C" volatile int amix_mmu_on;        // set once the AMIX kernel's own MMU is up (030 or 040)
+static int amix_click_done = 0;             // auto-click session budget spent -> disarmed for good
 #define INTREQR_PORTS 0x0008
+
+/* AMIX kernel console -> jtag serial. The kernel writes Paula SERDAT ($00DFF030) as
+ * `movew d0,a0@(0x30)` with a0 = $00DFF000 (amix-040-060-port src/serdbg.s, btrace.s,
+ * mainmarks.s), i.e. a WORD write -- which is what ps_write_16 caught. Byte and long
+ * writes are mirrored too, so a differently-compiled console routine can never be the
+ * reason the serial stays silent; on the proven 030 path only the word arm ever fires,
+ * so this adds nothing to it. The first mirrored character announces itself once, which
+ * is what makes "the mirror is armed" provable from the log instead of inferred from
+ * the absence of output. */
+static void amix_serdat_mirror(unsigned int value)
+{
+   static int announced = 0;
+   if (!announced) { announced = 1; z3660_printf("\r\n[SERMIRROR] AMIX console -> serial\r\n"); }
+   char c = (char)(value & 0xFF);
+   if (c == '\n') z3660_printf("\r\n"); else if (c >= 9) z3660_printf("%c", c);
+}
 static inline void ps_tally(unsigned int a)
 {
    ps_count++;
@@ -1681,6 +1699,8 @@ static inline void ps_tally(unsigned int a)
 extern "C" void ps_write_32(unsigned int address, unsigned int value)
 {
    ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF030)   // move.l writes SERDAT (high word) + SERPER
+      amix_serdat_mirror(value >> 16);
    switch(address&3)
    {
       case 0:
@@ -1705,10 +1725,8 @@ extern "C" void ps_write_32(unsigned int address, unsigned int value)
 extern "C" void ps_write_16(unsigned int address, unsigned int value)
 {
    ps_tally(address);
-   if (a3000_amix_mode && address == 0x00DFF030) { // Paula SERDAT: mirror AMIX serial console to jtag
-      char c = (char)(value & 0xFF);
-      if (c == '\n') z3660_printf("\r\n"); else if (c >= 9) z3660_printf("%c", c);
-   }
+   if (a3000_amix_mode && address == 0x00DFF030) // Paula SERDAT: mirror AMIX serial console to jtag
+      amix_serdat_mirror(value);
    switch(address&3)
    {
       case 0:
@@ -1730,6 +1748,8 @@ extern "C" void ps_write_16(unsigned int address, unsigned int value)
 extern "C" void ps_write_8(unsigned int address, unsigned int value)
 {
    ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF031)   // move.b to SERDAT's low (data) byte
+      amix_serdat_mirror(value);
    switch(address&3)
    {
       case 0:
@@ -1752,21 +1772,47 @@ extern "C" unsigned int ps_read_8(unsigned int address)
    ps_tally(address);
    if (a3000_scsi_irq && address == 0x00DFF01F)   // low byte of INTREQR holds PORTS bit
       return ((arm_read_amiga_byte(address)) & 0xFF) | INTREQR_PORTS;
-   if (a3000_amix_mode && !amix_kernel_loaded && address == 0x00BFE001) { // CIA-A PRA (LMB=bit6, low)
+   if (a3000_amix_mode && !amix_kernel_loaded && !amix_mmu_on && !amix_click_done
+       && address == 0x00BFE001) { // CIA-A PRA (LMB=bit6, low)
       // Auto-click past the AmigaOS boot-loader's "Press a mouse button to continue."
-      // prompt ONLY. We stop the instant the kernel starts loading from UNIX_Boot, so
-      // AMIX's own later (pre-root) prompt is left completely untouched for a REAL mouse
-      // click (its button handling differs - left only redraws, right opens a menu).
+      // prompt ONLY. AMIX's own later (pre-root) prompt must be left untouched for a REAL
+      // mouse click (its button handling differs - left only redraws, right opens a menu).
       // Detect the mouse-poll spin via rapid consecutive PRA reads (tiny ps_count gaps).
-      static uint32_t last_ps = 0, spin = 0, press = 0, eclicks = 0;
+      //
+      // THREE DISARMS, because the original single one could not hold:
+      //  - amix_kernel_loaded: the original. Set from an LBA>1700000 read heuristic, so it
+      //    only ever trips on a disk big enough to put the kernel that far in. On the 85 MB
+      //    040 source disk it never trips at all.
+      //  - amix_mmu_on: NEW, and the exact signal. Once the AMIX kernel's own MMU is up the
+      //    loader is long gone and every prompt from here on is AMIX's, so clicking must
+      //    stop. It is disk-size independent and now latches on BOTH cores (the 030 PMOVE
+      //    site and the 040 MOVEC->TC site), which is what makes it usable here.
+      //  - amix_click_done: NEW backstop. A hard session-wide budget that never resets, so
+      //    even with both signals absent the clicker cannot escalate indefinitely.
+      // Without the latter two, image 6FDBDA40 reached [CLICK] e48 with spin=9.4M, clicking
+      // into the running kernel and across the panic screen.
+      //
+      // 030-safe: on the golden path the loader prompt is dismissed long before the AMIX
+      // kernel enables its MMU, so neither new disarm can fire early. The per-episode cap
+      // of 64 is untouched (the post-warm-reboot A3000-KS prompt genuinely needs that many),
+      // and the session budget is 4 full episodes' worth -- AMIX's bootstrap warm reset
+      // needs two, so there is 2x headroom before the backstop engages.
+      static uint32_t last_ps = 0, spin = 0, press = 0, eclicks = 0, total_clicks = 0;
       static int armed = 0;
+      const uint32_t CLICK_SESSION_BUDGET = 4 * 64;
       unsigned int v = (arm_read_amiga_byte(address) >> 16) & 0xFF;
       uint32_t gap = ps_count - last_ps; last_ps = ps_count;
       if (gap < 16) {
          if (spin < 0x0FFFFFFF) spin++;
-         if (eclicks < 64 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {  // cap 6->64: the post-warm-reboot A3000-KS prompt isn't dismissed by 6 clicks; self-limited because the else branch (gap>=16) re-arms/zeroes eclicks the instant the poll spin ends
-            armed = 1; press = 0; eclicks++;
-            z3660_printf("[CLICK] e%lu spin=%lu\n", (unsigned long)eclicks, (unsigned long)spin);
+         if (eclicks < 64 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {  // cap 6->64: the post-warm-reboot A3000-KS prompt isn't dismissed by 6 clicks
+            armed = 1; press = 0; eclicks++; total_clicks++;
+            z3660_printf("[CLICK] e%lu spin=%lu tot=%lu\n", (unsigned long)eclicks,
+                         (unsigned long)spin, (unsigned long)total_clicks);
+            if (total_clicks >= CLICK_SESSION_BUDGET) {
+               amix_click_done = 1; armed = 0;
+               z3660_printf("[CLICK] session budget spent (%lu) -> auto-click disarmed for good\n",
+                            (unsigned long)total_clicks);
+            }
          }
          if (armed) {
             if (press < 40000) { v &= ~0x40u; press++; } // hold the left button

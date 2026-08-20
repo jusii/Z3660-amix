@@ -4442,7 +4442,17 @@ static void m68k_run_mmu040(void)
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             cpu_cycles = adjust_cycles(cpu_cycles);
 
-            check_uae_int_request();
+            // Same IPL/cross-core poll throttle the 030 loop has, and for the same reason:
+            // check_uae_int_request() runs z3660_tasks() + ipl_main_read() + (under AMIX)
+            // the WD33C93 hsync pump on EVERY instruction, which is real per-instruction
+            // overhead during long guest polling loops. do_specialties() stays
+            // per-instruction (STOP/trace/mode-change correctness). cadence 1 -- the
+            // default and what the env sets today -- is byte-for-byte the old behaviour;
+            // this only makes the existing SERV knob reach the 040 loop as well.
+            z3660_perf_count++;
+            if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();
+            { static int serv_ctr = 0;
+              if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } }
             if (regs.spcflags) {
                if (do_specialties(cpu_cycles))
                   return;
