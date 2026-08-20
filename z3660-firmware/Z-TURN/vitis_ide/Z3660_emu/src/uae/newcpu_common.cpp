@@ -75,13 +75,45 @@ int m68k_move2c (int regno, uae_u32 *regp)
 			break;
 		/* 68040 only */
 		case 3:
+			// MOVEC to TC. Storing regs.tcr is NOT enough on a 68040: this write is what
+			// turns translation on, and every quantity derived from it lives behind
+			// mmu_set_tc() -- regs.mmu_enabled (which every *_mmu040 accessor tests before
+			// it will translate at all), the page size and its masks/shifts, the ATC flush,
+			// and the default cache modes. Without the call the guest's MMU never actually
+			// engages: the kernel builds its tables, writes TC with E=1, believes it is now
+			// running in virtual space -- and the emulator keeps every access transparent,
+			// so the first kernel VA touched lands at whatever that number happens to be as
+			// a PHYSICAL address. On this board VAs at 0x40000000+ fall in the Z3 expansion
+			// window (slow_bank, no RAM), which is how the AMIX 68040 kernel reached
+			// "PANIC: page_sub" and then a wild pc at 0x40080000 (metal, image 6FDBDA40).
+			//
+			// The 68030 path never comes through here: it enables its PMMU with PMOVE to TC,
+			// handled in cpummu030.cpp (which is also where the "68030 MMU enabled" line is
+			// printed). That is why UAE_030_MMU was unaffected and this stayed hidden.
 			regs.tcr = *regp & 0xc000;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060)
+				regs.tcr = mmu_set_tc((uae_u16)regs.tcr);
 			break;
 
-		case 4: regs.itt0 = *regp & 0xffffe364; break;
-		case 5: regs.itt1 = *regp & 0xffffe364; break;
-		case 6: regs.dtt0 = *regp & 0xffffe364; break;
-		case 7: regs.dtt1 = *regp & 0xffffe364; break;
+		// Transparent translation registers. mmu_tt_modified() recomputes mmu_ttr_enabled /
+		// _ins / _data, which are what the accessors test before consulting a TTR at all --
+		// so without it a guest's transparent windows are stored but never honoured.
+		case 4:
+			regs.itt0 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 5:
+			regs.itt1 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 6:
+			regs.dtt0 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 7:
+			regs.dtt1 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
 
 		case 0x800: regs.usp = *regp; break;
 		case 0x801: regs.vbr = *regp; break;

@@ -974,6 +974,83 @@ static void test_mmu040_access_error_frame(void)
 }
 
 /* ==================================================================
+ * MOVEC to TC must actually ENABLE the 68040 MMU.
+ *
+ * The 68040 turns translation on by writing TC with MOVEC; everything derived
+ * from it (regs.mmu_enabled -- which every *_mmu040 accessor tests before it will
+ * translate at all -- the page size, its masks and shifts, the ATC flush) lives
+ * behind mmu_set_tc(). m68k_move2c() used to only store regs.tcr, so the guest's
+ * MMU never engaged: the AMIX 68040 kernel installed its tables, enabled the MMU,
+ * believed it was running in virtual space, and every access stayed transparent.
+ * Kernel VAs at 0x40000000+ then landed in the Z3 expansion window with no RAM.
+ *
+ * The 68030 does NOT come through here (it uses PMOVE, handled in cpummu030.cpp),
+ * which is exactly why the proven 030 path never showed this.
+ * ================================================================== */
+static void test_mmu040_movec_tc_enables_mmu(void)
+{
+	printf("[test] MOVEC to TC enables the 68040 MMU (not just stores TCR)\n");
+	const uae_u32 VA = 0x00408678, PA = 0x0A000000;
+	(void)mmu040_map1(VA, PA, 0, false);      /* tables built; fixture enables via mmu_set_tc */
+
+	mmu_set_tc(0x0000);                        /* start from a known-OFF state */
+	CHECK_EQ32(regs.mmu_enabled, 0, "MMU off before the MOVEC");
+
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+	cpu_set_context(0x00002000);
+	regs.s = 1;
+	hram_poke16(0x2000, 0x4e7b);               /* MOVEC Rn,Rc        */
+	hram_poke16(0x2002, 0x0003);               /*   ext: D0 -> TC    */
+	m68k_dreg(regs, 0) = 0x00008000;           /* TC: E=1, 4K pages  */
+
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	CHECK(!faulted, "movec d0,tc did not fault\n");
+	CHECK_EQ32(regs.mmu_enabled, 1, "MOVEC to TC turned translation ON");
+	CHECK_EQ32(regs.mmu_page_size, 4096, "page size derived from the TC the guest wrote");
+	CHECK_EQ32(regs.tcr & 0x8000, 0x8000, "TCR stored as well");
+
+	/* and translation now genuinely walks the guest's tables */
+	bool tfault = false; uaecptr pa = 0;
+	SAVE_EXCEPTION;
+	TRY(p2) { pa = mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(p2) { tfault = true; (void)p2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!tfault, "translation after the MOVEC-enable did not fault\n");
+	CHECK_EQ32(pa, PA + (VA & 0xFFF), "VA translated through the tables the guest installed");
+
+	/* MOVEC to a TTR must take effect too (mmu_tt_modified recomputes the enables).
+	 * MMU back OFF for this arm so the instruction fetch at 0x2000 stays transparent --
+	 * only VA 0x00408678's page is mapped in this fixture. */
+	mmu_set_tc(0x0000);
+	regs.dtt0 = regs.dtt1 = regs.itt0 = regs.itt1 = 0;
+	mmu_tt_modified();
+	CHECK_EQ32(mmu_ttr_enabled_data, 0, "no data TTR enabled to begin with");
+	cpu_set_context(0x00002000);
+	regs.s = 1;
+	hram_poke16(0x2000, 0x4e7b);
+	hram_poke16(0x2002, 0x0006);               /*   ext: D0 -> DTT0  */
+	m68k_dreg(regs, 0) = MMU_TTR_BIT_ENABLED;  /* enable bit only    */
+	bool ttrfault = false;
+	TRY(p3) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p3) { ttrfault = true; (void)p3; } ENDTRY
+	CHECK(!ttrfault, "movec d0,dtt0 did not fault\n");
+	CHECK(mmu_ttr_enabled_data != 0, "MOVEC to DTT0 armed the data transparent window\n");
+
+	mmu040_off();
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1422,6 +1499,7 @@ int main(int argc, char **argv)
 	test_mmu040_modified_bit();
 	test_fpu040_unimplemented_trap();
 	test_mmu040_access_error_frame();
+	test_mmu040_movec_tc_enables_mmu();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();

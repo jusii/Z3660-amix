@@ -1560,12 +1560,17 @@ uae_u16 REGPARAM2 mmu_set_tc(uae_u16 tc)
 	//
 	// This latch does NOT arm the hard-coded 68030-kernel-image reads in a3000_scsi.cpp;
 	// those hang off amix_kimage_030, which is set from the CPU model in a3000_scsi_init().
-	if (a3000_amix_mode && currprefs.mmu_model == 68040 && regs.mmu_enabled && !amix_mmu_on) {
+	if (a3000_amix_mode && currprefs.mmu_model == 68040 && regs.mmu_enabled && !amix_mmu_on)
 		amix_mmu_on = 1;
-		write_log(_T("68040 MMU enabled under AMIX. Page size = %d PC=%08x\n"), regs.mmu_page_size, m68k_getpc());
-	}
 
-	write_log(_T("%d MMU: TC=%04x enabled=%d page8k=%d PC=%08x\n"), currprefs.mmu_model, tc, regs.mmu_enabled, mmu_pagesize_8k, m68k_getpc());
+	// One line per TC write, deliberately shaped like cpummu030.cpp's "68030 MMU enabled.
+	// Page size = 2048 PC=..." so the two cores read the same on the serial. Page size is
+	// spelled out (the 68040 has no 2K page, so this is the fastest way to see whether the
+	// guest chose 4K or 8K), and amix_mmu_on is echoed so the SCSI pacing regime is visible
+	// at the moment it engages rather than having to be inferred later.
+	write_log(_T("%d MMU %s. TC=%04x Page size = %d amix_mmu_on=%d PC=%08x\n"),
+	          currprefs.mmu_model, regs.mmu_enabled ? _T("enabled") : _T("disabled"),
+	          tc, regs.mmu_page_size, amix_mmu_on, m68k_getpc());
 	return tc;
 }
 
