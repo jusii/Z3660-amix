@@ -1130,6 +1130,40 @@ static void test_mmu040_pflush_ptest(void)
 }
 
 /* ==================================================================
+ * A guest RESET must clear the 68040 MMU's out-of-regs state too.
+ *
+ * m68k_reset_newcpu() zeroes regs.itt0..dtt1 / tcr / srp / urp, but
+ * regs.mmu_enabled, the page geometry and the mmu_ttr_enabled* flags live
+ * outside `regs` and are only recomputed by mmu_set_tc() / mmu_tt_modified().
+ * Left unapplied, a warm reset carries the previous session's MMU state into the
+ * Kickstart ROM that runs next -- ttr_enabled true against a now-zero ITT0, and
+ * mmu_enabled true with a zero root pointer, so the walk reads descriptors from
+ * address 0. Same shape as the MOVEC->TC and mmu_op bugs, third instance.
+ * ================================================================== */
+void m68k_reset_newcpu(bool hardreset);   /* C++ linkage: defined in newcpu.cpp */
+
+static void test_mmu040_reset_clears_mmu_state(void)
+{
+	printf("[test] a guest reset clears the 68040 MMU state, not just the registers\n");
+	(void)mmu040_map1(0x00408678, 0x0A000000, 0, false);   /* MMU on, tables built */
+	regs.dtt0 = MMU_TTR_BIT_ENABLED;                        /* arm a transparent window */
+	mmu_tt_modified();
+	CHECK_EQ32(regs.mmu_enabled, 1, "MMU on before the reset");
+	CHECK(mmu_ttr_enabled_data != 0, "a data TTR is armed before the reset\n");
+
+	m68k_reset_newcpu(true);
+
+	CHECK_EQ32(regs.mmu_enabled, 0, "reset cleared regs.mmu_enabled (mmu_set_tc applied)");
+	CHECK_EQ32(regs.itt0 | regs.itt1 | regs.dtt0 | regs.dtt1, 0, "reset cleared the TTR registers");
+	CHECK(mmu_ttr_enabled == 0, "reset recomputed mmu_ttr_enabled (mmu_tt_modified applied)\n");
+	CHECK(mmu_ttr_enabled_ins == 0, "reset recomputed mmu_ttr_enabled_ins\n");
+	CHECK(mmu_ttr_enabled_data == 0, "reset recomputed mmu_ttr_enabled_data\n");
+
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1580,6 +1614,7 @@ int main(int argc, char **argv)
 	test_mmu040_access_error_frame();
 	test_mmu040_movec_tc_enables_mmu();
 	test_mmu040_pflush_ptest();
+	test_mmu040_reset_clears_mmu_state();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();

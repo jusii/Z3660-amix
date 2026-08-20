@@ -2426,6 +2426,38 @@ void m68k_reset_newcpu(bool hardreset)
    regs.caar = regs.cacr = 0;
    regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
    regs.tcr = regs.mmusr = regs.urp = regs.srp = 0;
+   // The registers above are cleared, but on the 68040 path clearing them is only half a
+   // reset: regs.mmu_enabled, the page geometry (mmu_pagesize_8k and the masks/shifts), the
+   // mmu_ttr_enabled/_ins/_data flags and the ATC all live OUTSIDE regs and are only ever
+   // recomputed by mmu_set_tc() and mmu_tt_modified(). This is the same shape as the
+   // MOVEC->TC and mmu_op bugs: the register is stored, the side-effect function is never
+   // called -- third instance.
+   //
+   // Left unapplied, a guest WARM RESET carries the previous session's MMU state into the
+   // Kickstart ROM that runs next: mmu_ttr_enabled_ins stays true while itt0 is now zero, so
+   // mmu_match_ttr_ins() finds no match; regs.mmu_enabled stays true, so the accessor walks
+   // the tables anyway; and srp/urp are now zero, so the walk reads descriptors from address
+   // 0. That is precisely the metal signature of cycle 2 -- an ATC fault on an instruction
+   // fetch of kernel text that ITT0 covers (vec=2 fa=0800ABEA ssw=0546, TM=6), address
+   // specific because the stale ATC still had valid entries for the handlers that did fetch
+   // fine -- and it is why cycles 2 and 3 wedged in early KS before the strap while cycle 1
+   // ran for 2:20.
+   //
+   // 68030 is untouched: the guard is on mmu_model, and the 030 PMMU keeps its state in
+   // mmu030.* which mmu030_reset() already handles.
+   if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) {
+      mmu_tt_modified();        // recompute mmu_ttr_enabled/_ins/_data from the now-zero TTRs
+      mmu_set_tc(0);            // clears regs.mmu_enabled + page geometry, and flushes the ATC
+   }
+   // AMIX: a guest reset means the AMIX kernel is gone and the Kickstart ROM runs next, so
+   // the emulated A3000 SCSI must return to ROM-load timing. amix_mmu_on is latched when the
+   // kernel brings its MMU up (cpummu030.cpp on 030, mmu_set_tc() on 040) and was never
+   // cleared, so every cycle after the first ran the ROM's kernel load under AMIX-RUNTIME
+   // pacing -- paced completions, per-access pump suppressed -- instead of the immediate
+   // completion regime the code comments call "the proven kernel-load behavior". This makes
+   // every cycle start in the state cycle 1 starts in, which is the metal-proven one; the
+   // kernel re-latches the flag as soon as it enables its MMU again.
+   amix_mmu_on = 0;
    if (currprefs.cpu_model == 68020) {
       regs.cacr |= 8;
       set_cpu_caches (false);
