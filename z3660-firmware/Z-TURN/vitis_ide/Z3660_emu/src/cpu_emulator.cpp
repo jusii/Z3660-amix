@@ -1509,10 +1509,58 @@ static inline void wait_write_ack(int address)
 #endif
 }
 uint32_t last_bank=-1;
+/* ===========================================================================
+ * FRONT-1 BUS WATCHDOG (diagnostic only -- no behaviour change).
+ *
+ * A clean AMIX-040 cycle wedged with core1 executing no guest instructions while
+ * core0 kept ticking. Two live probes eliminated the obvious classes: every
+ * cross-core mailbox flag in SHARED read zero, and read_reset read 1. Two samples
+ * of ps_count/ps_lastaddr nine seconds apart were byte-identical -- ps_count
+ * frozen, last attempted access chip RAM 0x001D6BC0 -- so core1 was parked inside
+ * a real-Amiga-bus cycle that never completed.
+ *
+ * Of the three waits in these accessors, only ONE is unbounded. wait_read_ack()
+ * has WAIT_TIMEOUT + WAIT_TIMEOUT2 and a force-exit; wait_write_ack() has a
+ * 1,000,000 spin and a REG4 recovery poke. Both escape. The pipe-empty wait is a
+ * bare `while(read_reg(REG4)&(1<<4));` in all six accessors with no bound at all,
+ * so a permanent stall parks core1 exactly here. This names it.
+ *
+ * WHY N = 20,000,000. The loop body is one FPGA register read across the Zynq GP
+ * AXI port -- an uncached device access, order 100-300 ns -- so N is roughly 2-6
+ * seconds of waiting. The longest LEGITIMATE lockout on an Amiga is the chipset
+ * winning DMA priority: display fetches cost microseconds per scanline, and the
+ * worst case is a blitter-nasty blit holding the bus for the length of the blit,
+ * order 10-20 ms even for a large one. That is ~100k-200k iterations, so N sits
+ * 100-200x above the worst legitimate stall while still firing within seconds of a
+ * real wedge. The per-iteration cost is deliberately uncalibrated: the threshold is
+ * "seconds, not milliseconds" by construction, which is the property that matters.
+ *
+ * ONE-SHOT and global, so a permanent wedge prints one line and never floods. Not
+ * mmu_model-gated -- this is the bus path, and any guest that wedges here benefits.
+ * Cost when nothing is wrong: the loop is normally not entered at all, and when it
+ * is, one increment plus one compare per iteration.
+ * =========================================================================== */
+extern volatile uint32_t ps_count, ps_lastaddr;
+#define BUS_WD_N 20000000u
+static volatile int bus_wd_reported = 0;
+static void bus_wd_report(const char *what, uint32_t address)
+{
+   if (bus_wd_reported) return;
+   bus_wd_reported = 1;
+   z3660_printf("\r\n[BUSWD] STALL %s addr=%08lX REG4=%08lX REG5=%08lX nbg=%d ps_count=%lu ps_last=%08lX\r\n",
+                what, (unsigned long)address,
+                (unsigned long)read_reg(REG4), (unsigned long)read_reg(REG5),
+                nbg_arm, (unsigned long)ps_count, (unsigned long)ps_lastaddr);
+}
+#define WAIT_PIPE_EMPTY(tag, addr) \
+   do { uint32_t _wd = 0; \
+        while(read_reg(REG4)&(1<<4)) { if(++_wd == BUS_WD_N) bus_wd_report((tag), (addr)); } \
+   } while(0)
+
 extern "C" void arm_write_amiga_long(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W32", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1534,7 +1582,7 @@ extern "C" void arm_write_amiga_long(uint32_t address, uint32_t data)
 extern "C" void arm_write_amiga_word(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W16", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1556,7 +1604,7 @@ extern "C" void arm_write_amiga_word(uint32_t address, uint32_t data)
 extern "C" void arm_write_amiga_byte(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W8", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1579,7 +1627,7 @@ extern "C" void arm_write_amiga_byte(uint32_t address, uint32_t data)
 extern "C" uint32_t arm_read_amiga_long(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R32", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else
@@ -1606,7 +1654,7 @@ extern "C" uint32_t arm_read_amiga_long(uint32_t address)
 extern "C" uint32_t arm_read_amiga_word(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R16", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else
@@ -1633,7 +1681,7 @@ extern "C" uint32_t arm_read_amiga_word(uint32_t address)
 extern "C" uint32_t arm_read_amiga_byte(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R8", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else

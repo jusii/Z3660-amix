@@ -1560,10 +1560,49 @@ these waits have no bound.
 
 **Deliberately not fixed.** Bounding those waits is a change to the hottest path in the
 firmware, shared with the metal-proven 030 boot, where a spuriously-firing timeout would break
-everything. The zero-risk next step is a **watchdog that diagnoses without changing behaviour**:
-after N million iterations in each wait, print once — which wait, the address, `REG4`/`REG5`
-status, `nbg_arm` — and then keep spinning. That names the stall (bus never granted vs pipe
-never empty vs ack never returned) in one boot without altering a single timing decision.
+everything. Instead a **watchdog that diagnoses without changing behaviour** was built (below).
+
+### 10.3 The bus watchdog, and which wait it had to target
+
+Reading the three waits closely narrowed the target to one before a line was written:
+
+| wait | bounded? |
+|---|---|
+| `wait_read_ack()` | **yes** — `WAIT_TIMEOUT`, then `WAIT_TIMEOUT2`, then `write_reg(REG4, 0x80000001)` to force the ARM state machine out |
+| `wait_write_ack()` | **yes** — 1,000,000 spins, then a `REG4` recovery poke |
+| pipe-empty | **NO** — a bare `while(read_reg(REG4)&(1<<4));` in all six accessors, no bound at all |
+
+Both ack waits escape on their own. **The pipe-empty wait is the only genuinely unbounded one
+in the bus path, so that is where a permanent stall parks core1**, and it is the only site the
+watchdog needs.
+
+All six sites (`W32`/`W16`/`W8`/`R32`/`R16`/`R8`) now use `WAIT_PIPE_EMPTY(tag, address)`,
+which spins exactly as before but counts, and on crossing the threshold prints **one** line and
+keeps spinning:
+
+```
+[BUSWD] STALL R8 addr=001D6BC0 REG4=........ REG5=........ nbg=0 ps_count=...... ps_last=001D6BC0
+```
+
+`REG4`/`REG5`/`nbg` are what discriminate the causes: bus never granted (`nbg`), pipe never
+drained (`REG4`), or a cycle that started and never acked (`REG5`).
+
+**N = 20,000,000, and why.** The loop body is one FPGA register read across the Zynq GP AXI
+port — an uncached device access, order 100–300 ns — so N is roughly **2–6 seconds** of
+waiting. The longest *legitimate* CPU lockout on an Amiga is the chipset winning DMA priority:
+display fetches cost microseconds per scanline, and the worst case is a blitter-nasty blit
+holding the bus for the length of the blit, order 10–20 ms even for a large one — about
+100k–200k iterations. **N therefore sits 100–200× above the worst legitimate stall while still
+firing within seconds of a real wedge.** The per-iteration cost is deliberately uncalibrated;
+the property that matters is that the threshold is *seconds, not milliseconds*, by
+construction. A healthy boot, display repaints included, cannot reach it.
+
+**Cost when nothing is wrong: none that matters.** The loop is normally not entered at all, and
+the compiler hoists the counting path out of line — the generated fast path in
+`arm_read_amiga_byte` is still `ldr r1,[r5,#16]` / `ands r0,r1,#16` / `bne <out-of-line>`,
+identical to the original bare `while`, with one extra `mov r6,#0` to seed the counter. The
+report is global one-shot, so a permanent wedge prints once and can never flood the serial. Not
+`mmu_model`-gated: this is the bus path, and any guest that wedges here benefits.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
