@@ -851,12 +851,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040
-                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -916,12 +911,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040
-                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -961,12 +951,7 @@ int debug_thread(struct pt *pt)
             debug_console.cmd=0;
             debug_console.subcmd=0;
             int emu;
-            if(   config.boot_mode==MUSASHI
-               || config.boot_mode==UAE_030
-               || config.boot_mode==UAEJIT_030
-               || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040
-               || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+            if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                emu=1;
             else
                emu=0;
@@ -982,12 +967,7 @@ int debug_thread(struct pt *pt)
             debug_console.cmd=0;
             debug_console.subcmd=0;
             int emu;
-            if(   config.boot_mode==MUSASHI
-               || config.boot_mode==UAE_030
-               || config.boot_mode==UAEJIT_030
-               || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040
-               || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+            if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                emu=1;
             else
                emu=0;
@@ -1043,12 +1023,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040
-                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -1100,12 +1075,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040
-                  || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;

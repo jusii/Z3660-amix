@@ -841,6 +841,16 @@ int main()
    Xil_L1DCacheEnable();
    Xil_L2CacheEnable();
 
+   // Breadcrumb, before the first risky init (the MMU-table pokes below). Its ABSENCE is
+   // the diagnostic: it means core0 never started core1 at all -- only core0's emu==1 path
+   // writes core1's entry address to 0xFFFFFFF0 and sev's it -- as opposed to core1 having
+   // launched and then died in its own bring-up. Distinguishing those two cost the first
+   // AMIX-040 metal boot (2026-08-20): UAE_040_MMU was missing from core0's emulator-mode
+   // predicate, so there was no core1 to hear from and every later print was absent too.
+   // Note `shared` is still NULL here (init_shared() runs much further down), so this line
+   // must not dereference it; the mode values are printed at the dispatch instead.
+   z3660_printf("[Core1] alive\n");
+
    //    Xil_L1DCacheDisable();
    //    Xil_L2CacheDisable();
 
@@ -942,6 +952,12 @@ int main()
       if(shared->shared_data)
       {
          //            sleep(5);
+         // What core0 actually handed us, before any arm is chosen: the boot-mode index
+         // and the AMIX contract flag. Pins cfg_emu against the BOOTMODE enum replicas
+         // (Z3660/src/config_file.h, ZTop, ARM_ztop) and shows the amix_mode core0 read
+         // from the BASE config -- read_env_files() does not rewrite shared->amix_mode.
+         z3660_printf("[Core1] dispatch: cfg_emu=%lu amix_mode=%lu\n",
+                      (unsigned long)shared->cfg_emu,(unsigned long)shared->amix_mode);
 #ifdef UAE_EMULATOR
 #ifdef MUSASHI_EMULATOR
          shared->shared_data=0; // ack to core0

@@ -21,6 +21,30 @@ enum BOOTMODE{
    BOOTMODE_NUM        // ../Z3660_emu/src/main.h, ZTop/Ztop.c, ARM_ztop.
 };
 
+/* Is this boot mode EMULATED (the 68k is executed by core1) rather than a real CPU
+ * driving the bus? Single source of truth -- main.c, debug_console.c and rtg/rtg.c all
+ * ask here.
+ *
+ * Deliberately a CLOSED list of the REAL-CPU modes. It used to be spelled the other way
+ * round, as eight separate copies that each enumerated the emulator modes, so appending
+ * UAE_040_MMU to BOOTMODE left every copy answering "not emulated". main.c's copy is the
+ * one that starts core1 -- it guards the only site that writes core1's entry address to
+ * 0xFFFFFFF0 and sev's it -- so UAE_040_MMU booted as if a real 68060 were fitted: core1
+ * was never started, core0 fell through to its real-CPU path, relinquished the bus to a
+ * CPU that is not on this board, and the Amiga watchdog-reset every ~3 s forever
+ * (first 040 metal boot 2026-08-20, firmware 2CFA9216: "060 starting now..." instead of
+ * "Starting CPU emulator on Core1", and not one line of core1 output).
+ *
+ * The inversion also changes what a FUTURE appended mode defaults to, from real-CPU to
+ * emulated -- which is the safe direction: core1's own dispatch halts loudly with
+ * "No emulator selected!!!" if it has not been taught the mode, whereas the old default
+ * silently handed the bus to absent silicon. Add a new REAL-CPU mode to this list.
+ */
+static inline int boot_mode_is_emulated(int boot_mode)
+{
+   return !(boot_mode == MOBOCPU || boot_mode == CPU);
+}
+
 enum YESNO{
    NO,
    YES,

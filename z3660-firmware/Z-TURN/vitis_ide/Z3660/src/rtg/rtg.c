@@ -843,12 +843,8 @@ uint32_t read_rtg_register(uint32_t zaddr)
          data=env_file_vars_temp[preset_selected].cpufreq;
          break;
       case REG_ZZ_EMULATION_USED:
-         data=   env_file_vars_temp[preset_selected].boot_mode==UAEJIT_030
-              || env_file_vars_temp[preset_selected].boot_mode==UAE_030
-              || env_file_vars_temp[preset_selected].boot_mode==UAEJIT_040
-              || env_file_vars_temp[preset_selected].boot_mode==UAE_040
-              || env_file_vars_temp[preset_selected].boot_mode==MUSASHI
-              || env_file_vars_temp[preset_selected].boot_mode==UAE_030_MMU;
+         // closed real-CPU list; see boot_mode_is_emulated() in config_file.h
+         data=boot_mode_is_emulated(env_file_vars_temp[preset_selected].boot_mode);
          break;
       case REG_ZZ_SCSIBOOT_EN:
          data=env_file_vars_temp[preset_selected].scsiboot==YES;

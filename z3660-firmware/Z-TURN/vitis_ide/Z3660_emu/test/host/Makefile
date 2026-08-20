@@ -41,8 +41,15 @@ BIN := $(BUILD)/mmu_harness
 # the board seams, so it links WITHOUT the UAE core objects or board_stubs.cpp.
 SCSI_CD_BIN := $(BUILD)/scsi_cd_test
 
-.PHONY: all clean objs run run-scsi
-all: $(BIN) $(SCSI_CD_BIN)
+# core0 boot-mode classification guard. Compiles ONLY Z3660/src/config_file.h (which is
+# self-contained), because the rest of core0 needs the Xilinx BSP. Catches the class of
+# bug that killed the first AMIX-040 metal boot: a boot mode that core0 does not
+# recognise as emulated, so core1 is never started.
+BOOTMODE_BIN := $(BUILD)/bootmode_test
+CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h
+
+.PHONY: all clean objs run run-scsi run-bootmode
+all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
@@ -66,12 +73,21 @@ $(BUILD)/host/%.o: %.cpp
 	@echo "  CXX   host/$*.cpp"
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
-run: $(BIN) $(SCSI_CD_BIN)
+$(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  bootmode_test.cpp"
+	@$(CXX) $(CXXFLAGS) bootmode_test.cpp -o $@
+
+run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN)
 	@$(BIN)
 	@$(SCSI_CD_BIN)
+	@$(BOOTMODE_BIN)
 
 run-scsi: $(SCSI_CD_BIN)
 	@$(SCSI_CD_BIN)
+
+run-bootmode: $(BOOTMODE_BIN)
+	@$(BOOTMODE_BIN)
 
 clean:
 	rm -rf $(BUILD)

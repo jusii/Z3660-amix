@@ -1400,18 +1400,17 @@ int main()
    }
    printf("Current CPU Frequency: %3.3f MHz (applied value)\n",get_current_cpu_frequency()/1000000.0f);
 
-   if(   config.boot_mode==MOBOCPU    )
+   // emu==1 is load-bearing: it gates the ONLY site that starts core1 (below, ~line 1780
+   // -- entry address to 0xFFFFFFF0 + sev + the shared_data handshake). Get it wrong and
+   // core0 walks into the real-CPU path and relinquishes the bus to a CPU that is not
+   // fitted. See boot_mode_is_emulated() in config_file.h for why it is a closed list of
+   // real-CPU modes rather than an enumeration of the emulated ones.
+   if(config.boot_mode==MOBOCPU)
       emu=2;
-   else if(
-         config.boot_mode==MUSASHI
-      || config.boot_mode==UAE_030
-      || config.boot_mode==UAEJIT_030
-      || config.boot_mode==UAE_040
-      || config.boot_mode==UAEJIT_040
-      || config.boot_mode==UAE_030_MMU)   // AMIX (real 030 PMMU) is an emulator mode too
+   else if(boot_mode_is_emulated(config.boot_mode))
       emu=1; // -> 060 not used -> PCLK/2
    else
-      emu=0;
+      emu=0; // CPU: the real 68060 on the card drives the bus
    write_reg_s01(REG2,INT_TON); // 100 us aprox
    write_reg_s01(REG3,INT_TOFF); // 10 ms
 
