@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-08-20 — UAE_040_MMU: core0 never started core1 (9e1c776, adf8ea1)
+
+First AMIX-040 metal boot (firmware `2CFA9216`) produced no core1 output and the
+Amiga reset line cycled every ~3 s forever. Core1 did not crash — it was never
+started, and the emulator was not involved.
+
+- `Z3660/src/main.c` classified the boot mode with a copy-pasted list of the
+  *emulator* modes that omitted `UAE_040_MMU`, so `emu` was 0 (the real-68060
+  setting). `emu==1` gates the only site that starts core1, so core0 skipped it,
+  took its real-CPU path and relinquished the bus to a 68060 that is not fitted.
+  Log proof: `060 starting now...` — 1 occurrence in the entire serial history,
+  this boot — instead of `Starting CPU emulator on Core1` (648 historically).
+- The predicate was replicated **8×** (`main.c`, `debug_console.c` ×6, `rtg.c`),
+  all omitting the mode. Now one `boot_mode_is_emulated()` in `config_file.h`,
+  written as a **closed list of the real-CPU modes** so an appended mode defaults
+  to emulated — which fails safe (core1 halts loudly) instead of handing the bus
+  to absent silicon.
+- New host guard `test/host/bootmode_test.cpp` (26 checks) asserts the invariant
+  over every `BOOTMODE` index; proven non-vacuous against the pre-fix predicate.
+  The rest of core0 is not host-compilable, so the symptom itself stays
+  metal-only — stated explicitly rather than papered over.
+- Permanent core1 breadcrumbs: `[Core1] alive` (first statement of `main()`) and
+  `[Core1] dispatch: cfg_emu=N amix_mode=N`.
+- **Nothing in the 68040 access-error frame or the `amix_mmu_on` latch was
+  reached**, so neither is implicated and neither is yet metal-tested.
+- Known issue, deferred: AmigaOS-side `z3660-drivers/ZTop/Ztop.c` carries the
+  same class of bug — its private `BOOTMODE` enum and label table stop at
+  `UAE_030_MMU`, so ZTop opened while the card runs mode 8 reads its label
+  array out of bounds and cannot select the mode. Not on the AMIX boot path
+  (no AmigaOS/ZTop in the chain); needs a two-line driver-side fix later.
+- `BOOT.BIN` 12,762,340 B, zlib crc32 `BBD5C14F`. Build warning-free.
+
 ## 2026-08-20 — UAE_040_MMU: the 68040 fault path (10587eb, d25b073)
 
 The two blockers the 040-readiness audit found, closed.
