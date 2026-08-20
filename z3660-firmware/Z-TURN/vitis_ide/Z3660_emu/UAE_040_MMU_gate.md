@@ -7,13 +7,14 @@
 > exact unknown). `UAE_040_MMU` is now **runnable**: the run loop, the
 > `set_x_funcs` 040 accessor arm and the `main.cpp` dispatch are wired, the six
 > compile bridges are faithful, and a host smoke executes the 68040 interpreter.
-> **MMU-ON address translation is now validated on the host harness (96/96):**
+> **MMU-ON address translation is validated on the host harness (126/126):**
 > the real 040 table walk (4K/8K), TTR matching, protection and U/M-bit updates
-> all check against the 68040 spec (§6). The 040 MMU semantics this core does
-> NOT model faithfully — where a real 68040 OS would exercise unmodelled paths —
-> are listed in §7; the faithful 68040 bus-error stack frame is the still-parked
-> 3.4 task and is the first place a real 040 kernel would break. A metal MMU-off
-> AmigaOS smoke is still queued.
+> all check against the 68040 spec (§6). **The 68040 access-error (format `$7`)
+> frame is implemented and harness-proven, contents included** — the old parked
+> 3.4 task, and the first thing a demand-paging 040 kernel needs (§8). The AMIX
+> contract now travels onto the 040 core with the mode (§8). Remaining unmodelled
+> 040 semantics are listed in §7. A metal MMU-off AmigaOS smoke is still queued,
+> and no AMIX-040 boot has been attempted on metal yet.
 
 This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
 mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
@@ -87,7 +88,8 @@ green, 040 table linked in.
 | Baseline `BOOT.BIN` (no 040 table) | 12 428 476 | 11.853 MiB |
 | Metal-proven image (table linked, pre-run-loop) | 12 745 900 | 12.156 MiB, zlib crc32 `0x95E2020C` — the image booted on metal |
 | Runnable image (P3.2 wiring) | 12 745 956 | 12.156 MiB, zlib crc32 `0x92E1473F` (+56 B: run loop + dispatch) |
-| **AMIX-contract image (§8 wiring)** | **12 762 340** | **12.171 MiB, zlib crc32 `0x76FBA34C`** — same byte size as the flashed `455A7D12` production image; the §8 changes are a few instructions and a pref |
+| AMIX-contract image (§8 wiring) | 12 762 340 | 12.171 MiB, zlib crc32 `0x76FBA34C` — same byte size as the flashed `455A7D12` production image |
+| **AMIX-040 fault-path image (§8.1 + §8.2)** | **12 762 340** | **12.171 MiB, zlib crc32 `0x2CFA9216`** — format-$7 frame + the 040 `amix_mmu_on` latch |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -96,7 +98,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 340 B, zlib crc32 `0x76FBA34C` — compare against the board's SD `E`→CRC).
+(12 762 340 B, zlib crc32 `0x2CFA9216` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -167,9 +169,9 @@ non-MMU 040); (4) reclaim space by auditing which boot-mode tables are reachable
 `test/host/harness_main.cpp` drives the real 040 table walk in `cpummu.cpp`
 (`mmu_translate` / `mmu_fill_atc`) with hand-built root→pointer→page descriptor
 tables in the flat buffer, plus `mmu_match_ttr` for transparent windows. Total
-harness **96/96** (64 pre-existing 030 + 5 P3.2 040 interp + 21 P3.3 040
-translation + 6 §8 040 FPU-trap). Coverage, in 68040 terms, of the cases the 030
-harness covered:
+harness **126/126** (64 pre-existing 030 + 5 P3.2 040 interp + 21 P3.3 040
+translation + 6 §8 040 FPU-trap + 24 §8.1 040 access-error frame + 6 §8.2 AMIX
+040 latch). Coverage, in 68040 terms, of the cases the 030 harness covered:
 
 | behavior | test | asserted |
 |---|---|---|
@@ -195,13 +197,12 @@ Surfaced now so they are a written list, not a surprise when a real 68040 kernel
 (or a 68040 AMIX port) lands. In rough order of how likely a booting 040 OS is to
 hit them:
 
-1. **Faithful 68040 bus-error stack frame (format $7)** — *the first thing a real
-   040 fault handler needs.* On a page fault `mmu_translate`/`mmu_bus_error`
-   THROW and the run loop restarts, but `Exception()` does not yet build the
-   68040 format-$7 frame (SSW, fault address, writeback status/data). This is the
-   parked **3.4** task; a demand-paging 040 kernel would RTE off a wrong frame.
-   The host harness cannot cover it (it asserts the translation result / that a
-   fault is raised, not the frame the guest OS would read).
+1. ~~**Faithful 68040 bus-error stack frame (format $7)**~~ — **DONE 2026-08-20,
+   see §8.1.** `Exception_normal()` now routes an `mmu_model == 68040` access
+   error to a real format-$7 frame and `Exception_build_stack_frame()` fills it
+   from the fault record (SSW, FA, EA, and the WB2/WB3 write-back slots) instead
+   of zeros. Harness-covered end to end by `test_mmu040_access_error_frame`, which
+   reads the frame the guest OS would read.
 2. **Cache model / copyback + cache-inhibit coherency** — the walk decodes the
    descriptor/TTR CM bits into `mmu_cache_state`, but this bare-metal emulator has
    **no data/instruction cache model** (the Z3660 uses the real bus / a direct
@@ -259,7 +260,7 @@ trap (vector 11, stack frame format `$2`) and the unimplemented-data-type trap
 actually arrive; left clear, the emulator quietly computes `FSIN`/`FINTRZ`/
 packed-decimal and FPSP never runs. 68881/68882 keep their existing `true`; a
 plain AmigaOS 040 (`amix_mode` off) keeps its existing `false`. Host vector
-`test_fpu040_unimplemented_trap` pins both directions (harness now **96/96**).
+`test_fpu040_unimplemented_trap` pins both directions.
 
 **Operator requirement.** `amix_mode` is NOT implied by `bootmode UAE_040_MMU`.
 `config_file.c` resolves the unset default (`-1`) as *AMIX iff `UAE_030_MMU`*, so
@@ -269,41 +270,124 @@ the config/preset must carry **`amix_mode YES`** explicitly. Left that way
 deliberately: widening the default would silently change §4's recipe and force
 `cpu_ram=0` for every existing 040-MMU config.
 
-### Known blockers for an AMIX-040 boot (audit; not fixed here)
+### The two AMIX-040 blockers — FIXED 2026-08-20
 
-Both are emulator-side, found while wiring the above. Neither is hit by an MMU-off
-AmigaOS run; both go live the moment the 040 AMIX kernel enables its MMU or
-touches the disk.
+Both were emulator-side, found while wiring the section above, and both are now
+closed. Neither was reachable from an MMU-off AmigaOS run; both went live the
+moment the 040 AMIX kernel enabled its MMU or touched the disk.
 
-1. **Bus-error frame: the 030 branch hijacks the 040 fault.** `Exception_normal()`
-   (`newcpu.cpp`) tests `if (currprefs.mmu_model && nr == 2)` — *truthy for
-   `mmu_model == 68040`* — and builds a **68030 frame `$A`/`$B`** out of
-   `mmu030_state[]` and `regs.mmu_ssw`, neither of which the 040 walk maintains in
-   that shape. So an 040 page fault does not merely lack the format `$7` frame of
-   §7.1: it is handed an 030 frame the 040 kernel cannot parse, and never reaches
-   the `cpu_model >= 68040` arm below. First demand-paging fault = wrong frame.
-   Fixing it is the parked **3.4** task (a real format `$7` access-error frame:
-   SSW, fault address, writeback status/data) plus a model guard on that branch.
+#### 1. Access-error frame — the 030 branch was hijacking the 040 fault
 
-2. **`amix_mmu_on` can never latch under the 040 core.** It is set in exactly one
-   place — `cpummu030.cpp`, on the 030 TC write, and only when
-   `regs.mmu_page_size == 2048`. The 68040 has no 2 KB page size (4 K/8 K only)
-   and never runs that code, so the flag stays 0 for the whole session. That flag
-   is the "AMIX kernel is up now" latch the emulated A3000 SCSI uses to leave
-   Kickstart-ROM-load timing for AMIX-runtime timing: `set_status()` pacing
-   (`eff = (wd_delay_mode || amix_mmu_on) ? delay : 0`), the
-   `wd_check_interrupt()` re-arm to `irq = 2`, the per-access pump suppression
-   (`if (!amix_mmu_on) wd_check_interrupt(1, 0)`) and the aux-streak force. Under
-   `UAE_040_MMU` the controller therefore stays in immediate-completion mode for
-   the whole boot — the regime AMIX-030's `sd` open specifically needed pacing to
-   escape.
+`Exception_normal()` (`newcpu.cpp`) tested `if (currprefs.mmu_model && nr == 2)`,
+which is **truthy for `mmu_model == 68040`**, and built a 68030 frame `$A`/`$B`
+out of `mmu030_state[]` and the 030-shaped `regs.mmu_ssw` — state the 040 table
+walk never maintains. An 040 access error therefore never reached the
+`cpu_model >= 68040` arm below it. The test is now `currprefs.mmu_model == 68030`,
+and the 040 arm builds the genuine **format `$7`** frame:
 
-   *If* that latch is later extended to the 040 path, note it also arms code that
-   reads **hard-coded 68030-kernel image addresses** (`0x0700D016` istate,
-   `0x0700D176` curunitp, `0x070EA740` ddtab, in `a3000_scsi.cpp`). Those are
-   harmless today only because `amix_mmu_on` keeps them dead; against a 040 kernel
-   image they would read garbage. Separate the latch from the image-specific pokes
-   first.
+```
+Exception_build_stack_frame(regs.mmu_effective_addr, currpc, regs.mmu_ssw, nr, 0x07);
+```
+
+only when `mmu_model == 68040`. The MMU-off 040 modes (`UAE_040`, `UAEJIT_040`)
+keep their old synthesized frame byte for byte — they have no 040 fault record to
+stack. (`mmu_model == 68060` now also lands on that synthesized arm instead of the
+030 one; `cpuemu_33` is not built and no `BOOTMODE` selects it, so this is inert,
+but a future 060 lane needs its own arm.)
+
+**The contents were the real defect.** The `case 0x7:` builder in
+`newcpu_common.cpp` already had the right field *order*, but stacked **zeros** for
+every write-back slot. That matters because the 68040 does not re-run a faulted
+write on `rte`: the store is handed to the OS in WB3 and the kernel completes it.
+Zeroed slots = the store silently dropped. The builder now stacks the real fault
+record `mmu_bus_error()` had already computed:
+
+| offset | field | value | real or synthesized |
+|---|---|---|---|
+| `$08` | EA | `regs.mmu_effective_addr` | **real** (now initialised to the fault address at the top of `mmu_bus_error`'s 040 arm; the MOVE16/MOVEM arms refine it) |
+| `$0C` | SSW | `regs.mmu_ssw` | **real** — TM=FC, SIZE, RW, ATC, plus CM/LK/TT0/TT1 for MOVEM / locked RMW / MOVES / MOVE16 |
+| `$0E` | WB3S | `regs.wb3_status` | **real** — `0x80 \| (ssw & 0x7f)` on a write, `0` on a read |
+| `$10` | WB2S | `regs.wb2_status` | **real** — non-zero only for a MOVE16 line write |
+| `$12` | WB1S | `0` | **real value, no source**: this core models no store buffer, so only the faulting access can be pending. `0` = "slot not valid" is the truthful report and the kernel's replay loop skips it |
+| `$14` | FA | `regs.mmu_fault_addr` | **real** |
+| `$18` | WB3A | `regs.mmu_fault_addr` | **real** — the pending store's address is the faulting address |
+| `$1C` | WB3D | `regs.wb3_data` | **real** — the value the instruction was storing. This is the field ISSUE-10 measured being consumed verbatim |
+| `$20` | WB2A | `regs.wb2_address` | **real** for MOVE16; otherwise carries whatever it last held (the 040 arm only writes it for a MOVE16 line) |
+| `$24` | WB2D | `0` | **structural**: the 68040 has no scalar WB2 data — a MOVE16 line's data travels in PD0–PD3 |
+| `$28` | WB1A | `0` | **real value, no source** (see WB1S) |
+| `$2C`–`$38` | PD0–PD3 | `mmu040_move16[0..3]` | **real** for a MOVE16 fault; otherwise a stale line, and inert because the kernel only reads them when WB2S marks a cache-line write-back |
+
+The field order was cross-checked against the AMIX 68040 kernel's own
+empirically-dumped offsets in the port repo's `src/wb040.s`
+(`WB3S@+78 WB3A@+88 WB3D@+92 / WB2S@+80 WB2A@+96 WB2D@+100 / WB1S@+82 WB1A@+104
+WB1D@+108`, relative to its trap frame = these + 64) — they agree exactly. So does
+the encoding: that file documents `WBxS` as "valid = bit 7 (0x80); FC = bits 2-0;
+SIZE = bits 6-5", which is precisely `0x80 | (ssw & 0x7f)` with this tree's
+`MMU_SSW_TM`/`MMU_SSW_SIZE_*`. Its metal-captured example `WB3S=0x0081` (user-data
+long write) is what this builder now produces.
+
+**Why WB3 is safe to present here.** The generated 040 handlers already implement
+the silicon's continuation semantics: immediately before the final store they do
+`m68k_incpci(n); regs.instruction_pc = m68k_getpci(); mmu_restart = false;`
+(881 sites in `cpuemu_31.cpp`), and `m68k_run_mmu040()`'s CATCH only rewinds the
+PC and flags `if (mmu_restart)`. So a **write** fault stacks the *next*
+instruction's PC and the kernel's write-back completes the store exactly once —
+no double-apply on a non-idempotent RMW. A **read** fault leaves `mmu_restart`
+true, stacks the *faulting* PC, and reports WB3S invalid, so the restart redoes
+the access and nothing is replayed. `mmufixup` is disarmed by the handler before
+the continuation store, so `cpu_restore_fixup()` correctly leaves an `(An)+`
+increment standing on the write path and undoes it on the read path. Host vectors
+pin both directions.
+
+#### 2. `amix_mmu_on` under the 040 core, and the image/timing split
+
+The latch was set in exactly one place — `cpummu030.cpp`, on the 030 TC write,
+gated on `regs.mmu_page_size == 2048` — a page size the 68040 does not have. It
+now also latches in `cpummu.cpp`'s `mmu_set_tc()`:
+
+```c
+if (a3000_amix_mode && currprefs.mmu_model == 68040 && regs.mmu_enabled && !amix_mmu_on)
+```
+
+**Gate choice: amix_mode + the TC E-bit, not a page size.** The 030 site's
+`== 2048` test is really asking "is this the AMIX kernel's MMU rather than some
+AmigaOS MMU tool?", using the one page size AMIX-030 uses. On the 040 the mode
+already answers that: `UAE_040_MMU` + `amix_mode` exists only to run AMIX (the
+plain-AmigaOS smoke recipe of §4 runs with `amix_mode` off), so the E-bit alone is
+unambiguous. Testing for 4 K instead would silently drop the entire pacing regime
+if the 040 port ever moved to 8 K pages — and that would present as an
+intermittent SCSI timing fault, not as a configuration change. The page size is
+logged on the serial (`68040 MMU enabled under AMIX. Page size = N`) so a surprise
+is still visible.
+
+**The separation.** `amix_mmu_on` now means only *when* ("the AMIX kernel is up"),
+and is set by both cores. Everything it gates is **timing**, and applies to both:
+`set_status()` pacing (`eff = (wd_delay_mode || amix_mmu_on) ? delay : 0`), the
+`wd_check_interrupt()` re-arm to `irq = 2`, the per-access pump suppression
+(`if (!amix_mmu_on) wd_check_interrupt(1, 0)`), and the aux-streak force. The
+paced regime is needed under 040 as well: the 040 kernel embeds the same stock
+byte-patched `sd` driver whose step-by-step open required pacing on 030.
+
+A second flag, **`amix_kimage_030`**, now means *which guest* ("the running kernel
+is the 68030 AMIX image whose `.data` addresses are hard-coded in
+`a3000_scsi.cpp`"). It gates every hard-coded `0x07xxxxxx` read — `0x0700D016`
+istate, `0x0700D176` curunitp, `0x070EA740` ddtab, plus `0x0700CF8C`/`0x0700D014`/
+`0x0700D020` in `a3000_scsi_dumpqueue()`. Those are byte offsets into one linked
+kernel image; against the 040 image they read whatever happens to live there.
+
+It is derived from the CPU model **once per session** in `a3000_scsi_init()`
+(`amix_kimage_030 = (currprefs.mmu_model == 68030)`), deliberately *not* from the
+latch. Two consequences: the 030 path keeps its behaviour exactly, including
+before the latch fires (the flag is already 1 while the Kickstart ROM loads the
+kernel, so `a3000_scsi_dumpqueue()` still works pre-latch as it always did); and
+no future change to the latch can re-arm the pokes by accident. The two reader
+helpers (`amix_cpu_istate()`, `amix_cpu_curunitp_req()`) also refuse internally
+(`if (!amix_kimage_030) return 0;`), so a new call site cannot reintroduce the
+hazard by forgetting the gate, and `a3000_scsi_dumpqueue()` prints a refusal
+instead of a page of garbage.
+
+**Rule for anyone adding to `a3000_scsi.cpp`:** a new hard-coded `0x07xxxxxx`
+guest-image read must test `amix_kimage_030`, never `amix_mmu_on`.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
