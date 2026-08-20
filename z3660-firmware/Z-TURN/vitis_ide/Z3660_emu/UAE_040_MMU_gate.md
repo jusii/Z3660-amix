@@ -105,7 +105,8 @@ green, 040 table linked in.
 | `MOVEC`->TC MMU-enable image (§8.6/§8.7) | 12 762 356 | 12.171 MiB, zlib crc32 `0xD910C41A` — **MMU enable + preload speedup both proven; kernel then died on a no-op `PFLUSH` (§8.8)** |
 | `PFLUSH`/`PTEST` dispatch image (§8.8) | 12 762 364 | 12.171 MiB, zlib crc32 `0x095356E9` — **panicked byte-identically to D910C41A: real bugs, not this panic's cause (§8.9)** |
 | exception-trace instrumentation image (§8.10) | 12 762 364 | 12.171 MiB, zlib crc32 `0xF4782D71` — **one-line trace; prediction falsified (§8.11)** |
-| **extended-trace image (§8.12)** | **12 762 372** | **12.171 MiB, zlib crc32 `0xF87F6FA7`** — diagnostic build, no behaviour change |
+| extended-trace image (§8.12) | 12 762 372 | 12.171 MiB, zlib crc32 `0xF87F6FA7` — **named the fault: exec's trap dispatcher on a dead ExecBase (§8.13)** |
+| **ROM-entry probe image (§8.14)** | **12 762 372** | **12.171 MiB, zlib crc32 `0x8C51370A`** — diagnostic build, no behaviour change |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -114,7 +115,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 372 B, zlib crc32 `0xF87F6FA7` — compare against the board's SD `E`→CRC).
+(12 762 372 B, zlib crc32 `0x8C51370A` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -1036,6 +1037,112 @@ not free to drift:
 3. **Few interrupts, `a7` high at MMU-on, and the stack falls between** → ordinary but
    pathologically deep execution after MMU-on; the `[XT..]` sequence plus `vbr` should
    then show what the kernel is doing.
+
+#### 13. The fault named: AmigaOS exec's trap dispatcher, reading a dead ExecBase
+
+`F87F6FA7` settled the open questions and moved the case out of the emulator.
+
+```
+68040 MMU enabled. TC=8000 Page size = 4096 amix_mmu_on=1 PC=080d7550 a7=080f49e8 vbr=08001378
+[XI-SUM] at first non-interrupt exception total=0 minSP=080F48C0
+[XT01] vec=3  ipc=00F80B4C pc=00F80B4C fa=00000000 ssw=0000 sr=2700 a7=080F48C0 vbr=08001378
+[XT01]   fault=FFFFFFFE addr=00F80B4C vec3@=080DA660
+```
+
+**Outcome 2 of the three pre-registered readings.** `total=0`: no interrupts at all, so the
+storm hypothesis is dead and the level-7 edge-trigger question in §8.11 is moot — that code
+was never entered, and not changing it on suspicion was the right call. `a7 = 0x080F49E8`
+**at MMU-on**: `pstack` was already 6936 of 8000 bytes deep before the MMU was even enabled,
+and only 296 further bytes were consumed before the fault. **The deep stack is ambient state,
+not the failure.** §8.9's exhaustion reading was the cascade — the vec-3 handler plus panic
+machinery landing on an already-full stack — not the primary event.
+
+##### What is at 0x00F80B4C (KS 2.04 r37.175, ROM base 0x00F80000, file offset 0x0B4C)
+
+```
+f80ae2:  subil #0x00F80ABA,%sp@   ; recover the vector index from the bsr.s return address
+f80ae8:  lsrw  %sp@(2)
+f80aec:  btst  #5,%sp@(4)         ; supervisor?
+f80af2:  beqs  f80b38
+f80af4:  braw  f83a04
+f80af8..f80b36:  ~32 x `bsr.s f80ae2`     <- the per-vector stub table
+f80b38:  moveml %a0-%a1,%sp@-
+f80b3c:  moveal 4,%a0             ; ExecBase   <- ABSOLUTE ADDRESS 4
+f80b40:  moveal %a0@(276),%a0     ; ExecBase->ThisTask   (offset 0x114)
+f80b44:  movel  %a0@(50),%sp@(4)  ; Task->tc_TrapCode    (offset 0x32) overwrites saved a1
+f80b4a:  moveal %sp@+,%a0
+f80b4c:  rts                      ; <- jumps to tc_TrapCode
+```
+
+This is **AmigaOS exec's CPU-exception dispatcher**: a table of `bsr.s` stubs whose return
+address encodes the vector number, and a tail that forwards to the current task's
+`tc_TrapCode`. The instruction that took `-2` is the **`rts` at 0xF80B4C**, and the `-2` came
+from `ExecBase->ThisTask->tc_TrapCode` — a pointer chain rooted at **absolute address 4**.
+
+Under AMIX that chain is dead. The kernel has taken the machine over and owns low memory
+(the emulator's own warm-reboot guard exists because "AMIX has cleared the overlay so
+`$0-$8` is chip RAM"), so `4` no longer holds a valid ExecBase and the walk lands on
+whatever is there now. `0xFFFFFFFE` is simply what came back.
+
+##### How execution got there — and the elimination that decides attribution
+
+**Not by an exception.** The kernel's VBR is its own table: `M68Kvec` at `.text+0x1378`,
+which is exactly the observed `vbr = 0x08001378`. Its relocations are **entirely kernel
+symbols** — `_start` at vector 1, `nullvect` throughout, `fpsp_vec11` at vector 11 — with
+**not one ROM address in the table**. The trace confirms it independently: zero interrupts,
+and the vec 3 *is* the first non-interrupt exception. So no CPU exception could have
+vectored into ROM, and none did. Control was transferred there **through a pointer** —
+a call or jump — which is candidate world (b), with world (c) describing what then happened
+*inside* the ROM routine.
+
+(Correction to §8.9: the MMU-enable code is **not** inside `pstart`. `pstart` is
+`.text+0xd71a8` size `0x2d4`, ending at `0xd747c`; the TC write at `0xd7550` lies in the
+local region after it, nearest label `Lkroot` (`.text+0xd74be`), before `sysseginit`
+(`.text+0xd7628`). The load-base derivation is unaffected.)
+
+##### Verdict: the emulator is exonerated on this evidence — port-lane case
+
+Everything the firmware is responsible for behaved correctly at the moment of failure:
+
+- the MMU is on with the kernel's own TC/TTRs, and `PFLUSH`/`PTEST` are real (§8.6, §8.8);
+- exactly **one** exception was delivered, correctly, with the right frame format for
+  vector 3, to the kernel's own sane handler (`vec3@ = 0x080DA660`), which panicked as
+  designed;
+- no interrupt storm, no stale ATC, no fabricated MMUSR;
+- the deep boot stack predates MMU-on and is the kernel's own budget.
+
+The failing act is a control transfer into an AmigaOS ROM service whose backing structures
+AMIX has already destroyed. That is a kernel/handover question, and per the standing rule it
+belongs to the port lane rather than to this repo.
+
+**The single fact that finishes it** is the *source* of that transfer — which kernel pointer
+still held an AmigaOS-era value ~296 stack-bytes after the TC write. That is a runtime fact
+the kernel binary cannot supply, so §8.14 ships a probe for it and nothing else.
+
+**Contract option, proposed not implemented.** The 030-shaped AMIX memory contract (one
+≤16 MB window at `$08000000`, the vestigial `a3000mem` at `$07000000`) remains a *possible
+trigger* if the 040 kernel's `MAINSTORE`/`VSIZOFMEM` expectations differ and it bailed into
+an AmigaOS error path. Changing that contract firmware-side is a real option but it is also
+the single most load-bearing thing the proven 030 boot depends on, so it should not move
+without a decision and a 030 regression plan. The `[ROMENT]` probe distinguishes the two
+worlds cheaply: an error/bail path shows a source pc inside the kernel's probe or panic
+code, a stale pointer shows one somewhere unrelated.
+
+#### 14. ROM-entry probe (third instrumentation build)
+
+One `if` per instruction in `m68k_run_mmu040()`, AMIX-040 only, silent after four hits:
+
+```
+[ROMENT1] pc=00F80B38 from=080Dxxxx a7=080F48C8 sp@=080Dxxxx sp@4=xxxxxxxx execbase@4=xxxxxxxx
+```
+
+`from` is the last non-ROM pc — **the kernel instruction that transferred control** — and
+`sp@`/`sp@4` are the top of the stack at entry, which for a `jsr`/`bsr` is the pushed return
+address, naming the call site. `execbase@4` shows what AMIX has left at absolute address 4,
+which is what the ROM routine is about to walk. Four hits is enough to see whether this is a
+one-off or a pattern, and the probe cannot flood.
+
+That single line names the caller and closes the attribution question in one 3-minute boot.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 

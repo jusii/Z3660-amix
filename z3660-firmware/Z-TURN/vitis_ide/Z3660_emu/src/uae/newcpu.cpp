@@ -4551,6 +4551,31 @@ static void m68k_run_mmu040(void)
             mmu_restart = true;
             regs.instruction_pc = m68k_getpc();
 
+            // ROM-ENTRY PROBE (diagnostic, AMIX-040 only, first few hits then silent).
+            // The F87F6FA7 trace put the failure at 0x00F80B4C -- the `rts` at the tail of
+            // AmigaOS exec's CPU-exception dispatcher in KS 2.04, which jumps to
+            // ExecBase->ThisTask->tc_TrapCode read from ABSOLUTE ADDRESS 4. The kernel's own
+            // vector table (M68Kvec, .text+0x1378 == the observed vbr 0x08001378) relocates
+            // entirely to kernel symbols -- no ROM address anywhere -- and the trace saw zero
+            // interrupts, so NO exception vectored there. Control was transferred by a
+            // pointer. This names the source pc and the pushed return address, which is the
+            // one fact the kernel binary cannot supply and the emulator can.
+            if (amix_mmu_on && currprefs.mmu_model == 68040) {
+               static uae_u32 prev_pc = 0; static int rom_hits = 0;
+               uae_u32 pc_now = (uae_u32)regs.instruction_pc;
+               int in_rom  = (pc_now  & 0xFFF80000u) == 0x00F80000u;
+               int was_rom = (prev_pc & 0xFFF80000u) == 0x00F80000u;
+               if (in_rom && !was_rom && rom_hits < 4) {
+                  rom_hits++;
+                  uae_u32 sp = m68k_areg(regs, 7);
+                  z3660_printf("[ROMENT%d] pc=%08lX from=%08lX a7=%08lX sp@=%08lX sp@4=%08lX execbase@4=%08lX\r\n",
+                               rom_hits, (unsigned long)pc_now, (unsigned long)prev_pc,
+                               (unsigned long)sp, (unsigned long)get_long(sp),
+                               (unsigned long)get_long(sp + 4), (unsigned long)get_long(4));
+               }
+               prev_pc = pc_now;
+            }
+
             do_cycles(cpu_cycles);
 
             mmu_opcode = -1;
