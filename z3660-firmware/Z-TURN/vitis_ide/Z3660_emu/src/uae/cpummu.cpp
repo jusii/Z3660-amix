@@ -1568,9 +1568,14 @@ uae_u16 REGPARAM2 mmu_set_tc(uae_u16 tc)
 	// spelled out (the 68040 has no 2K page, so this is the fastest way to see whether the
 	// guest chose 4K or 8K), and amix_mmu_on is echoed so the SCSI pacing regime is visible
 	// at the moment it engages rather than having to be inferred later.
-	write_log(_T("%d MMU %s. TC=%04x Page size = %d amix_mmu_on=%d PC=%08x\n"),
+	// a7 and vbr are here for one reason: the first exception trace showed the boot stack
+	// already ~92% consumed by the time the first non-interrupt exception arrived, and there
+	// was no way to tell whether that happened BEFORE or AFTER the MMU came up. This line is
+	// the "before" sample. pstack runs 0x080F45C0..0x080F6500.
+	write_log(_T("%d MMU %s. TC=%04x Page size = %d amix_mmu_on=%d PC=%08x a7=%08x vbr=%08x\n"),
 	          currprefs.mmu_model, regs.mmu_enabled ? _T("enabled") : _T("disabled"),
-	          tc, regs.mmu_page_size, amix_mmu_on, m68k_getpc());
+	          tc, regs.mmu_page_size, amix_mmu_on, m68k_getpc(),
+	          m68k_areg(regs, 7), regs.vbr);
 	return tc;
 }
 

@@ -1913,20 +1913,75 @@ static void add_approximate_exception_cycles(int nr)
  * ------------------------------------------------------------------------- */
 extern "C" { extern volatile int amix_mmu_on; }
 #define AMIX_XTRACE_MAX 64
-static int amix_xtrace_n = 0;
+#define AMIX_XINT_FIRST 12                       /* interrupts logged in full before summarising */
+static int amix_xtrace_n = 0, amix_xint_logged = 0, amix_xint_sums = 0;
+static uae_u32 amix_int_n[8], amix_int_minsp[8], amix_int_total = 0;
+static uae_u32 amix_xt_minsp = 0xFFFFFFFFu;
+static int amix_xt_init = 0;
+
+static void amix_xint_summary(const char *why)
+{
+   z3660_printf("[XI-SUM] %s total=%lu minSP=%08lX (pstack 080F45C0..080F6500)\r\n",
+                why, (unsigned long)amix_int_total, (unsigned long)amix_xt_minsp);
+   for (int i = 0; i < 8; i++) {
+      if (!amix_int_n[i]) continue;
+      z3660_printf("[XI-SUM]   lvl%d n=%-8lu minSP=%08lX\r\n",
+                   i, (unsigned long)amix_int_n[i], (unsigned long)amix_int_minsp[i]);
+   }
+}
+
 static void amix_xtrace(int nr)
 {
    if (!amix_mmu_on || currprefs.mmu_model != 68040) return;
-   if (nr >= 24 && nr < 32) return;              /* interrupts: not the fault chain */
+   if (!amix_xt_init) { amix_xt_init = 1; for (int i = 0; i < 8; i++) amix_int_minsp[i] = 0xFFFFFFFFu; }
+
+   uae_u32 sp = m68k_areg(regs, 7);
+   if (sp < amix_xt_minsp) amix_xt_minsp = sp;
+
+   /* INTERRUPTS. The first trace deliberately skipped these, and that is precisely what
+    * hid the answer: XT01 arrived with pstack already ~92% consumed and no non-interrupt
+    * exception before it, so whatever ate ~7 KB did it here or in ordinary execution.
+    * Counted per level with a stack high-water mark, first few logged in full, then
+    * summarised periodically -- a storm cannot hide and cannot flood the serial. */
+   if (nr >= 24 && nr < 32) {
+      int lvl = nr - 24;
+      amix_int_n[lvl]++; amix_int_total++;
+      if (sp < amix_int_minsp[lvl]) amix_int_minsp[lvl] = sp;
+      if (amix_xint_logged < AMIX_XINT_FIRST) {
+         amix_xint_logged++;
+         z3660_printf("[XI%02d] lvl=%d vec=%-2d pc=%08lX sr=%04lX a7=%08lX vbr=%08lX vec@=%08lX\r\n",
+                      amix_xint_logged, lvl, nr, (unsigned long)m68k_getpc(),
+                      (unsigned long)regs.sr, (unsigned long)sp, (unsigned long)regs.vbr,
+                      (unsigned long)x_get_long(regs.vbr + 4 * nr));
+      } else if ((amix_int_total & 0x3FFFu) == 0 && amix_xint_sums < 8) {
+         amix_xint_sums++;
+         amix_xint_summary("periodic");
+      }
+      return;
+   }
+
    if (amix_xtrace_n >= AMIX_XTRACE_MAX) return;
    amix_xtrace_n++;
-   z3660_printf("[XT%02d] vec=%-2d ipc=%08lX pc=%08lX fa=%08lX ssw=%04lX sr=%04lX a7=%08lX\r\n",
+   if (amix_xtrace_n == 1) amix_xint_summary("at first non-interrupt exception");
+   z3660_printf("[XT%02d] vec=%-2d ipc=%08lX pc=%08lX fa=%08lX ssw=%04lX sr=%04lX a7=%08lX vbr=%08lX\r\n",
                 amix_xtrace_n, nr,
                 (unsigned long)regs.instruction_pc, (unsigned long)m68k_getpc(),
                 (unsigned long)regs.mmu_fault_addr, (unsigned long)(regs.mmu_ssw & 0xffff),
-                (unsigned long)regs.sr, (unsigned long)m68k_areg(regs, 7));
-   if (amix_xtrace_n == AMIX_XTRACE_MAX)
+                (unsigned long)regs.sr, (unsigned long)sp, (unsigned long)regs.vbr);
+   if (nr == 3 || nr == 2) {
+      /* For vector 3 the interesting number is the ODD address that caused it -- which is
+       * often the exception VECTOR itself: Exception_normal() raises exception 3 through
+       * exception3_notinstruction() when the longword at vbr + 4*nr is odd. So an odd
+       * vector-table entry for some EARLIER exception presents here as vec=3 at an even pc. */
+      z3660_printf("[XT%02d]   fault=%08lX addr=%08lX vec3@=%08lX\r\n", amix_xtrace_n,
+                   (unsigned long)last_fault_for_exception_3,
+                   (unsigned long)last_addr_for_exception_3,
+                   (unsigned long)x_get_long(regs.vbr + 4 * 3));
+   }
+   if (amix_xtrace_n == AMIX_XTRACE_MAX) {
+      amix_xint_summary("at trace close");
       z3660_printf("[XT] %d exceptions traced -- trace closed\r\n", AMIX_XTRACE_MAX);
+   }
 }
 
 static void Exception_normal (int nr)

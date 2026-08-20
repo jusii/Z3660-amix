@@ -104,7 +104,8 @@ green, 040 table linked in.
 | `STOP` pc-advance image (§8.5) | 12 762 340 | 12.171 MiB, zlib crc32 `0x6FDBDA40` — **ran the whole 040 chain; kernel panicked because the 040 MMU was never enabled (§8.6)** |
 | `MOVEC`->TC MMU-enable image (§8.6/§8.7) | 12 762 356 | 12.171 MiB, zlib crc32 `0xD910C41A` — **MMU enable + preload speedup both proven; kernel then died on a no-op `PFLUSH` (§8.8)** |
 | `PFLUSH`/`PTEST` dispatch image (§8.8) | 12 762 364 | 12.171 MiB, zlib crc32 `0x095356E9` — **panicked byte-identically to D910C41A: real bugs, not this panic's cause (§8.9)** |
-| **exception-trace instrumentation image (§8.10)** | **12 762 364** | **12.171 MiB, zlib crc32 `0xF4782D71`** — diagnostic build, no behaviour change |
+| exception-trace instrumentation image (§8.10) | 12 762 364 | 12.171 MiB, zlib crc32 `0xF4782D71` — **one-line trace; prediction falsified (§8.11)** |
+| **extended-trace image (§8.12)** | **12 762 372** | **12.171 MiB, zlib crc32 `0xF87F6FA7`** — diagnostic build, no behaviour change |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -113,7 +114,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 364 B, zlib crc32 `0xF4782D71` — compare against the board's SD `E`→CRC).
+(12 762 372 B, zlib crc32 `0xF87F6FA7` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -959,6 +960,82 @@ times and never resolved". 68030 and non-AMIX 040 boots are untouched by the
 One boot of this image answers, in order: is it one address or many; is it a read or a
 write (`ssw` RW bit); does the kernel's handler run at all between faults (`ipc` moving);
 and how many faults fit before `pstack` runs out.
+
+#### 11. The trace came back with one line, and it falsified the prediction
+
+`F4782D71` produced the entire trace in a single entry, ~3 s after MMU-on:
+
+```
+[XT01] vec=3  ipc=00F80B4C pc=00F80B4C fa=00000000 ssw=0000 sr=2700 a7=080F48C0
+```
+
+No `vec=2` chain, ever. The pre-registered prediction (a repeating access fault with
+`a7` marching down) is **dead**. What it establishes instead:
+
+- The **first non-interrupt exception after MMU-on is the Address Error itself**, at the
+  exact pc both panic screens reported.
+- `a7 = 0x080F48C0` at that first entry: `pstack` was **already ~92% consumed**
+  (7232 of 8000 bytes) *before any traced exception*. So the consumer is either ordinary
+  execution or the one thing the tracer deliberately skipped — **interrupt vectors 24–31**.
+- The §8.9 stack-exhaustion reading survives; only the cause of the consumption is open.
+
+**Why vec 3 at an even pc — the code path, not a guess.** `Exception_normal()` fetches
+the handler with `newpc = x_get_long(regs.vbr + 4 * vector_nr)` and then:
+
+```c
+if (newpc & 1) {
+        ...
+        } else {
+                exception_check_trace(nr);
+                exception3_notinstruction(regs.ir, newpc);   /* raise vector 3 */
+        }
+```
+
+So **an odd entry in the vector table raises exception 3** while the pc is still wherever
+it was. That makes `vec=3` at an even `pc` entirely consistent — and it means the
+interesting number is the *odd value that was fetched*, which the first tracer did not
+print. If the exception whose vector was odd happened to be an interrupt, the first
+tracer skipped it and only its consequence appeared. That single filter can account for
+the whole one-line trace.
+
+**Level 7 is level-triggered here.** `check_uae_int_request()` gates on
+`if (eff_irq > regs.intmask || eff_irq == 7)`. On real silicon IPL7 is *edge*-sensitive —
+taken on the transition into 7 — but this test re-fires on every poll while the lines
+read 7, regardless of `regs.intmask`. A stuck or mis-read IPL7 would therefore be taken
+over and over, each one stacking a frame, consuming the boot stack **with nothing visible
+to the old tracer**. `sr=2700` at the fault (intmask 7) is consistent with a level-7
+interrupt having been taken. This code is shared with the metal-proven 030 path, so it is
+**not** being changed on suspicion — the trace has to say whether interrupts are actually
+storming, and at which level.
+
+#### 12. Extended trace (second instrumentation build) — what each field decides
+
+| field | question it settles |
+|---|---|
+| `[XI..]` lines + `[XI-SUM]` per-level counts | Is anything storming, and at which level? Silence here means ordinary execution ate the stack. |
+| `minSP` per level, and global | Did interrupts drive the stack down, or was it already low when they arrived? |
+| `a7` on the **MMU-enable** line | Was `pstack` already ~7 KB deep at MMU-on? Splits "consumed after MMU-on" from "arrived deep", which nothing so far can distinguish. |
+| `vbr` on every line | Is the kernel's vector table where it should be, or still ROM/chip-RAM era? |
+| `vec@` (the fetched handler) on interrupts | Directly exposes an odd vector entry — the thing that raises vec 3. |
+| `fault=` / `vec3@` on vec 2/3 | The odd address itself (`last_fault_for_exception_3`), and the vector-3 entry. |
+
+Interrupts are counted rather than printed after the first 12, with a periodic summary
+capped at 8 lines, so a storm is unmissable but cannot flood the serial. The
+`mmu_model == 68040` gate keeps 030 and non-AMIX 040 boots untouched.
+
+Three outcomes and what each means, written down before the boot so the next reading is
+not free to drift:
+
+1. **`[XI-SUM]` shows a large count at one level with `minSP` marching down** → interrupt
+   storm; the source and the level-7 edge-trigger question above become the fix target,
+   with evidence.
+2. **`[XI-SUM]` shows few or no interrupts, and the MMU-enable line already shows
+   `a7 ≈ 0x080F48C0`** → the stack arrived deep; the consumer is upstream of MMU-on and
+   this is a kernel/port-lane question about a 7 KB call chain against an 8000-byte
+   `pstack`, not an emulator bug.
+3. **Few interrupts, `a7` high at MMU-on, and the stack falls between** → ordinary but
+   pathologically deep execution after MMU-on; the `[XT..]` sequence plus `vbr` should
+   then show what the kernel is doing.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
