@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-08-21 — bus: recover the stuck pipe (678b5ce)
+
+The watchdog fired on `FF261896` (030 canary green) and the decode named the wedge:
+`REG4=0x15` is a **pending byte WRITE** (bit1=0 write, bits2-3=01 byte, bit4 pending),
+not the `R32` in the line — and `REG5=0x80000000` is exactly what `wait_write_ack()`
+spins on, with `nbg=0` (bus granted). A byte write entered the pipe and never acked.
+
+- **Ordering deadlock:** `arm_write_amiga_byte()` writes fire-and-forget (never calls
+  `wait_write_ack()`); the *next* access absorbs the latency in its pipe-empty wait. So
+  the stuck-write recovery poke lives in the write path and is unreachable from the read
+  that's stuck. Fixed by applying the same poke from the pipe-empty wait, retried every
+  `BUS_WD_N`, report still one-shot. Cannot fire on a healthy boot (seconds-scale
+  threshold, 100–200× the worst legitimate lockout).
+- **Cache modes eliminated:** `DTT0`'s CM=3 (cache-inhibited/nonserialized) only sets
+  `mmu_cache_state`; this core models no cache, so no access-pattern change.
+- **MOVE16 named as the 040-only rhythm delta:** four `move16` in the kernel, issued as
+  four back-to-back long bus cycles; the 030 cannot produce that burst.
+- **Workaround, not a cure** — the un-acked write is below the firmware. Recurring
+  `[BUSWD]` with the boot continuing = a real FPGA/CPLD ack fault for that lane.
+- `BOOT.BIN` 12,762,356 B, zlib crc32 `0BF7BAAE`. Harness 167/167. Warning-free.
+
 ## 2026-08-21 — bus watchdog on the pipe-empty wait (1e6178f)
 
 Front 1's wedge (core1 executing no guest instructions, `ps_count` frozen, last access
