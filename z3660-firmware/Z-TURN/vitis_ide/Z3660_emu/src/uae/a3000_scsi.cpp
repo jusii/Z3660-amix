@@ -21,6 +21,7 @@
 #include "sysconfig.h"
 #include "sysdeps.h"         // TCHAR, z3660_printf, base UAE types
 #include <string.h>          // memset/memcpy
+#include "options.h"         // currprefs.mmu_model (which guest kernel image are we facing)
 #include "memory.h"          // put_byte/get_byte/put_long/get_long (bank dispatch)
 #include "../memorymap.h"    // SCSI_NO_DMA_ADDRESS (host-DDR bounce buffer)
 #include "xil_cache.h"
@@ -247,6 +248,28 @@ extern "C" { volatile int amix_kernel_loaded = 0; }
 // and no longer needs the boot RAM at $08000000. After this, phys_get/put hide $08000000
 // so AMIX's RAM probe doesn't count it (AMIX needs $08000000+ free; too much RAM => vatosde).
 extern "C" { volatile int amix_mmu_on = 0; }
+// ===========================================================================================
+// amix_mmu_on vs amix_kimage_030 -- the hard separation (2026-08-20).
+//
+// amix_mmu_on says WHEN: "the AMIX kernel is up now". It is set by BOTH cores -- the 030 site
+// in cpummu030.cpp (2KB-page TC write) and the 040 site in cpummu.cpp mmu_set_tc() (amix_mode
+// + the TC E-bit). Everything it gates is TIMING and applies to both: set_status() pacing, the
+// wd_check_interrupt() irq=2 re-arm, the per-access pump suppression, the aux-streak force.
+//
+// amix_kimage_030 says WHICH GUEST: "the running kernel is the 68030 AMIX image whose .data
+// addresses are hard-coded below" (0x0700D016 istate, 0x0700D176 curunitp, 0x070EA740 ddtab,
+// 0x0700CF8C units, 0x0700D014/D020 operands). Those are byte offsets into ONE linked kernel
+// image; against the 68040 image they read whatever happens to live there. So they hang off
+// this flag and NOT off amix_mmu_on -- an 040 boot can never arm them, however the latch got
+// set. It is derived from the CPU model once per session in a3000_scsi_init(), so it is a
+// property of the guest rather than of the boot phase: the 030 path keeps its pre-latch
+// behaviour exactly (the flag is already 1 while the Kickstart ROM loads the kernel).
+//
+// RULE: any new hard-coded 0x07xxxxxx guest-image read must test amix_kimage_030, never
+// amix_mmu_on. The two reader helpers below also refuse internally, so a future call site
+// cannot reintroduce the hazard by forgetting the gate.
+// ===========================================================================================
+extern "C" { volatile int amix_kimage_030 = 0; }
 extern "C" int amix_cpu_intmask(void);   /* guest CPU SR interrupt mask (newcpu.cpp) — gates AMIX completion delivery */
 extern "C" uae_u32 amix_cpu_pc(void);    /* TEMP diag: guest PC + frame, to record WHO reads WD_SCSI_STATUS */
 extern "C" uae_u32 amix_cpu_a6(void);
@@ -692,6 +715,7 @@ volatile uae_u32 amix_issued_req = 0, amix_desync_n = 0, amix_match_n = 0;
 volatile uae_u32 amix_dsy_iss[8], amix_dsy_cmp[8], amix_dsy_cu[8]; volatile int amix_dsy_h = 0;
 static uae_u32 amix_cpu_curunitp_req(void)   /* curunitp->4 (the request a3091intr's COMPLETE arm will biodone) */
 {
+   if (!amix_kimage_030) return 0;            /* 68030-image-only address; refuse on any other guest */
    #define GB4(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
    uae_u32 cpa = GB4(0x0700D176u);            /* &curunitp (operand of a3091intr movea.l curunitp,a3 @d174) */
    uae_u32 cu  = GB4(cpa);
@@ -756,6 +780,10 @@ extern "C" void a3000_scsi_dumpstate(void)
  * the .data globals come from the linker-patched operands in .text (a3091queue/startany/a3091intr). */
 extern "C" void a3000_scsi_dumpqueue(void)
 {
+   if (!amix_kimage_030) {   /* every address below is a 68030-image .data offset -- see amix_kimage_030 */
+      z3660_printf("[QUEUE] not the 68030 AMIX kernel image; the a3091 .data addresses do not apply\r\n");
+      return;
+   }
    #define PL(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
    uae_u32 tst = PL(0x0700D014u);                 /* sanity: tst.l istate opcode, expect 0x4AB9xxxx */
    uae_u32 ia = PL(0x0700D016u);                  /* &istate   (operand of startany tst.l istate @d014) */
@@ -808,6 +836,7 @@ extern "C" void a3000_scsi_dumpqueue(void)
  * tst.l operand @ runtime 0x0700D016 (verified vs reloc R_68K_32->istate). Used to gate trailing completion statuses. */
 static int amix_cpu_istate(void)
 {
+   if (!amix_kimage_030) return 0;            /* 68030-image-only address; refuse on any other guest */
    #define GB4(a) ((uae_u32)(((uae_u32)get_byte(a)<<24)|((uae_u32)get_byte((a)+1)<<16)|((uae_u32)get_byte((a)+2)<<8)|(uae_u32)get_byte((a)+3)))
    uae_u32 ia = GB4(0x0700D016u);
    return (int)GB4(ia);
@@ -829,7 +858,7 @@ static void doscsistatus(uae_u8 status)
    if (status == CSR_SEL_XFER_DONE) amix_dlv_sxd++; else if (status == CSR_DISC) amix_dlv_disc++; else amix_dlv_other++;  // TEMP: delivered-type
    { int h = amix_dlv_seqh % 24; amix_dlv_seq[h] = status; amix_dlv_seqh++; }   // TEMP: delivery sequence ring
    amix_aux_streak = 0;   /* a fresh completion starts a new poll context (so a3091intr's entry cipwait can't inherit a streak) */
-   if (amix_mmu_on) { int ist = amix_cpu_istate();   /* TEMP diag: which CSR delivered at which guest istate */
+   if (amix_kimage_030 && amix_mmu_on) { int ist = amix_cpu_istate();   /* TEMP diag: which CSR delivered at which guest istate (68030 image only) */
       int h = amix_delv_h & 15; amix_delv_csr[h] = status; amix_delv_ist[h] = (uae_u32)ist; amix_delv_h++;
       if (ist == 0) amix_delv_istate0++; }
    a3000_recompute_irq();
@@ -1385,7 +1414,7 @@ static void wdscsi_put(uae_u8 d)
       wc.wd_busy = 1;
       /* DESYNC DETECTOR: snapshot curunitp->4 (the request the guest dispatcher set just before this
        * WD_COMMAND write) so the WD_SCSI_STATUS completion ack can verify it didn't move. */
-      if ((d & 0x7f) == WD_CMD_SEL_ATN_XFER && amix_mmu_on) amix_issued_req = amix_cpu_curunitp_req();
+      if ((d & 0x7f) == WD_CMD_SEL_ATN_XFER && amix_kimage_030 && amix_mmu_on) amix_issued_req = amix_cpu_curunitp_req();
       /* Execute synchronously; the per-status hsync countdown (set_status / wd_check_interrupt) now
        * spaces the two completion statuses so a3091intr's in-ISR re-issued completion lands AFTER the
        * ISR rte's. (The async-DMA defer is retired -- it double-deferred the command without spacing
@@ -1422,7 +1451,7 @@ static uae_u8 wdscsi_get(void)
          /* DESYNC DETECTOR: at this completion ack, does curunitp->4 still equal the request issued by the
           * matching cmd=08? a3091intr's COMPLETE arm is about to biodone curunitp->4 -- if it moved, that
           * biodone hits the WRONG buf and the issued chunk is stranded (the intermittent lost-completion). */
-         if (amix_mmu_on && amix_issued_req) {
+         if (amix_kimage_030 && amix_mmu_on && amix_issued_req) {
             uae_u32 cmp = amix_cpu_curunitp_req();
             if (cmp != amix_issued_req) {
                int h = amix_dsy_h & 7; amix_dsy_iss[h] = amix_issued_req; amix_dsy_cmp[h] = cmp;
@@ -1614,6 +1643,10 @@ void a3000_scsi_init(void)
    sense_key = sense_asc = sense_ascq = 0;
    a3000_scsi_irq = 0;
    a3000_amix_mode = 1;
+   // Which guest kernel image are we facing? The hard-coded .data addresses in this file
+   // belong to the 68030 AMIX kernel only (see the amix_kimage_030 note at the top).
+   // currprefs.mmu_model is already final here -- uae_emulator() sets it before calling us.
+   amix_kimage_030 = (currprefs.mmu_model == 68030) ? 1 : 0;
    wd_master_reset(0);
    a3000_recompute_irq();
    z3660_printf("[A3000SCSI] WD33C93+SuperDMAC emulation initialised ($00DD0000)\n");

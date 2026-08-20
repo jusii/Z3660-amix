@@ -32,6 +32,10 @@ extern "C" uae_u32  amix_cpu_kread(uae_u32) { return 0; }
 uae_u32 memory_get_byte(uaecptr) { return 0; }
 void    memory_put_byte(uaecptr, uae_u32) { }
 volatile int a3000_scsi_irq = 0;
+/* a3000_scsi_init() reads currprefs.mmu_model to decide amix_kimage_030 (which guest
+ * kernel image the hard-coded 0x07xxxxxx reads belong to). Nothing here links the real
+ * prefs; zeroed => mmu_model 0 => not the 68030 image, which is right for CDB tests. */
+struct uae_prefs currprefs;
 
 /* ---------------------------------------------------------------- */
 static int g_pass = 0, g_fail = 0;

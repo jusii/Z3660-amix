@@ -65,6 +65,9 @@ int mmu040_movem;
 uaecptr mmu040_movem_ea;
 uae_u32 mmu040_move16[4];
 
+extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
+extern "C" volatile int amix_mmu_on;      // set in mmu_set_tc() when AMIX's 040 MMU comes up
+
 #if MMU_ICACHE
 struct mmu_icache mmu_icache_data[MMU_ICACHE_SZ];
 #endif
@@ -397,6 +400,13 @@ void mmu_bus_error(uaecptr addr, uae_u32 val, int fc, bool write, int size,uae_u
 {
 	if (currprefs.mmu_model == 68040) {
 		uae_u16 ssw = 0;
+
+		// EA (format-$7 frame offset $08) defaults to the faulting address; the MOVE16 and
+		// MOVEM arms below refine it (cache-line base / the instruction's own EA). Without
+		// this it was never assigned on the ordinary fault path, so the frame's EA -- and,
+		// through the MOVE16 arm, regs.wb2_address -- carried whatever the PREVIOUS MOVE16
+		// or MOVEM had left in it.
+		regs.mmu_effective_addr = addr;
 
 		if (ismoves) {
 			// MOVES special behavior
@@ -1532,6 +1542,28 @@ uae_u16 REGPARAM2 mmu_set_tc(uae_u16 tc)
 	}
 
 	mmu_flush_atc_all(true);
+
+	// AMIX on the 68040 core: the mirror of cpummu030.cpp's latch. amix_mmu_on is the
+	// "the AMIX kernel is up now" signal the emulated A3000 SCSI uses to leave
+	// Kickstart-ROM-load timing (every status immediate) for AMIX-runtime timing (the
+	// paced hsync countdown the stock byte-patched `sd` driver's step-by-step open needs).
+	//
+	// Gate = amix_mode + the TC E-bit, NOT a page size. The 030 site tests
+	// regs.mmu_page_size == 2048 because that is the one page size AMIX-030 uses, i.e. it
+	// is really asking "is this the AMIX kernel's MMU rather than some AmigaOS MMU tool?".
+	// On the 040 that question is already answered by the mode: UAE_040_MMU + amix_mode
+	// exists only to run AMIX (the plain-AmigaOS smoke recipe runs with amix_mode off), so
+	// the E-bit alone is unambiguous. Testing for 4K instead would silently drop the whole
+	// pacing regime if the 040 port ever moved to 8K pages -- and that would surface as an
+	// intermittent SCSI timing fault, not as a configuration change. The page size is
+	// logged below so a surprise is still visible on the serial.
+	//
+	// This latch does NOT arm the hard-coded 68030-kernel-image reads in a3000_scsi.cpp;
+	// those hang off amix_kimage_030, which is set from the CPU model in a3000_scsi_init().
+	if (a3000_amix_mode && currprefs.mmu_model == 68040 && regs.mmu_enabled && !amix_mmu_on) {
+		amix_mmu_on = 1;
+		write_log(_T("68040 MMU enabled under AMIX. Page size = %d PC=%08x\n"), regs.mmu_page_size, m68k_getpc());
+	}
 
 	write_log(_T("%d MMU: TC=%04x enabled=%d page8k=%d PC=%08x\n"), currprefs.mmu_model, tc, regs.mmu_enabled, mmu_pagesize_8k, m68k_getpc());
 	return tc;

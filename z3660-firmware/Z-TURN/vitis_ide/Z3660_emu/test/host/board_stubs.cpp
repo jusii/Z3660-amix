@@ -151,6 +151,9 @@ addrbank dmmy_bank = {
 extern "C" {
 volatile int a3000_amix_mode = 0;          /* AMIX (A3000 SCSI) mode — off for MMU tests */
 volatile int amix_mmu_on = 0;
+/* "the guest is the 68030 AMIX kernel image" — set only by a3000_scsi_init() (not linked
+ * here). Stubbed so test_amix_mmu040_latch can assert the 040 latch never touches it. */
+volatile int amix_kimage_030 = 0;
 volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_compl_csr[16],
                  amix_compl_unit[16], amix_compl_head[16];
 volatile int amix_compl_h = 0;

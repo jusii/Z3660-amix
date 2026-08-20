@@ -1951,7 +1951,13 @@ static void Exception_normal (int nr)
       nextpc = exception_pc (nr);
       if (nr == 2 || nr == 3) {
          int i;
-         if (currprefs.mmu_model && nr == 2) {
+         // NOTE the `== 68030`: this arm is the 68030 PMMU's frame $A/$B builder and reads
+         // 030-only state (mmu030_state[], the 030-shaped regs.mmu_ssw). It used to test a
+         // bare `currprefs.mmu_model`, which is TRUTHY for mmu_model == 68040 -- so under
+         // UAE_040_MMU every 68040 bus error was handed an 030 frame built from state the
+         // 040 table walk never maintains, and control never reached the cpu_model >= 68040
+         // arm below. The 68040's own access-error frame is built there now.
+         if (currprefs.mmu_model == 68030 && nr == 2) {
             // UAE_030_MMU: a real 68030 data/instruction bus fault from the page-fault
             // engine. mmu030_page_fault() already computed regs.mmu_ssw (with DF set and
             // the real RW/SIZE/FC) and regs.mmu_fault_addr; stack them VERBATIM so that
@@ -1964,9 +1970,24 @@ static void Exception_normal (int nr)
             Exception_build_stack_frame(regs.instruction_pc, currpc, regs.mmu_ssw, nr, frameformat);
             used_exception_build_stack_frame = true;
          } else if (currprefs.cpu_model >= 68040) {
-            if (nr == 2) {
+            if (nr == 2 && currprefs.mmu_model == 68040) {
+               // UAE_040_MMU: a real 68040 access error out of the 040 table walk.
+               // mmu_bus_error() has already computed the whole fault record -- SSW (TM=FC,
+               // SIZE, RW, ATC, plus CM/LK/TT for MOVEM/locked/MOVES), the fault address,
+               // the effective address, and the pending write-back (wb3_status/wb3_data,
+               // and wb2_status/wb2_address for a MOVE16 line). Stack it as the genuine
+               // format $7 access-error frame so the guest kernel's write-back handler can
+               // complete the store the 68040 does NOT re-run on rte.
+               Exception_build_stack_frame(regs.mmu_effective_addr, currpc, regs.mmu_ssw, nr, 0x07);
+               used_exception_build_stack_frame = true;
+            } else if (nr == 2) {
 
                   // 68040 bus error (not really, some garbage?)
+                  // MMU-OFF 040 modes only (UAE_040 / UAEJIT_040): there is no 040 fault
+                  // record to stack, so this synthesized frame is left exactly as it was.
+                  // (A 68060 MMU would land here too, but mmu_model 68060 is unreachable --
+                  // cpuemu_33 is not built and no BOOTMODE selects it. A future 060 lane
+                  // needs its own arm here, not this one and not the 68030 one above.)
                   for (i = 0 ; i < 18 ; i++) {
                      m68k_areg (regs, 7) -= 2;
                      x_put_word (m68k_areg (regs, 7), 0);

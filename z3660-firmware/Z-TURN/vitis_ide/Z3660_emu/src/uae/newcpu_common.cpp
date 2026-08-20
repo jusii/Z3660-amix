@@ -1070,38 +1070,57 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		x_put_long(m68k_areg(regs, 7), oldpc);
 		break;
 	case 0x7: // access error stack frame (68040)
-
+		// MC68040 UM Table 8-3. Offsets below are from the FINAL sp (the common tail adds
+		// sr/pc/format at $00/$02/$06), pushed here highest-offset first:
+		//   $08 EA  $0C SSW  $0E WB3S  $10 WB2S  $12 WB1S  $14 FA
+		//   $18 WB3A $1C WB3D $20 WB2A $24 WB2D $28 WB1A $2C WB1D/PD0 $30 PD1 $34 PD2 $38 PD3
+		// Cross-checked against the AMIX 68040 kernel's own empirically-dumped offsets in
+		// src/wb040.s (WB3S@+78 WB3A@+88 WB3D@+92 / WB2S@+80 WB2A@+96 WB2D@+100 /
+		// WB1S@+82 WB1A@+104 WB1D@+108, relative to its trap frame = these + 64).
+		//
+		// The CONTENTS are load-bearing, not just the format nibble: the 68040 does not
+		// re-run a faulted WRITE on rte, so the kernel's write-back handler completes the
+		// pending store itself from WBxS/WBxA/WBxD (`moves.<size> WBxD -> (WBxA)` with
+		// DFC = WBxS & 7). WBxS: bit7 = valid, bits 6-5 = SIZE, bits 2-0 = FC -- exactly
+		// mmu_bus_error()'s `0x80 | (ssw & 0x7f)`. These were all stacked as ZERO before,
+		// so every write-back was silently dropped and the store lost.
 		for (i = 3; i >= 0; i--) {
-			// WB1D/PD0,PD1,PD2,PD3
+			// PD3,PD2,PD1,PD0(==WB1D): MOVE16 push data. Only consumed when WB2S marks a
+			// cache-line write-back, so a stale line from an earlier MOVE16 is inert.
 			m68k_areg(regs, 7) -= 4;
-			x_put_long(m68k_areg(regs, 7), 0);
+			x_put_long(m68k_areg(regs, 7), mmu040_move16[i]);
 		}
 
+		// WB1 is never populated by this core (it models no store buffer, so only the
+		// faulting access can be pending). WB1S = 0 = "not valid" is the truthful report,
+		// and the kernel's replay loop skips the slot.
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), 0); // WB1A
+		// WB2D is unused on the 68040: the only WB2 case is a MOVE16 line write-back,
+		// whose data travels in PD0-PD3 above, not here.
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), 0); // WB2D
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0); // WB2A
+		x_put_long(m68k_areg(regs, 7), regs.wb2_address); // WB2A (MOVE16 write only)
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0); // WB3D
+		x_put_long(m68k_areg(regs, 7), regs.wb3_data); // WB3D = the pending store's data
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // WB3A
+		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // WB3A = its address
 
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // FA
 
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), 0); // WB1S: always invalid here
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb2_status); // WB2S
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb3_status); // WB3S
 
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), ssw);
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
+		x_put_long(m68k_areg(regs, 7), oldpc); // EA (caller passes regs.mmu_effective_addr)
 		break;
 	case 0x8: // bus/address error (68010)
 	{

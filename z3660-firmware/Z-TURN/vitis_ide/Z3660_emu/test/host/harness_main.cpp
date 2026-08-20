@@ -824,6 +824,205 @@ static void test_fpu040_unimplemented_trap(void)
 }
 
 /* ==================================================================
+ * 68040 ACCESS ERROR -- the format $7 frame, CONTENTS INCLUDED.
+ *
+ * The 68040 does not re-run a faulted WRITE on rte: the instruction has already
+ * retired (the generated handler does `m68k_incpci; regs.instruction_pc =
+ * m68k_getpci(); mmu_restart = false;` immediately before the store), and the
+ * pending store travels to the OS in the frame's WB3 slot for the kernel's
+ * write-back handler to complete. A faulted READ is restartable, so nothing is
+ * pending and WB3 must be reported invalid.
+ *
+ * These two vectors pin both halves, because either one silently broken loses
+ * data: a dropped WB3 loses the store outright, a spurious WB3 on a restarted
+ * instruction applies it twice.
+ * ================================================================== */
+
+/* Root/pointer tables covering VAs in [0x00400000,0x00440000) -- every VA in that
+ * span shares root index 0 and pointer index 16, so one page table serves them
+ * all. MMU on, 4K pages, supervisor, nothing mapped yet. */
+static void mmu040_pt_init(void)
+{
+	harness_mem_reset();
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040;
+	currprefs.mmu_model = 68040;
+	currprefs.mmu_ec    = 0;
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+
+	regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+	regs.srp = regs.urp = M4_ROOT;
+	hram_poke32(M4_ROOT + 0,  (M4_PTR  & MMU_ROOT_PTR_ADDR_MASK)   | 2);
+	hram_poke32(M4_PTR  + 64, (M4_PAGE & MMU_PTR_PAGE_ADDR_MASK_4) | 2);
+	mmu_set_tc(0x8000);                 /* enable, 4K pages */
+	mmu_flush_atc_all(true);
+	regs.s = 1;
+	regs.address_space_mask = 0xffffffff;
+}
+
+static void mmu040_map_page(uae_u32 va, uae_u32 pa)
+{
+	hram_poke32(M4_PAGE + ((va >> 10) & 0xfc), (pa & MMU_PAGE_ADDR_MASK_4) | 1);
+	mmu_flush_atc_all(true);
+}
+
+/* One instruction, exactly as m68k_run_mmu040() runs it (including the CATCH). */
+static bool mmu040_step_catch(void)
+{
+	struct flag_struct f = regs.ccrflags;
+	bool faulted = false;
+	mmu_restart = true;
+	regs.instruction_pc = m68k_getpc();
+	TRY(prb) {
+		mmu_opcode = -1;
+		mmu_opcode = regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(prb) {
+		faulted = true;
+		if (mmu_restart) {                       /* restartable fault: rewind */
+			regs.ccrflags = f;
+			m68k_setpci(regs.instruction_pc);
+		}
+		cpu_restore_fixup();
+		Exception(prb);                          /* -> the format $7 frame */
+	} ENDTRY
+	return faulted;
+}
+
+static void test_mmu040_access_error_frame(void)
+{
+	printf("[test] MMU040 access error -> format $7 frame with real FA/SSW/write-back slots\n");
+	const uae_u32 VCODE = 0x00400000, PCODE = 0x0C000000;
+	const uae_u32 VSTK  = 0x00401000, PSTK  = 0x0E000000;
+	const uae_u32 VVEC  = 0x00402000, PVEC  = 0x0F000000;
+	const uae_u32 VDATA = 0x00403000;              /* deliberately never mapped */
+	const uae_u32 FAULT = VDATA + 0x10;
+	const uae_u32 VALUE = 0xDEADBEEF;
+	const uae_u32 HANDLER = VCODE + 0x100;
+	const uae_u32 SP0 = VSTK | 0xF00;
+	uae_u32 sp;
+/* the frame is written THROUGH the MMU; read it back from the stack page's frame */
+#define F16(off) ((uae_u32)hram_peek16(PSTK | ((sp + (off)) & 0xFFF)))
+#define F32(off) ((uae_u32)hram_peek32(PSTK | ((sp + (off)) & 0xFFF)))
+
+	/* ---- (a) WRITE fault: instruction retired, store pending in WB3 ---- */
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSTK,  PSTK);
+	mmu040_map_page(VVEC,  PVEC);
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x2080);      /* move.l d0,(a0) */
+	hram_poke32(PVEC  | 8, HANDLER);                   /* vector 2 -> handler */
+
+	regs.vbr = VVEC;
+	m68k_dreg(regs, 0) = VALUE;
+	m68k_areg(regs, 0) = FAULT;
+	m68k_areg(regs, 7) = SP0;
+	m68k_setpc(VCODE);
+	regs.wb2_address = 0;                              /* only a MOVE16 line write sets this */
+	for (int i = 0; i < 4; i++) mmu040_move16[i] = 0;
+
+	CHECK(mmu040_step_catch(), "store to an unmapped page raised a 68040 access error\n");
+	CHECK_EQ32(m68k_getpc(), HANDLER, "vectored through vector 2 into the handler");
+
+	sp = m68k_areg(regs, 7);
+	CHECK_EQ32(SP0 - sp, 60, "format $7 frame is 60 bytes");
+	CHECK_EQ32(F16(0x06), 0x7008, "format $7, vector offset $008 (bus error)");
+	CHECK_EQ32(F32(0x02), VCODE + 2, "stacked PC = NEXT insn (write fault CONTINUES, no restart)");
+	CHECK_EQ32(F32(0x08), FAULT, "EA");
+	CHECK_EQ32(F16(0x0C), 0x0405, "SSW = ATC | TM 5 (super data) | SIZE long | RW clear (write)");
+	CHECK_EQ32(F16(0x0E), 0x0085, "WB3S = valid $80 | SIZE long | FC 5");
+	CHECK_EQ32(F16(0x10), 0, "WB2S invalid");
+	CHECK_EQ32(F16(0x12), 0, "WB1S invalid");
+	CHECK_EQ32(F32(0x14), FAULT, "FA");
+	CHECK_EQ32(F32(0x18), FAULT, "WB3A = the pending store's address");
+	CHECK_EQ32(F32(0x1C), VALUE, "WB3D = the pending store's DATA (wb040.s replays this verbatim)");
+	CHECK_EQ32(F32(0x20), 0, "WB2A (MOVE16 only)");
+	CHECK_EQ32(F32(0x24), 0, "WB2D (unused on 68040)");
+	CHECK_EQ32(F32(0x28), 0, "WB1A (no store buffer modelled)");
+	CHECK_EQ32(F32(0x2C), 0, "PD0 (MOVE16 push data)");
+
+	/* ---- (b) READ fault: nothing pending, instruction restarts ---- */
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSTK,  PSTK);
+	mmu040_map_page(VVEC,  PVEC);
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x2210);      /* move.l (a0),d1 */
+	hram_poke32(PVEC  | 8, HANDLER);
+
+	regs.vbr = VVEC;
+	m68k_dreg(regs, 1) = 0;
+	m68k_areg(regs, 0) = FAULT;
+	m68k_areg(regs, 7) = SP0;
+	m68k_setpc(VCODE);
+
+	CHECK(mmu040_step_catch(), "load from an unmapped page raised a 68040 access error\n");
+	sp = m68k_areg(regs, 7);
+	CHECK_EQ32(F16(0x06), 0x7008, "read fault also builds a format $7 frame");
+	CHECK_EQ32(F32(0x02), VCODE, "stacked PC = the faulting insn (read fault RESTARTS)");
+	CHECK_EQ32(F16(0x0C) & 0x0100, 0x0100, "SSW RW set (read)");
+	CHECK_EQ32(F16(0x0E), 0, "WB3S invalid: a read fault leaves NO pending write-back");
+	CHECK_EQ32(F32(0x1C), 0, "WB3D zero on a read fault");
+	CHECK_EQ32(F32(0x14), FAULT, "FA");
+
+#undef F16
+#undef F32
+	mmu040_off();
+}
+
+/* ==================================================================
+ * AMIX 040 latch (cpummu.cpp mmu_set_tc). amix_mmu_on says "the AMIX kernel is
+ * up" and gates the emulated A3000 SCSI's timing regime; amix_kimage_030 says
+ * "the guest is the 68030 kernel image" and gates the hard-coded 0x07xxxxxx
+ * reads. The 040 latch must set the first and never the second.
+ *
+ * The harness links neither a3000_scsi.cpp nor its timing model, so this pins
+ * the LATCH ONLY -- that the flags move exactly when they should. The pacing
+ * behaviour they gate (set_status/wd_check_interrupt/pump suppression) is not
+ * modelled here and is not asserted.
+ * ================================================================== */
+extern "C" {
+	extern volatile int a3000_amix_mode;
+	extern volatile int amix_mmu_on;
+	extern volatile int amix_kimage_030;
+}
+
+static void test_amix_mmu040_latch(void)
+{
+	printf("[test] AMIX 040 latch: amix_mmu_on on the TC enable, amix_kimage_030 left alone\n");
+
+	/* amix_mode OFF: a plain AmigaOS 040 must not arm the AMIX timing regime. */
+	a3000_amix_mode = 0; amix_mmu_on = 0; amix_kimage_030 = 0;
+	mmu040_pt_init();                                  /* enables the 040 MMU */
+	CHECK_EQ32(amix_mmu_on, 0, "no latch without amix_mode");
+
+	/* amix_mode ON + the TC E-bit: latch. */
+	a3000_amix_mode = 1; amix_mmu_on = 0;
+	mmu040_pt_init();
+	CHECK_EQ32(amix_mmu_on, 1, "040 MMU enable under amix_mode latches amix_mmu_on");
+	CHECK_EQ32(amix_kimage_030, 0, "the 040 latch does NOT arm the 68030-image reads");
+
+	/* E-bit clear must not latch. */
+	amix_mmu_on = 0;
+	mmu_set_tc(0x0000);
+	CHECK_EQ32(amix_mmu_on, 0, "TC with E clear does not latch");
+
+	/* Wrong model must not latch here (the 030 latch lives in cpummu030.cpp). */
+	amix_mmu_on = 0;
+	currprefs.mmu_model = 68030;
+	mmu_set_tc(0x8000);
+	CHECK_EQ32(amix_mmu_on, 0, "mmu_set_tc does not latch for mmu_model 68030");
+	CHECK_EQ32(amix_kimage_030, 0, "amix_kimage_030 still untouched");
+
+	a3000_amix_mode = 0; amix_mmu_on = 0;              /* leave the globals inert */
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * MMU030 demand-paging END TO END (the path AMIX actually depends on).
  * Earlier MMU tests stop at the THROW; this one drives the WHOLE loop:
  *   fault -> (run-loop CATCH) Exception(2) builds the 030 bus-error frame
@@ -1144,6 +1343,8 @@ int main(int argc, char **argv)
 	test_mmu040_protection();
 	test_mmu040_modified_bit();
 	test_fpu040_unimplemented_trap();
+	test_mmu040_access_error_frame();
+	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
