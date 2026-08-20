@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-08-20 — core1 wedged by a pre-init z3660_printf (d7e996f, af93d9a)
+
+`BBD5C14F` proved the core0 fix — core0 reached `Starting CPU emulator on Core1`
+and `060 starting now...` was gone — but core1 then died on **every** boot mode,
+including the 030 path that was multiuser-green on `455A7D12` hours earlier.
+
+- **The breadcrumb was the bug.** `z3660_printf()` takes a UART semaphore living
+  in the SHARED struct; `shared` is assigned in `init_shared()` at `main.cpp:886`,
+  and the `[Core1] alive` breadcrumb sat at `main.cpp:852`. Core1's first
+  statement was therefore `while(((SHARED*)0)->uart_semaphore != 0);` — a spin on
+  DDR `0x0000001C`. Nothing faults (`MMUTable[0]=0` runs at line 882, *after* the
+  breadcrumb), so core1 spun silently forever and core0 hung on the ack.
+  Mode-independent by construction, which is why golden 030 broke too.
+- **Fix:** `z3660_printf()` is NULL-safe — semaphore once `shared` exists, bare
+  `vprintf` before that, matching core1's long-proven pre-init prints. Breadcrumb
+  keeps its earliest placement; the pre-init contract is documented at the
+  definition and the call site.
+- **Static-initialiser suspect refuted by measurement:** no `_GLOBAL__sub_I_` in
+  any object touched that night; `.init_array` unchanged at 4 entries.
+- Not host-checkable — the harness compiles no `main.cpp` and `board_stubs.cpp`
+  fakes the very seam that broke. Stated rather than worked around. The
+  static-ctor check IS mechanical and is recorded in the gate doc.
+- `BOOT.BIN` 12,762,340 B, zlib crc32 `806C76AE`. Build warning-free.
+- Still true: neither the 68040 access-error frame nor the `amix_mmu_on` latch has
+  executed on hardware yet.
+
 ## 2026-08-20 — UAE_040_MMU: core0 never started core1 (9e1c776, adf8ea1)
 
 First AMIX-040 metal boot (firmware `2CFA9216`) produced no core1 output and the
