@@ -1144,6 +1144,181 @@ one-off or a pattern, and the probe cannot flood.
 
 That single line names the caller and closes the attribution question in one 3-minute boot.
 
+## 9. THE PORT-LANE CASE: `page_free` on the 68040 kernel (handover)
+
+**Self-contained.** Everything needed to pick this up is in this section; nothing else in
+this document is required reading. Written for `amix-040-060-port`.
+
+**Bottom line: the ROM/ExecBase chain everyone (including me) chased is the DOUBLE PANIC —
+the kernel's own panic path failing on the way out. The primary bug is whatever makes
+`page_free` panic, and it is not visible to any emulator-side exception trace because it is
+a software panic, not a CPU exception.** The kernel said so on the screen all along:
+`PANIC: page_free` first, `DOUBLE PANIC` second.
+
+### 9.1 The full mechanism chain
+
+Every address below is from the shipped `unix-040` brel (load base `0x08000000`, proven by
+`movec %d0,%tc` at `.text+0xd7550` matching the serial's `PC=080d7550`), symbolised against
+`build/unix-040-z3660`, and from the card's own `A3k204r37.rom` (KS 2.04 r37.175, base
+`0x00F80000`).
+
+1. **Primary failure — unknown.** Something in early VM init panics with `page_free`. This is
+   a *software* panic: `panic()` is called, no CPU exception is taken. That is precisely why
+   the firmware exception trace showed **zero** exceptions before the crash
+   (`[XI-SUM] total=0`, and the vec-3 entry was the *first* non-interrupt exception).
+2. **`panic()` → `xpanic()` → `sync()`.** `panic` is `.text+0x3eb58`; `xpanic` is
+   `.text+0x3e668` (size `0x56`) and carries a relocation **`0x3e6a2 R_68K_32 sync`**. So the
+   panic path flushes filesystems on its way out — standard SVR4.
+3. **`sync()` walks the vfs switch through a NULL pointer.** `sync` is `.text+0x5d21a`:
+
+   ```
+   5d222:  moveq  #1,%d2                  ; i = 1   <- starts at ONE
+   5d224:  cmpl   nfstype,%d2
+   5d22a:  bgew   5d260                   ; done
+   5d22e:  lea    vfssw,%a2
+   5d236:  asll   #4,%d0                  ; i * 16  (sizeof struct vfssw)
+   5d238:  moveal %a2@(8,%d0:l),%a0       ; a0 = vfssw[i].vsw_vfsops   (+8)
+   5d24a:  moveal %a0@(16),%a0            ; a0 = vfsops->vfs_sync      (+16)
+   5d24e:  jsr    %a0@                    ; <<< the transfer, 2 bytes (0x4E90)
+   ```
+
+   `vfssw` is `.data+0x913c`, `0xc0` bytes = 12 entries x 16. Its relocations show the
+   initialisation policy exactly:
+
+   | entry | `+0` `vsw_name` | `+4` `vsw_init` | `+8` `vsw_vfsops` |
+   |---|---|---|---|
+   | 0 | `LC%0` | — | **`vfs_strayops` (static)** |
+   | 1 | `LC%1` | `s5init` | *(none — runtime)* |
+   | 2 | `LC%2` | `ufsinit` | *(none — runtime)* |
+   | 3.. | `LC%n` | `fifoinit`, `rf_init`, `xnaminit`, `bfinit`, `prinit`, `specinit`, `nameinit`, … | *(none — runtime)* |
+
+   `vsw_vfsops` is populated at runtime by each filesystem's `vsw_init()`, i.e. by
+   `vfsinit()`. **The only statically populated entry is index 0 — and `sync()`'s loop starts
+   at index 1.** Panicking before `vfsinit()` has run therefore guarantees
+   `vsw_vfsops == NULL`.
+4. **NULL + 16 lands on the low-memory vector table.** `moveal %a0@(16),%a0` with `a0 = 0`
+   reads absolute address **`0x10`** — which is **CPU exception vector 4 (Illegal
+   Instruction)** in the vector table AmigaOS left in low memory.
+5. **The fetched value is an AmigaOS ROM stub, and it self-identifies as vector 4.** The
+   captured value is `0x00F80A62`. In the ROM, exec's per-vector stub table is a run of
+   `bsr.s` entries whose common tail recovers the vector index from the pushed return
+   address: `subil #0x00F80A5C,%sp@ ; lsrw %sp@(2)`. For the stub at `0xF80A62` the pushed
+   return address is `0xF80A64`, giving `(0xF80A64 - 0xF80A5C) >> 1 = 4`.
+
+   > **Two fully independent derivations agree on vector 4** — the offset from NULL
+   > (`16 / 4 = 4`) and the ROM dispatcher's own arithmetic. That is the proof that the
+   > pointer came from low-memory vector 4 via a NULL `vsw_vfsops`, and not from a saved
+   > vector the kernel deliberately kept.
+
+6. **exec's dispatcher walks AMIX's pseudo-ExecBase and finds a sentinel.** Control reaches
+   the tail at `0xF80B38`:
+
+   ```
+   f80b38:  moveml %a0-%a1,%sp@-
+   f80b3c:  moveal 4,%a0             ; ExecBase  <- absolute address 4  (= 0x080007F0)
+   f80b40:  moveal %a0@(276),%a0     ; ExecBase->ThisTask   (0x114)
+   f80b44:  movel  %a0@(50),%sp@(4)  ; Task->tc_TrapCode    (0x32)  -> overwrites saved a1
+   f80b4a:  moveal %sp@+,%a0
+   f80b4c:  rts                      ; jumps to tc_TrapCode == 0xFFFFFFFE
+   ```
+
+   `execbase@4 = 0x080007F0` is a **kernel** address: AMIX installs its own pseudo-ExecBase.
+   The walk through it yields `0xFFFFFFFE`, evidently a "no trap code" sentinel.
+7. **`rts` to `-2` → odd → Address Error (vector 3)** → the kernel's own, correct vec-3
+   handler (`vec3@ = 0x080DA660`) → **`DOUBLE PANIC ... vector=0x3`**.
+
+Captured in one line by the firmware probe:
+
+```
+[ROMENT1] pc=00F80A62 from=0805D24E a7=080F48C8 sp@=0805D250 sp@4=00000000 execbase@4=080007F0
+```
+
+`from = 0x0805D24E` is `sync+0x34`, `sp@ = from+2` confirms the 2-byte `jsr (a0)`.
+
+### 9.2 Why the bench boots green and the card does not
+
+**The cascade is not environment-dependent.** Steps 2–7 are pure kernel code plus the KS
+ROM, with no dependence on the strap, the SCSI path, the emulator or the memory map. If
+anything panicked this early under Amiberry, the identical chain would fire there — the
+bench uses the same KS 2.04, and AmigaOS leaves the same vector 4 in low memory.
+
+**The bench boots green because `page_free` never panics there.** The divergence is entirely
+in **step 1**, the primary failure. So:
+
+> **The ROM, ExecBase, `tc_TrapCode` and the address error are a dead end for
+> root-causing. Do not spend time on them.** They are a faithful report that the kernel
+> panicked before `vfsinit()`.
+
+That relocates the question to: *what differs about the card that makes the 040 kernel's VM
+init reach a `page_free` panic?* The standing candidate is the memory geometry — see §9.4.
+
+### 9.3 What the firmware has been cleared of
+
+Stated so the port lane does not re-litigate it. At the moment of failure, on image
+`8C51370A`, all of the following were verified correct, several of them fixed during this
+investigation and each covered by a host-harness guard:
+
+| firmware behaviour | status |
+|---|---|
+| 68040 MMU enable (`MOVEC`->TC) | fixed and verified; `TC=8000`, 4 KiB pages, latch on |
+| Transparent translation registers (ITT0/ITT1/DTT0/DTT1) | fixed (`mmu_tt_modified`); decoding verified against the kernel's exact values |
+| `PFLUSH` / `PFLUSHA` / `PTEST` | fixed (were a no-op and a fake); harness-guarded |
+| 68040 access-error frame (format `$7`) | implemented with real SSW/FA/WB slots |
+| `STOP` pc advance | fixed |
+| Exception delivery at the failure | exactly one, correct frame format for vector 3, into the kernel's own handler |
+| Interrupts | **zero** between MMU-on and the fault — no storm, no stale ATC, no fabricated MMUSR |
+| Boot stack | `a7 = 0x080F49E8` at MMU-on: `pstack` was already 6936/8000 deep *before* the MMU came up. Ambient, not caused by anything the emulator did. |
+
+### 9.4 Candidate kernel-side fixes, and the one firmware option
+
+**A. Make the panic path survivable (defensive, small, independently valuable).**
+`sync()` dereferences `vsw_vfsops` without a NULL check, so *any* panic before `vfsinit()`
+turns into a double panic that destroys the diagnostic. A null guard in `sync()`'s loop — or
+having `xpanic()` skip `sync()` when the vfs switch is not yet initialised — would let the
+original `page_free` panic print cleanly with its backtrace intact. **This alone would have
+made the whole ROM investigation unnecessary, and it will pay for itself the next time
+anything panics early.** It does not fix the boot.
+
+**B. Find the primary `page_free` panic (the actual bug).** This is kernel-side and needs the
+kernel's own view, which no emulator trace can supply. The cheapest instrument is the panic
+site itself: `page_free` is at relocation `0xaf9ea` and `page_abort` at `0xaf8d6` (per the
+port repo's own `docs/contracts/CB-PAGE-LIFECYCLE-CLOSURE.md` census), with `panic` at
+`.text+0x3eb58` and `xpanic` at `.text+0x3e668`. **What to capture: the panic format string
+and its arguments, plus the caller of `page_free`.** With fix A in place the existing panic
+printer supplies both.
+
+**C. Memory geometry — the standing hypothesis for step 1.** The AMIX memory contract this
+firmware presents was shaped for the **68030** kernel: exactly one <=16 MB Fast-RAM window at
+`$08000000`, plus a vestigial `a3000mem` window at `$07000000`. The 040 kernel's
+`MAINSTORE`/`VSIZOFMEM` expectations may differ, and a page-allocator panic during VM init is
+consistent with a geometry the kernel did not expect. The port lane can check this without
+the card: compare the 040 kernel's memory probe and `MAINSTORE`/`VSIZOFMEM` derivation against
+what the bench (Amiberry) presents versus the contract in §8.
+
+> **Firmware-side contract change: PROPOSED, NOT IMPLEMENTED.** Widening or reshaping that
+> window is a real option and lives in this repo (`uae_emulator.cpp`, the `amix_mode` memory
+> map). It is deliberately not done, because that single window is the most load-bearing
+> thing the metal-proven 030 boot depends on — the 030 kernel panics `vatosde()` if it sees a
+> region outside SCN1, and two adjacent banks coalescing is equally fatal. It must not move
+> without an explicit decision and a 030 regression plan. If the port lane's analysis shows
+> the 040 kernel needs a different geometry, say what it needs and it can be built and
+> A/B'd against the 030 golden.
+
+### 9.5 Corrections to the record
+
+Kept because the wrong turns are informative:
+
+- **§8.9 called the stack exhaustion the mechanism.** It is not; it is ambient. `pstack` was
+  already 6936 of 8000 bytes deep *at MMU-on*, and only 296 further bytes were used before
+  the fault. `page_sub`/`page_free` are neighbours in the page allocator and were simply
+  where the panic fired.
+- **§8.13 said control was transferred "through a pointer", implying a wild one.** Correct
+  but incomplete: the pointer is a *specific, explainable* NULL-plus-offset — `vsw_vfsops`
+  is NULL and `+16` lands on low-memory vector 4. Not garbage, and not a saved vector the
+  kernel keeps on purpose.
+- **The pre-registered "repeating access fault with `a7` marching down" prediction was
+  falsified**, which is what made the software-panic reading findable at all.
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and
