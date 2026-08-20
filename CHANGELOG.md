@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-08-20 — httpd: single connection-teardown path (state + pcb lifetime) (7952863)
+
+Follow-up to the streaming/download change: every way a connection could end
+had its own cleanup and most were wrong. Consolidated into `http_conn_close()`,
+the only place a connection ends and the only place the per-connection state is
+freed. It detaches all five callbacks, then closes, then frees.
+
+The rule the old code broke, read out of the BSP's lwIP 2.1.3: `tcp_close()`
+may free the pcb before returning — `tcp_close_shutdown()` takes an RST path
+that calls `tcp_free()` outright when the receive window is still short (the
+request not yet `tcp_recved()`) — and an `ERR_MEM` is returned as `ERR_OK` with
+a deferred close from `tcp_tmr`. After `tcp_close()` the pcb must not be used
+again, and there is nothing to retry.
+
+- **`http_send_404()` closed inline and freed nothing** — every 404 leaked a
+  connection state, and because it closed before the request was `tcp_recved()`
+  it hit the RST-and-free path, so the caller then used a freed pcb and the
+  client got a reset instead of the 404 body. It now queues the body and sets
+  `close_pending`; the close happens from `http_sent()`/`http_poll()` after the
+  request is finished, which reaches the graceful FIN path.
+- **`http_sent()`/`http_poll()` called `tcp_arg(pcb, NULL)` after
+  `tcp_close()`** — the same use-after-close on every served response.
+- **Peer FIN freed the state but never closed**, parking the pcb in CLOSE_WAIT
+  permanently: a `tcp_pcb` leak (`MEMP_NUM_TCP_PCB` = 32) per client-closed
+  connection, so the server eventually stops accepting.
+- **`http_send_json_system()` early-returned** on snprintf/tcp_write failure
+  without `close_pending` — state and pcb both stranded.
+- **`http_accept()` closed the pcb and returned `ERR_MEM`** — lwIP aborts the
+  pcb itself on a non-OK accept return, so that was a close plus an abort of
+  the same pcb. Refusal is left to lwIP.
+- `http_recv()` drops a connection handed a NULL state, establishing the
+  invariant instead of each handler re-checking it.
+- Host-harness negative control: the identical 14-scenario lifetime suite
+  against the pre-fix tree fails 12 (leaks, use-after-free, CLOSE_WAIT
+  strands); fixed tree passes all, ASan+UBSan clean. Send-engine and
+  path-policy suites re-run unchanged, all green.
+- Visible behavior change: a 404 is now a real HTTP response with a graceful
+  FIN instead of a connection reset.
+- Build: `BOOT.BIN` 12,762,340 bytes, crc32 `455A7D12`. Not flashed yet.
+
 ## 2026-08-20 — httpd: whole-file streaming + native GET /download (both volumes) (311694d..366a53a)
 
 The boot-menu HTTP server could not send a response much larger than
