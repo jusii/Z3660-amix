@@ -58,7 +58,8 @@ struct http_conn_state {
 const char *mime_type(const char *name);
 static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len);
 void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *state);
-void http_send_404(struct tcp_pcb *pcb);
+static void http_send_404(struct tcp_pcb *pcb, struct http_conn_state *state);
+static void http_conn_close(struct tcp_pcb *pcb, struct http_conn_state *state);
 static err_t send_http_header(struct tcp_pcb *pcb, const char *filename,
                               FSIZE_t size, const char *attach_name);
 void extract_filename(char *request, char *filename, size_t size);
@@ -146,6 +147,45 @@ static int http_download_path_ok(const char *path)
     if (strstr(path, "..") != NULL)
         return 0;
     return 1;
+}
+
+/* The single way a connection ends, and the only place the per-connection
+   state is released.
+
+   The ordering is not a style choice, it is what lwIP requires. tcp_close()
+   may free the pcb before it returns -- tcp_close_shutdown() sends an RST and
+   calls tcp_free() outright when the receive window is still short, i.e. when
+   the request has not been tcp_recved() yet -- and when it cannot allocate the
+   FIN it returns ERR_OK anyway, having flagged the pcb for a close from
+   tcp_tmr. Its own comment spells out the contract: once tcp_close() has been
+   called the pcb must not be used again. So there is nothing to retry on
+   "failure", and anything that touches the pcb afterwards (a tcp_arg() to
+   detach, say) is a use-after-free waiting for the RST path to be taken.
+
+   Detach every callback first, so lwIP cannot hand a freed state to one of
+   them; then close; then free. The caller must not touch the pcb after this
+   returns. Passing a NULL state is fine -- it just closes the connection. */
+static void http_conn_close(struct tcp_pcb *pcb, struct http_conn_state *state)
+{
+    if (state) {
+        if (state->send_active) {
+            f_close(&state->send_file);
+            state->send_active = 0;
+        }
+        if (state->upload_active) {
+            f_close(&state->upload_file);
+            state->upload_active = 0;
+        }
+    }
+
+    tcp_arg(pcb, NULL);
+    tcp_sent(pcb, NULL);
+    tcp_recv(pcb, NULL);
+    tcp_err(pcb, NULL);
+    tcp_poll(pcb, NULL, 0);
+
+    tcp_close(pcb);
+    free(state);
 }
 
 /* Hand as much of the open file to lwIP as the send window will take, then
@@ -239,23 +279,25 @@ static err_t http_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
         http_send_pump(pcb, state);
 
     if (!state->send_active && state->close_pending) {
-        err_t err = tcp_close(pcb);
-        if (err == ERR_OK) {
-            printf2(64,"[httpd] %s: tcp_close succeeded", __func__);
-            tcp_arg(pcb, NULL);
-            free(state);
-        } else {
-            printf2(64,"[httpd] %s: tcp_close still failed (%d)", __func__, err);
-        }
+        printf2(64,"[httpd] %s: response complete, closing", __func__);
+        http_conn_close(pcb, state);
     }
     return ERR_OK;
 }
 
-/* Safety net for the send engine. http_send_pump() normally resumes from
-   tcp_sent(), which needs an ACK to fire -- and an ACK only comes if something
-   is still unacknowledged. If a pass ever ends having queued nothing at all
-   (pbufs momentarily exhausted) there would be no ACK left to wake it, so the
-   coarse timer retries too. Same reason lwIP's own httpd registers a poll. */
+/* Safety net for the send engine, and the backstop for every close.
+
+   http_send_pump() normally resumes from tcp_sent(), which needs an ACK to
+   fire -- and an ACK only comes if something is still unacknowledged. If a
+   pass ever ends having queued nothing at all (pbufs momentarily exhausted)
+   there would be no ACK left to wake it, so the coarse timer retries too.
+
+   It is also what guarantees a connection marked close_pending is always
+   reaped, whether or not another ACK ever arrives: every response path just
+   sets the flag and returns, and this fires roughly every two seconds until
+   the connection is gone. lwIP supports closing from here -- tcp_slowtmr()
+   reads pcb->next before the callback and restarts its walk if the callback
+   changed the active list. */
 static err_t http_poll(void *arg, struct tcp_pcb *pcb)
 {
     struct http_conn_state *state = (struct http_conn_state *)arg;
@@ -266,10 +308,8 @@ static err_t http_poll(void *arg, struct tcp_pcb *pcb)
         return ERR_OK;
     }
     if (state->close_pending) {
-        if (tcp_close(pcb) == ERR_OK) {
-            tcp_arg(pcb, NULL);
-            free(state);
-        }
+        printf2(64,"[httpd] %s: closing on poll", __func__);
+        http_conn_close(pcb, state);
     }
     return ERR_OK;
 }
@@ -304,28 +344,34 @@ err_t http_recv(void *arg,
 //    HTTPD_TRACE();
     if (p == NULL)
     {
-        printf2(64,"[httpd] %s: p == NULL, cleaning up state", __func__);
-        if (state) {
-            /* the peer went away mid-transfer: don't leak the open file */
-            if (state->send_active) {
-                f_close(&state->send_file);
-                state->send_active = 0;
-            }
-            if (state->upload_active) {
-                f_close(&state->upload_file);
-                state->upload_active = 0;
-            }
-            free(state);
-            tcp_arg(pcb, NULL);
-        }
-        printf2(64,"[httpd] %s: return ERR_OK", __func__);
+        /* The peer sent FIN. Closing is ours to do: freeing the state without
+           closing left the pcb parked in CLOSE_WAIT for good, which leaks a
+           tcp_pcb (there are MEMP_NUM_TCP_PCB of them) on every connection the
+           client closed first. http_conn_close() also closes any file an
+           interrupted transfer left open. */
+        printf2(64,"[httpd] %s: peer closed, tearing down", __func__);
+        http_conn_close(pcb, state);
+        return ERR_OK;
+    }
+
+    /* Below here the state is required: it is where the response, the open
+       file and the close flag live. It can only be NULL if a callback fired
+       after teardown, which cannot happen because teardown detaches them all
+       -- http_accept() refuses the connection outright when the allocation
+       fails. Handled anyway, so no path below has to re-check it. */
+    if (state == NULL)
+    {
+        printf2(64,"[httpd] %s: no state, dropping connection", __func__);
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+        http_conn_close(pcb, NULL);
         return ERR_OK;
     }
 
     /* A body is still streaming out on this connection. Every response says
        "Connection: close", so a second request here is not a pipelined one to
        honour -- and acting on it would clobber the in-flight send_file. */
-    if (state && state->send_active) {
+    if (state->send_active) {
         printf2(64,"[httpd] %s: request while sending, ignored", __func__);
         tcp_recved(pcb, p->tot_len);
         pbuf_free(p);
@@ -335,7 +381,7 @@ err_t http_recv(void *arg,
     char *data = (char *)p->payload;
 
     /* If an upload is in progress, write the received payload to file */
-    if (state && state->upload_active) {
+    if (state->upload_active) {
         size_t to_write = p->tot_len;
         if (to_write > state->upload_remaining) to_write = state->upload_remaining;
         UINT bw;
@@ -346,7 +392,7 @@ err_t http_recv(void *arg,
             f_close(&state->upload_file);
             state->upload_active = 0;
             state->upload_remaining = 0;
-            http_send_404(pcb);
+            http_send_404(pcb, state);
         } else {
             state->upload_remaining -= bw;
             // This printf spams the console, so reduce its frequency
@@ -396,12 +442,12 @@ err_t http_recv(void *arg,
         const char *pfx = "/upload/";
         if (strncmp(filename, pfx, strlen(pfx)) != 0) {
             printf2(1000,"[httpd] %s: PUT to unsupported path %s", __func__, filename);
-            http_send_404(pcb);
+            http_send_404(pcb, state);
         } else {
             const char *name = filename + strlen(pfx);
             if (*name == '\0') {
                 printf2(64,"[httpd] %s: PUT missing filename", __func__);
-                http_send_404(pcb);
+                http_send_404(pcb, state);
             } else {
                 /* parse path= in query if provided */
                 char dest[257] = {0};
@@ -431,7 +477,7 @@ err_t http_recv(void *arg,
                    has changed. */
                 if (!(dest[0] == '1' && dest[1] == ':')) {
                     printf2(1000,"[httpd] %s: invalid destination %s (uploads are 1: only)", __func__, dest);
-                    http_send_404(pcb);
+                    http_send_404(pcb, state);
                 } else {
                     /* ensure directory exists */
                     FRESULT st = f_stat(dest, NULL);
@@ -459,7 +505,7 @@ err_t http_recv(void *arg,
                 FRESULT fres = f_open(&state->upload_file, fullpath, FA_CREATE_ALWAYS | FA_WRITE);
                 if (fres != FR_OK) {
                     printf2(1000,"[httpd] %s: f_open upload failed %s: %d", __func__, fullpath, (int)fres);
-                    http_send_404(pcb);
+                    http_send_404(pcb, state);
                 } else {
                     printf2(1000,"[httpd] %s: upload start %s, expecting %lu bytes", __func__, fullpath, (unsigned long)content_len);
                     state->upload_active = 1;
@@ -478,7 +524,7 @@ err_t http_recv(void *arg,
                                 printf2(64,"[httpd] %s: f_write initial body failed %d", __func__, (int)fres2);
                                 f_close(&state->upload_file);
                                 state->upload_active = 0;
-                                http_send_404(pcb);
+                                http_send_404(pcb, state);
                             } else {
                                 if (bw > state->upload_remaining) bw = state->upload_remaining;
                                 state->upload_remaining -= bw;
@@ -540,6 +586,14 @@ char firmware[300]={0};
 void http_send_json_system(struct tcp_pcb *pcb, struct http_conn_state *state)
 {
     HTTPD_TRACE();
+    /* Every exit from here marks the connection for close, including the
+       failure ones. They used to just return: nothing then set close_pending,
+       so neither http_sent() nor http_poll() would ever tear the connection
+       down, and both the state and the pcb were stranded until the client
+       gave up. Same lifetime rule as the 404 path. */
+    if (state)
+        state->close_pending = 1;
+
     DWORD free_clusters;
     FATFS *fs = &fatfs;
     FRESULT fres = f_getfree("1:", &free_clusters, &fs);
@@ -588,11 +642,6 @@ void http_send_json_system(struct tcp_pcb *pcb, struct http_conn_state *state)
     tcp_output(pcb);
     printf2(100,"[httpd] %s: sent json system info (%d bytes)", __func__, json_len);
     printf2(1000,"jsonn %s",json_buf);
-    
-    if (state) {
-        state->close_pending = 1;
-    }
-    tcp_output(pcb);
 }
 
 void http_send_json_dirs(struct tcp_pcb *pcb, struct http_conn_state *state)
@@ -676,7 +725,7 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
        volume a request actually needs is re-checked where it is opened. */
     if (!fatfs_mounted && !fatfs0_mounted) {
         printf2(64,"[httpd] %s: fatfs not mounted", __func__);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
 
@@ -712,7 +761,7 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
 
     if (!state) {
         printf2(64,"[httpd] %s: no connection state", __func__);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
 
@@ -722,7 +771,7 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
     if (fres != FR_OK)
     {
         printf2(1000,"[httpd] %s: f_open failed for %s: %d", __func__, fullpath, (int)fres);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         printf2(64,"[httpd] %s: returning after 404", __func__);
         return;
     }
@@ -735,7 +784,7 @@ void http_send_file(struct tcp_pcb *pcb, char *request, struct http_conn_state *
     FSIZE_t size = f_size(&state->send_file);
     if (send_http_header(pcb, fullpath, size, NULL) != ERR_OK) {
         f_close(&state->send_file);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
     state->send_active = 1;
@@ -757,29 +806,29 @@ static void http_send_download(struct tcp_pcb *pcb, const char *query,
 
     if (!state) {
         printf2(64,"[httpd] %s: no connection state", __func__);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
     if (!query_get(query, "path", path, sizeof(path)) || path[0] == '\0') {
         printf2(64,"[httpd] %s: no path= in query", __func__);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
     if (!http_download_path_ok(path)) {
         printf2(1000,"[httpd] %s: rejected path %s", __func__, path);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
     if ((path[0] == '0' && !fatfs0_mounted) || (path[0] == '1' && !fatfs_mounted)) {
         printf2(1000,"[httpd] %s: volume not mounted for %s", __func__, path);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
 
     FRESULT fres = f_open(&state->send_file, path, FA_READ);
     if (fres != FR_OK) {
         printf2(1000,"[httpd] %s: f_open failed for %s: %d", __func__, path, (int)fres);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
 
@@ -789,7 +838,7 @@ static void http_send_download(struct tcp_pcb *pcb, const char *query,
 
     if (send_http_header(pcb, path, size, base) != ERR_OK) {
         f_close(&state->send_file);
-        http_send_404(pcb);
+        http_send_404(pcb, state);
         return;
     }
     state->send_active = 1;
@@ -847,12 +896,24 @@ static err_t send_http_header(struct tcp_pcb *pcb, const char *filename,
     return header_err;
 }
 
-void http_send_404(struct tcp_pcb *pcb)
+/* Queue a 404 and mark the connection for close, exactly like every other
+   response path. It deliberately does NOT close here.
+
+   Closing inline was wrong twice over. It leaked the per-connection state --
+   nothing freed it, and after tcp_close() no callback of ours runs to do it
+   later. And it closed while the request pbuf was still unacknowledged, which
+   is the case tcp_close_shutdown() answers with an RST plus an immediate
+   tcp_free() of the pcb: the client lost the 404 body it was meant to read,
+   and the caller went on to use a freed pcb. Setting the flag instead lets
+   http_recv() finish the request (tcp_recved() included) and leaves the close
+   to http_sent()/http_poll(), which get a graceful FIN and a freed state. */
+static void http_send_404(struct tcp_pcb *pcb, struct http_conn_state *state)
 {
     HTTPD_TRACE();
     static const char msg[] =
         "HTTP/1.1 404 Not Found\r\n"
         "Content-Type: text/html\r\n"
+        "Connection: close\r\n"
         "\r\n"
         "<html><body><h1>404</h1></body></html>";
 
@@ -863,8 +924,14 @@ void http_send_404(struct tcp_pcb *pcb)
 
     tcp_output(pcb);
 
-    printf2(64,"[httpd] %s: closing pcb after 404", __func__);
-    tcp_close(pcb);
+    if (state) {
+        state->close_pending = 1;
+    } else {
+        /* Unreachable: http_recv() drops a stateless connection before it can
+           reach any handler. Left deliberately without a close so that no
+           caller can be handed a pcb that died under it. */
+        printf2(64,"[httpd] %s: 404 with no state", __func__);
+    }
 }
 
 const char *mime_type(const char *name)
@@ -934,8 +1001,11 @@ err_t http_accept(void *arg,
     printf2(64,"[httpd] %s: new pcb %p", __func__, (void *)newpcb);
     struct http_conn_state *state = malloc(sizeof(*state));
     if (!state) {
-        printf2(64,"[httpd] %s: malloc failed, closing pcb", __func__);
-        tcp_close(newpcb);
+        /* Returning anything but ERR_OK makes lwIP tcp_abort() this pcb for
+           us (tcp_process(), the "accept function returns with an error"
+           branch). Closing it here as well handed that abort an already-freed
+           pcb, so the refusal is left entirely to lwIP. */
+        printf2(64,"[httpd] %s: malloc failed, refusing connection", __func__);
         return ERR_MEM;
     }
     memset(state, 0, sizeof(*state));
