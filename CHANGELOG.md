@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-20 — 040: PFLUSH was a no-op, PTEST was fabricated (06f45ce, 95bf4af)
+
+`D910C41A` proved the MMU-enable fix and collapsed the preload to seconds; the kernel
+then reached one VM-init stage further and panicked again (`page_sub` → `page_free`).
+
+- Same disease as `MOVEC`→TC, one layer along. `cpuemu_31`'s six F5xx handlers call
+  `mmu_op(opcode, 0)`; `cpummu.h` doesn't declare `mmu_op`, so it bound to
+  `newcpu.cpp`'s copy — which was missing upstream's
+  `if (currprefs.mmu_model) { mmu_op_real(opcode, extra); return; }`. Every 040 MMU
+  instruction fell into the **fake** path: `PFLUSH` a complete no-op, `PTEST`
+  fabricated from the address. `mmu_op_real()` had **no caller in the tree**.
+- Localised by diffing the bench-proven `../amiberry`: its `cpuemu_31` handler is
+  byte-identical; its `newcpu.cpp` has the guard. The divergence was ours alone.
+- Both halves are on AMIX's VM-init path — page-table edits plus `getfault040.s`'s
+  PTEST fault classifier — which is why the panic moved but stayed in `page_*`.
+- Restored guard is model-gated: `UAE_040`/`UAEJIT_040` and all non-MMU tables keep
+  the fake path verbatim; `UAE_030_MMU` uses `mmu_op30()` and is untouched.
+- **Hypothesis 4 closed as correct as-is:** a 68040 ATC entry has no ASID or
+  root-pointer tag on silicon either, so `PFLUSH` is the sole coherence point by
+  architecture. Contract documented at the code site; URP/SRP deliberately unchanged.
+- Callerless-entry-point sweep of cpummu.cpp: mmu_set_tc and mmu_op_real were the
+  only two; every other entry point has live callers now.
+- Harness 152 → **160**, new stale-ATC/PFLUSHA/PTEST guard proven non-vacuous.
+  `BOOT.BIN` 12,762,364 B, zlib crc32 `095356E9`.
+
 ## 2026-08-20 — 040: the MMU was never enabled (2f78695, 84c5269, 12ca0c2)
 
 `6FDBDA40` ran the whole 040 chain (strap → boot1 → boot2-040 → 31 MB preload →
