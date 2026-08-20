@@ -1448,6 +1448,123 @@ Kept because the wrong turns are informative:
 - **The pre-registered "repeating access fault with `a7` marching down" prediction was
   falsified**, which is what made the software-panic reading findable at all.
 
+### 9.8 RESOLVED: `page_free` was ISSUE-48 (unzeroed page database) — kernel-side, confirmed
+
+**The §9 case is closed and the diagnosis held.** The port lane's fix build confirmed
+**ISSUE-48 — the page database was unzeroed DRAM** — on metal, with live counters:
+`calls=1 npages=3688 dirty=3620 **held=150**`. The `page_free` panic is **gone**
+(`syncg calls=0`), and the kernel now runs for **minutes** rather than seconds.
+
+That vindicates the §9.6/§9.7 conclusion on both counts: the geometry (candidate C) was
+correctly derived and was never the problem, and the failure was one of the three `assfail`
+assertions in `page_free` — a page-struct pointer that was garbage because the database it
+indexes had never been zeroed. It also retroactively explains why the fault was byte-for-byte
+deterministic: unzeroed DRAM after a cold ARM boot is deterministic.
+
+Candidate A (the `sync()` NULL guard) remains worth landing on its own merits — it is what
+turned the double panic into a readable one — but it is no longer on the critical path.
+
+## 10. Post-ISSUE-48: three fronts
+
+With the kernel running for minutes, three new failures surfaced. Two of them share a single
+firmware root cause; the third is firmware-side but not yet fixed.
+
+### 10.1 Fronts 2 and 3: one root cause — a guest reset did not clear the MMU state
+
+**Third instance of the pattern that produced the `MOVEC`->TC and `mmu_op` bugs: the register
+is stored, the side-effect function is never called.**
+
+`m68k_reset_newcpu()` zeroes `regs.itt0..dtt1`, `tcr`, `mmusr`, `srp`, `urp` — but on the
+68040 path `regs.mmu_enabled`, the page geometry (`mmu_pagesize_8k` and the masks/shifts) and
+the `mmu_ttr_enabled`/`_ins`/`_data` flags live **outside `regs`** and are only recomputed by
+`mmu_set_tc()` / `mmu_tt_modified()`. The ATC was not flushed either. So a guest warm reset
+carried the previous session's MMU state into the Kickstart ROM that ran next:
+
+- `mmu_ttr_enabled_ins` stays true while `itt0` is now zero → `mmu_match_ttr_ins()` finds no
+  match where ITT0 would have covered the address;
+- `regs.mmu_enabled` stays true → the accessor walks the tables anyway;
+- `srp`/`urp` are now zero → the walk reads descriptors from address 0.
+
+**Front 2 is exactly this signature.** `[XT01] vec=2 ipc=0800ABEA fa=0800ABEA ssw=0546` is a
+supervisor **instruction** fetch (TM=6) taking an ATC fault on kernel text that ITT0 covers,
+and it is address-specific because the stale ATC still held valid entries for the handlers
+that *did* fetch fine in the same window (`080DA860`, `08001068`). **Front 3** — cycle 1 runs
+2:20, cycles 2 and 3 wedge in early KS before the strap — is the same stale state breaking the
+post-reset ROM.
+
+Both front-2 sub-questions answered directly:
+
+- **(a) Does the mmu040 ifetch path consult ITT0?** Yes, correctly. `get_iword_mmu040` gates
+  on `(!mmu_ttr_enabled_ins || mmu_match_ttr_ins(addr, regs.s != 0) == TTR_NO_MATCH) &&
+  regs.mmu_enabled`. The fault cannot come from the ifetch path ignoring TTRs.
+- **(b) Does the kernel clear its TTRs post-`sysseginit`?** No. The **only** TTR-clear site in
+  the whole image is `Lhs_mmu040` (`.text+0xda012`) — `moveq #0` into TC and all four TTRs,
+  then `pflusha` — which is the **haltsys** path, i.e. shutdown. ITT0 stays armed across normal
+  operation, so an ATC fault on ITT0-covered kernel text had to come from stale emulator state.
+
+**Fixed**, `mmu_model`-gated so 030 is untouched (the 030 PMMU keeps its state in `mmu030.*`,
+which `mmu030_reset()` already handles). Host guard `test_mmu040_reset_clears_mmu_state` arms a
+TTR and the MMU, calls `m68k_reset_newcpu(true)` and requires `regs.mmu_enabled` clear, the TTR
+registers clear and all three `mmu_ttr_enabled*` flags recomputed; proven non-vacuous (three
+failures against the pre-fix reset). Harness 160 → **167**.
+
+**`amix_mmu_on` reset — the deferred flag, now implemented, with the argument.** It is latched
+when the kernel brings its MMU up and was never cleared, so every cycle after the first ran the
+ROM's kernel load under AMIX-*runtime* pacing (paced completions, per-access pump suppressed)
+instead of the immediate-completion regime the code comments call "the proven kernel-load
+behavior". The safety argument is that clearing it on reset makes every cycle **start in the
+state cycle 1 starts in** — the metal-proven one — rather than introducing a new regime; the
+kernel re-latches it as soon as it enables its MMU again, and the auto-clicker correctly
+re-arms for the new KS prompt (still bounded by the session budget added earlier). It is
+nonetheless a behaviour change on the proven 030 warm-reset path, and the cheap 030 regression
+should run before it is trusted.
+
+### 10.2 Front 1: core1 wedged on the real Amiga bus (mechanism named, NOT fixed)
+
+The clean cycle wedged with core1 executing no guest instructions — no `[PC]` samples under
+DEMU — while core0's `C0STAT` kept ticking at ~1.0 M it/s. Core1 has **eleven** unbounded
+busy-waits, so the question was which. Two live read-only probes settled it:
+
+1. **The cross-core mailbox class is eliminated.** `DM 0xFFFF0000` len `0xC0` on the wedged box:
+   `shared_data`, `write_rtg(+04)`, `uart_semaphore(+1C)`, `reset_emulator(+24)`,
+   `write_scsi(+38)`, `read_scsi(+48)`, `read_rtg(+60)`, `write_floppy(+9C)`,
+   `read_floppy(+AC)` — **all zero**. (`cfg_emu(+34) = 8` and `debug_emu(+BC) = 1` confirm the
+   dump is aligned and live.) Core1 is not waiting on core0.
+2. **The reset-line spin is eliminated.** `check_uae_int_request()` has
+   `do { ... } while(read_reset==0)`; `read_reset` (map: `0x30610288`) reads **1** — not
+   asserted.
+
+What remains is the **real-bus accessor**. `arm_read_amiga_byte()` and its siblings contain
+**three unbounded waits per access** — `while(read_reg(REG4)&(1<<4))` (pipe empty),
+`wait_write_ack()`, `wait_read_ack()` — between `BUS_REQUEST()` and `BUS_RELINQUISH()`. A
+cycle that never completes spins core1 forever with no instruction advance, no `[PC]` samples,
+core0 unaffected, and the display still painting (the chipset runs from chip RAM independently).
+
+**Confirmed by measurement.** `ps_tally()` records every physical access, so two samples of
+`ps_count`/`ps_lastaddr` (map: `0x3071FC68`/`0x3071FC7C`) nine seconds apart:
+
+```
+0x3071FC60  00000000 00000000 001D6BC0 00002F81 00069D7C 00030579 013FB97D 01498BF3
+0x3071FC60  00000000 00000000 001D6BC0 00002F81 00069D7C 00030579 013FB97D 01498BF3
+                              ^lastaddr                                     ^ps_count
+```
+
+**Byte-identical: `ps_count` frozen at `0x01498BF3`, zero physical accesses in nine seconds**,
+with the last attempted access at **`ps_lastaddr = 0x001D6BC0` — chip RAM**. Core1 is wedged
+inside a chip-RAM bus cycle that never completed.
+
+The correlation worth chasing: the last observable guest action before the wedge was a
+**display mode change** (repaint to a striped field at ~23:41–42). A freshly programmed
+high-bandwidth display, or a blitter running with BLTPRI, starves the CPU of bus slots — and
+these waits have no bound.
+
+**Deliberately not fixed.** Bounding those waits is a change to the hottest path in the
+firmware, shared with the metal-proven 030 boot, where a spuriously-firing timeout would break
+everything. The zero-risk next step is a **watchdog that diagnoses without changing behaviour**:
+after N million iterations in each wait, print once — which wait, the address, `REG4`/`REG5`
+status, `nbg_arm` — and then keep spinning. That names the stall (bus never granted vs pipe
+never empty vs ack never returned) in one boot without altering a single timing decision.
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and
