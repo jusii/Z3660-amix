@@ -19,8 +19,11 @@
 > core1 breadcrumb called `z3660_printf` before `init_shared()` and wedged core1 on every
 > mode (§8.4). The third brought the 040 core fully up (banner, `Emulation mode 4`,
 > `CPU=68040 FPU=68040`, 030 canary green) and AmigaOS wedged on its first `STOP`, whose
-> 040-MMU-table handler never advanced the pc (§8.5). All three fixed; the 040 access-error
-> frame and the `amix_mmu_on` latch have still not executed on hardware.
+> 040-MMU-table handler never advanced the pc (§8.5). The fourth reached the AMIX kernel,
+> which panicked because `MOVEC`->TC never enabled the MMU (§8.6); the fifth got one VM-init
+> stage further, because `PFLUSH` was a no-op and `PTEST` fabricated (§8.8). All fixed. The
+> recurring shape: a 68040 register or instruction whose side-effect function exists in
+> `cpummu.cpp` but has no caller.
 
 This tracks a 68040-MMU interpreter as a sibling to the existing `UAE_030_MMU`
 mode (the real 68030 PMMU interpreter — "Emulation mode 4", see
@@ -99,7 +102,8 @@ green, 040 table linked in.
 | core1-launch fix image (§8.3) | 12 762 340 | 12.171 MiB, zlib crc32 `0xBBD5C14F` — `boot_mode_is_emulated()` + the core1 breadcrumbs. **Core1 wedged on every mode: the breadcrumb called `z3660_printf` pre-`init_shared()` (§8.4)** |
 | NULL-safe `z3660_printf` image (§8.4) | 12 762 340 | 12.171 MiB, zlib crc32 `0x806C76AE` — **first image to run the 040 core; AmigaOS wedged on its first `STOP` (§8.5)** |
 | `STOP` pc-advance image (§8.5) | 12 762 340 | 12.171 MiB, zlib crc32 `0x6FDBDA40` — **ran the whole 040 chain; kernel panicked because the 040 MMU was never enabled (§8.6)** |
-| **`MOVEC`->TC MMU-enable image (§8.6/§8.7)** | **12 762 356** | **12.171 MiB, zlib crc32 `0xD910C41A`** |
+| `MOVEC`->TC MMU-enable image (§8.6/§8.7) | 12 762 356 | 12.171 MiB, zlib crc32 `0xD910C41A` — **MMU enable + preload speedup both proven; kernel then died on a no-op `PFLUSH` (§8.8)** |
+| **`PFLUSH`/`PTEST` dispatch image (§8.8)** | **12 762 364** | **12.171 MiB, zlib crc32 `0x095356E9`** |
 
 040-table linked contribution (from `Z3660_emu/build/mapfile.txt`): `cpuemu_31.o`
 268 364 + `cpustbl_mmu040.o` 22 488 = 290 852 B. (For reference the 030 table is
@@ -108,7 +112,7 @@ handlers generate more compactly.)
 
 Current image on disk for flashing (rebuild target, gitignored):
 `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-(12 762 356 B, zlib crc32 `0xD910C41A` — compare against the board's SD `E`→CRC).
+(12 762 364 B, zlib crc32 `0x095356E9` — compare against the board's SD `E`→CRC).
 
 ## 3. What is wired (P3.2), and what is not
 
@@ -755,6 +759,108 @@ nine handshakes at core0's measured ~1 µs loop iteration, so something else dom
 guessing at it is how metal cycles get burned. The cheap next step, if the preload cost
 matters more than the boot: add a cross-core handshake counter and latency span to PSTAT and
 let one boot decide it.
+
+#### 8. Fifth metal attempt (2026-08-20): PFLUSH was a no-op and PTEST was fabricated
+
+`D910C41A` proved the MMU-enable fix — serial showed
+`68040 MMU enabled. TC=8000 Page size = 4096 amix_mmu_on=1 PC=080d7550`, the first 4 KiB-page
+040 MMU enable on the card, latch engaged — and the `service_cadence` wiring collapsed the
+preload from ~10.5 min to seconds. The kernel then got one VM-init stage further and panicked
+again: `page_sub` → `page_free`, psw `2400` → `2708`, wild pc `0x40080000` → `0xF80B4C`, and an
+Address Error / fmt `$2` double fault instead of Line-F / fmt `$0` (both frame formats correct
+for their vectors — the exception plumbing is fine).
+
+**Same disease as `MOVEC`→TC, one layer along.** `cpuemu_31`'s six F5xx handlers
+(`PFLUSHN`/`PFLUSH`/`PFLUSHAN`/`PFLUSHA`/`PTESTW`/`PTESTR`) all call `mmu_op(opcode, 0)` —
+and that call bound to the wrong function. `cpummu.h` does not declare `mmu_op`, so the only
+visible declaration is `newcpu.h`'s, and this fork's `newcpu.cpp` copy of `mmu_op()` was
+missing upstream's first three lines:
+
+```c
+void mmu_op (uae_u32 opcode, uae_u32 extra)
+{
+        if (currprefs.mmu_model) {        /* <-- DROPPED BY THIS FORK */
+                mmu_op_real (opcode, extra);
+                return;
+        }
+        ... the "fake" path, for configs with NO MMU model ...
+```
+
+So every 68040 MMU instruction fell into the fake path:
+
+| instruction | what actually happened |
+|---|---|
+| `PFLUSH` / `PFLUSHA` / `…N` | **complete no-op** — `regs.mmusr = 0; return;`. The real ATC (`mmu_atc_array`) and the `MMU_DPAGECACHE` shortcut arrays kept serving translations the guest had just invalidated. |
+| `PTEST` | **fabricated** — consulted `fake_mmu_match_ttr()` only, never walked the guest's tables, and returned an MMUSR built from the address (`addr & 0xfffff000`), with no resident bit and no real frame. |
+
+Meanwhile `mmu_op_real()` — the genuine implementation, with `mmu_flush_atc_all(glob)`,
+`mmu_flush_atc(addr, super, glob)`, `flush_internals()` and a real `mmu_fill_atc()`-backed
+PTEST — sat in `cpummu.cpp` with **no caller anywhere in the tree**, exactly as `mmu_set_tc()`
+had.
+
+**Diffed against the bench-proven core, as the sharper test.** `../amiberry`'s
+`cpuemu_31.cpp` PFLUSH handler is byte-identical to ours — it also calls `mmu_op(opcode, 0)`.
+The divergence is entirely in `newcpu.cpp`: Amiberry's `mmu_op()` has the dispatch guard
+(`src/newcpu.cpp:4232-4236`), ours had lost it. That settles where the bug lives without
+having to reason about it.
+
+Both halves are on AMIX's VM-init critical path, which is why the panic moved but did not
+leave the `page_*` family: the kernel edits page tables and `PFLUSH`es (stale translations
+survive → it reads and writes the wrong physical frames), and its 040 fault classifier
+(`amix-040-060-port` `src/getfault040.s`, called from the `wb040.s` path) `PTEST`s to decide
+how to resolve a fault (fabricated MMUSR → wrong resolution).
+
+**Fix:** restore upstream's three lines. Model-guarded, so the fake path still runs verbatim
+for every `mmu_model == 0` configuration — `UAE_040`, `UAEJIT_040` and every 68000–68030
+non-MMU table are untouched — and the 68030 MMU path never enters this function at all
+(`cpuemu_32` calls `mmu_op30()`), so `UAE_030_MMU` is unaffected.
+
+**Host guard** `test_mmu040_pflush_ptest` is shaped like the bug: map a VA, translate it to
+populate the ATC, repoint the page descriptor *behind the ATC's back* and prove the stale
+entry still wins (which is what makes the ATC real rather than a pass-through), then execute
+a genuine `PFLUSHA` through the 040 dispatch table and prove the new mapping takes effect;
+finally execute `PTESTR (A0)` and require a resident bit and the frame the walk actually
+found. Proven non-vacuous — against the pre-fix `mmu_op()` it produces exactly three
+failures:
+
+```
+FAIL: PFLUSHA made the updated descriptor take effect: got 0x0a000000 want 0x0b000000
+FAIL: PTEST reports the page RESIDENT (a real table walk)
+FAIL: PTEST reports the frame the walk found: got 0x00401000 want 0x0b000000
+```
+
+Harness 152 → **160**.
+
+##### Hypothesis 4 (URP/SRP without an ATC flush) — closed, correct as-is
+
+The suspicion was that `MOVEC` to URP/SRP needs an implicit flush in an emulator whose ATC
+caches translations, even though silicon does not flush. It does not, and the reasoning is
+worth keeping because it is the kind of thing that gets "fixed" wrongly later.
+
+A 68040 ATC entry is tagged by **address + supervisor bit** (`mmu_tagmask`) — there is no
+ASID and no root-pointer tag. So a URP/SRP write cannot invalidate anything by itself **on
+real hardware either**, which is precisely why the architecture makes the OS responsible for
+`PFLUSH` after a root-pointer change. This core's ATC model has the same shape, so adding an
+implicit flush would *diverge* from hardware and would mask a kernel that omits a required
+`PFLUSH`.
+
+The contract, now written at the code site: **`PFLUSH` is the sole ATC coherence point in
+this core, exactly as on silicon; URP/SRP writes deliberately do not flush.** That contract
+was vacuous while `PFLUSH` was a no-op — which is exactly why hypothesis 4 looked suspicious
+from the outside. With `PFLUSH` real it holds, and the URP/SRP site is right as it stands.
+
+##### Remaining ranked hypotheses, if `page_free` survives this
+
+1. **Write-back fabrication** (the bench ISSUE-10 class) — the format-`$7` path of §8.1 is now
+   genuinely executing for the first time, with real WB3S/WB3A/WB3D. Top of the list.
+2. **The AMIX memory contract** — the single ≤16 MB window at `$08000000` and the `$07000000`
+   `a3000mem` window were sized for the 030 kernel's SCN1; a 040 kernel with a different
+   `MAINSTORE`/`VSIZOFMEM` would fault differently.
+3. **4 KiB first-run paths** — now known to be 4096, so `mmu_pagesize_8k` is *not* implicated;
+   what is newly exercised is every 4 K masking path in the walk, which §6 covered on the host
+   but which had never run on metal until `D910C41A`.
+4. **Cache model** (§7.2) — the 040 copyback/CINV/CPUSH semantics this core does not model at
+   all. Unchanged in rank; would show as data-visibility oddities rather than a clean panic.
 
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
