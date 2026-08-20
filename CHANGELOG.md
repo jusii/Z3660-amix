@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-08-20 — 040: the MMU was never enabled (2f78695, 84c5269, 12ca0c2)
+
+`6FDBDA40` ran the whole 040 chain (strap → boot1 → boot2-040 → 31 MB preload →
+warm reset → kernel) and panicked in VM init. Not a VM bug: `m68k_move2c()` handled
+`MOVEC → TC` as `regs.tcr = *regp & 0xc000` and **`mmu_set_tc()` had no caller in the
+tree**. Every `*_mmu040` accessor gates translation on `regs.mmu_enabled`, which only
+`mmu_set_tc()` sets — so the kernel enabled its MMU, believed it was in virtual space,
+and every access stayed transparent. Kernel VAs at `0x40000000+` fall in the Z3
+expansion window (no RAM) → `page_sub`, wild pc `0x40080000`, F-line double panic.
+Cases 4–7 (TTRs) were inert the same way (`mmu_tt_modified()` never called).
+The 68030 uses `PMOVE`, not `MOVEC`, which is why the golden path never showed it.
+
+- `fmt=0x0` on the F-line is **correct** (format `$2` is only the FPU-unimplemented
+  path) — evidence of garbage execution, not a frame-format defect.
+- MMU-enable print added: `68040 MMU enabled. TC=… Page size = … amix_mmu_on=…`.
+- Console mirror: no gating bug (the gate was engaged; the kernel died before console
+  init). Hardened to byte/word/long and announces itself once as `[SERMIRROR]`.
+- Auto-click: added `amix_mmu_on` disarm + a hard session budget of 4 episodes; the
+  old LBA heuristic can't trip on an 85 MB disk (hence `[CLICK] e48`). 030 unchanged.
+- 040 run loop now honours `service_cadence` (identical at cadence 1). Preload
+  round-trip cost: documented no-go, whole-L1D-flush candidate deferred to its own
+  dispatch (same class as the cdfs page-crossing incident — needs bench proof).
+- Ranked follow-up hypotheses if page_sub survives: write-back fabrication
+  (ISSUE-10 class, now reachable), 8K page-size first run, URP/SRP without ATC flush
+  (deliberately unfixed, wants a decision), 030-shaped memory contract vs the 040
+  kernel.
+- New guard `test_mmu040_movec_tc_enables_mmu` (real `movec d0,tc` through the 040
+  table: translation on, page size derived, VA walks to the right frame; TTR arm) —
+  proven non-vacuous. Harness 142 → **152**.
+- `BOOT.BIN` 12,762,356 B, zlib crc32 `D910C41A`. Build warning-free.
+
 ## 2026-08-20 — 040: STOP never advanced the pc (54838a6, a05da20)
 
 `806C76AE` brought the 040 core up for the first time — banner, `Emulation mode 4`,
