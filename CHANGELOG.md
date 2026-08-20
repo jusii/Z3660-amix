@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-08-20 — httpd: whole-file streaming + native GET /download (both volumes) (311694d..366a53a)
+
+The boot-menu HTTP server could not send a response much larger than
+TCP_SND_BUF (8192). `http_send_file()` looped `f_read(1024)` → `tcp_write()` →
+`tcp_output()` and broke out on the first `tcp_write()` error; since nothing
+pumps lwIP inside a callback, no ACK could arrive and no send buffer could
+free up mid-loop, so every response was silently truncated at the send-buffer
+boundary. Replaced with a `tcp_sent`-driven continuation (`http_send_pump()`),
+with the open `FIL`, its read offset and the not-yet-accepted bytes carried in
+the per-connection state; a `tcp_poll` net covers a pass that queues nothing.
+Proven in a host harness on the extracted functions: the doc's 12,428,476-byte
+benchmark payload delivered byte-exact through 1517 forced `ERR_MEM` refusals
+(the old loop delivered 8,192 bytes of it).
+
+- **New `GET /download?path=<vol>:/<file>`** — reads any file from `0:` or
+  `1:`, same `?path=` convention (and percent-decoding) as `PUT /upload`.
+  `0:` is mounted read-only in the httpd init (`f_clk_mount`, the sd_fileops
+  pattern). Paths must name `0:`/`1:` and must not contain `..`; else 404.
+- **`Content-Length` on all file responses**, so a short transfer is
+  detectable host-side instead of silent. Downloads also get
+  `Content-Disposition`. `Connection: close` unchanged.
+- **`1:/web` assets share the engine** — they had the same truncation bound.
+- **Uploads stay `1:`-only, now by explicit policy.** The `0:` refusal
+  previously held only because that volume was unmounted; mounting it for
+  reads would have made the boot volume HTTP-writable. Flashing stays on the
+  boot-menu `E` → `COPY` → `CRC` gate with FAILSAFE behind it. `/api/dirs`
+  (the shipped UI's upload destination selector) drops its `0:` candidate for
+  the same reason — no web-UI JS change needed.
+- Bounded `extract_filename()` (unbounded target length → caller-buffer
+  overrun); closed files leaked by aborted transfers (`tcp_err`, recv-NULL);
+  removed per-chunk console logging from the send path (`printf2` also paints
+  HDMI — per-ACK logging would dominate a multi-MB transfer).
+- Docs: `http-vs-tftp-upload.md` practical guidance rewritten by direction;
+  the stale "deploy-kvm.sh broken on beta 21" warning retired (the script was
+  rewritten to the HTTP → COPY → dual-CRC route and works).
+- Build: `BOOT.BIN` 12,762,340 bytes, crc32 `C05D5F5C`. Not flashed yet;
+  metal validation pending (queued: >8 KB web asset, `GET ?path=0:/Z3660.bin`
+  vs on-card `CRC`, `PUT` to `0:` still 404).
+
 ## 2026-08-19 — Beta-21 consolidation FLASHED + METAL-VALIDATED (CEEC4984 live)
 
 Same-day follow-up to the consolidation entry: `BOOT.BIN` crc32 `CEEC4984`
