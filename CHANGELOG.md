@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-08-20 — 040: page_free is boot-stack exhaustion (9143d5a)
+
+`095356E9` panicked byte-identically to `D910C41A`, so PFLUSH/PTEST were real bugs but
+not this panic's cause. Static read-out of the kernel binary, no boot needed:
+
+- Load base proven at `0x08000000` (`movec %d0,%tc` at `.text+0xd7550` == serial's
+  `PC=080d7550`); enclosing symbol `pstart`.
+- **The panic is `pstack` exhaustion**: an 8000-byte boot stack (`pstackt` `.data+0x4`
+  → `pstack` `.data+0x1f44`, VA `0x080F45C0`..`0x080F6500`), ~92% consumed at both
+  panics. `page_sub`/`page_free` are page-allocator neighbours — where the runaway was
+  standing, not the bug. The first panic's odd `Backtrace` (`0x080F485B`) explains the
+  Address-Error double fault.
+- `pstart`'s TTRs (`itt0=0x003FC000`, `dtt0=0x003FC060`, `dtt1=0x807FA060`) make the
+  kernel image **and Kickstart ROM** transparent, so `pc=0xF80B4C` is legitimately
+  executable — not a wild jump. The page-table-walked window is `0x40000000+`, where
+  the first panic's `pc=0x40080000` sat.
+- **TTR decoding verified correct** against those exact values — class eliminated.
+- Ships `amix_xtrace()`: first 64 non-interrupt exceptions after the 040 MMU enable
+  (`vec/ipc/pc/fa/ssw/sr/a7`), self-arming and self-closing. Instrumentation, not a fix.
+- `BOOT.BIN` 12,762,364 B, zlib crc32 `F4782D71`. Build warning-free.
+
 ## 2026-08-20 — 040: PFLUSH was a no-op, PTEST was fabricated (06f45ce, 95bf4af)
 
 `D910C41A` proved the MMU-enable fix and collapsed the preload to seconds; the kernel
