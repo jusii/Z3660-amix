@@ -16,11 +16,17 @@ the firmware now flashed there is no choice to make. HTTP is also **~18 % faster
 > **An upload still costs a power-cycle and the running guest.** The throughput numbers below and
 > the 404-on-`0:` finding are unaffected; the ARM-state column has been corrected.
 
-⚠ **Operational consequence: `amix-kerntools/tools/hw-ops/deploy-kvm.sh` no longer works on
-beta-21 firmware.** It presses `P` and then TFTPs — the `P` now starts HTTP and the TFTP transfer
-will hang. The replacement route is proven below.
+> **UPDATE 2026-08-20 — the deploy-kvm.sh warning below is retired.** An earlier revision of this
+> document warned that `amix-kerntools/tools/hw-ops/deploy-kvm.sh` was broken on beta 21 because it
+> pressed `P` and then TFTPed. That script has since been rewritten to the HTTP-upload → boot-menu
+> `COPY` → `CRC` route proven further down, and it works on beta-21 firmware. No action needed.
 
-## Numbers## Numbers
+> **UPDATE 2026-08-20 — download is now native.** Finding 2 below ("HTTP cannot write the boot
+> volume") still holds for *writes*, and deliberately so. But the server now **reads** both volumes:
+> `GET /download?path=<vol>:/<file>` streams any file off `0:` or `1:`, with a real
+> `Content-Length`. See *Practical guidance*.
+
+## Numbers
 
 Same 12,428,476-byte payload (a BOOT.BIN, used purely as a representative image-sized file),
 same host, same LAN, same board.
@@ -62,11 +68,12 @@ HTTP variance across three runs was ±0.3 %, so the gap is not noise.
    whatever was running — before the transfer itself begins. **HTTP uploads happen with the guest
    running and cost nothing but the transfer.** For iterating on disk images that difference
    dwarfs the throughput gap.
-2. **HTTP cannot write the boot volume.** `PUT … ?path=0:/` is answered with a 404: the web server
-   mounts only `1:` (`[httpd] FATFS mounted on 1:` at startup), so `0:` is syntactically accepted
-   by the destination validator and then fails to open. **Firmware flashing therefore still
-   requires TFTP** (`0:/Z3660.bin`), and that is unlikely to change without mounting `0:` in the
-   httpd path.
+2. **HTTP cannot write the boot volume.** `PUT … ?path=0:/` is answered with a 404. *(As measured,
+   that was an accident of mounting: `0:` was syntactically accepted by the destination validator
+   and then failed to open, because the server mounted only `1:`. Since 2026-08-20 the server does
+   mount `0:` — for reading — so the refusal is now written into the validator explicitly, and the
+   404 is a decision rather than a side effect. Writing the boot volume stays a boot-menu-only
+   operation: `E` → `COPY` → `CRC`, with `FAILSAFE.bin` behind it.)*
 
 ## Caveat, stated plainly
 
@@ -78,9 +85,9 @@ load**, so the protocol gap is if anything understated here.
 
 ## The replacement flash route — proven on hardware 2026-08-02
 
-HTTP cannot write the boot volume (`PUT …?path=0:/` → 404; the server mounts only `1:`, per
-`[httpd] FATFS mounted on 1:` at startup), and the web UI's **"Update Firmware" button has no
-event handler at all** — only the upload button does. So firmware is flashed in two steps now:
+HTTP cannot write the boot volume (`PUT …?path=0:/` → 404, now by explicit policy — see finding 2),
+and the web UI's **"Update Firmware" button has no event handler at all** — only the upload button
+does. So firmware is flashed in two steps now:
 
 1. **Upload over HTTP** (from the boot menu, after `C` → `P`):
    `curl -T fw.bin "http://<board>/upload/fw.bin?path=1:/hdf"` — 27 s for a 12.4 MB firmware.
@@ -93,27 +100,61 @@ Verified end to end: `COPY 1:/hdf/bench.tmp 0:/flashtest.bin` reported
 **`CDEF0090`** — byte-identical to the file uploaded over HTTP. Volume `0:` has 149 MB free of
 196 MB, so a staging copy fits comfortably beside the three firmware images.
 
+Since 2026-08-20 there is a third, optional step available: **`GET /download?path=0:/Z3660.bin`
+pulls the flashed image back off the card**, so the on-card `CRC` can be checked against a hash of
+the bytes the board actually serves, not only against the host's copy of what was sent. Useful for
+capturing the currently-flashed firmware before replacing it, too — that rollback image no longer
+has to be staged by hand.
+
 Better than the old flow on every axis that survives scrutiny: faster transfer, a direct write to
 the data volume, a real status code, two independent CRC gates, and one power cut instead of two.
 It is *not* faster in the way the first draft claimed — the guest stops either way.
 
 ## Practical guidance
 
+### Getting files onto the card — `PUT /upload`, volume `1:` only
 
 - **Disk images (`.hdf`, `.iso`) → HTTP.** They live on `1:`, which is the only volume HTTP can
   write: `curl -T image.hdf "http://<board>/upload/image.hdf?path=1:/hdf"` from the boot menu's
   `P` mode. The guest still has to stop — see the correction at the top — but the transfer is
   faster, lands directly on `1:`, and reports a status code.
   The endpoint creates the destination directory if it is missing.
+- **`?path=0:/…` is refused, on purpose.** Uploads are `1:`-only. The boot volume carries
+  `Z3660.bin` and `FAILSAFE.bin`, and the only supported way to replace them is the boot menu's
+  `E` → `COPY` → `CRC` gate, which verifies both sides and leaves a failsafe image in place. An
+  HTTP write path to `0:` would bypass all of that, so there isn't one.
 - **Firmware (`Z3660.bin`, `FAILSAFE.bin`) → HTTP upload to `1:` then boot-menu `COPY` to `0:`**
-  (see above). TFTP is gone on beta 21; `deploy-kvm.sh` needs rewriting to this route, or the fork
-  can simply re-enable `USE_TFTP` in `mobotest.c` — it is a one-line uncomment and the server is
-  still compiled in.
+  (see above). This is the route `amix-kerntools/tools/hw-ops/deploy-kvm.sh` now drives, and it
+  works on beta 21. (Re-enabling `USE_TFTP` in `mobotest.c` remains a one-line uncomment if TFTP
+  is ever wanted back — the server is still compiled in — but nothing needs it.)
 - The upload has **no integrity check of its own** — the server reports `UPLOAD OK` on a completed
   write, nothing more. Verify large images afterwards with the boot menu's `CRC <file>` against a
   host-side `zlib.crc32`, exactly as the firmware flash procedure does.
-- There is **no delete over HTTP**. A scratch upload can only be shrunk by overwriting it with a
-  small file; removing it needs the boot menu's `DEL`.
+
+### Getting files off the card — `GET /download`, both volumes (since 2026-08-20)
+
+```
+curl -o Z3660.bin  "http://<board>/download?path=0:/Z3660.bin"
+curl -o amix.hdf   "http://<board>/download?path=1:/hdf/amix.hdf"
+```
+
+- **Both volumes are readable**, `0:` and `1:`. `0:` is mounted read-only by the server; the
+  asymmetry with upload is the deliberate flash gate described above, not an oversight.
+- **Same `?path=` convention as upload**, percent-decoding included, so
+  `?path=1%3A%2Fhdf%2Fa.hdf` works too. The volume prefix is required; anything other than `0:`
+  or `1:`, and any path containing `..`, is a 404.
+- **A `Content-Length` is always sent**, so a truncated transfer is detectable rather than silent —
+  `curl` reports `transfer closed with N bytes remaining to read` and exits non-zero. Worth
+  scripting a size check around, since the upload direction still has no integrity signal of
+  its own.
+- **Whole files, any size.** The response is streamed from the `tcp_sent` callback, so it is not
+  bounded by `TCP_SND_BUF` (8 KB). Before this change, any HTTP response past roughly the send
+  buffer was silently cut off at that point — which is why the web UI's own assets had to stay
+  tiny.
+- Reads are the natural verification companion to a `CRC` on the card: download the file back and
+  hash it host-side if you want an end-to-end check of a round trip.
+- There is still **no delete or rename over HTTP**. A scratch upload can only be shrunk by
+  overwriting it with a small file; removing it needs the boot menu's `DEL`.
 
 ## Cleanup
 
