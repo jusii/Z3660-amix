@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-08-20 — 040: fault named, case handed to the port lane (37cb2aa)
+
+`F87F6FA7` returned outcome 2: **zero interrupts** (storm dead, IPL7 edge question moot)
+and `a7=080f49e8` **at MMU-on** — `pstack` already 6936/8000 deep before the MMU was
+enabled, only 296 bytes more to the fault. The deep stack is ambient; the exhaustion
+panic was the cascade.
+
+- `0x00F80B4C` disassembled from the card's own KS 2.04 r37.175: the **`rts` at the tail
+  of AmigaOS exec's CPU-exception dispatcher**, which jumps to
+  `ExecBase->ThisTask->tc_TrapCode` read from **absolute address 4**. AMIX owns low
+  memory by then, so the walk returns garbage — `0xFFFFFFFE`.
+- **Not reached by an exception:** the kernel's VBR is `M68Kvec` (`.text+0x1378` == the
+  observed `0x08001378`) and every entry relocates to a kernel symbol — no ROM address.
+  Control was transferred through a pointer.
+- Emulator exonerated: one exception, correct frame, kernel's own handler, no storm, no
+  stale ATC. **Kernel/handover question → port lane.**
+- Corrections: the TC write sits after `pstart` (nearest label `Lkroot`), and the
+  missing `[SERMIRROR]` is expected — `btrace_mark` gates on `btrace_on` (DBG-only).
+- Ships `[ROMENT]` (one compare/instruction, AMIX-040, 4 hits max) naming the source pc,
+  the pushed return address and `execbase@4` — the one fact the binary can't supply.
+- Memory-contract change proposed, **not** implemented (needs a decision + 030 regression).
+- `BOOT.BIN` 12,762,372 B, zlib crc32 `8C51370A`. Warning-free.
+
 ## 2026-08-20 — 040: extended exception trace (c086aa7)
 
 `F4782D71` returned a one-line trace and falsified the prediction:
