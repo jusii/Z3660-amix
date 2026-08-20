@@ -2668,8 +2668,32 @@ static int fake_mmu_match_ttr(uaecptr addr, bool super, bool data)
 }
 
 // 68040+ MMU instructions only
+// 68040+ MMU instructions (PFLUSH / PFLUSHN / PFLUSHA / PFLUSHAN / PTEST / PLPA).
 void mmu_op (uae_u32 opcode, uae_u32 extra)
 {
+   // RESTORED from WinUAE/Amiberry (this fork had dropped these three lines, the same way it
+   // dropped the mmu_model branch in Exception_normal). Without them EVERY 68040 MMU
+   // instruction fell through into the "fake" path below -- the one meant for configs with
+   // NO MMU model -- so under UAE_040_MMU:
+   //   PFLUSH/PFLUSHA  = a complete no-op. regs.mmusr was cleared and nothing else happened;
+   //                     the real ATC (mmu_atc_array) and the MMU_DPAGECACHE shortcut arrays
+   //                     kept serving translations the guest had just invalidated.
+   //   PTEST           = fabricated. It consulted fake_mmu_match_ttr() only, never walked the
+   //                     guest's tables, and reported an MMUSR built from the address.
+   // Both sit squarely on AMIX's VM-init path: the kernel edits page tables and PFLUSHes, and
+   // its 040 fault classifier (amix-040-060-port src/getfault040.s) PTESTs to decide how to
+   // resolve a fault. Stale translations plus a fabricated MMUSR is how the 68040 kernel died
+   // in page_sub/page_free (metal, images 6FDBDA40 and D910C41A).
+   //
+   // cpuemu_31.cpp's six F5xx handlers call mmu_op(opcode, 0) -- byte-identical to Amiberry's,
+   // which is the bench-proven core; the divergence was here, not in the generated table.
+   // The 68030 does not come through this function at all (cpuemu_32 calls mmu_op30()), and
+   // the fake path below still runs verbatim for every mmu_model == 0 configuration, so
+   // UAE_030_MMU, UAE_040 and UAEJIT_040 are all untouched.
+   if (currprefs.mmu_model) {
+      mmu_op_real (opcode, extra);
+      return;
+   }
    if ((opcode & 0xFE0) == 0x0500) {
       /* PFLUSH */
       regs.mmusr = 0;

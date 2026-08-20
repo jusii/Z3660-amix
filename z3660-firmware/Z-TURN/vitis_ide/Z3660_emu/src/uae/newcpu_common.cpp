@@ -123,6 +123,19 @@ int m68k_move2c (int regno, uae_u32 *regp)
 			/* 68040 only */
 		case 0x805: regs.mmusr = *regp; break;
 	  /* 68040 stores all bits */
+		// URP/SRP: store only, NO implicit ATC flush -- deliberate, and it matches silicon.
+		// A 68040 ATC entry is tagged by address + supervisor bit (see mmu_tagmask); there is
+		// no ASID and no root-pointer tag, so changing URP/SRP cannot invalidate anything by
+		// itself -- on real hardware either, which is exactly why the architecture makes the
+		// OS responsible for PFLUSH after a root-pointer change. This core's ATC model has the
+		// same shape, so adding a flush here would diverge from hardware and mask kernel bugs.
+		//
+		// THE CONTRACT: PFLUSH is the sole ATC coherence point in this core, as on silicon.
+		// That contract was vacuous until 2026-08-20, because mmu_op() dropped upstream's
+		// dispatch to mmu_op_real() and every PFLUSH was a no-op (see newcpu.cpp). With PFLUSH
+		// real the contract holds, and this site is correct as it stands. Re-examined and left
+		// unchanged on purpose -- do not "fix" it without evidence that AMIX omits a PFLUSH
+		// the 68040 UM requires.
 		case 0x806: regs.urp = *regp & 0xffffffff; break;
 		case 0x807: regs.srp = *regp & 0xffffffff; break;
 		default:

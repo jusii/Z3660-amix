@@ -1051,6 +1051,85 @@ static void test_mmu040_movec_tc_enables_mmu(void)
 }
 
 /* ==================================================================
+ * PFLUSH must invalidate the ATC, and PTEST must walk the real tables.
+ *
+ * cpuemu_31's six F5xx handlers call mmu_op(opcode, 0) -- byte-identical to the
+ * bench-proven Amiberry core. The divergence was in mmu_op() itself: this fork had
+ * dropped upstream's `if (currprefs.mmu_model) { mmu_op_real(...); return; }`, so
+ * every 68040 MMU instruction fell into the "fake" path meant for configs with no
+ * MMU model. PFLUSH became a no-op (the ATC kept serving translations the guest had
+ * just invalidated) and PTEST became fabricated (it never walked the tables).
+ *
+ * The shape of the guard is the shape of the bug: change a page descriptor behind
+ * the ATC's back, prove the stale entry is still served, then PFLUSH and prove the
+ * new mapping takes effect. A no-op PFLUSH fails the last assertion.
+ * ================================================================== */
+static void test_mmu040_pflush_ptest(void)
+{
+	printf("[test] PFLUSH invalidates the ATC; PTEST walks the guest's tables\n");
+	const uae_u32 VCODE = 0x00400000, PCODE = 0x0C000000;
+	const uae_u32 VDATA = 0x00401000, PA1 = 0x0A000000, PA2 = 0x0B000000;
+	const uae_u32 pd = M4_PAGE + ((VDATA >> 10) & 0xfc);   /* VDATA's page descriptor */
+
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VDATA, PA1);
+	regs.s = 1;
+	regs.dfc = 5;                          /* supervisor data: mmu_op_real decodes super/data from DFC */
+
+	uaecptr pa = 0; bool f = false;
+	SAVE_EXCEPTION;
+	TRY(p) { pa = mmu_translate(VDATA, 0, true, true, false, sz_long); } CATCH(p) { f = true; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!f, "first translation did not fault\n");
+	CHECK_EQ32(pa, PA1, "VDATA translates to the frame its descriptor names");
+
+	/* repoint the descriptor behind the ATC's back -- the stale entry must still win */
+	hram_poke32(pd, (PA2 & MMU_PAGE_ADDR_MASK_4) | 1);
+	SAVE_EXCEPTION;
+	TRY(p2) { pa = mmu_translate(VDATA, 0, true, true, false, sz_long); } CATCH(p2) { (void)p2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK_EQ32(pa, PA1, "unflushed descriptor change is masked by the ATC (so the ATC is real)");
+
+	/* a genuine PFLUSHA, executed through the 040 dispatch table */
+	cpu_set_context(VCODE);
+	regs.s = 1;
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0xf518);      /* PFLUSHA */
+	bool pf = false;
+	TRY(p3) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p3) { pf = true; (void)p3; } ENDTRY
+	CHECK(!pf, "PFLUSHA did not fault\n");
+
+	SAVE_EXCEPTION;
+	TRY(p4) { pa = mmu_translate(VDATA, 0, true, true, false, sz_long); } CATCH(p4) { (void)p4; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK_EQ32(pa, PA2, "PFLUSHA made the updated descriptor take effect");
+
+	/* PTEST must report a REAL walk: resident, with the frame it actually found.
+	 * The fake path only ever produced (addr & 0xfffff000) with no R bit. */
+	regs.mmusr = 0;
+	cpu_set_context(VCODE);
+	regs.s = 1;
+	regs.dfc = 5;
+	m68k_areg(regs, 0) = VDATA;
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0xf568);      /* PTESTR (A0) */
+	bool pt = false;
+	TRY(p5) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p5) { pt = true; (void)p5; } ENDTRY
+	CHECK(!pt, "PTESTR did not fault\n");
+	CHECK((regs.mmusr & MMU_MMUSR_R) != 0, "PTEST reports the page RESIDENT (a real table walk)\n");
+	CHECK_EQ32(regs.mmusr & MMU_MMUSR_ADDR_MASK, PA2, "PTEST reports the frame the walk found");
+
+	mmu040_off();
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1500,6 +1579,7 @@ int main(int argc, char **argv)
 	test_fpu040_unimplemented_trap();
 	test_mmu040_access_error_frame();
 	test_mmu040_movec_tc_enables_mmu();
+	test_mmu040_pflush_ptest();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
