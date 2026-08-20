@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-21 — 040: guest reset now clears the MMU state (27664e2, 87310e9)
+
+**ISSUE-48 resolution recorded:** the port lane confirmed the page database was
+unzeroed DRAM (`calls=1 npages=3688 dirty=3620 held=150`); `page_free` is gone
+(`syncg calls=0`) and the kernel runs for minutes. That vindicates §9.6/§9.7 — the
+geometry was correctly derived and never the problem — and explains the byte-for-byte
+determinism (unzeroed DRAM after a cold boot is deterministic).
+
+- **Fronts 2 and 3 share one firmware root cause**, the third instance of
+  "register stored, side-effect function never called": `m68k_reset_newcpu()` zeroed
+  the MMU registers but never called `mmu_set_tc()`/`mmu_tt_modified()`, so a warm
+  reset carried stale `mmu_enabled` + `mmu_ttr_enabled*` + ATC into the next ROM run.
+  Explains the ATC ifetch fault on ITT0-covered kernel text (`vec=2 fa=0800ABEA
+  ssw=0546`, address-specific via stale ATC) and the cycle-2/3 early-KS wedges.
+  Fixed, `mmu_model`-gated (030 untouched). Also clears `amix_mmu_on` so each cycle
+  starts in cycle 1's proven state — **wants the 030 regression before trusting**.
+- Confirmed the mmu040 ifetch path consults ITT0 correctly, and that the kernel's
+  only TTR-clear is the **haltsys** path (`.text+0xda012`), not post-`sysseginit`.
+- **Front 1 measured:** mailbox class eliminated (all nine SHARED flags zero),
+  reset-line spin eliminated (`read_reset == 1`), and `ps_count` frozen across 9 s
+  with `ps_lastaddr = 0x001D6BC0` — core1 wedged in a chip-RAM bus cycle. Not fixed;
+  behaviour-preserving watchdog proposed.
+- Harness 160 → **167**, new guard non-vacuous. `BOOT.BIN` 12,762,372 B, crc32
+  `C3191831`. Warning-free.
+
 ## 2026-08-20 — 040: candidate C exonerated; QUICK_KLUDGE landmine found (d6d0df8)
 
 Static three-way diff of kernel expectation vs card vs bench.
