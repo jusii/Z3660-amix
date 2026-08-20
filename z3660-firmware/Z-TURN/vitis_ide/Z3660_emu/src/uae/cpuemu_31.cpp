@@ -16,7 +16,29 @@
  * Each maps to the faithful 68040 behavior on this non-cycle-exact, chipset-less
  * interpreter; the non-obvious ones are explained in UAE_040_MMU_gate.md. */
 #define x_get_disp_ea_020(base, idx) x_get_disp_ea_020(base)  /* 2nd arg vestigial (always 0) in this lineage */
-#define m68k_setstopped(level)       m68k_setstopped()         /* arg-less; sets stopped + SPCFLAG_STOP, DOTRACE-aware */
+/* STOP: the generated 68040 handler (op_4e72_31_ff) uses WinUAE's RE-ENTRANT idiom -- it
+ * guards the operand fetch with `if (!regs.stopped)` and deliberately never advances the pc,
+ * because upstream's 040 run loop re-dispatches the same STOP while stopped and advances the
+ * pc when the stop ends. This tree is the older advance-and-stop lineage: EVERY other CPU
+ * table here (cpuemu_0/4/11/13/32/40/44) ends STOP with m68k_incpc(4)/m68k_incpci(4), and
+ * neither m68k_run_mmu040() nor do_specialties()/m68k_resumestopped() advances it for us.
+ * Left as generated, the pc stays pinned on the STOP forever. Interrupts are still taken --
+ * but every rte returns to the STOP and re-stops, so the instruction AFTER it never runs.
+ * Under AmigaOS that is exec's idle loop, `... stop #$2000 ; bra <loop top>`, never reaching
+ * the bra: the scheduler never re-checks TaskReady, no task is ever made runnable again, and
+ * the machine sits on a grey screen. Metal, image 806C76AE: pc pinned at 0x00F81420, which
+ * DM shows is `4E72 2000` (STOP #$2000) with `60E6` (BRA back) at 0x00F81424 -- i.e. pinned
+ * ON the STOP, where a correct run would sit at 0x00F81424.
+ * Bridge it to this tree's contract: stop, then step past STOP's opcode + operand word, in
+ * that order (matching the metal-proven 030 table, whose DOTRACE fill_prefetch runs at the
+ * un-advanced pc). m68k_setstopped is used exactly ONCE in this file -- the STOP handler --
+ * so the pc advance cannot leak into any other instruction. */
+static inline void z3660_stop_and_step_past(void)
+{
+   m68k_setstopped();
+   m68k_incpci(4);
+}
+#define m68k_setstopped(level)       z3660_stop_and_step_past()  /* arg-less + the pc advance this tree's tables all do */
 #define do_cycles_stop(c)            ((void)(c))               /* non-CE + no chipset: STOP wait is driven by do_specialties' poll */
 #define MakeFromSR_STOP()            MakeFromSR()              /* full SR rebuild (non-CE); same call the 030 STOP path uses */
 #define checkint()                   doint()                   /* raise SPCFLAG_INT for a pending interrupt (wakes STOP) */

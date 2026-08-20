@@ -974,6 +974,84 @@ static void test_mmu040_access_error_frame(void)
 }
 
 /* ==================================================================
+ * STOP must advance the pc, on EVERY CPU table this firmware can select.
+ *
+ * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
+ * NEXT instruction runs. Every table in this tree ends STOP with
+ * m68k_incpc(4)/m68k_incpci(4) -- except the generated 68040 MMU table, which
+ * came from a newer WinUAE gencpu whose STOP is re-entrant (pc deliberately left
+ * on the instruction, upstream's run loop advancing it when the stop ends). This
+ * tree's run loop does not do that half, so the pc stayed pinned on the STOP:
+ * interrupts were still taken, but every rte re-stopped and the instruction after
+ * STOP never ran. On metal that is AmigaOS exec's idle loop never reaching the
+ * `bra` after its `stop #$2000` -- no task ever rescheduled, grey screen forever.
+ *
+ * Host-checkable, and cheaply: execute a real STOP through each dispatch table and
+ * assert the pc moved. Written as a loop over the tables rather than a one-off so
+ * a table added later is covered by construction.
+ * ================================================================== */
+static void stop_check_one(const char *what, int cpu_model, int mmu_model)
+{
+	const uae_u32 VCODE = 0x00002000;
+	harness_mem_reset();
+	cpu_bringup(cpu_model);
+	currprefs.cpu_model = cpu_model;
+	currprefs.mmu_model = mmu_model;
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+	regs.mmu_enabled = 0;              /* MMU off: this is about the pc, not translation */
+
+	cpu_set_context(VCODE);
+	regs.s = 1;
+	regs.stopped = 0;
+	regs.spcflags = 0;
+	hram_poke16(VCODE + 0, 0x4e72);    /* STOP #$2000 */
+	hram_poke16(VCODE + 2, 0x2000);
+	hram_poke16(VCODE + 4, 0x4e71);    /* nop -- the instruction that must be reachable */
+
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+		mmu030_opcode = -1;
+		regs.opcode = x_prefetch(0);
+		mmu030_opcode = regs.irc = regs.opcode;
+		mmu030_idx = 0; mmu030_idx_done = 0; mmu030_retry = false;
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	if (faulted) {
+		g_fail++;
+		printf("  FAIL: %s: STOP faulted\n", what);
+		return;
+	}
+	if (m68k_getpc() == VCODE) {
+		g_fail++;
+		printf("  FAIL: %s: STOP left the pc ON the instruction (%08x). An rte would\n"
+		       "        re-stop forever and the next instruction would never run.\n",
+		       what, (unsigned)m68k_getpc());
+	} else {
+		g_pass++;
+	}
+	CHECK_EQ32(m68k_getpc(), VCODE + 4, what);
+	CHECK(regs.stopped != 0, "%s: regs.stopped set\n", what);
+	CHECK_EQ32(regs.intmask, 0, "STOP #$2000 loaded intmask 0 from the operand");
+}
+
+static void test_stop_advances_pc_all_tables(void)
+{
+	printf("[test] STOP advances the pc on every selectable CPU table\n");
+	stop_check_one("68030 non-MMU table",  68030, 0);
+	stop_check_one("68040 non-MMU table",  68040, 0);
+	stop_check_one("68030 MMU table (cpuemu_32)", 68030, 68030);
+	stop_check_one("68040 MMU table (cpuemu_31)", 68040, 68040);
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * AMIX 040 latch (cpummu.cpp mmu_set_tc). amix_mmu_on says "the AMIX kernel is
  * up" and gates the emulated A3000 SCSI's timing regime; amix_kimage_030 says
  * "the guest is the 68030 kernel image" and gates the hard-coded 0x07xxxxxx
@@ -1344,6 +1422,7 @@ int main(int argc, char **argv)
 	test_mmu040_modified_bit();
 	test_fpu040_unimplemented_trap();
 	test_mmu040_access_error_frame();
+	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
