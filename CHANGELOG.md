@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-21 — 040: [URTE] syscall-return probe (ISSUE-52 round-4) (b89af61)
+
+The bus-misalign fix moved the fault past the launch RTE — PID 1 launches correctly
+(fault PC 0x80000012 → 0x80800012) and runs. The remaining fault is at the syscall
+RETURN from icode's `trap #0`, with a corrupt A7 (metal `fa=0x40001FC0` = kernel SSP;
+kernel ring saw `usp=0xCB7C0002`).
+
+- **Statically exonerated:** 040 `move An,USP`/`move USP,An` handlers are byte-identical
+  to the proven 030 ones, and `MakeFromSR` installs `regs.usp` into A7 correctly on the
+  S 1→0 transition. New harness `test_mmu040_rte_syscall_return_usp` proves the install
+  lands A7 on USP, not the leftover SSP, given a valid `regs.usp`.
+- **Ships the `[URTE]` probe:** fires on any user-transition RTE (frame SR S-bit clear),
+  printing `pc/sr/ssp/usp/fmt`; `usp` (read pre-`MakeFromSR`) is the value RTE installs.
+  Firing #1 = launch (clean), #2 = syscall return (decisive). A corrupt #2 `usp` with a
+  well-formed frame ⇒ `regs.usp` was corrupt before the RTE ⇒ kernel-side; a wrong frame
+  ⇒ kernel-side.
+- Diagnostic; becomes a fix only if a read implicates the emulator's USP handling (harness
+  currently says it's faithful). Harness 212 → **217**.
+- `BOOT.BIN` 12,762,388 B, zlib crc32 `309F04F1`. Warning-free.
+
 ## 2026-08-21 — 040: split bus-misaligned MMU accesses (ISSUE-52, family #6) (4bf1f00)
 
 Round-3 metal overturned the prior "kernel-side" call: the frame holds `f_pc=0x80800000`
