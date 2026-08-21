@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-21 — 040: bitfield ops used the 68030 accessors (ISSUE-49) (6e8e33a)
+
+The port lane isolated `bfins %d0,%a2@{2:1}` (d0=0) failing to write against table-walked
+kernel VAs while neighbouring byte ops landed — 149/149 page structs reading `0x22`.
+
+- **Cause:** `cpuemu_32`'s bitfield fix (call `x_get_bitfield`/`x_put_bitfield` instead of
+  the physical-accessor bare versions) was copied to `cpuemu_31` **without swapping the
+  accessor family** — those helpers use `get_byte_mmu030_state`/`put_byte_mmu030_state`, so
+  every 040 bitfield op translated through 68030 PMMU state this core never sets up.
+  Invisible under ITT0/DTT0 identity mapping, fatal in the table-walked window.
+- **Fix:** `x_get_bitfield_040`/`x_put_bitfield_040` (`*_mmu040` accessors) + a two-line
+  bridge in `cpuemu_31.cpp`, keeping the generated body byte-identical across all 68 sites.
+- **Guard = the reproduction.** Pre-fix: six table-mapped arms fail (including the
+  byte-exact `0x20`→unchanged and `0x22`), TTR-covered / MMU-off / register-destination all
+  pass. Localises to translation, not decode. **BFEXTU failed too** — the read half was
+  broken as well. Harness 167 → **182**.
+- **Closes the metal signature:** `0x20 → 0x00`, then `ori.b #2` → `0x02` not `0x22`; no
+  stale `p_free`, so `segmap_unlock` should not fire. Kernel needs no change — port
+  ISSUE-49 becomes a symptom record.
+- **Fifth instance of one family** — STOP, MOVEC→TC, mmu_op, reset state, bitfield
+  accessors: every one a 68040 path present in the tree but never exercised until this
+  kernel ran. The standing sweep: find the 040 equivalent of anything the 030 path was
+  hand-patched for.
+- `BOOT.BIN` 12,762,388 B, zlib crc32 `034901C0`. Warning-free.
+
 ## 2026-08-21 — bus: recover the stuck pipe (678b5ce)
 
 The watchdog fired on `FF261896` (030 canary green) and the decode named the wedge:
