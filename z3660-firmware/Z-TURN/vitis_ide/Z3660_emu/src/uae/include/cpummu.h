@@ -700,7 +700,7 @@ static ALWAYS_INLINE uae_u32 uae_mmu040_get_ilong(uaecptr addr)
 	result |= uae_mmu040_getc_iword(addr + 2);
 	return result;
 #else
-	if (unlikely(is_unaligned_page(addr, 4)))
+	if (unlikely(is_unaligned_bus(addr, 4)))   /* ISSUE-52: see uae_mmu040_get_long */
 		return mmu_get_ilong_unaligned(addr);
 	return mmu_get_ilong(addr, sz_long);
 #endif
@@ -716,13 +716,19 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_get_ibyte(uaecptr addr)
 }
 static ALWAYS_INLINE uae_u32 uae_mmu040_get_long(uaecptr addr)
 {
-	if (unlikely(is_unaligned_page(addr, 4)))
+	/* ISSUE-52: split on BUS misalignment, not just page-crossing. A misaligned longword
+	 * within one page (the format-0 frame PC at a7+2 = 0x...FBA) used to take the single
+	 * mmu_get_long -> x_phys_get_long path, handing a misaligned PHYSICAL address to the
+	 * board's memory layer, which cannot do a misaligned transfer and drops bytes on metal
+	 * (0x80800000 -> 0x80000000, bit 23). The unaligned splitter issues only aligned word/
+	 * byte sub-accesses, which every backing does correctly. See is_unaligned_bus. */
+	if (unlikely(is_unaligned_bus(addr, 4)))
 		return mmu_get_long_unaligned(addr, true);
 	return mmu_get_long(addr, true, sz_long);
 }
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_word(uaecptr addr)
 {
-	if (unlikely(is_unaligned_page(addr, 2)))
+	if (unlikely(is_unaligned_bus(addr, 2)))   /* ISSUE-52: see uae_mmu040_get_long */
 		return mmu_get_word_unaligned(addr, true);
 	return mmu_get_word(addr, true, sz_word);
 }
@@ -733,7 +739,7 @@ static ALWAYS_INLINE uae_u8 uae_mmu040_get_byte(uaecptr addr)
 
 static ALWAYS_INLINE void uae_mmu040_put_word(uaecptr addr, uae_u16 val)
 {
-	if (unlikely(is_unaligned_page(addr, 2)))
+	if (unlikely(is_unaligned_bus(addr, 2)))   /* ISSUE-52: see uae_mmu040_get_long */
 		mmu_put_word_unaligned(addr, val, true);
 	else
 		mmu_put_word(addr, val, true, sz_word);
@@ -744,7 +750,7 @@ static ALWAYS_INLINE void uae_mmu040_put_byte(uaecptr addr, uae_u8 val)
 }
 static ALWAYS_INLINE void uae_mmu040_put_long(uaecptr addr, uae_u32 val)
 {
-	if (unlikely(is_unaligned_page(addr, 4)))
+	if (unlikely(is_unaligned_bus(addr, 4)))   /* ISSUE-52: see uae_mmu040_get_long */
 		mmu_put_long_unaligned(addr, val, true);
 	else
 		mmu_put_long(addr, val, true, sz_long);

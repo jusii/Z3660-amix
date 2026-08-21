@@ -1857,6 +1857,67 @@ exonerated on this leg too and the remaining distance to `init`, `getty` and the
 is kernel-side.
 
 
+### 10.9 ISSUE-52 RESOLVED: a misaligned frame PC read on the real bus (family #6)
+
+§10.8 concluded the frame was "already wrong" and the gap was kernel-side. **That was wrong,
+and the round-3 metal capture overturned it:** the frame in memory holds `f_pc = 0x80800000`
+read straight back (correct), main computed the entry right (`ini_ret = 0x80800000`), yet PID 1
+surfaces at `PC = 0x80000012` — `0x80800000` with **bit 23** cleared, two instructions in. So
+the RTE reads `0x80800000` from the frame and *delivers* `0x80000000`. The emulator IS at
+fault; §10.8's exoneration missed the mechanism because its harness case did not reproduce it.
+
+**The mechanism — the same family, on the misaligned-access path.** The kernel's `_start`
+builds a format-0 frame at `a7 = 0x40001FB8`, so the frame's PC longword sits at
+`a7 + 2 = 0x40001FBA` — **bus-misaligned (address mod 4 = 2), but within one 4 KiB page.** The
+68040 data accessors split their access only when it *crosses a page*:
+
+```c
+static ALWAYS_INLINE uae_u32 uae_mmu040_get_long(uaecptr addr) {
+        if (unlikely(is_unaligned_page(addr, 4)))   /* misaligned AND page-crossing */
+                return mmu_get_long_unaligned(addr, true);
+        return mmu_get_long(addr, true, sz_long);   /* single access, misaligned phys addr */
+}
+```
+
+`is_unaligned_page(0x40001FBA, 4)` = `(0xBA & 3) && ((addr ^ addr+3) & page_size)` =
+`2 && 0` = **false** — misaligned, but not page-crossing. So the read took the single
+`mmu_get_long` → `x_phys_get_long(0x...FBA)` path, handing a **misaligned physical address**
+to the board's memory layer. `memory_get_long` on a direct bank does `swap32(*(uae_u32*)addr)`
+— an unaligned 32-bit load the physical backing (real Amiga bus / device-mapped DDR) cannot do
+correctly, and it drops a byte: `0x80800000 → 0x80000000`, exactly bit 23.
+
+**Why §10.8's harness passed while metal failed.** The host harness reads through a
+byte-composing flat-buffer accessor that handles *any* alignment, so both the single and the
+split path return `0x80800000` — a value assertion cannot see the bug. The metal physical layer
+is the part that differs, and it is not exercised on the host. §10.8's
+`test_mmu040_rte_delivers_pc` even used a misaligned frame (`0xF00 + 2`) and passed, which is
+precisely why the round needed the metal round-3 data to break the tie.
+
+**The fix.** The 68040-correct model is a single misaligned bus cycle, but this emulator's
+physical layer cannot issue one. So the 040 data/instruction accessors now split on **bus
+misalignment** (`is_unaligned_bus`, pure `addr & (size-1)`) rather than only on page-crossing.
+`mmu_get_long_unaligned` issues only aligned sub-accesses — for `0x40001FBA` it reads the
+aligned words at `0x40001FBA` and `0x40001FBC` and composes `0x80800000` correctly — which
+every backing performs faithfully. Changed in `uae_mmu040_get_long`/`_get_word`/`_get_ilong`
+and the `put` twins; `is_unaligned_page ⊂ is_unaligned_bus`, so nothing that split before stops
+splitting. The 68060 wrappers and the entire 68030 path are untouched.
+
+**The guard.** The host cannot value-reproduce this (see above), so the guard pins the
+**routing invariant** the fix establishes: a bus-misaligned 040 access must go through the
+splitter — the physical layer must never receive a misaligned address. A harness-only counter
+(`mmu_unaligned_split_count`, `#ifdef HOST_TEST_HARNESS`, firmware binary unchanged) is bumped
+in the unaligned splitters; `test_mmu040_misaligned_split` and the RTE test assert that an
+in-page misaligned long read/write routes through it and round-trips `0x80800000` exactly, and
+that an *aligned* access does not. Proven non-vacuous: reverted to the page-crossing gate, all
+three routing checks fail. Harness 201 → **212**.
+
+**Does this predict PID 1 executing its first instruction?** Yes. With the fix, RTE reads the
+format-0 frame's PC via aligned sub-accesses, delivers `0x80800000` intact, and PID 1 starts at
+`0x80800000` — the icode's stack `lea`. Behind it: `init`, `getty`, and the login prompt. This
+was the last emulator gate on the boot; the shipped `[RTE]` probe (§10.8) will now read back
+`pc=80800000` as positive confirmation rather than a diagnostic.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

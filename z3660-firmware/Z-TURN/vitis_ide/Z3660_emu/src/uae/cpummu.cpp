@@ -65,6 +65,16 @@ int mmu040_movem;
 uaecptr mmu040_movem_ea;
 uae_u32 mmu040_move16[4];
 
+#ifdef HOST_TEST_HARNESS
+/* ISSUE-52 guard support: counts every time an mmu040 access is routed through the
+ * unaligned splitter (which issues only aligned sub-accesses). The host's flat buffer
+ * reads a misaligned longword correctly either way, so a value assertion cannot catch
+ * the metal bug; this counter lets the harness assert the ROUTING invariant instead --
+ * that a bus-misaligned 040 access never hands a misaligned address to the physical
+ * layer. Harness build only; the firmware binary is unchanged. */
+unsigned long mmu_unaligned_split_count = 0;
+#endif
+
 extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
 extern "C" volatile int amix_mmu_on;      // set in mmu_set_tc() when AMIX's 040 MMU comes up
 
@@ -942,6 +952,9 @@ static void misalignednotfirstcheck(uaecptr addr)
 
 uae_u16 REGPARAM2 mmu_get_word_unaligned(uaecptr addr, bool data)
 {
+#ifdef HOST_TEST_HARNESS
+	mmu_unaligned_split_count++;
+#endif
 	uae_u16 res;
 
 	res = (uae_u16)mmu_get_byte(addr, data, sz_word) << 8;
@@ -960,6 +973,9 @@ uae_u16 REGPARAM2 mmu_get_word_unaligned(uaecptr addr, bool data)
 
 uae_u32 REGPARAM2 mmu_get_long_unaligned(uaecptr addr, bool data)
 {
+#ifdef HOST_TEST_HARNESS
+	mmu_unaligned_split_count++;
+#endif
 	uae_u32 res;
 
 	if (likely(!(addr & 1))) {
@@ -1106,6 +1122,9 @@ static void REGPARAM2 mmu_put_lrmw_word_unaligned(uaecptr addr, uae_u16 val)
 
 void REGPARAM2 mmu_put_long_unaligned(uaecptr addr, uae_u32 val, bool data)
 {
+#ifdef HOST_TEST_HARNESS
+	mmu_unaligned_split_count++;
+#endif
 	SAVE_EXCEPTION;
 	TRY(prb) {
 		if (likely(!(addr & 1))) {
@@ -1129,6 +1148,9 @@ void REGPARAM2 mmu_put_long_unaligned(uaecptr addr, uae_u32 val, bool data)
 
 void REGPARAM2 mmu_put_word_unaligned(uaecptr addr, uae_u16 val, bool data)
 {
+#ifdef HOST_TEST_HARNESS
+	mmu_unaligned_split_count++;
+#endif
 	SAVE_EXCEPTION;
 	TRY(prb) {
 		mmu_put_byte(addr, val >> 8, data, sz_word);

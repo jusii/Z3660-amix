@@ -1468,6 +1468,24 @@ static void test_mmu040_rte_delivers_pc(void)
 	              VSTK | 0xF00, PSTK | 0xF00, VCODE, PCODE | (VCODE & 0xFFF));
 	mmu040_off();
 
+	/* --- the exact metal case: MISALIGNED frame in a table-walked page (ISSUE-52).
+	 * a7 = ...FB8 so the frame PC longword sits at a7+2 = ...FBA, bus-misaligned but not
+	 * page-crossing. The value is correct on the host either way (flat buffer composes any
+	 * alignment), so the meaningful assertion is the ROUTING invariant: the misaligned long
+	 * read must go through the unaligned splitter, which issues only aligned sub-accesses --
+	 * the fix that keeps the board's memory layer from ever seeing a misaligned transfer. */
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSTK,  PSTK);
+	extern unsigned long mmu_unaligned_split_count;
+	mmu_unaligned_split_count = 0;
+	rte_frame_arm("RTE from a MISALIGNED table-walked frame delivers the exact PC",
+	              VSTK | 0xFB8, PSTK | 0xFB8, VCODE, PCODE | (VCODE & 0xFFF));
+	CHECK(mmu_unaligned_split_count >= 1,
+	      "the misaligned frame PC longword was read via the aligned splitter, not a raw "
+	      "misaligned physical access (the metal bit-23 bug)\n");
+	mmu040_off();
+
 	/* --- control: frame on a TTR-covered address (logical == physical) --- */
 	mmu040_pt_init();
 	mmu040_map_page(VCODE, PCODE);
@@ -1478,6 +1496,39 @@ static void test_mmu040_rte_delivers_pc(void)
 	mmu040_off();
 
 	cpu_bringup(68030);
+}
+
+/* Direct accessor-level pin of the ISSUE-52 routing invariant, both directions. */
+static void test_mmu040_misaligned_split(void)
+{
+	printf("[test] bus-misaligned 040 access routes through the aligned splitter\n");
+	extern unsigned long mmu_unaligned_split_count;
+	const uae_u32 VA = 0x00408000, PA = 0x0A000000;   /* one mapped page */
+	(void)mmu040_map1(VA, PA, 0, false);
+	regs.s = 1;
+
+	hram_poke32(PA + 0x10, 0x11223344u);              /* aligned longword (non-overlapping) */
+	hram_poke32(PA + 0x02, 0x80800000u);              /* the metal value at a misaligned VA */
+
+	/* aligned read: single path, splitter NOT used, value correct */
+	mmu_unaligned_split_count = 0;
+	uae_u32 v_al = get_long_mmu040(VA + 0x10);
+	CHECK_EQ32(mmu_unaligned_split_count, 0, "aligned long read does not use the splitter");
+	CHECK_EQ32(v_al, 0x11223344u, "aligned long read value");
+
+	/* misaligned, same page: splitter USED, value still correct (bit 23 preserved) */
+	mmu_unaligned_split_count = 0;
+	uae_u32 v_un = get_long_mmu040(VA + 0x02);
+	CHECK(mmu_unaligned_split_count >= 1, "misaligned in-page long read uses the splitter\n");
+	CHECK_EQ32(v_un, 0x80800000u, "misaligned long read preserves bit 23 (0x80800000)");
+
+	/* misaligned write must also route through the splitter */
+	mmu_unaligned_split_count = 0;
+	put_long_mmu040(VA + 0x02, 0x80800000u);
+	CHECK(mmu_unaligned_split_count >= 1, "misaligned in-page long WRITE uses the splitter\n");
+	CHECK_EQ32(get_long_mmu040(VA + 0x02), 0x80800000u, "misaligned write round-trips exactly");
+
+	mmu040_off();
 }
 
 /* ==================================================================
@@ -1935,6 +1986,7 @@ int main(int argc, char **argv)
 	test_mmu040_bitfield_translates();
 	test_mmu040_user_mode();
 	test_mmu040_rte_delivers_pc();
+	test_mmu040_misaligned_split();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
