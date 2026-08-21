@@ -42,7 +42,18 @@ static inline void z3660_stop_and_step_past(void)
 #define do_cycles_stop(c)            ((void)(c))               /* non-CE + no chipset: STOP wait is driven by do_specialties' poll */
 #define MakeFromSR_STOP()            MakeFromSR()              /* full SR rebuild (non-CE); same call the 030 STOP path uses */
 #define checkint()                   doint()                   /* raise SPCFLAG_INT for a pending interrupt (wakes STOP) */
-#define op_unimpl(op)                Exception(61)             /* 68060 unimplemented-integer vector; unreachable on 68040 (m68k_mull/divl always succeed) */
+#define op_unimpl(op)                Exception(61)
+/* BITFIELD ops (BFINS/BFCLR/BFSET/BFCHG/BFEXTU/BFEXTS/BFTST/BFFFO) on a memory operand.
+ * These sites were hand-patched to x_get_bitfield/x_put_bitfield -- but those are the
+ * SIXTY-EIGHT-THOUSAND-THIRTY helpers: their bodies use get_byte_mmu030_state /
+ * put_byte_mmu030_state etc. The 030 fix was copied to this table without swapping the
+ * accessor family, so every bitfield op on the 040 MMU path translates through 68030 PMMU
+ * state that this core never sets up. Redirect them to the _040 twins. A bridge keeps the
+ * generated body byte-identical and cannot miss one of the 68 sites. This is ISSUE-49; see
+ * x_put_bitfield_040 for the full note. */
+#define x_get_bitfield(src, bdata, offset, width)       x_get_bitfield_040((src), (bdata), (offset), (width))
+#define x_put_bitfield(dst, bdata, val, offset, width)  x_put_bitfield_040((dst), (bdata), (val), (offset), (width))
+             /* 68060 unimplemented-integer vector; unreachable on 68040 (m68k_mull/divl always succeed) */
 /* OR.B #<data>.B,Dn */
 uae_u32 REGPARAM2 op_0000_31_ff(uae_u32 opcode)
 {

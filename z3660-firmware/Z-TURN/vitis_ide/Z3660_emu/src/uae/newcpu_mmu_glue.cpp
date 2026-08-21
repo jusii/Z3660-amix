@@ -20,6 +20,7 @@
 #include "memory.h"
 #include "newcpu.h"
 #include "cpummu030.h"
+#include "cpummu.h"      /* 68040 MMU accessors for the _040 bitfield twins below */
 
 /* ce_cachable: hardware cache-attribute table. Upstream owner is memory.cpp (def +
  * memset/per-bank init) but that whole block is #if 0'd out in this fork, so this
@@ -124,6 +125,92 @@ void REGPARAM2 x_put_bitfield(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s3
 	case 5:
 		put_long_mmu030_state(dst, bdata[0] | (val >> (offset - 32)));
 		put_byte_mmu030_state(dst + 4, bdata[1] | (val << (40 - offset)));
+		break;
+	default:
+		break;
+	}
+}
+
+/* 68040 twins of the two functions above.
+ *
+ * Same defect, one core along. cpuemu_32 (the 030 MMU table) was hand-patched to call
+ * x_get_bitfield/x_put_bitfield so its bitfield ops translate; cpuemu_31 (the 040 MMU
+ * table) was left calling the BARE get_bitfield/put_bitfield in newcpu_common.cpp, which
+ * use the physical get_byte/get_word/get_long -- i.e. they read and write the UNTRANSLATED
+ * logical address.
+ *
+ * On the 040 that is invisible anywhere ITT0/DTT0 identity-map the address (logical ==
+ * physical, so the untranslated access still lands), and fatal in the table-walked kernel
+ * window: a bitfield write to a VA at 0x40000000+ goes to PHYSICAL 0x40000000+, which on
+ * this board is RANGE_MAP(0x4000,0x8000,slow_bank) -- the Z3 expansion window, no RAM --
+ * so the write simply vanishes. That is ISSUE-49's metal signature exactly: `bfins
+ * %d0,%a2@{2:1}` does not clear its bit while the andi.b/ori.b/move.w to the same byte,
+ * nine instructions away, all land, because those use the *_mmu040 accessors and translate.
+ *
+ * Bodies mirror the 030 twins with each accessor swapped for its _mmu040 form. */
+uae_u32 REGPARAM2 x_get_bitfield_040(uae_u32 src, uae_u32 bdata[2], uae_s32 offset, int width)
+{
+	uae_u32 tmp, res, mask;
+	offset &= 7;
+	mask = 0xffffffffu << (32 - width);
+	switch ((offset + width + 7) >> 3) {
+	case 1:
+		tmp = get_byte_mmu040(src);
+		res = tmp << (24 + offset);
+		bdata[0] = tmp & ~(mask >> (24 + offset));
+		break;
+	case 2:
+		tmp = get_word_mmu040(src);
+		res = tmp << (16 + offset);
+		bdata[0] = tmp & ~(mask >> (16 + offset));
+		break;
+	case 3:
+		tmp = get_word_mmu040(src);
+		res = tmp << (16 + offset);
+		bdata[0] = tmp & ~(mask >> (16 + offset));
+		tmp = get_byte_mmu040(src + 2);
+		res |= tmp << (8 + offset);
+		bdata[1] = tmp & ~(mask >> (8 + offset));
+		break;
+	case 4:
+		tmp = get_long_mmu040(src);
+		res = tmp << offset;
+		bdata[0] = tmp & ~(mask >> offset);
+		break;
+	case 5:
+		tmp = get_long_mmu040(src);
+		res = tmp << offset;
+		bdata[0] = tmp & ~(mask >> offset);
+		tmp = get_byte_mmu040(src + 4);
+		res |= tmp >> (8 - offset);
+		bdata[1] = tmp & ~(mask << (8 - offset));
+		break;
+	default:
+		res = 0;
+		break;
+	}
+	return res;
+}
+void REGPARAM2 x_put_bitfield_040(uae_u32 dst, uae_u32 bdata[2], uae_u32 val, uae_s32 offset, int width)
+{
+	offset = (offset & 7) + width;
+	switch ((offset + 7) >> 3) {
+	case 1:
+		put_byte_mmu040(dst, bdata[0] | (val << (8 - offset)));
+		break;
+	case 2:
+		put_word_mmu040(dst, bdata[0] | (val << (16 - offset)));
+		break;
+	case 3:
+		put_word_mmu040(dst, bdata[0] | (val >> (offset - 16)));
+		put_byte_mmu040(dst + 2, bdata[1] | (val << (24 - offset)));
+		break;
+	case 4:
+		put_long_mmu040(dst, bdata[0] | (val << (32 - offset)));
+		break;
+	case 5:
+		put_long_mmu040(dst, bdata[0] | (val >> (offset - 32)));
+		put_byte_mmu040(dst + 4, bdata[1] | (val << (40 - offset)));
 		break;
 	default:
 		break;

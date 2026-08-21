@@ -1164,6 +1164,139 @@ static void test_mmu040_reset_clears_mmu_state(void)
 }
 
 /* ==================================================================
+ * ISSUE-49: bitfield ops on TABLE-MAPPED memory must translate.
+ *
+ * Metal (five instrumented boots + a flag histogram over the kernel's page
+ * array): `bfins %d0,%a2@{2:1}` with d0=0 against a kernel VA in the
+ * table-walked window does NOT write, while andi.b/ori.b/move.w to the SAME
+ * byte nine instructions away land correctly. 149 of 149 allocated page structs
+ * read byte0 == 0x22 -- the ori.b's bit landed, the bfins' clear did not.
+ *
+ * Cause: the generated 040 table calls the BARE get_bitfield/put_bitfield, which
+ * use the PHYSICAL get_byte/get_word/get_long, so a bitfield access goes to the
+ * UNTRANSLATED logical address. Invisible wherever ITT0/DTT0 identity-map the
+ * address (logical == physical), fatal in the table-walked window where the same
+ * number is slow_bank with no RAM.
+ *
+ * The reproduction is the guard. Ladder, in the order that localises it:
+ *   1  table-mapped  -> the metal signature itself (0x20 -> 0x00, then 0x22)
+ *   2  TTR-covered   -> must PASS even unfixed  (isolates translation, not decode)
+ *   3  MMU off       -> must PASS even unfixed
+ *   4  width > 1 and byte-crossing fields
+ *   5  register destination -> must PASS (never went near memory)
+ *   6  bfextu read back through the same path -> pins the read half too
+ * ================================================================== */
+#define BF_VCODE 0x00400000u
+#define BF_PCODE 0x0C000000u
+#define BF_VDATA 0x00403000u
+#define BF_PDATA 0x0D000000u
+
+/* Run one instruction at BF_VCODE with the 040 MMU on and a2 = target. */
+static bool bf_run(uae_u16 op0, uae_u16 op1, uae_u32 a2val, int words)
+{
+	cpu_set_context(BF_VCODE);
+	regs.s = 1;
+	m68k_areg(regs, 2) = a2val;
+	hram_poke16(BF_PCODE | (BF_VCODE & 0xFFF), op0);
+	hram_poke16((BF_PCODE | (BF_VCODE & 0xFFF)) + 2, op1);
+	(void)words;
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+	return !faulted;
+}
+
+static void test_mmu040_bitfield_translates(void)
+{
+	printf("[test] ISSUE-49: bitfield ops translate through the 040 page tables\n");
+
+	/* --- 1. the metal signature: table-mapped, BFINS {2:1} with d0=0 --- */
+	mmu040_pt_init();
+	mmu040_map_page(BF_VCODE, BF_PCODE);
+	mmu040_map_page(BF_VDATA, BF_PDATA);
+	hram_poke8(BF_PDATA, 0x20);                      /* seed byte0 = 0x20 */
+	m68k_dreg(regs, 0) = 0;
+	/* BFINS Dn,<ea>{offset:width}: 0xEFC0 | ea ; ext = (Dn<<12)|(off<<6)|width
+	 * ea = (a2) -> mode 010 reg 2 -> 0x12 ; d0 -> 0x0000 ; off=2 width=1 -> 0x0081 */
+	CHECK(bf_run(0xEFD2, 0x0081, BF_VDATA, 2), "BFINS to a table-mapped page did not fault\n");
+	CHECK_EQ32(hram_peek8(BF_PDATA), 0x00,
+	           "BFINS {2:1} d0=0 CLEARED the bit through the page tables (metal saw 0x20 stay)");
+
+	/* the exact metal cascade: ori.b #2 after the bfins -> 0x02, not 0x22 */
+	hram_poke8(BF_PDATA, 0x20);
+	m68k_dreg(regs, 0) = 0;
+	(void)bf_run(0xEFD2, 0x0081, BF_VDATA, 2);
+	{   /* ori.b #2,(a2) = 0x0012 0x0002 */
+		bool ok = bf_run(0x0012, 0x0002, BF_VDATA, 2);
+		CHECK(ok, "ori.b #2,(a2) did not fault\n");
+	}
+	CHECK_EQ32(hram_peek8(BF_PDATA), 0x02,
+	           "bfins-then-ori gives 0x02, not the metal signature 0x22");
+
+	/* --- 4. wider field, and a byte-crossing one --- */
+	hram_poke32(BF_PDATA, 0xFFFFFFFFu);
+	m68k_dreg(regs, 0) = 0;
+	CHECK(bf_run(0xEFD2, 0x0008, BF_VDATA, 2), "BFINS {0:8} did not fault\n");
+	CHECK_EQ32(hram_peek8(BF_PDATA), 0x00, "BFINS {0:8} cleared a whole byte");
+	hram_poke32(BF_PDATA, 0xFFFFFFFFu);
+	m68k_dreg(regs, 0) = 0;
+	CHECK(bf_run(0xEFD2, 0x0108, BF_VDATA, 2), "BFINS {4:8} (byte-crossing) did not fault\n");
+	CHECK_EQ32(hram_peek8(BF_PDATA + 0), 0xF0, "byte-crossing BFINS cleared the high nibble of byte 0");
+	CHECK_EQ32(hram_peek8(BF_PDATA + 1), 0x0F, "byte-crossing BFINS cleared the low nibble of byte 1");
+
+	/* --- 6. BFEXTU reads back through the same path --- */
+	hram_poke8(BF_PDATA, 0x40);                      /* bit 1 set (offset 1) */
+	m68k_dreg(regs, 1) = 0xDEAD;
+	/* BFEXTU <ea>{o:w},Dn = 0xE9C0|ea ; ext = (Dn<<12)|(off<<6)|width */
+	CHECK(bf_run(0xE9D2, 0x1041, BF_VDATA, 2), "BFEXTU did not fault\n");
+	CHECK_EQ32(m68k_dreg(regs, 1), 1, "BFEXTU read the bit back through the page tables");
+
+	mmu040_off();
+
+	/* --- 2. TTR-covered: must pass even unfixed (logical == physical) --- */
+	mmu040_pt_init();
+	mmu040_map_page(BF_VCODE, BF_PCODE);
+	regs.dtt0 = MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED;  /* base 0, mask 0, match BOTH privileges */
+	mmu_tt_modified();
+	hram_poke8(0x00050000u, 0x20);
+	m68k_dreg(regs, 0) = 0;
+	CHECK(bf_run(0xEFD2, 0x0081, 0x00050000u, 2), "BFINS on a TTR-covered address did not fault\n");
+	CHECK_EQ32(hram_peek8(0x00050000u), 0x00, "BFINS works on a TTR-covered address (control arm)");
+	mmu040_off();
+
+	/* --- 3. MMU off: must pass even unfixed --- */
+	harness_mem_reset();
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040; currprefs.mmu_model = 68040;
+	changed_prefs = currprefs;
+	init_m68k(); build_cpufunctbl(); harness_set_x_funcs();
+	regs.mmu_enabled = 0;
+	hram_poke8(0x00003000u, 0x20);
+	m68k_dreg(regs, 0) = 0;
+	cpu_set_context(0x2000); regs.s = 1;
+	m68k_areg(regs, 2) = 0x00003000u;
+	hram_poke16(0x2000, 0xEFD2); hram_poke16(0x2002, 0x0081);
+	TRY(p9) { regs.instruction_pc = m68k_getpc(); regs.opcode = x_prefetch(0);
+	          (*cpufunctbl[regs.opcode])(regs.opcode); } CATCH(p9) { (void)p9; } ENDTRY
+	CHECK_EQ32(hram_peek8(0x00003000u), 0x00, "BFINS works with the MMU off (control arm)");
+
+	/* --- 5. register destination: never goes near memory --- */
+	m68k_dreg(regs, 3) = 0xFFFFFFFFu;
+	m68k_dreg(regs, 0) = 0;
+	cpu_set_context(0x2000); regs.s = 1;
+	hram_poke16(0x2000, 0xEFC3); hram_poke16(0x2002, 0x0081);   /* BFINS d0,d3{2:1} */
+	TRY(pa) { regs.instruction_pc = m68k_getpc(); regs.opcode = x_prefetch(0);
+	          (*cpufunctbl[regs.opcode])(regs.opcode); } CATCH(pa) { (void)pa; } ENDTRY
+	CHECK_EQ32(m68k_dreg(regs, 3), 0xDFFFFFFFu, "BFINS to a register destination (control arm)");
+
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1615,6 +1748,7 @@ int main(int argc, char **argv)
 	test_mmu040_movec_tc_enables_mmu();
 	test_mmu040_pflush_ptest();
 	test_mmu040_reset_clears_mmu_state();
+	test_mmu040_bitfield_translates();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();

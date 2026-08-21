@@ -1668,6 +1668,61 @@ FPGA-level ack fault and belongs to the CPLD/FPGA lane, with the MOVE16 burst as
 suspected trigger to reproduce.
 
 
+### 10.6 ISSUE-49: bitfield ops on the 040 MMU path used the 68030 accessors
+
+The port lane's five instrumented boots plus a flag histogram over the kernel's page array
+isolated it to a single instruction: **`bfins %d0,%a2@{2:1}` with `d0 = 0` against a
+table-walked kernel VA does not write**, while `andi.b`/`ori.b`/`move.w` to the same byte
+nine instructions later land correctly — 149 of 149 allocated page structs read
+`byte0 == 0x22` (the `ori.b`'s bit landed, the `bfins`' clear did not).
+
+**Cause, found statically.** `cpuemu_32` (the 030 MMU table) was hand-patched at every
+bitfield call site to use `x_get_bitfield`/`x_put_bitfield` instead of the bare
+`get_bitfield`/`put_bitfield`, because the bare ones in `newcpu_common.cpp` use the
+*physical* `get_byte`/`get_word`/`get_long`. **`cpuemu_31` (the 040 MMU table) got the same
+patch — to the same functions.** But those helpers' bodies are 68030-specific:
+
+```c
+uae_u32 REGPARAM2 x_get_bitfield(...)      { ... tmp = get_byte_mmu030_state(src); ... }
+void    REGPARAM2 x_put_bitfield(...)      { ... put_byte_mmu030_state(dst, ...); ... }
+```
+
+So the 030 fix was copied to the 040 table **without swapping the accessor family**, and
+every bitfield op on the 040 MMU path translated through 68030 PMMU state that this core
+never sets up. It is invisible wherever ITT0/DTT0 identity-map the address, and fatal in the
+table-walked window — which is exactly where the kernel's page structs live.
+
+This is the same family as `STOP`, `MOVEC`→TC, `mmu_op` and the reset state: **a 68040 path
+that was simply never exercised until this kernel ran.** Fixed with `x_get_bitfield_040` /
+`x_put_bitfield_040` (identical bodies, `*_mmu040` accessors) plus a two-line bridge in
+`cpuemu_31.cpp`'s existing block, which keeps the generated body byte-identical and cannot
+miss one of the 68 call sites.
+
+**The reproduction is the guard, and it localises.** `test_mmu040_bitfield_translates` walks
+the handover spec's ladder. Against the pre-fix code:
+
+| arm | pre-fix |
+|---|---|
+| table-mapped `BFINS {2:1}`, `d0=0` | **FAIL** — `0x20` unchanged, the metal signature |
+| table-mapped `bfins` then `ori.b #2` | **FAIL** — **`0x22`**, byte-exact against metal |
+| table-mapped `BFINS {0:8}` and byte-crossing `{4:8}` | **FAIL** |
+| table-mapped `BFEXTU` read-back | **FAIL** — returns 0, so the read half was broken too |
+| **TTR-covered address** | **PASS** |
+| **MMU off** | **PASS** |
+| **register destination** | **PASS** |
+
+Six failures on the translated arms, three controls green: the defect is in the bitfield
+path's *translation*, not its decode. Harness 167 → **182**.
+
+**Does this close the metal signature?** Yes, for the mechanism ISSUE-49 documents. With the
+fix the `bfins` clear lands, so `byte0` goes `0x20 → 0x00` and the following `ori.b #2` gives
+**`0x02`, not `0x22`** — the harness asserts exactly that transition. No stale `p_free` bit
+means `segmap_unlock` has nothing to trip on, so the boot should proceed past the 22 s wall.
+**The port lane's kernel needs no change; ISSUE-49 becomes a symptom record.** The caveat is
+the honest one: this closes *this* mechanism, and whether the boot then runs depends on
+nothing else lurking further in.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and
