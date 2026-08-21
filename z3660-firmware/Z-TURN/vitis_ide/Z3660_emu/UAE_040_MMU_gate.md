@@ -1723,6 +1723,76 @@ the honest one: this closes *this* mechanism, and whether the boot then runs dep
 nothing else lurking further in.
 
 
+### 10.7 USER MODE: the emulator lane is clean (ISSUE-50 handover)
+
+The kernel now boots and runs (the §10.6 bitfield fix validated on metal: banner, 6 min
+alive, 65k interrupts, no panic). `init` then died instantly:
+
+```
+NOTICE: User BUS ERROR at 40001FC0, PC:80000012 FAULT:6 PID:1 CMD:
+```
+
+`init` is the first user-mode code ever run through this 040 MMU path and every one of the
+seven fixes before it was supervisor-side, so the family heuristic pointed here. **It does
+not hold this time, and the tests say so directly.**
+
+**Suspect 1 — URP stored but unwired: REFUTED.** The walker selects the root live and
+correctly: `cpummu.cpp:674`, `desc = super ? regs.srp : regs.urp;`.
+
+**Suspects 2 and 3 — user-mode accessor selection and the user-context fault frame:
+REFUTED BY TEST.** `test_mmu040_user_mode` gives the user root its own tables and asserts:
+
+| check | result |
+|---|---|
+| supervisor access to a shared VA walks **SRP** → its frame | pass |
+| user access to the same VA walks **URP** → a *different* frame | pass |
+| a mapping present only in SRP is **invisible** to user mode (faults) | pass |
+| a fault taken **in user mode** builds a format `$7` frame | pass |
+| its stacked **SR has the S bit CLEAR** (kernel sees a user fault) | pass |
+| its **SSW TM = 1 (user data)**, not a supervisor function code | pass |
+| FA and WB3A are the faulting user address | pass |
+
+Eleven checks, all green. Harness 182 → **193**. **No emulator change was needed; the
+firmware binary is byte-identical (`0x034901C0`).**
+
+**Suspect 4 — what `FAULT:6` means.** It is not an SSW field: it is `u_trap`'s
+`faultcode_t` class, and 6 is **`FLTBOUNDS`** — *"the address is not in the process's
+address space"*. The port repo's own `docs/SIGINFO-TRANSLATION-260806.md` documents the
+class mechanism, and `FAULT:6` appears throughout its history including on **68060 real
+hardware** (`docs/REALHW-ISSUE36-260728.md`), so it is not an emulator signature. It says
+the kernel received a well-formed user fault and correctly decided the address was out of
+bounds — which is precisely what a correct emulator should produce for this access.
+
+`get_fault` (port repo `src/getfault040.s`) also handles format `$7` correctly, taking the
+FA from `frame+84` = CPU`+0x14`, so the address the kernel classified is the address the
+emulator reported.
+
+#### The handover: why is `init` touching `0x40001FC0`?
+
+That is the kernel-side question, and two facts point the same way:
+
+1. **`0x40001FC0` is in the u-block window** (`0x40000000`–`0x4000FFFF`, per ISSUE-50), not
+   anywhere a user program should be reaching.
+2. **`CMD:` is empty.** `u_comm` lives in the u-block. The kernel could not read a command
+   name for the very process it was reporting on — so the u-block content is not what the
+   kernel expects, in the same window as the fault.
+
+Meanwhile `PC:80000012` is user text, so `exec` worked and the user text mapping is sound —
+which the URP test independently confirms.
+
+**Leading hypothesis, with precedent in the port repo's own notes:** `init`'s **USP is
+wrong** and points into the u-block window, so its first stack access faults at
+`0x40001FC0` and the kernel correctly classifies it `FLTBOUNDS`. This is the ISSUE-10 class,
+which `src/wb040.s`'s header already describes in the same words — *"init's lea never set
+USP → systrap read the syscall args from a stale kernel USP = garbage"*. A USP of
+`0x40001FC0` is a stale kernel value, not a user stack address.
+
+**What would confirm it in one boot:** the USP for PID 1 at the moment of the fault, and
+whether the u-block for PID 1 was populated. Both are kernel-side; the emulator has nothing
+further to add, and the bench-green reference binary means the difference is in how this
+kernel sets up PID 1, not in how the instructions execute.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

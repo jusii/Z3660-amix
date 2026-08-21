@@ -1297,6 +1297,122 @@ static void test_mmu040_bitfield_translates(void)
 }
 
 /* ==================================================================
+ * USER MODE: root selection (URP vs SRP) and the user-mode fault frame.
+ *
+ * init is the first user-mode code ever run through this 040 MMU path, and every
+ * fix so far was supervisor-side. Two things have never been exercised:
+ *   - does the table walker pick URP for user accesses and SRP for supervisor?
+ *   - does a fault taken IN USER MODE build a format-$7 frame the kernel can
+ *     classify -- SSW TM = user, and a stacked SR with S clear?
+ * The metal report is "User BUS ERROR at 40001FC0, PC:80000012 FAULT:6 PID:1".
+ * ================================================================== */
+#define M4_UROOT 0x00110000u
+#define M4_UPTR  0x00111000u
+#define M4_UPAGE 0x00112000u
+
+/* Give the USER root its own tables, mapping va -> pa (4K). */
+static void mmu040_map_user(uae_u32 va, uae_u32 pa)
+{
+	hram_poke32(M4_UROOT + ((va >> 23) & 0x1fc), (M4_UPTR  & MMU_ROOT_PTR_ADDR_MASK)   | 2);
+	hram_poke32(M4_UPTR  + ((va >> 16) & 0x1fc), (M4_UPAGE & MMU_PTR_PAGE_ADDR_MASK_4) | 2);
+	hram_poke32(M4_UPAGE + ((va >> 10) & 0xfc),  (pa & MMU_PAGE_ADDR_MASK_4) | 1);
+	mmu_flush_atc_all(true);
+}
+
+static void test_mmu040_user_mode(void)
+{
+	printf("[test] user mode: URP root selection and the user-mode fault frame\n");
+	const uae_u32 VCODE = 0x00400000, PCODE = 0x0C000000;
+	const uae_u32 VSTK  = 0x00401000, PSTK  = 0x0E000000;
+	const uae_u32 VVEC  = 0x00402000, PVEC  = 0x0F000000;
+	const uae_u32 VSHR  = 0x00403000;                 /* mapped in BOTH roots, to different frames */
+	const uae_u32 PSUP  = 0x0A000000, PUSR = 0x0B000000;
+	const uae_u32 VUNMAP = 0x00404000;                /* mapped in SRP only -> user must fault */
+
+	mmu040_pt_init();                                  /* srp = urp = M4_ROOT */
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSTK,  PSTK);
+	mmu040_map_page(VVEC,  PVEC);
+	mmu040_map_page(VSHR,  PSUP);
+	mmu040_map_page(VUNMAP, 0x0D000000);               /* supervisor-only mapping */
+	regs.urp = M4_UROOT;                               /* user gets its OWN root */
+	mmu040_map_user(VCODE, PCODE);                     /* user can fetch code */
+	mmu040_map_user(VSHR,  PUSR);                      /* same VA, different frame */
+	hram_poke32(PSUP, 0x5A5A5A5Au);
+	hram_poke32(PUSR, 0xA5A5A5A5u);
+
+	/* --- A. root selection: same VA must translate differently per privilege --- */
+	uaecptr pa_s = 0, pa_u = 0; bool f = false;
+	SAVE_EXCEPTION;
+	TRY(p1) { pa_s = mmu_translate(VSHR, 0, true,  true, false, sz_long); } CATCH(p1) { f = true; (void)p1; } ENDTRY
+	TRY(p2) { pa_u = mmu_translate(VSHR, 0, false, true, false, sz_long); } CATCH(p2) { f = true; (void)p2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!f, "both privileged translations of the shared VA succeeded\n");
+	CHECK_EQ32(pa_s, PSUP, "supervisor access walks SRP");
+	CHECK_EQ32(pa_u, PUSR, "user access walks URP (not SRP)");
+
+	/* a VA present only in SRP must FAULT for user -- proves URP is really consulted */
+	bool ufault = false;
+	SAVE_EXCEPTION;
+	TRY(p3) { (void)mmu_translate(VUNMAP, 0, false, true, false, sz_long); }
+	CATCH(p3) { ufault = true; (void)p3; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(ufault, "a supervisor-only mapping is NOT visible to user mode\n");
+
+	/* --- B. a fault taken IN USER MODE builds a user-context format-$7 frame --- */
+	hram_poke16(PCODE | (VCODE & 0xFFF), 0x2039);      /* move.l VUNMAP.l,d0 */
+	hram_poke16((PCODE | (VCODE & 0xFFF)) + 2, (uae_u16)(VUNMAP >> 16));
+	hram_poke16((PCODE | (VCODE & 0xFFF)) + 4, (uae_u16)(VUNMAP & 0xFFFF));
+	hram_poke32(PVEC | 8, VCODE + 0x100);              /* vector 2 handler (in the mapped code page) */
+
+	regs.vbr = VVEC;
+	regs.isp = VSTK | 0xF00;                           /* supervisor stack the frame lands on */
+	regs.msp = VSTK | 0xF00;
+	regs.m = 0;
+	m68k_areg(regs, 7) = VSTK | 0xE00;                 /* user sp (unused here) */
+	m68k_setpc(VCODE);
+	regs.s = 0;                                        /* <-- USER MODE */
+	MakeSR();
+
+	bool faulted = false;
+	{
+		struct flag_struct fl = regs.ccrflags;
+		mmu_restart = true;
+		regs.instruction_pc = m68k_getpc();
+		TRY(p4) {
+			mmu_opcode = -1;
+			mmu_opcode = regs.opcode = x_prefetch(0);
+			(*cpufunctbl[regs.opcode])(regs.opcode);
+		} CATCH(p4) {
+			faulted = true;
+			if (mmu_restart) { regs.ccrflags = fl; m68k_setpci(regs.instruction_pc); }
+			cpu_restore_fixup();
+			Exception(p4);
+		} ENDTRY
+	}
+	CHECK(faulted, "user-mode access to an unmapped user page faulted\n");
+	CHECK_EQ32(regs.s, 1, "the exception switched to supervisor");
+
+	{
+		uae_u32 sp = m68k_areg(regs, 7);
+#define UF16(o) ((uae_u32)hram_peek16(PSTK | ((sp + (o)) & 0xFFF)))
+#define UF32(o) ((uae_u32)hram_peek32(PSTK | ((sp + (o)) & 0xFFF)))
+		CHECK_EQ32(UF16(0x06), 0x7008, "user fault builds a format $7 frame, vector offset $008");
+		CHECK_EQ32(UF16(0x00) & 0x2000, 0x0000,
+		           "stacked SR has the S bit CLEAR -- the kernel must see a USER fault");
+		CHECK_EQ32(UF16(0x0C) & MMU_SSW_TM, 1,
+		           "SSW TM = 1 (user data) -- not a supervisor function code");
+		CHECK_EQ32(UF32(0x14), VUNMAP, "FA is the faulting user address");
+		CHECK_EQ32(UF32(0x18), VUNMAP, "WB3A matches");
+#undef UF16
+#undef UF32
+	}
+
+	regs.urp = regs.srp;
+	mmu040_off();
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1749,6 +1865,7 @@ int main(int argc, char **argv)
 	test_mmu040_pflush_ptest();
 	test_mmu040_reset_clears_mmu_state();
 	test_mmu040_bitfield_translates();
+	test_mmu040_user_mode();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
