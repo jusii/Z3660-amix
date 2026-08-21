@@ -1793,6 +1793,70 @@ further to add, and the bench-green reference binary means the difference is in 
 kernel sets up PID 1, not in how the instructions execute.
 
 
+### 10.8 ISSUE-52: the exception-return path is clean — the frame is already wrong
+
+The hypothesis was family member #6: RTE (and the rest of the exception-return path) reading
+the frame through the wrong accessor family, the way the bitfield path did. **It is refuted,
+by inspection and by test.**
+
+**The sweep, run on the exception-return path.** `op_4e73_31_ff` (RTE, 040 MMU table) reads
+the frame with `get_word_mmu040(a)`, `get_long_mmu040(a + 2)`, `get_word_mmu040(a + 2 + 4)`
+— the correct family — and dispatches format `$7` to `m68k_do_rte_mmu040()`, which exists
+(`cpummu.cpp:1595`). `op_4e77_31_ff` (RTR) likewise uses `get_word_mmu040`/`get_long_mmu040`.
+A grep for `mmu030_state` in `cpuemu_31.cpp` returns **only the two occurrences inside the
+ISSUE-49 comment** — there is no 030-accessor residue left in the 040 table's code.
+
+**The test.** `test_mmu040_rte_delivers_pc` builds a real format-0 frame (`SR` word, `PC`
+long, format word) at a **table-walked** stack address, points `a7` at it, executes `RTE`,
+and requires exact delivery:
+
+| assertion | table-walked | TTR-covered |
+|---|---|---|
+| delivered PC == the frame's `0x80800000` | pass | pass |
+| dropped to user mode (S clear from the popped SR) | pass | pass |
+| `a7` switched to the USP | pass | pass |
+
+Harness 193 → **201**.
+
+**What that means for the metal report.** "The rte delivered a WRONG PC from a frame fed the
+RIGHT one" cannot happen inside this core: with the frame containing `0x80800000`, RTE
+delivers `0x80800000`, from exactly the memory class in question. So **the frame must already
+contain `0x80000012` by the time RTE reads it** — the round-3 latch shows *main's computed
+entry* is correct, which is a different moment from *what is on the stack when RTE runs*. The
+gap between those two moments is where the bug is, and it is kernel-side.
+
+#### The probe that closes the gap in one boot
+
+Shipped in `m68k_run_mmu040()`: for an `RTE` executed in supervisor whose `a7` lies in the
+u-block window (`0x40000000`–`0x4000FFFF`) — exactly the frame class `_start` builds — print
+what RTE is about to consume:
+
+```
+[RTE1] a7=40001Fxx sr=0000 pc=80800000 fmt=0000 usp=C0800000
+```
+
+Cost is one opcode compare per instruction plus a range test on `a7`; the three frame reads
+happen only for that rare frame class, and the probe caps at 8 lines. Reading the frame there
+cannot introduce a new fault class — RTE is about to read the same three locations.
+
+**It is a two-way discriminator, and both answers are useful:**
+
+- `pc=80800000` → the frame is right and the delivery is right, so the wrong PC arrives
+  *after* this RTE. Look downstream: a second exception/return before the first user
+  instruction retires, or the icode's own first instruction faulting and being reported with
+  a stale PC.
+- `pc=80000012` (or anything else) → **the frame was built wrong**, and the kernel's
+  `_start`/`main` path between "entry computed" and "frame pushed" owns it. `usp` and `a7`
+  in the same line say whether the stack the frame sits on is the one that was intended.
+
+**Does the fix predict PID 1 executing its first instruction?** No — because there is no fix
+here to predict from. This round found no emulator defect; the exception-return path was
+already correct, and the firmware carries only the probe. The prediction I can make is the
+falsifiable one above: the probe will show `pc=80800000`, and if it does, the emulator is
+exonerated on this leg too and the remaining distance to `init`, `getty` and the login prompt
+is kernel-side.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

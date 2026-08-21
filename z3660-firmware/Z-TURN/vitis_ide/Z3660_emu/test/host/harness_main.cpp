@@ -1413,6 +1413,74 @@ static void test_mmu040_user_mode(void)
 }
 
 /* ==================================================================
+ * RTE must deliver the frame's PC exactly, from a TABLE-WALKED stack.
+ *
+ * ISSUE-52: the kernel's _start builds a format-0 frame on its kernel stack (in
+ * the table-walked u-block window), pushes PC = 0x80800000, and rte's to user
+ * mode -- and PID 1 surfaces at 0x80000012 instead. The hypothesis was that the
+ * exception-return path reads the frame through the wrong accessor family, the
+ * way the bitfield path did. This pins the delivery both ways.
+ * ================================================================== */
+static void rte_frame_arm(const char *what, uae_u32 frame_va, uae_u32 frame_pa,
+                          uae_u32 vcode, uae_u32 pcode)
+{
+	const uae_u32 WANT_PC = 0x80800000u;
+	const uae_u16 WANT_SR = 0x0000;          /* user mode, all interrupts enabled */
+
+	/* format-0 frame: SR(word) PC(long) format&vector(word) */
+	hram_poke16(frame_pa + 0, WANT_SR);
+	hram_poke32(frame_pa + 2, WANT_PC);
+	hram_poke16(frame_pa + 6, 0x0000);       /* format 0, vector offset 0 */
+
+	hram_poke16(pcode, 0x4e73);              /* RTE */
+
+	cpu_set_context(vcode);
+	regs.s = 1;
+	MakeSR();
+	regs.usp = 0xC0800000u;                  /* the icode stack the kernel built */
+	m68k_areg(regs, 7) = frame_va;
+
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	if (faulted) { g_fail++; printf("  FAIL: %s: RTE faulted\n", what); return; }
+	g_pass++;
+	CHECK_EQ32(m68k_getpc(), WANT_PC, what);
+	CHECK_EQ32(regs.s, 0, "RTE dropped to user mode (S clear from the popped SR)");
+	CHECK_EQ32(m68k_areg(regs, 7), 0xC0800000u, "RTE switched a7 to the USP");
+}
+
+static void test_mmu040_rte_delivers_pc(void)
+{
+	printf("[test] RTE delivers the frame's PC exactly, table-walked and TTR-covered\n");
+	const uae_u32 VCODE = 0x00400000, PCODE = 0x0C000000;
+	const uae_u32 VSTK  = 0x00401000, PSTK  = 0x0E000000;
+
+	/* --- the metal case: frame on a TABLE-WALKED page --- */
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSTK,  PSTK);
+	rte_frame_arm("RTE from a TABLE-WALKED frame delivers the exact PC",
+	              VSTK | 0xF00, PSTK | 0xF00, VCODE, PCODE | (VCODE & 0xFFF));
+	mmu040_off();
+
+	/* --- control: frame on a TTR-covered address (logical == physical) --- */
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	regs.dtt0 = MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED;   /* covers 0x00xxxxxx */
+	mmu_tt_modified();
+	rte_frame_arm("RTE from a TTR-covered frame delivers the exact PC",
+	              0x00060F00u, 0x00060F00u, VCODE, PCODE | (VCODE & 0xFFF));
+	mmu040_off();
+
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -1866,6 +1934,7 @@ int main(int argc, char **argv)
 	test_mmu040_reset_clears_mmu_state();
 	test_mmu040_bitfield_translates();
 	test_mmu040_user_mode();
+	test_mmu040_rte_delivers_pc();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();

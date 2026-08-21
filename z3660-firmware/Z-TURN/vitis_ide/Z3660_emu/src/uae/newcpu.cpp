@@ -1915,6 +1915,7 @@ extern "C" { extern volatile int amix_mmu_on; }
 #define AMIX_XTRACE_MAX 64
 #define AMIX_XINT_FIRST 12                       /* interrupts logged in full before summarising */
 static int amix_xtrace_n = 0, amix_xint_logged = 0, amix_xint_sums = 0;
+static int amix_rte_probe_n = 0;   /* ISSUE-52 RTE frame probe, capped */
 static uae_u32 amix_int_n[8], amix_int_minsp[8], amix_int_total = 0;
 static uae_u32 amix_xt_minsp = 0xFFFFFFFFu;
 static int amix_xt_init = 0;
@@ -4613,6 +4614,30 @@ static void m68k_run_mmu040(void)
             mmu_opcode = -1;
             mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
             count_instr(regs.opcode);
+
+            /* ISSUE-52 RTE PROBE (diagnostic). The harness proves RTE delivers a
+             * table-walked frame's PC exactly (test_mmu040_rte_delivers_pc), so
+             * "fed 0x80800000, delivered 0x80000012" cannot happen inside the core --
+             * which means the frame already holds the wrong PC when RTE reads it.
+             * This shows what RTE actually consumes. Cost: one opcode compare per
+             * instruction, then a range test on a7; the frame is only read for RTEs
+             * whose stack is in the u-block window (0x40000000-0x4000FFFF), which is
+             * exactly the frame class _start builds, and those are rare. Capped at 8
+             * lines. Reading the frame here cannot introduce a new fault class: RTE is
+             * about to read the same three locations. */
+            if (regs.opcode == 0x4E73 && regs.s && amix_mmu_on
+                && currprefs.mmu_model == 68040 && amix_rte_probe_n < 8) {
+               uaecptr _a = m68k_areg(regs, 7);
+               if ((_a & 0xFFFF0000u) == 0x40000000u) {
+                  amix_rte_probe_n++;
+                  z3660_printf("[RTE%d] a7=%08lX sr=%04lX pc=%08lX fmt=%04lX usp=%08lX\r\n",
+                               amix_rte_probe_n, (unsigned long)_a,
+                               (unsigned long)get_word_mmu040(_a),
+                               (unsigned long)get_long_mmu040(_a + 2),
+                               (unsigned long)get_word_mmu040(_a + 6),
+                               (unsigned long)regs.usp);
+               }
+            }
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             cpu_cycles = adjust_cycles(cpu_cycles);
 
