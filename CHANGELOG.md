@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-08-21 — 040: ISSUE-52 round-8 RESOLVED — the cold `mmufixup[1]` slot zeroed copyout's source register (7429a58)
+
+- Metal proved round 7's fix was not the corruptor (symptom byte-identical), and the
+  `[IDCMP]` probe exonerated fetch/translation: I and D agree on the same physical long
+  and both read the poison — the page CONTENT was wrong.
+- Root cause: `m68k_reset_newcpu()` cleared only `mmufixup[0].reg`; upstream (amiberry
+  `src/newcpu.cpp:3703-3704`) clears both. `cpu_restore_fixup()` reads `reg >= 0` as ARMED,
+  so the BSS-zero slot 1 means "A0 armed, restore 0". `cpuemu_31` never arms slot 1, so on
+  the 040 path nothing cleared it and the FIRST bus fault of the session set A0 = 0. On the
+  030 path `m68k_run_mmu030`'s CATCH clears both slots on its first fault — invisible there.
+- That first fault is the icode copyout's first-touch write: `lcolloop`'s
+  `moves.l %d1,(%a1)+` (DFC=1) at kernel `0x080005C2`, frame PC `0x080005C6`, `ssw=0401`.
+  A0 is the copy's SOURCE, so the loop resumed reading from guest address 0 — the ISSUE-10
+  signature and ISSUE-52's garbage user PC, one bug.
+- Fix: restore the lost reset line + static `{ -1, 0 }` initialiser (cold state safe by
+  construction). `m68k_run_mmu040` de-`static`'d so the harness drives the real loop.
+- Harness 244 → 256: `test_mmu040_copyout_fault_keeps_source_reg` reproduces metal byte
+  for byte pre-fix (A0 = 0x34, dest long 1 = 0x4AFC0000, 13/14 longs wrong, long 0 right).
+- `BOOT.BIN` 12,762,380 B, zlib crc32 `D5CBFAF4` — flashed and metal-validated same day:
+  3/3 boots to the interactive installer prompt; the first 68040 AMIX install ran on it.
+  Detail in `UAE_040_MMU_gate.md` §10.14.
+
+## 2026-08-21 — 040: ISSUE-52 round-7, the format-$7 write-back slot was never consumed (60ce49f)
+
+- The [USTEP] "translated user-page instruction fetch returns garbage" reading is
+  REFUTED, arithmetically: 68040 translation composes by OR (`l->phys | (addr &
+  mmu_pagemask)`, and the MMU_IPAGECACHE shortcut likewise), so the page offset is
+  invariant — a fetch at page offset 4 can never return the content of physical 0,
+  whatever frame it resolves to. No pc_p-relative fetch is reachable from the 040
+  table either (cpuemu_31: 1182 m68k_getpci, zero m68k_getpc/m68k_incpc/next_d*).
+  set_x_funcs' 040 arm, the *_mmu040 fetch inlines (byte-identical to upstream),
+  x_get_disp_ea_020 and m68k_run_mmu040 all check out. The address was right; the
+  bytes on the page were wrong.
+- FIXED (`newcpu_common.cpp`, Exception_build_stack_frame case 0x7): the frame
+  stacked regs.wb2_status/regs.wb3_status without clearing them — two upstream
+  lines lost in the port. Handing the slot to the guest consumes it: AMIX's
+  wb040.s replays on WB3S bit 7 alone. mmu_bus_error() recomputes both words on
+  every fault it handles, hiding this for six rounds; the faults that reach
+  Exception(2) WITHOUT it (hardware_exception2 / exception2_read /
+  exception2_fetch*, which THROW straight to the run loop's CATCH under this
+  non-cpu_compatible config) then stacked the PREVIOUS write fault's valid WB3S
+  and stale WB3D against the CURRENT fault's address — the guest performs that
+  store. A stray write, of a stale datum, into the page that just faulted: the
+  ISSUE-10 "write-back-fabricated value" signature, landing in pages being
+  demand-paged in (proc 1's text among them). 68030 path untouched.
+- Harness 221 → 244. test_mmu040_user_icode_stream drives the metal case end to
+  end through the real run loop and passes before and after — the proof the fetch
+  is faithful. test_mmu040_writeback_slot_consumed fails 3 assertions before the
+  fix and passes after.
+- Build: BOOT.BIN 12,762,380 B, zlib crc32 `B29BF9EB` (superseded same day by
+  round 8's `D5CBFAF4`). Detail incl. two latent divergences found and deliberately
+  NOT changed: `UAE_040_MMU_gate.md` §10.13.
+
 ## 2026-08-21 — 040: [USTEP] probe; LEA path proven correct (ISSUE-52 round-5) (a3c6a0b)
 
 Hypothesis was family #7 — the 040 core mis-executing the icode's full-format PC-relative
