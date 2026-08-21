@@ -2035,6 +2035,68 @@ all-aligned instruction with no icache — a new and surprising class — and th
 name which field is wrong so the fix is targeted rather than guessed.
 
 
+### 10.12 ISSUE-52 round-6: translated user-instruction fetch returns garbage (I-vs-D probe)
+
+The registered falsifying outcome from §10.11 fired. The `[USTEP]` trace (firmware `368993CA`):
+
+```
+[USTEP0] pc=80800000 op=4FFB a7=08003118 d0=80800000   <- the lea, correct opword
+[USTEP1] pc=80800008 op=0800  a7=CB7C0002 d0=80800000   <- AFTER the lea
+[USTEP2] pc=8080000C op=00F8  a7=CB7C0002 d0=80800000
+[USTEP3] pc=80800012 op=0A9E  a7=CB7C0002 d0=80800000
+```
+
+Two facts, both **contradicting the harness** (which passed §10.11):
+
+1. The `lea` consumed the **right length** (`0x80800000 → 0x80800008`, 8 bytes, exactly as the
+   harness predicts) but produced `A7 = 0xCB7C0002`, not `0x8080002A`. That decodes exactly:
+   `0xCB7C0002 − 0x80800002 = 0x4AFC0000`, so the 32-bit **base displacement was read as
+   `0x4AFC0000` instead of `0x00000028`** (`0x4AFC` is the m68k illegal-opcode fill — the
+   ISSUE-10 poison).
+2. The **opword fetches themselves return garbage** past offset 0: `@0x80800008` reads `0x0800`
+   where the icode is `0x700B`, `@…0C` `0x00F8`, `@…12` `0x0A9E`. So fetching the *translated
+   user instruction page* returns wrong bytes for offsets > 0, while offset 0 read correctly.
+
+This is the same structural class as §10.9 (family #6): a metal-only divergence in how the 040
+core reads translated memory, the host flat buffer cannot reproduce it — but now on the
+**instruction/extension fetch** path (`next_iword`/`next_ilong_mmu040`), not data reads.
+
+**Static analysis did not name it.** Every relevant path was read and is consistent, and each
+matches the host (which passes): the LEA handler and `x_get_disp_ea_020` (§10.11); `set_x_funcs`
+wiring `x_next_iword`/`x_next_ilong` to the translating `next_*_mmu040`; `mmu_translate` (same
+`tag`/`index`/`l->phys | offset` for the whole page); the `MMU_IPAGECACHE` store
+(`atc_last_ins_paddr = l->phys`, page-aligned) and HIT recomposition; and
+`flush_shortcut_cache` (invalidates the shortcut on every fill and flush). `MMU_ICACHE == 0`, so
+no stale instruction cache; the bd at `0x80800004` is long-aligned, so §10.9's misalignment
+class does not apply. The "offset-0-correct, offset-4+-wrong within one page" pattern is not
+explained by any of these being individually wrong — the divergence is in *what physical frame
+the instruction path lands on* versus where the kernel's data write went, and that is a runtime
+fact.
+
+**The decisive probe.** `[IDCMP]` fires once, for the first user instruction, and reads the
+known-wrong location (`pc+4`, the lea's base displacement) **both ways** — instruction and data
+— printing each path's physical translation and value:
+
+```
+[IDCMP] at=<pc+4> iphys=<instr translation> dphys=<data translation> iword=<instr read> dword=<data read> srp=<> urp=<>
+```
+
+It splits the last question cleanly:
+
+- **`iphys != dphys`** → the instruction and data translations of the same user VA resolve to
+  **different physical frames** — an I-vs-D ATC / user-page translation-coherence bug (the write
+  went to `dphys`, the fetch reads `iphys`). `srp`/`urp` on the same line show whether the user
+  root is even the one the write used.
+- **`iphys == dphys` and `iword == dword` (both `0x4AFC0000…`)** → same frame, **content wrong**:
+  the kernel's write never landed there (data-write / `MOVE16` / kernel copyout), and the fetch
+  is faithfully reading poison.
+- **`iphys == dphys` but `iword != dword`** → same frame, the **physical long read itself**
+  diverges between the instruction and data accessors (a bus/accessor issue).
+
+One boot names which. This round ships the probe (firmware `3DB2B240`); no speculative fix, and
+an amiberry diff of the instruction-fetch/ATC path is in flight in case it names a static tell.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

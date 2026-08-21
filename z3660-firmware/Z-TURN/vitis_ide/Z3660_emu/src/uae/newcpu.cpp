@@ -4688,6 +4688,34 @@ static void m68k_run_mmu040(void)
                             (unsigned long)m68k_areg(regs, 7),
                             (unsigned long)m68k_dreg(regs, 0));
                amix_ustep_n++;
+
+               /* ISSUE-52 round-6 I-vs-D TRANSLATION COMPARE (one-shot). The [USTEP] trace
+                * showed the user instruction FETCH returning garbage for offsets > 0 of a
+                * page whose bytes the kernel wrote via the DATA path -- so the INSTRUCTION
+                * translation of a user VA resolves to a different physical frame than the
+                * DATA translation, or the fetched frame's content is wrong. This reads the
+                * known-wrong spot (pc+4, the lea's 32-bit base displacement) BOTH ways and
+                * prints each path's physical translation and value. Decisive:
+                *   iphys != dphys           -> INSTRUCTION and DATA resolve different frames
+                *                               (I-vs-D ATC / user-page translation coherence)
+                *   iphys == dphys, iw==dw   -> same frame, content wrong (the write never
+                *     both 0x4AFC0000...        landed there: data-write / MOVE16 / kernel)
+                *   iphys == dphys, iw!=dw   -> same frame, the PHYSICAL long read itself
+                *                               diverges I-vs-D (bus/accessor)
+                * Fires once, for the first user instruction. Wrapped so a fault cannot
+                * derail the boot; each mmu_translate/read is exactly what the fetch does. */
+               if (amix_ustep_n == 1) {
+                  uaecptr _t = (uaecptr)regs.instruction_pc + 4;
+                  uae_u32 iphys = 0xFFFFFFFF, dphys = 0xFFFFFFFF, iw = 0xFFFFFFFF, dw = 0xFFFFFFFF;
+                  TRY(pi) { iphys = mmu_translate(_t, 0, false, false, false, sz_long); } CATCH(pi) { (void)pi; } ENDTRY
+                  TRY(pd) { dphys = mmu_translate(_t, 0, false, true,  false, sz_long); } CATCH(pd) { (void)pd; } ENDTRY
+                  TRY(pw) { iw = uae_mmu040_get_ilong(_t); } CATCH(pw) { (void)pw; } ENDTRY
+                  TRY(pv) { dw = get_long_mmu040(_t);      } CATCH(pv) { (void)pv; } ENDTRY
+                  z3660_printf("[IDCMP] at=%08lX iphys=%08lX dphys=%08lX iword=%08lX dword=%08lX srp=%08lX urp=%08lX\r\n",
+                               (unsigned long)_t, (unsigned long)iphys, (unsigned long)dphys,
+                               (unsigned long)iw, (unsigned long)dw,
+                               (unsigned long)regs.srp, (unsigned long)regs.urp);
+               }
             }
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             cpu_cycles = adjust_cycles(cpu_cycles);
