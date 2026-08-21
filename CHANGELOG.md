@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-08-21 — 040: exception-return path clean; ISSUE-52 frame is pre-corrupted (f4d787b)
+
+Hypothesis was family member #6 — RTE reading the frame through the wrong accessor
+family. **Refuted by inspection and by test.**
+
+- `op_4e73_31_ff` (RTE) and `op_4e77_31_ff` (RTR) both use `get_word_mmu040`/
+  `get_long_mmu040`; format `$7` goes to `m68k_do_rte_mmu040()` (`cpummu.cpp:1595`). No
+  `mmu030_state` residue in the 040 table's code.
+- New `test_mmu040_rte_delivers_pc`: a real format-0 frame on a **table-walked** stack
+  delivers its exact PC (`0x80800000`), drops to user mode, and switches `a7` to the USP —
+  table-walked and TTR-covered. Harness 193 → **201**.
+- Therefore "fed the right PC, delivered the wrong one" is impossible in-core: the frame
+  already holds `0x80000012` when RTE reads it. *Main's computed entry* being correct is a
+  different moment from *what's on the stack at RTE*.
+- Ships a bounded `[RTE]` probe (u-block-window `a7` only, 8 lines) printing the frame RTE
+  is about to consume — two-way discriminator between "built wrong" and "corrupted after".
+- **No emulator defect found and none invented.** Second consecutive "not us" round; the
+  sweep has now covered supervisor access, MMU control, exception entry, user mode, and
+  exception return, with permanent guards at each — the 040 core looks converged.
+- `BOOT.BIN` 12,762,404 B, crc32 `AA1E8B4F`. Warning-free.
+
 ## 2026-08-21 — ISSUE-49 fix FLASHED + METAL-VALIDATED: THE FIRST 68040 AMIX BANNER (034901C0 live)
 
 `034901C0` (the bitfield-accessor fix) flashed through both deploy gates, 030 canary
