@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-08-21 — ISSUE-49 fix FLASHED + METAL-VALIDATED: THE FIRST 68040 AMIX BANNER (034901C0 live)
+
+`034901C0` (the bitfield-accessor fix) flashed through both deploy gates, 030 canary
+green, and the verdict boot delivered the campaign's goal: **the 68040 AMIX kernel
+runs on the metal card** — no panic, no reset, six minutes observed, 65,536
+interrupts serviced at steady rates — and the screen shows the full banner:
+`UNIX(R) System V Release 4.0 AT&T Amiga (Unlimited) 68040-260821-10 Version 2.1c`,
+memory sized correctly under the contract (16,773,120 total / 14,487,552 available).
+
+The kernel exec'd **PID 1**; init took a user-space bus error (`User BUS ERROR at
+40001FC0, PC:80000012 FAULT:6 PID:1`) which the kernel handled gracefully as a
+NOTICE and survived. The frontier is now USERLAND bring-up (init's exec at a
+near-null user PC) — a new case, not a kernel or MMU one.
+
+Night's tally on this line: SEVEN emulator defects fixed and harness-guarded (mode
+predicate, pre-init printf, STOP pc, MOVEC→TC, PFLUSH/PTEST accessors, reset MMU
+state, bitfield 030-accessors) + one latent stock kernel bug (unzeroed page DB,
+port ISSUE-48, confirmed ×4) + the panic-path guard (ISSUE-46) metal-proven.
+Harness 90 → **182**. Box parked OFF, selector restored to golden.
 ## 2026-08-21 — 040: bitfield ops used the 68030 accessors (ISSUE-49) (6e8e33a)
 
 The port lane isolated `bfins %d0,%a2@{2:1}` (d0=0) failing to write against table-walked
