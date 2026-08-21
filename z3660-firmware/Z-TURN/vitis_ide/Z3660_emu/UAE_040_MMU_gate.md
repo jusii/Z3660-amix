@@ -1966,6 +1966,75 @@ handling — which the harness currently says is correct, so the working expecta
 kernel/port-lane cause. Harness 212 → **217**.
 
 
+### 10.11 ISSUE-52 round-5: single-step probe + a harness proof the LEA is correct
+
+The hypothesis this round was family #7: the 040 core mis-executing the icode's first
+instruction, a full-format PC-relative `lea %pc@(L%stack),%sp` (bytes `4FFB 0170 0000 0028`).
+The correct 040 result is `A7 = (0x80800000+2) + 0x28 = 0x8080002A` with the instruction 8
+bytes long; a kernel ring saw `A7 = 0xCB7C0002` (garbage, odd) at the trap. Two deliverables:
+a single-step probe, and a harness test of exactly this instruction on the mmu040 path.
+
+**The emulator's LEA path checks out on every static and host test.** The handler
+(`op_41fb_31_ff` and its dst-reg siblings) advances past the opword and anchors the base at
+the extension-word address:
+
+```c
+m68k_incpci(2);                       /* PC -> opword+2 = the extension word */
+uaecptr tmppc = m68k_getpci();
+srca = x_get_disp_ea_020(tmppc, 0);   /* base = opword+2 */
+```
+
+`x_get_disp_ea_020` (in `newcpu_common.cpp`, reached through the tree's compile bridge) takes
+the full-format branch on `dp & 0x100`, honours base-suppress / index-suppress, reads the
+32-bit base displacement via `x_next_ilong`, and returns `base + 0x28`. On the 68040 path
+`set_x_funcs` wires `x_next_iword`/`x_next_ilong` to `next_iword_mmu040`/`next_ilong_mmu040`
+(translating), so the extension words come through the page tables. Every read in this
+instruction is naturally aligned (opword `@0x80800000`, ext `@…02` word-aligned, bd `@…04`
+long-aligned), so §10.9's misalignment class does not apply; and `MMU_ICACHE == 0`, so there
+is no stale-instruction path.
+
+`test_mmu040_lea_pcrel_fullformat` executes the exact instruction on a table-walked, mmu040
+code page and asserts all three decisive facts: `A7 = (pc+2)+0x28`, the instruction is 8
+bytes (`PC` advances opword 2 + ext 2 + bd 4), and the *next* fetch decodes the following
+instruction cleanly (the stream is not skewed). **It passes.** So the EA value, the extension
+parse and the instruction length are all correct on the emulator's 040 accessor path.
+
+> A first draft of the test failed — but with stale `x_next_*` pointers left by the prior
+> test's `cpu_bringup(68030)`, i.e. it was not exercising the mmu040 accessors at all. Wired
+> correctly (via `mmu040_pt_init`, as the other 040 tests do) it passes. Recorded because a
+> mis-wired test that "reproduces" the bug is exactly the trap to avoid. Harness 217 → **221**.
+
+**Conclusion, stated honestly.** Statics and the harness both say the emulator's full-format
+PC-relative `lea` is correct; I have no named emulator defect to fix, and I will not ship a
+speculative change to code that passes every check. So this round is the **probe**.
+
+**The [USTEP] single-step probe** prints the pre-state of the first up-to-8 user-mode
+instructions under AMIX-040 — proc 1's icode — one line each:
+
+```
+[USTEP<n>] pc=<PC> op=<opword@PC> a7=<A7> d0=<D0>
+```
+
+`regs.opcode`/`regs.instruction_pc` are the instruction about to run; `a7`/`d0` are the
+register state *before* it. So **step 0** shows the `lea` about to execute (`pc=0x80800000
+op=0x4ffb a7=<launch stack>`), and **step 1**'s `a7` is the value the `lea` produced. The
+decisive cells:
+
+- **step 1 `a7` must be `0x8080002A`.** Anything else (`0xCB7C0002`, …) means the EA was
+  mis-computed on metal — which, given the harness proof, would point at a metal-only effect,
+  not the arithmetic.
+- **step 1 `pc` must be `0x80800008`.** A different value means the extension length was
+  mis-parsed and the stream (including the `trap #0`) is skewed.
+
+**Prediction (to falsify).** Because the emulator path is harness-proven correct and every
+read is aligned with no icache, I expect `[USTEP1]` to show `a7=0x8080002A pc=0x80800008` —
+i.e. the `lea` is faithful and the `0xCB7C0002` the kernel ring saw was either a timing-fragile
+mis-read (the reason a firmware read was wanted) or corruption from a later instruction. If
+instead `[USTEP1]` shows a wrong `a7`/`pc`, that is a genuine metal-only divergence on an
+all-aligned instruction with no icache — a new and surprising class — and the step data will
+name which field is wrong so the fix is targeted rather than guessed.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

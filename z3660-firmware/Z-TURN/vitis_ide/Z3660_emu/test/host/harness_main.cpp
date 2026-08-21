@@ -1553,6 +1553,58 @@ static void test_mmu040_rte_syscall_return_usp(void)
 	cpu_bringup(68030);
 }
 
+/* ==================================================================
+ * Full-format PC-relative LEA (the icode's first instruction) on the 040 path.
+ *
+ * ISSUE-52 round-5: proc 1's icode opens with
+ *   lea %pc@(L%stack),%sp   ; 4FFB 0170 0000 0028
+ * a full-format (dp bit 8), base-not-suppressed, index-suppressed (dp bit 6),
+ * 32-bit base-displacement (dp bits 5-4 = 11) PC-relative EA. The correct result
+ * is EA = (pc_of_ext_word) + 0x28 and the instruction is 8 bytes (opword 2 + ext 2
+ * + bd 4). This pins both the EA value and the length on the mmu040 accessor path.
+ * ================================================================== */
+static void test_mmu040_lea_pcrel_fullformat(void)
+{
+	printf("[test] full-format PC-relative LEA: EA and instruction length (icode)\n");
+	const uae_u32 VCODE = 0x00408000, PCODE = 0x0C000000;
+	mmu040_pt_init();                            /* wires the mmu040 x-funcs + cpufunctbl */
+	mmu040_map_page(VCODE, PCODE);               /* one mapped, table-walked code page */
+	regs.s = 1;
+
+	/* lea %pc@(0x28,ZPC),%a2  -- dst A2 to avoid disturbing the stack pointer.
+	 * opword 0x45FB = LEA, dst An=2, mode 7 reg 3; ext 0x0170; bd 0x00000028. */
+	hram_poke16(PCODE + 0, 0x45FB);
+	hram_poke16(PCODE + 2, 0x0170);
+	hram_poke32(PCODE + 4, 0x00000028);
+	hram_poke16(PCODE + 8, 0x4e71);              /* nop (must be the next instruction) */
+
+	cpu_set_context(VCODE);
+	regs.s = 1;
+	m68k_areg(regs, 2) = 0xDEADBEEFu;
+
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	CHECK(!faulted, "full-format PC-relative LEA did not fault\n");
+	/* base anchor is the extension-word address = VCODE + 2; EA = base + 0x28 */
+	CHECK_EQ32(m68k_areg(regs, 2), (VCODE + 2) + 0x28,
+	           "EA = (pc+2) + base-disp 0x28 (full-format PC-relative)");
+	CHECK_EQ32(m68k_getpc(), VCODE + 8,
+	           "instruction length is 8 bytes (opword 2 + ext 2 + bd 4)");
+
+	/* the very next fetch must be the nop, proving the stream did not skew */
+	regs.instruction_pc = m68k_getpc();
+	uae_u32 nextop = x_prefetch(0);
+	CHECK_EQ32(nextop, 0x4e71, "the instruction after the LEA decodes correctly (stream aligned)");
+
+	mmu040_off();
+	cpu_bringup(68030);
+}
+
 /* Direct accessor-level pin of the ISSUE-52 routing invariant, both directions. */
 static void test_mmu040_misaligned_split(void)
 {
@@ -2042,6 +2094,7 @@ int main(int argc, char **argv)
 	test_mmu040_user_mode();
 	test_mmu040_rte_delivers_pc();
 	test_mmu040_rte_syscall_return_usp();
+	test_mmu040_lea_pcrel_fullformat();
 	test_mmu040_misaligned_split();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();

@@ -1917,6 +1917,7 @@ extern "C" { extern volatile int amix_mmu_on; }
 static int amix_xtrace_n = 0, amix_xint_logged = 0, amix_xint_sums = 0;
 static int amix_rte_probe_n = 0;   /* ISSUE-52 RTE frame probe, capped */
 static int amix_urte_probe_n = 0;  /* ISSUE-52 user-transition RTE probe (syscall-return capture), capped */
+static int amix_ustep_n = 0;       /* ISSUE-52 round-5: single-step the first user instructions (icode), capped */
 static uae_u32 amix_int_n[8], amix_int_minsp[8], amix_int_total = 0;
 static uae_u32 amix_xt_minsp = 0xFFFFFFFFu;
 static int amix_xt_init = 0;
@@ -4666,6 +4667,27 @@ static void m68k_run_mmu040(void)
                                (unsigned long)regs.usp,
                                (unsigned long)get_word_mmu040(_a + 6));
                }
+            }
+
+            /* ISSUE-52 round-5 USER SINGLE-STEP PROBE (diagnostic). Prints the pre-state of
+             * the first up-to-8 USER-mode instructions executed under AMIX-040 -- i.e. proc 1's
+             * icode. regs.opcode / regs.instruction_pc are already the instruction about to run;
+             * a7 and d0 are the register state BEFORE it. So step 0 shows the icode's lea about
+             * to run (pc=0x80800000 op=0x4ffb a7=<launch stack>), and step 1 shows the state
+             * AFTER the lea -- its a7 is the lea's computed EA. The decisive cells:
+             *   step 0 op must be 0x4ffb; step 1 a7 must be 0x8080002A (base 0x80800002 + bd
+             *   0x28) and pc must be 0x80800008 (opword 2 + ext 2 + bd 4). A wrong step-1 a7
+             *   means the full-format PC-relative EA is mis-computed; a step-1 pc != 0x80800008
+             *   means the extension length was mis-parsed and the stream (incl. trap #0) is
+             *   skewed. Capped, one line per step, gated to the AMIX-040 user path only. */
+            if (!regs.s && amix_mmu_on && currprefs.mmu_model == 68040 && amix_ustep_n < 8) {
+               z3660_printf("[USTEP%d] pc=%08lX op=%04lX a7=%08lX d0=%08lX\r\n",
+                            amix_ustep_n,
+                            (unsigned long)regs.instruction_pc,
+                            (unsigned long)(regs.opcode & 0xFFFF),
+                            (unsigned long)m68k_areg(regs, 7),
+                            (unsigned long)m68k_dreg(regs, 0));
+               amix_ustep_n++;
             }
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             cpu_cycles = adjust_cycles(cpu_cycles);
