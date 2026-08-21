@@ -182,8 +182,15 @@ static struct cputbl_data cpudatatbl[65536];
 /* Two elements: index 1 is driven by the imported 68030-MMU table (cpuemu_32.cpp
  * MOVES/CAS2/double-(An) handlers), the m68k_run_mmu030 CATCH path below, and
  * cpummu030.cpp's mmu030fixupreg(1)/mmu030fixupmod(...,1). Upstream WinUAE 4.4.0
- * sizes this [2]; the fork had shrunk it to [1] (UB once MMU mode drives idx 1). */
-struct mmufixup mmufixup[2];
+ * sizes this [2]; the fork had shrunk it to [1] (UB once MMU mode drives idx 1).
+ *
+ * EXPLICITLY initialised to "disarmed" (reg = -1), because the zero BSS state is
+ * not neutral: cpu_restore_fixup() reads `reg >= 0` as ARMED, so a cold slot means
+ * "A0 is armed, restore it to 0" and the first fault of the session destroys A0.
+ * Upstream relies on m68k_reset() alone for this (and this port had lost the
+ * mmufixup[1] half of that -- ISSUE-52 round-8); the static initialiser makes the
+ * cold state safe by construction, independent of when reset first runs. */
+struct mmufixup mmufixup[2] = { { -1, 0 }, { -1, 0 } };
 static_assert(sizeof(mmufixup) / sizeof(mmufixup[0]) >= 2,
               "mmufixup must hold index 1 (MMU030_REG_FIXUP) used by cpuemu_32 + run-loop CATCH");
 
@@ -2466,7 +2473,20 @@ void m68k_reset_newcpu(bool hardreset)
       set_cpu_caches (false);
    }
 
+   // BOTH fixup slots, as upstream (amiberry src/newcpu.cpp:3703-3704 / WinUAE
+   // m68k_reset2). The port kept only slot 0, and on the 68040 path nothing else
+   // ever clears slot 1: cpuemu_31 arms slot 0 only (388 sites, zero for slot 1),
+   // and cpu_restore_fixup() -- which m68k_run_mmu040's CATCH calls on every fault
+   // -- treats the BSS-zero slot as "A0 armed, restore 0". So the FIRST bus fault
+   // of an AMIX-040 boot wrote 0 into A0. That fault is the icode copyout's
+   // first-touch write (lcolloop's `moves.l d1,(a1)+`, DFC=1), whose source pointer
+   // IS A0: the copy resumed reading from guest address 0 and filled proc 1's text
+   // page with low memory (0x4AFC0000, the pseudo-ExecBase, the KS ROM vector
+   // stubs) -- ISSUE-52's garbage user PC and the ISSUE-10 signature both.
+   // The 68030 path never showed it: m68k_run_mmu030's CATCH clears both slots on
+   // its first fault, harmlessly, long before anything reads them.
    mmufixup[0].reg = -1;
+   mmufixup[1].reg = -1;
    if (currprefs.cpu_model >= 68040) {
       set_cpu_caches(false);
    }
@@ -4574,7 +4594,14 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
 // 68040 bus-error STACK FRAME (format $7) that Exception() must build on a real
 // 040 page fault is the separate, still-parked bus-error-frame task; this loop
 // only provides the correct restart/dispatch structure around it.
-static void m68k_run_mmu040(void)
+//
+// NOT static: the host harness drives THIS function rather than a transcription of
+// it, so a vector exercises the genuine loop body and, above all, the genuine CATCH.
+// ISSUE-52 round-8 hid from a hand-copied CATCH for exactly that reason -- a copy
+// and the original can drift, and the defect lived in the state the real CATCH
+// consumes. Harness stepping arms SPCFLAG_MODE_CHANGE so do_specialties() returns 1
+// after each instruction and the loop returns; the firmware never sets it that way.
+void m68k_run_mmu040(void)
 {
    struct flag_struct f;
    int halt = 0;

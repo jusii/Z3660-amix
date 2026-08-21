@@ -2198,6 +2198,129 @@ next round does not re-derive them, and so a change is made on purpose rather th
   `SPCFLAG_MODE_CHANGE` on every check and never converge.
 
 
+### 10.14 ISSUE-52 round-8 RESOLVED: the cold `mmufixup[1]` slot zeroed the copy's source register
+
+Round 7's fix (`60ce49f`, flashed as `B29BF9EB`) is correct and stays, but metal came back
+**byte-identical**: `[USTEP1] pc=80800008 op=0800 a7=CB7C0002`. The round-6 `[IDCMP]` probe fired
+in the same boot and settled the fetch question for good:
+
+```
+[IDCMP] at=80800004 iphys=08F36004 dphys=08F36004 iword=4AFC0000 dword=4AFC0000
+        srp=08106000 urp=08F3F000
+```
+
+Instruction and data translation agree, both read the same physical long, and that long is the
+poison. **The page content is wrong**; fetch and translation are exonerated on metal, not just in
+the harness. A DM dump of the icode frame `0x08F36000` says what wrote it:
+
+| offset | content |
+|---|---|
+| `00` | `4FFB0170` — the icode's real first long, **correct** |
+| `04`–`37` | guest low memory `0`–`0x33`: `4AFC0000` (ILLEGAL-at-null), `080007F0` (pseudo-ExecBase), then the `00F8xxxx` KS ROM vector stubs |
+| `38`+ | zero — the copy **length** was preserved |
+
+So the copy ran to completion with its **source** pointer collapsed to 0 and its **destination**
+pointer intact.
+
+#### The instruction, from the kernel binary
+
+`0x080005C6` in `unix-040-…-i52f` (banner `68040-260821-27`) is inside `copyout_orig`'s local
+path `lcopyout`:
+
+```
+080005A2   movec  d0,dfc          ; DFC = 1 (user data), set ONCE for the whole loop
+080005C0   lcolloop:
+080005C0     move.l  (a0)+,d1     ; A0 = KERNEL source
+080005C2     moves.l d1,(a1)+     ; A1 = USER dest, through DFC   <-- the faulting store
+080005C6     subq.l  #4,d0
+080005C8     bge.l   lcolloop
+```
+
+`0x080005C6` is the `subq`, i.e. the instruction **after** the store — which is exactly what a
+68040 write fault stacks, and exactly what `op_0e98_31_ff` produces
+(`m68k_incpci(4); regs.instruction_pc = m68k_getpci(); mmu_restart = false;`). The metal frame
+agrees on every field:
+
+```
+[XT01] vec=2 ipc=080005C6 pc=080005C6 fa=80800000 ssw=0401 sr=2109
+```
+
+`SSW 0x0401` = `ATC` | `RW=0` (write) | `SIZE=long` | `TT=00 TM=001` — a *user-data* access taken
+from supervisor mode, which only a `MOVES` through `DFC=1` produces. (There is no `MOVE16` in this
+kernel at all: the four `move16` mnemonics an objdump finds are FPSP constant tables
+misdisassembled as code.)
+
+#### The defect
+
+`mmufixup[]` is the run loop's `(An)+`/`-(An)` rollback record. `cpu_restore_fixup()` — called by
+`m68k_run_mmu040()`'s CATCH on **every** fault — writes back any slot whose `reg >= 0`, so
+`reg == 0` does not mean "disarmed", it means **"A0 is armed; restore it to `value`"**.
+
+- `cpuemu_31` (the 040 table) arms **slot 0 only**: 388 arm sites, none for slot 1. Slot 1 belongs
+  to the 030 engine (`cpuemu_32`, `cpummu030`'s `mmu030fixupreg(…,1)`).
+- `mmufixup` lives in BSS, so both slots come up `{0, 0}`.
+- Upstream clears both at reset (amiberry `src/newcpu.cpp:3703-3704`, WinUAE `m68k_reset2`):
+  ```c
+  mmufixup[0].reg = -1;
+  mmufixup[1].reg = -1;
+  ```
+  **This port kept only the first line** — the same one-line-lost-in-the-port class as round 7's
+  two missing write-back clears.
+
+On the 68030 path the omission is invisible: `m68k_run_mmu030`'s CATCH clears both slots on its
+first fault, harmlessly, long before anything depends on them. On the 68040 path **nothing** ever
+clears slot 1, so the first bus fault of the session runs `cpu_restore_fixup()` against a slot that
+says "A0 := 0". It is a one-shot — the restore disarms the slot — and the shot lands on the first
+non-interrupt exception of an AMIX-040 boot, which `[XT01]` shows is the icode copyout's
+first-touch write fault.
+
+#### Every observed cell falls out of it
+
+| observation | mechanism |
+|---|---|
+| destination offset `00` correct | the MOVES store's own data rode out in `WB3`; `wb040.s` replayed it |
+| A0 = 0 afterwards, A1 correct | slot 0 was correctly **disarmed** by `op_0e98_31_ff` before the store (a continued write must not rewind A1); only the cold slot 1 was left, and it names A0 |
+| offsets `04`–`37` = guest `0`–`0x33` | the loop resumed at `0x080005C6` with A0 = 0 and walked up |
+| copy length preserved | D0 and A1 were never touched |
+| `copyout` returned success | no second fault, so `sf_fault` never ran — `execve` completed and PID 1 executed the poison |
+| bench amiberry boots the same kernel | it never lost the second line |
+| six rounds of probes saw a "fetch" bug | the fetch was faithful; it was reading a page the kernel had genuinely filled with low memory |
+
+#### Fix
+
+1. `m68k_reset_newcpu()`: restore the lost `mmufixup[1].reg = -1;` (upstream parity).
+2. `struct mmufixup mmufixup[2] = { { -1, 0 }, { -1, 0 } };` — make the cold state safe by
+   construction rather than depending on when reset first runs. Zero-cost, and it removes the
+   whole class rather than this instance of it.
+
+`m68k_run_mmu040()` is no longer `static`: the new harness vector drives the **real** loop, because
+the defect lived in state that only the real CATCH consumes and a transcribed CATCH had been
+passing for two rounds. `SPCFLAG_MODE_CHANGE` makes `do_specialties()` return 1 after each
+instruction so the fixture can step it.
+
+#### Harness 244 → 256: `test_mmu040_copyout_fault_keeps_source_reg`
+
+Rebuilds the metal scenario end to end: MMU on with real tables, kernel text/stack/source pages
+mapped, the destination `0x80800000` **unmapped**, guest low memory carrying the metal values, the
+`lcolloop` body instruction-for-instruction (`moveq #1,d0` / `movec d0,dfc` / `move.l (a0)+,d1` /
+`moves.l d1,(a1)+` / `subq` / `bge`), and a vector-2 handler modelled on `wb040.s`
+(`moves.l WB3D,(WB3A)`, consume `WB3S`, `rte`). The fixture maps the page when it sees the handler
+— i.e. it plays the kernel, not the CPU.
+
+Before the fix it reproduces metal **byte for byte**:
+
+```
+FAIL: a guest reset disarms mmufixup[1] ...
+FAIL: A0 (the copy SOURCE) survived the fault: got 0x00000034 want 0x00403038
+FAIL: destination long 1 is NOT the guest-0 sentinel 0x4AFC0000
+FAIL: every longword of the copy matches the source: got 0x0000000d want 0
+```
+
+A0 = `0x34` is the collapsed pointer having walked guest `0`…`0x33`; 13 of 14 longs wrong with
+long 0 right is the DM dump exactly. After the fix all 12 assertions pass; suite 244 → **256**
+(scsi 34, bootmode 26 unchanged).
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

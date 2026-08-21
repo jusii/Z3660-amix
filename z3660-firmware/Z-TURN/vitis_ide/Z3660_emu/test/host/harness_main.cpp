@@ -1894,6 +1894,176 @@ static void test_mmu040_misaligned_split(void)
 }
 
 /* ==================================================================
+ * ISSUE-52 round-8 / ISSUE-10 GENESIS: a kernel copyout whose destination page
+ * first-touch faults must resume with BOTH of its pointers intact.
+ *
+ * mmufixup[] is the run loop's (An)+/-(An) rollback record: a handler arms a slot
+ * with an address register's PRE-increment value before an access that may fault,
+ * and disarms it once the access lands.  m68k_run_mmu040()'s CATCH calls
+ * cpu_restore_fixup(), which writes every ARMED slot back into its register.
+ *
+ * The 68040 table (cpuemu_31) uses slot 0 only -- 388 arms, zero for slot 1.  Slot
+ * 1 belongs to the 68030 engine (cpuemu_32 / cpummu030's mmu030fixupreg(...,1)).
+ * mmufixup lives in BSS, so at cold boot BOTH slots read {reg = 0, value = 0} --
+ * and `reg = 0` is not "disarmed", it is "A0 is armed, restore it to 0".  Upstream
+ * (amiberry src/newcpu.cpp:3703-3704, WinUAE m68k_reset2) clears both at reset:
+ *     mmufixup[0].reg = -1;
+ *     mmufixup[1].reg = -1;
+ * This port kept only the first line.  On the 68030 path the omission is invisible
+ * -- m68k_run_mmu030's CATCH clears both on its first fault, harmlessly, long
+ * before anything depends on it.  On the 68040 path nothing ever clears slot 1, so
+ * the FIRST bus fault of the session runs cpu_restore_fixup() against a slot that
+ * says "A0 := 0", and A0 is destroyed.
+ *
+ * Metal (firmware B29BF9EB, kernel 68040-260821-27) is exactly that, once:
+ *   [XT01] vec=2 ipc=080005C6 pc=080005C6 fa=80800000 ssw=0401 sr=2109
+ * SSW 0x0401 = ATC | RW=0 (write) | SIZE=long | TT=00 TM=001 (user data from
+ * supervisor mode) -- a MOVES store through DFC.  The kernel's local copyout is
+ *   080005C0 lcolloop: move.l  (a0)+,d1     ; A0 = kernel source
+ *   080005C2           moves.l d1,(a1)+     ; A1 = user dest, DFC=1  <-- faults
+ *   080005C6           subq.l  #4,d0        ; <- the frame PC (write faults do not
+ *   080005C8           bge.l   lcolloop     ;    restart; the store rides in WB3)
+ * so the frame PC is 0x080005C6, one instruction past the MOVES, exactly as
+ * op_0e98_31_ff's `regs.instruction_pc = m68k_getpci(); mmu_restart = false;`
+ * arranges.  The handler had already disarmed slot 0 (correct -- a continued write
+ * must NOT rewind A1), so cpu_restore_fixup() found only the cold slot 1 and set
+ * A0 = 0.  The kernel then replayed WB3 (wb040.s) and RTE'd back to 0x080005C6,
+ * and the loop resumed reading from guest address 0.  Every metal cell falls out:
+ *   - destination offset 0 correct (the WB3 replay of the last good read),
+ *   - offsets 4..0x37 = guest low memory 0..0x33 (0x4AFC0000, 0x080007F0, the KS
+ *     ROM vector stubs) -- A0 walking up from zero,
+ *   - copy LENGTH preserved (D0 and A1 both untouched),
+ *   - copyout returns success, so execve completes and PID 1 executes the poison.
+ * Bench amiberry boots the same kernel because it never lost the second line.
+ *
+ * The vector drives the REAL m68k_run_mmu040() -- not a transcription of it --
+ * because the defect lives in state that only the real CATCH consumes.
+ * SPCFLAG_MODE_CHANGE makes do_specialties() return 1 after each instruction, so
+ * the loop returns and the fixture can step it.
+ * ================================================================== */
+void m68k_run_mmu040(void);            /* the real 68040 MMU run loop (newcpu.cpp) */
+#define Z_SPCFLAG_MODE_CHANGE 8192     /* custom.h, not includable in the harness */
+
+static void test_mmu040_copyout_fault_keeps_source_reg(void)
+{
+	printf("[test] a kernel copyout that faults on its destination keeps its SOURCE register\n");
+	const uae_u32 VKCODE = 0x00400000u, PKCODE = 0x0D000000u;   /* kernel text       */
+	const uae_u32 VVEC   = 0x00402000u, PVEC   = 0x0F000000u;   /* vector table      */
+	const uae_u32 VSRC   = 0x00403000u, PSRC   = 0x0B000000u;   /* kernel source buf */
+	const uae_u32 VKSTK  = 0x40001000u, PKSTK  = 0x0E000000u;   /* kernel stack      */
+	const uae_u32 VDST   = 0x80800000u, PDST   = 0x0C000000u;   /* user dest (UNMAPPED at first) */
+	const uae_u32 NBYTES = 0x38u;                                /* the metal icode length */
+	const uae_u32 LOOP   = VKCODE + 0x18, DONE = VKCODE + 0x22, HANDLER = VKCODE + 0x100;
+
+	/* --- (a) the cold-boot mmufixup[] state, and what a guest reset must do to it --- */
+	mmufixup[0].reg = 0; mmufixup[0].value = 0;      /* BSS: slot armed on A0, value 0 */
+	mmufixup[1].reg = 0; mmufixup[1].value = 0;
+	m68k_reset_newcpu(true);
+	CHECK(mmufixup[0].reg == -1, "a guest reset disarms mmufixup[0]\n");
+	CHECK(mmufixup[1].reg == -1,
+	      "a guest reset disarms mmufixup[1] -- BSS zero means 'A0 armed, restore 0', and\n"
+	      "        the 68040 table never arms slot 1, so nothing else ever clears it\n");
+
+	/* --- (b) the metal scenario, through the real run loop --- */
+	mmu040_gen_init();
+	mmu040_gen_map(VKCODE, PKCODE, 0);
+	mmu040_gen_map(VVEC,   PVEC,   0);
+	mmu040_gen_map(VSRC,   PSRC,   0);
+	mmu040_gen_map(VKSTK,  PKSTK,  0);
+	mmu040_gen_map(0x00000000u, 0x00000000u, 0);   /* kernel low memory is readable on metal
+	                                                  (ITT/DTT), so a collapsed A0 reproduces
+	                                                  the metal bytes instead of re-faulting */
+	/* VDST deliberately NOT mapped yet -- the first store must fault. */
+
+	/* guest low memory, exactly as the metal DM dump decoded it */
+	hram_poke32(0x00000000u, 0x4AFC0000u);         /* ILLEGAL-at-null sentinel */
+	hram_poke32(0x00000004u, 0x080007F0u);         /* pseudo-ExecBase pointer  */
+	for (uae_u32 i = 8; i < NBYTES; i += 4)
+		hram_poke32(i, 0x00F80A00u | i);           /* KS ROM vector-stub family */
+
+	/* the payload: long 0 is the metal icode's first long, then a recognisable ramp */
+	hram_poke32(PSRC + 0, 0x4FFB0170u);
+	for (uae_u32 i = 4; i < NBYTES; i += 4)
+		hram_poke32(PSRC + i, 0xC0DE0000u | i);
+
+	/* the copy: DFC prologue + the lcolloop body, instruction for instruction */
+	hram_poke16(PKCODE + 0x00, 0x7001);                        /* moveq  #1,d0        */
+	hram_poke16(PKCODE + 0x02, 0x4E7B);                        /* movec  d0,dfc       */
+	hram_poke16(PKCODE + 0x04, 0x0001);
+	hram_poke16(PKCODE + 0x06, 0x207C);                        /* movea.l #VSRC,a0    */
+	hram_poke32(PKCODE + 0x08, VSRC);
+	hram_poke16(PKCODE + 0x0C, 0x227C);                        /* movea.l #VDST,a1    */
+	hram_poke32(PKCODE + 0x0E, VDST);
+	hram_poke16(PKCODE + 0x12, 0x203C);                        /* move.l #NBYTES-4,d0 */
+	hram_poke32(PKCODE + 0x14, NBYTES - 4);
+	hram_poke16(PKCODE + 0x18, 0x2218);                        /* lcolloop: move.l (a0)+,d1 */
+	hram_poke16(PKCODE + 0x1A, 0x0E99);                        /* moves.l d1,(a1)+    */
+	hram_poke16(PKCODE + 0x1C, 0x1800);
+	hram_poke16(PKCODE + 0x1E, 0x5980);                        /* subq.l #4,d0        */
+	hram_poke16(PKCODE + 0x20, 0x6CF6);                        /* bge.s  lcolloop     */
+	hram_poke16(PKCODE + 0x22, 0x4E71);                        /* DONE: nop           */
+
+	/* vector 2 = the kernel's write-back handler, modelled on AMIX src/wb040.s:
+	   replay WB3 with `moves.l WB3D,(WB3A)` (DFC is still 1), consume WB3S, rte. */
+	hram_poke16(PKCODE + 0x100, 0x246F);                       /* movea.l (0x18,a7),a2 */
+	hram_poke16(PKCODE + 0x102, 0x0018);
+	hram_poke16(PKCODE + 0x104, 0x242F);                       /* move.l  (0x1C,a7),d2 */
+	hram_poke16(PKCODE + 0x106, 0x001C);
+	hram_poke16(PKCODE + 0x108, 0x0E92);                       /* moves.l d2,(a2)      */
+	hram_poke16(PKCODE + 0x10A, 0x2800);
+	hram_poke16(PKCODE + 0x10C, 0x426F);                       /* clr.w   (0x0E,a7)    */
+	hram_poke16(PKCODE + 0x10E, 0x000E);
+	hram_poke16(PKCODE + 0x110, 0x4E73);                       /* rte                  */
+	hram_poke32(PVEC | 8, HANDLER);
+
+	cpu_set_context(VKCODE);
+	regs.vbr = VVEC;
+	regs.s = 1; MakeSR();
+	m68k_areg(regs, 7) = VKSTK | 0xF00;
+
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;   /* -> one instruction per run-loop call */
+	bool sawfault = false, mapped = false;
+	int guard = 400;
+	while (guard-- > 0) {
+		uae_u32 pc = m68k_getpc();
+		if (pc == DONE) break;
+		if (pc >= HANDLER && pc <= HANDLER + 0x08) {
+			sawfault = true;
+			if (!mapped) {                        /* the kernel resolves the fault */
+				mmu040_gen_map(VDST, PDST, 0);
+				mapped = true;
+			}
+		}
+		m68k_run_mmu040();
+	}
+	regs.spcflags = 0;
+
+	CHECK(sawfault, "the first store to the unmapped destination page faulted\n");
+	CHECK(guard > 0, "the copy loop terminated within the step budget\n");
+	CHECK_EQ32(m68k_getpc(), DONE, "execution reached the instruction after the loop");
+
+	CHECK_EQ32(m68k_areg(regs, 0), VSRC + NBYTES,
+	           "A0 (the copy SOURCE) survived the fault -- it is not 0");
+	CHECK(m68k_areg(regs, 0) != 0, "A0 is not the mmufixup[1] cold value 0\n");
+	CHECK_EQ32(m68k_areg(regs, 1), VDST + NBYTES, "A1 (the destination) advanced by the full length");
+	CHECK_EQ32(m68k_dreg(regs, 0), (uae_u32)-4, "the loop counter ran out exactly once");
+
+	CHECK_EQ32(hram_peek32(PDST + 0), 0x4FFB0170u,
+	           "destination long 0 is correct (the WB3 replay of the faulted store)");
+	CHECK(hram_peek32(PDST + 4) != 0x4AFC0000u,
+	      "destination long 1 is NOT the guest-0 sentinel 0x4AFC0000 (the metal poison)\n");
+	{
+		uae_u32 bad = 0;
+		for (uae_u32 i = 0; i < NBYTES; i += 4)
+			if (hram_peek32(PDST + i) != hram_peek32(PSRC + i)) bad++;
+		CHECK_EQ32(bad, 0, "every longword of the copy matches the source");
+	}
+
+	mmu040_off();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * STOP must advance the pc, on EVERY CPU table this firmware can select.
  *
  * A 68k STOP is `4E72 <sr>`: the CPU halts, and when an interrupt resumes it the
@@ -2353,6 +2523,7 @@ int main(int argc, char **argv)
 	test_mmu040_user_icode_stream();
 	test_mmu040_writeback_slot_consumed();
 	test_mmu040_misaligned_split();
+	test_mmu040_copyout_fault_keeps_source_reg();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();
 	test_mmu030_demand_page_read();
