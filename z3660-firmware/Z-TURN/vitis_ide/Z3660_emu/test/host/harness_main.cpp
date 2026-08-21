@@ -1605,6 +1605,261 @@ static void test_mmu040_lea_pcrel_fullformat(void)
 	cpu_bringup(68030);
 }
 
+/* ==================================================================
+ * ISSUE-52 round-7: the USER instruction stream on a TABLE-WALKED page.
+ *
+ * mmu040_pt_init()'s fixed root/pointer pair only covers VAs in
+ * [0x00400000,0x00440000).  proc 1's icode lives at 0x80800000 and its kernel
+ * stack in the 0x40000000 u-block window, so this lane needs mappings at
+ * arbitrary VAs.  Same 4K descriptor format, but the pointer and page tables
+ * are bump-allocated per (root index, pointer index) pair.
+ * ================================================================== */
+#define M4G_ROOT  0x00180000u          /* root table (512B) */
+#define M4G_HEAP  0x00181000u          /* bump arena for ptr/page tables */
+static uae_u32 m4g_next;
+
+static void mmu040_gen_init(void)
+{
+	harness_mem_reset();
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040;
+	currprefs.mmu_model = 68040;
+	currprefs.mmu_ec    = 0;
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+
+	regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+	regs.srp = regs.urp = M4G_ROOT;
+	m4g_next = M4G_HEAP;
+	mmu_set_tc(0x8000);                 /* enable, 4K pages */
+	mmu_flush_atc_all(true);
+	regs.s = 1;
+	regs.address_space_mask = 0xffffffff;
+}
+
+static void mmu040_gen_map(uae_u32 va, uae_u32 pa, uae_u32 page_extra)
+{
+	uae_u32 ri = (va >> 23) & 0x1fc;
+	uae_u32 pi = (va >> 16) & 0x1fc;
+	uae_u32 gi = (va >> 10) & 0xfc;
+
+	uae_u32 rd = hram_peek32(M4G_ROOT + ri), ptbl;
+	if ((rd & 2) == 0) {
+		ptbl = m4g_next; m4g_next += 0x200;
+		hram_poke32(M4G_ROOT + ri, (ptbl & MMU_ROOT_PTR_ADDR_MASK) | 2);
+	} else ptbl = rd & MMU_ROOT_PTR_ADDR_MASK;
+
+	uae_u32 pd = hram_peek32(ptbl + pi), pgtbl;
+	if ((pd & 2) == 0) {
+		pgtbl = m4g_next; m4g_next += 0x200;
+		hram_poke32(ptbl + pi, (pgtbl & MMU_PTR_PAGE_ADDR_MASK_4) | 2);
+	} else pgtbl = pd & MMU_PTR_PAGE_ADDR_MASK_4;
+
+	hram_poke32(pgtbl + gi, (pa & MMU_PAGE_ADDR_MASK_4) | 1 | page_extra);
+	mmu_flush_atc_all(true);
+}
+
+/* ==================================================================
+ * The metal ISSUE-52 vector, end to end, through the REAL run-loop fetch path.
+ *
+ * The kernel RTEs to user mode at 0x80800000 (a table-walked user page) and the
+ * icode's first instruction is
+ *     lea %pc@(L%stack),%sp     ; 4FFB 0170 0000 0028
+ * whose 32-bit base displacement sits at page offset 4 -- i.e. it is fetched by
+ * x_next_ilong() from the MIDDLE of an instruction, not by the run loop's
+ * opword prefetch.  Metal (firmware 368993CA, [USTEP] probe) returned
+ *     bd   = 0x4AFC0000  (the long at guest physical 0 -- the kernel's
+ *                         ILLEGAL-at-null sentinel)  -> a7 = 0xCB7C0002
+ *     next opword = 0x0800 (the word at guest physical 4)
+ * i.e. the fetch address collapsed to zero mid-instruction and stayed
+ * authoritative for the following opcode fetch, while m68k_getpc() stayed
+ * correct throughout.  Guest 0/4 are planted with exactly those metal values so
+ * a collapsed fetch reproduces the metal bytes rather than a benign zero.
+ *
+ * This drives the whole mechanism -- table walk, user privilege, RTE-to-user
+ * arming, x_prefetch, and the mid-instruction x_next_iword/x_next_ilong -- not
+ * an accessor called directly.
+ * ================================================================== */
+static void test_mmu040_user_icode_stream(void)
+{
+	printf("[test] user icode stream: RTE to a translated page, mid-instruction 32-bit "
+	       "base displacement\n");
+	const uae_u32 VUCODE = 0x80800000u, PUCODE = 0x0C000000u;   /* proc 1 icode page  */
+	const uae_u32 VKCODE = 0x00400000u, PKCODE = 0x0D000000u;   /* kernel code page   */
+	const uae_u32 VKSTK  = 0x40001000u, PKSTK  = 0x0E000000u;   /* kernel stack (u-block) */
+	const uae_u32 USP0   = 0x08003118u;                         /* metal's pre-lea a7 */
+
+	mmu040_gen_init();
+	mmu040_gen_map(VKCODE, PKCODE, 0);
+	mmu040_gen_map(VKSTK,  PKSTK,  0);
+	mmu040_gen_map(VUCODE, PUCODE, 0);
+
+	/* the two metal decoder values, at the addresses a collapsed fetch reads */
+	hram_poke32(0x00000000u, 0x4AFC0000u);   /* kernel ILLEGAL-at-null sentinel */
+	hram_poke32(0x00000004u, 0x080007F0u);   /* pseudo-ExecBase pointer         */
+
+	/* the icode: lea %pc@(0x28,ZPC),%sp ; moveq #11,d0 */
+	hram_poke16(PUCODE + 0, 0x4FFB);
+	hram_poke16(PUCODE + 2, 0x0170);
+	hram_poke32(PUCODE + 4, 0x00000028);
+	hram_poke16(PUCODE + 8, 0x700B);
+
+	/* the kernel's launch frame: format 0, SR with S clear -> rte drops to user */
+	hram_poke16(PKSTK + 0xFC0 + 0, 0x0000);
+	hram_poke32(PKSTK + 0xFC0 + 2, VUCODE);
+	hram_poke16(PKSTK + 0xFC0 + 6, 0x0000);
+	hram_poke16(PKCODE, 0x4E73);                 /* rte */
+
+	cpu_set_context(VKCODE);
+	regs.s = 1; MakeSR();
+	regs.usp = USP0;
+	m68k_areg(regs, 7) = VKSTK | 0xFC0;
+
+	CHECK(!mmu040_step_catch(), "the launch RTE did not fault\n");
+	CHECK_EQ32(regs.s, 0, "RTE dropped to USER mode");
+	CHECK_EQ32(m68k_getpc(), VUCODE, "RTE delivered the icode entry pc");
+	CHECK_EQ32(m68k_areg(regs, 7), USP0, "a7 is the user stack the kernel saved");
+
+	/* ---- USTEP0: the icode LEA, run exactly as m68k_run_mmu040 runs it ---- */
+	bool f = mmu040_step_catch();
+	printf("       USTEP0 pc=%08X op=%04X -> USTEP1 pc=%08X a7=%08X\n",
+	       (unsigned)VUCODE, (unsigned)(regs.opcode & 0xFFFF),
+	       (unsigned)m68k_getpc(), (unsigned)m68k_areg(regs, 7));
+	CHECK(!f, "the icode LEA did not fault\n");
+	CHECK_EQ32(regs.opcode & 0xFFFF, 0x4FFB, "USTEP0 opword is the icode LEA (offset 0 fetch)");
+	CHECK_EQ32(m68k_areg(regs, 7), VUCODE + 2 + 0x28,
+	           "a7 = (pc+2) + bd 0x28 -- the 32-bit base displacement came from the USER "
+	           "page, not from guest address 0");
+	CHECK(m68k_areg(regs, 7) != 0xCB7C0002u,
+	      "a7 is not the metal value 0xCB7C0002 (base + the guest-0 sentinel)\n");
+	CHECK_EQ32(m68k_getpc(), VUCODE + 8, "instruction length 8 (opword 2 + ext 2 + bd 4)");
+
+	/* ---- USTEP1: the next opcode fetch must not inherit a collapsed address ---- */
+	f = mmu040_step_catch();
+	CHECK(!f, "the instruction after the LEA did not fault\n");
+	CHECK_EQ32(regs.opcode & 0xFFFF, 0x700B,
+	           "next opword is moveq #11,d0 -- the fetch address did not stay collapsed");
+	CHECK(( regs.opcode & 0xFFFF) != 0x0800,
+	      "next opword is not the metal value 0x0800 (the word at guest address 4)\n");
+	CHECK_EQ32(m68k_dreg(regs, 0), 11, "moveq #11,d0 executed with the right operand");
+
+	regs.s = 1;
+	mmu040_off();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * ISSUE-52 round-7 / ISSUE-10: the format-$7 write-back slot must be CONSUMED.
+ *
+ * The 68040 does not re-run a faulted write on rte -- the pending store travels
+ * to the guest in the frame's WB3 slot (WB3S/WB3A/WB3D) and the kernel's
+ * write-back handler (AMIX src/wb040.s) performs it:
+ *     moves.<WB3S size> WB3D -> (WB3A)      with DFC = WB3S & 7
+ * gated ONLY on WB3S bit 7 (valid).  Handing the slot to the guest therefore
+ * CONSUMES it: the emulator must clear regs.wb3_status (and regs.wb2_status)
+ * as it stacks them, or the valid bit outlives the frame that delivered it.
+ *
+ * mmu_bus_error() recomputes both status words on every fault it handles, which
+ * hides the missing clear for MMU faults.  It does NOT hide it for the fault
+ * classes that reach Exception(2) WITHOUT mmu_bus_error -- hardware/physical bus
+ * errors (hardware_exception2 / exception2_read / exception2_fetch), which under
+ * this non-cpu_compatible config THROW straight to the run loop's CATCH.  Those
+ * frames then carry the PREVIOUS write fault's still-valid WB3S and its stale
+ * WB3D, paired with the CURRENT fault's address as WB3A -- so the guest's handler
+ * fabricates a store of a stale datum into the page that just faulted.  A stray
+ * store with no instruction behind it, which is exactly the ISSUE-10 signature.
+ *
+ * Both halves are asserted here, the first through the real run loop on a
+ * table-walked page in user mode.
+ * ================================================================== */
+static void test_mmu040_writeback_slot_consumed(void)
+{
+	printf("[test] format-$7 write-back slot is consumed by the frame that delivers it\n");
+	const uae_u32 VUCODE = 0x80800000u, PUCODE = 0x0C000000u;   /* user text page      */
+	const uae_u32 VKSTK  = 0x40001000u, PKSTK  = 0x0E000000u;   /* kernel stack        */
+	const uae_u32 VVEC   = 0x00402000u, PVEC   = 0x0F000000u;   /* vector table        */
+	const uae_u32 VUNMAP = 0x80802000u;                         /* never mapped        */
+	const uae_u32 POISON = 0x4AFC0000u;                         /* the ILLEGAL poison  */
+	const uae_u32 HANDLER = VUCODE + 0x100;
+	const uae_u32 SP0 = VKSTK | 0xF00;
+	uae_u32 sp;
+#define W16(off) ((uae_u32)hram_peek16(PKSTK | ((sp + (off)) & 0xFFF)))
+#define W32(off) ((uae_u32)hram_peek32(PKSTK | ((sp + (off)) & 0xFFF)))
+
+	mmu040_gen_init();
+	mmu040_gen_map(VUCODE, PUCODE, 0);
+	mmu040_gen_map(VKSTK,  PKSTK,  0);
+	mmu040_gen_map(VVEC,   PVEC,   0);
+	hram_poke32(0x00000000u, POISON);            /* the guest-0 sentinel, per the metal decode */
+
+	/* ---- (a) a USER-mode store that faults: WB3 armed, then delivered ---- */
+	hram_poke16(PUCODE, 0x2080);                 /* move.l d0,(a0) */
+	hram_poke32(PVEC | 8, HANDLER);              /* vector 2 */
+
+	regs.vbr = VVEC;
+	regs.isp = regs.msp = SP0;
+	regs.m = 0;
+	m68k_dreg(regs, 0) = POISON;                 /* the datum the handler would replay */
+	m68k_areg(regs, 0) = VUNMAP;
+	m68k_areg(regs, 7) = VKSTK | 0xE00;          /* user sp (unused) */
+	m68k_setpc(VUCODE);
+	regs.s = 0;                                  /* USER mode */
+	MakeSR();
+	regs.wb2_address = 0;
+	for (int i = 0; i < 4; i++) mmu040_move16[i] = 0;
+
+	CHECK(mmu040_step_catch(), "user-mode store to an unmapped page raised an access error\n");
+	sp = m68k_areg(regs, 7);
+	CHECK_EQ32(W16(0x0E), 0x0081, "WB3S = valid $80 | SIZE long | FC 1 (user data)");
+	CHECK_EQ32(W32(0x18), VUNMAP, "WB3A = the pending store's address");
+	CHECK_EQ32(W32(0x1C), POISON, "WB3D = the pending store's datum");
+
+	/* THE INVARIANT: the slot has been handed to the guest, so it is spent. */
+	CHECK_EQ32(regs.wb3_status, 0,
+	           "wb3_status is CLEARED by the frame that delivered it (not left armed)");
+	CHECK_EQ32(regs.wb2_status, 0,
+	           "wb2_status is CLEARED by the frame that delivered it (not left armed)");
+
+	/* ---- (b) a HARDWARE bus error next: no mmu_bus_error runs, so the frame is
+	 * built from whatever the write fault left behind. It must report NO pending
+	 * write-back -- otherwise the guest fabricates a store of the stale WB3D into
+	 * the address that just faulted. ---- */
+	{
+		const uae_u32 HWFAULT = VUCODE + 0x40;   /* a MAPPED user address: a replay here
+		                                          * would scribble the text page itself */
+		regs.isp = regs.msp = SP0;
+		m68k_areg(regs, 7) = VKSTK | 0xE00;
+		m68k_setpc(VUCODE);
+		regs.s = 0;
+		MakeSR();
+
+		SAVE_EXCEPTION;
+		exception2_read(0x2210, HWFAULT, sz_long, 1);   /* physical/hardware bus error */
+		RESTORE_EXCEPTION;
+
+		sp = m68k_areg(regs, 7);
+		CHECK_EQ32(W16(0x06), 0x7008, "hardware bus error also builds a format $7 frame");
+		CHECK_EQ32(W16(0x0E), 0,
+		           "WB3S invalid: a fault with no pending store must not inherit the "
+		           "previous write fault's valid bit");
+		CHECK_EQ32(W16(0x10), 0, "WB2S invalid on the same frame");
+		/* With WB3S invalid the guest's wb040.s skips the slot, so the stale WB3D is
+		 * inert. Left armed, it would have replayed POISON into WB3A = this fault's
+		 * address -- a stray store with no instruction behind it. */
+		CHECK(!(W16(0x0E) & 0x80) || W32(0x1C) != POISON,
+		      "no armed write-back carrying the stale poison datum\n");
+	}
+
+#undef W16
+#undef W32
+	regs.s = 1;
+	mmu040_off();
+	cpu_bringup(68030);
+}
+
 /* Direct accessor-level pin of the ISSUE-52 routing invariant, both directions. */
 static void test_mmu040_misaligned_split(void)
 {
@@ -2095,6 +2350,8 @@ int main(int argc, char **argv)
 	test_mmu040_rte_delivers_pc();
 	test_mmu040_rte_syscall_return_usp();
 	test_mmu040_lea_pcrel_fullformat();
+	test_mmu040_user_icode_stream();
+	test_mmu040_writeback_slot_consumed();
 	test_mmu040_misaligned_split();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();

@@ -2097,6 +2097,107 @@ One boot names which. This round ships the probe (firmware `3DB2B240`); no specu
 an amiberry diff of the instruction-fetch/ATC path is in flight in case it names a static tell.
 
 
+### 10.13 ISSUE-52 round-7: the fetch is faithful — the page content is not
+
+Round 6 framed the `[USTEP]` trace as a *fetch* bug: offset 0 correct, offsets ≥ 4 garbage, so
+"the instruction path lands on the wrong physical frame". This round audited that path to the
+bottom and **refutes the whole fetch-side hypothesis class**, then names and fixes the defect
+that actually fabricates the wrong bytes.
+
+#### The arithmetic that closes the fetch question
+
+The bogus values decode, at first sight, as low-memory content read at an offset of −4:
+`0x4AFC0000` = the long at guest `0`, `0x0800` = the word at guest `4`, and the later `0x00F8`
+/ `0x0A9E` fit guest `8` / `0xE` (ROM vector words). That mapping — `phys = VA − 0x80800004` —
+is **arithmetically impossible for a 68040 translation**, and that single fact settles it:
+
+> 68040 translation composes by **OR**, never by addition. Both the ATC path
+> (`mmu_translate`: `return l->phys | (addr & mmu_pagemask)`) and the `MMU_IPAGECACHE`
+> shortcut (`addr = atc_last_ins_paddr | (addr & mmu_pagemask)`) OR a **page-aligned** frame
+> base with the untouched page offset. **The page offset is invariant under translation.**
+> A fetch at page offset 4 therefore reads a physical address ≡ 4 (mod page size) — it can
+> *never* return the content of physical 0, whatever frame it resolves to, and no wrong ATC
+> entry, stale shortcut or failed table walk can shift an offset by −4.
+
+So the "collapsed fetch pointer / wrong frame" reading cannot be right, and the corroborating
+"linear pointer" reading has no mechanism behind it either:
+
+| audit target | finding |
+|---|---|
+| `set_x_funcs()` 040 arm (`newcpu.cpp:734`) | `x_prefetch`/`x_get_iword` = `get_iword_mmu040`, `x_next_iword`/`x_next_ilong` = `next_iword_mmu040`/`next_ilong_mmu040`. Substantively identical to upstream Amiberry's `mmu_model` arm. |
+| the `*_mmu040` fetch inlines (`cpummu.h:971-997`) | **byte-identical to upstream** (diffed). Address source is `m68k_getpci()` = `regs.pc` throughout; no `pc_p` arithmetic anywhere. |
+| `pc_p` / `pc_oldp` arming | `cpuemu_31.cpp` uses `m68k_getpci()` **1182 times and `m68k_getpc()` zero times**; no code use of `m68k_incpc(` (one mention, in a comment), and no `next_diword`/`next_dilong`/`get_diword` at all. Every `m68k_setpc()` site sets `pc_p == pc_oldp`, so `m68k_getpc() == regs.pc` invariantly. **There is no `pc_p`-relative fetch reachable from the 040 MMU table at all.** |
+| `x_get_disp_ea_020` (`newcpu_common.cpp:321`) | identical to upstream bar the unused `idx` parameter this lineage drops (an 030-replay index) and a dead `#if 0` cycle block; reads the 32-bit bd via `x_next_ilong`. |
+| `m68k_run_mmu040` | structurally identical to upstream's. |
+
+A new harness vector, `test_mmu040_user_icode_stream`, drives the whole mechanism rather than an
+accessor: page tables built at the real VAs (`0x80800000` user text, `0x40001000` kernel stack),
+the launch **RTE to user mode**, then the icode's `4FFB 0170 0000 0028` and `700B` executed
+through `mmu040_step_catch()` — the run loop's own shape — with `0x4AFC0000` planted at guest `0`
+so a collapsed fetch would reproduce the metal bytes rather than a benign zero. It asserts
+`a7 = 0x8080002A` (not `0xCB7C0002`), `pc = 0x80800008`, and that the next opword is `0x700B`
+(not `0x0800`). **It passes.** The fetch path is faithful; it faithfully fetched corrupted
+*content*.
+
+That is `[IDCMP]`'s third branch, reached by proof instead of by probe: `iphys == dphys`,
+**the page's bytes are wrong from offset 4 on**. It also explains the two loose ends round 6
+could not place — offset 0 was right because the corruption is *individual stray stores*, not a
+bad page mapping; and `m68k_getpc()` stayed correct because nothing was ever wrong with the pc
+bookkeeping. The 8 / 4 / 6-byte advances at `[USTEP1..3]` are simply the correct lengths of the
+garbage words the core honestly decoded.
+
+#### The defect: the format-$7 write-back slot is never consumed
+
+`Exception_build_stack_frame()` case `0x7` (`newcpu_common.cpp`) stacks `regs.wb2_status` and
+`regs.wb3_status` into the frame — and, unlike upstream WinUAE/Amiberry, **does not clear
+them**. The two `= 0` lines were lost in the port.
+
+Handing the slot to the guest *is* consuming it. The 68040 does not re-run a faulted write; the
+pending store travels in WB3 and AMIX's `wb040.s` replays a slot on **WB3S bit 7 alone**
+(`moves.<size> WB3D -> (WB3A)`, DFC = `WB3S & 7`). Left armed, the valid bit outlives the frame
+that delivered it.
+
+`mmu_bus_error()` recomputes both status words on every fault **it** handles
+(`regs.wb3_status = write ? 0x80 | (ssw & 0x7f) : 0; regs.wb2_status = 0;`), which is exactly
+why MMU faults hid this for six rounds. It does **not** cover the fault classes that reach
+`Exception(2)` without it — hardware/physical bus errors via `hardware_exception2()` /
+`exception2_read()` / `exception2_fetch*()`, which under this non-`cpu_compatible` config
+`THROW` straight to the run loop's `CATCH` and land on the same `nr == 2 && mmu_model == 68040`
+format-$7 builder. Those frames carry the **previous** write fault's still-valid `WB3S` and its
+**stale** `WB3D`, paired with the **current** fault's address as `WB3A`. The guest dutifully
+performs that store.
+
+A fabricated stray write, of a stale datum, into the page that just faulted, with no instruction
+behind it — the **ISSUE-10 "68040 write-back-fabricated value" signature**, and under AMIX-040 it
+lands in pages being demand-paged in, proc 1's text among them. One such store into the icode
+page past its first longword produces precisely the `[USTEP]` picture.
+
+**The fix** restores the two upstream clears. `test_mmu040_writeback_slot_consumed` pins both
+halves: a user-mode store fault on a table-walked page must deliver a valid WB3 **and leave
+`regs.wb3_status == 0`**; the hardware bus error that follows must then stack `WB3S = 0` rather
+than inherit the poison. Before the fix all three assertions fail (`wb3_status` stays `0x0081`,
+and the second frame hands the guest an armed write-back carrying `0x4AFC0000`); after it they
+pass. Harness 221 → **244**.
+
+The 68030 path is untouched — the clears sit inside the 040-only `case 0x7:`, which `break`s,
+and the 030 frame-`$B` builder reads `regs.wb3_status` in its own case.
+
+#### Two latent divergences found in the same audit, deliberately NOT changed
+
+Both are inert in the current AMIX-040 configuration and neither is this bug; recorded so the
+next round does not re-derive them, and so a change is made on purpose rather than in passing.
+
+- **`set_x_funcs()` never assigns `x_prefetch` outside the two MMU arms.** Upstream assigns it
+  in *every* arm (a real value or `nullptr`). Here it is sticky: a call that takes the
+  non-MMU arm leaves `x_prefetch` pointing at `get_iword_mmu040` while re-pointing
+  `x_next_iword`/`x_next_ilong` at the direct family — a translated opcode fetch beside
+  untranslated extension fetches. Unreachable today only because `currprefs.mmu_model` is set
+  once, before the first `set_x_funcs()`, and never changes.
+- **`prefs_changed_cpu()` never copies `mmu_model` / `mmu_ec`** (upstream does). Since
+  `check_prefs_changed_cpu2()` *compares* them, any divergence would raise
+  `SPCFLAG_MODE_CHANGE` on every check and never converge.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

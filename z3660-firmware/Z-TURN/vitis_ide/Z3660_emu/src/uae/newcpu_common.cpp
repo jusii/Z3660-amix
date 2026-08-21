@@ -1157,10 +1157,28 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), 0); // WB1S: always invalid here
+		// Stacking a write-back status CONSUMES it (upstream WinUAE/Amiberry clear both
+		// here, and this port dropped the two lines). The guest owns the pending store the
+		// moment the frame carries it: AMIX's wb040.s replays a slot on WBxS bit 7 alone
+		// (`moves.<size> WBxD -> (WBxA)`, DFC = WBxS & 7). Left armed, the valid bit
+		// outlives the frame that delivered it.
+		//
+		// mmu_bus_error() recomputes both status words on every fault IT handles, which is
+		// why MMU faults hid this. The fault classes that reach Exception(2) WITHOUT it --
+		// hardware/physical bus errors via hardware_exception2 / exception2_read /
+		// exception2_fetch*, which under this non-cpu_compatible config THROW straight to
+		// the run loop's CATCH -- then stack the PREVIOUS write fault's still-valid WB3S
+		// and its stale WB3D against the CURRENT fault's address as WB3A. The guest duly
+		// performs that store: a fabricated stray write, of a stale datum, into the page
+		// that just faulted, with no instruction behind it. Under AMIX-040 that lands in
+		// pages being demand-paged in (proc 1's text among them) and is the ISSUE-10
+		// "write-back-fabricated value" signature.
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), regs.wb2_status); // WB2S
+		regs.wb2_status = 0;
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), regs.wb3_status); // WB3S
+		regs.wb3_status = 0;
 
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), ssw);
