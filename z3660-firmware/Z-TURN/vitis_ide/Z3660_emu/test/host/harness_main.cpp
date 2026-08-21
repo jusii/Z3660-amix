@@ -1498,6 +1498,61 @@ static void test_mmu040_rte_delivers_pc(void)
 	cpu_bringup(68030);
 }
 
+/* ==================================================================
+ * SYSCALL-RETURN RTE: A7 must be the USP, never the leftover SSP.
+ *
+ * ISSUE-52 round-4: PID 1's icode runs (lea sets SP, trap #0), then faults after
+ * the syscall RETURN with a corrupt A7 (metal fa = 0x40001FC0 = the kernel SSP;
+ * a kernel ring saw usp = 0xCB7C0002, garbage/odd). A syscall-return RTE pops a
+ * format-0 frame off the SUPERVISOR (kernel) stack and, because the frame SR has
+ * S clear, MakeFromSR must install regs.usp into A7 -- NOT leave A7 on the popped
+ * supervisor stack. This pins the emulator's half: given a valid regs.usp, the
+ * RTE lands A7 exactly on it and not on the SSP. So if the metal [URTE] read shows
+ * a corrupt usp at firing #2, the emulator's install is exonerated and the bad
+ * value was already in regs.usp (kernel move-to-USP or trap-entry save) -- i.e.
+ * the corruption is upstream of the RTE, not in it.
+ * ================================================================== */
+static void test_mmu040_rte_syscall_return_usp(void)
+{
+	printf("[test] syscall-return RTE lands A7 on USP, not the leftover kernel SSP\n");
+	const uae_u32 VCODE = 0x00400000, PCODE = 0x0C000000;
+	const uae_u32 VSSP  = 0x00401000, PSSP  = 0x0E000000;   /* the kernel (supervisor) stack */
+	const uae_u32 SSP   = VSSP | 0xFC0;                     /* mirrors the metal 0x...FC0 */
+	const uae_u32 GOODUSP = 0x7FFF0000u;                    /* a valid user stack, distinct from SSP */
+	const uae_u32 RETPC   = 0x80800012u;                    /* the syscall-return user PC */
+
+	mmu040_pt_init();
+	mmu040_map_page(VCODE, PCODE);
+	mmu040_map_page(VSSP,  PSSP);
+
+	/* format-0 frame the kernel's syscall path built on the supervisor stack */
+	hram_poke16(PSSP | 0xFC0, 0x0000);        /* SR: S clear -> return to user */
+	hram_poke32((PSSP | 0xFC0) + 2, RETPC);   /* return PC */
+	hram_poke16((PSSP | 0xFC0) + 6, 0x0000);  /* format 0 */
+	hram_poke16(PCODE, 0x4e73);               /* RTE */
+
+	cpu_set_context(VCODE);
+	regs.s = 1; MakeSR();
+	regs.usp = GOODUSP;                        /* the user SP saved at trap entry */
+	m68k_areg(regs, 7) = SSP;
+
+	bool faulted = false;
+	TRY(p) {
+		regs.instruction_pc = m68k_getpc();
+		regs.opcode = x_prefetch(0);
+		(*cpufunctbl[regs.opcode])(regs.opcode);
+	} CATCH(p) { faulted = true; (void)p; } ENDTRY
+
+	CHECK(!faulted, "syscall-return RTE did not fault\n");
+	CHECK_EQ32(regs.s, 0, "dropped to user mode");
+	CHECK_EQ32(m68k_getpc(), RETPC, "delivered the syscall-return PC");
+	CHECK_EQ32(m68k_areg(regs, 7), GOODUSP, "A7 == USP after the return (the decisive install)");
+	CHECK(m68k_areg(regs, 7) != SSP, "A7 is NOT the leftover kernel SSP (the metal corruption)\n");
+
+	mmu040_off();
+	cpu_bringup(68030);
+}
+
 /* Direct accessor-level pin of the ISSUE-52 routing invariant, both directions. */
 static void test_mmu040_misaligned_split(void)
 {
@@ -1986,6 +2041,7 @@ int main(int argc, char **argv)
 	test_mmu040_bitfield_translates();
 	test_mmu040_user_mode();
 	test_mmu040_rte_delivers_pc();
+	test_mmu040_rte_syscall_return_usp();
 	test_mmu040_misaligned_split();
 	test_stop_advances_pc_all_tables();
 	test_amix_mmu040_latch();

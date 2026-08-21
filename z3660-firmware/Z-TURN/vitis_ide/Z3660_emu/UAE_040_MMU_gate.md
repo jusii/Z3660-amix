@@ -1918,6 +1918,54 @@ was the last emulator gate on the boot; the shipped `[RTE]` probe (§10.8) will 
 `pc=80800000` as positive confirmation rather than a diagnostic.
 
 
+### 10.10 ISSUE-52 round-4: syscall-return A7 — the [URTE] probe
+
+The bus-misalign fix (§10.9) moved the fault past the launch RTE: PID 1 now launches at the
+right entry (fault PC went `0x80000012` → `0x80800012`) and runs. The remaining fault is at the
+**syscall return** from the icode's `trap #0`: the icode's `lea` sets SP, `trap #0` enters the
+kernel, and on return PID 1 runs off the 14-byte icode into its `"/sbin/init"` string with a
+corrupt A7 (metal `fa = 0x40001FC0` = the kernel SSP; a kernel-side ring saw
+`usp = 0xCB7C0002`, garbage and odd). So A7 is wrong *after* the syscall return.
+
+**What the firmware already rules out, statically.** The 040 `move An,USP` / `move USP,An`
+handlers (`op_4e60_31_ff` / `op_4e68_31_ff`) are byte-for-byte the proven 030 versions
+(`regs.usp = src` / `An = regs.usp`), and `MakeFromSR`'s stack swap is correct: on an S 1→0
+transition it saves the popped supervisor stack to isp/msp and installs `regs.usp` into A7.
+Harness `test_mmu040_rte_syscall_return_usp` pins that install directly — a format-0 frame on
+a u-block-shaped SSP (`0x...FC0`), a valid `regs.usp` distinct from the SSP, and the assertion
+that RTE lands A7 **exactly on USP and not on the leftover SSP**. It passes. So the RTE's own
+USP install is correct *given a valid `regs.usp`*.
+
+**What only a metal read can decide.** Whether `regs.usp` is already corrupt when the
+syscall-return RTE runs. That is upstream of the RTE — the trap-`#0` entry saving the user SP,
+or a kernel `move An,USP` during syscall handling with a bad `An` — and it is not statically
+determinable. So this round ships a probe, not a fix.
+
+**The [URTE] probe.** Alongside the existing `[RTE]` u-block probe, a second probe fires on any
+RTE whose frame **drops to user** — the frame SR word at `a7+0` has the S bit (`0x2000`) clear
+— capping at 8. Per firing it prints one line:
+
+```
+[URTE<seq>] pc=<frame PC @a7+2> sr=<frame SR @a7> ssp=<a7 before pop> usp=<regs.usp> fmt=<@a7+6>
+```
+
+`usp` is read before `MakeFromSR` runs, so it is exactly the value the RTE will install into
+A7. Reading it against the frame it will deliver splits the question cleanly:
+
+- **firing #1 = proc 1's LAUNCH RTE** — expected clean: `pc=0x80800000`, `usp` a valid user
+  stack.
+- **firing #2 = the SYSCALL RETURN** from `trap #0` — the smoking gun. If `usp` here is
+  `0x40001FC0` (the SSP), `0xCB7C0002` (garbage), or otherwise not a valid user stack, while
+  the frame (`pc`/`sr`) is a well-formed kernel-built return frame, then **`regs.usp` was
+  already corrupt before the RTE** — the emulator's install is exonerated (the harness proves
+  it faithful) and the corruption is upstream: the trap-entry USP save or a kernel move-to-USP.
+  A frame whose `pc`/`sr` is itself wrong is kernel-side by construction.
+
+This is diagnostic. It becomes a fix only if a future read implicates the emulator's own USP
+handling — which the harness currently says is correct, so the working expectation is a
+kernel/port-lane cause. Harness 212 → **217**.
+
+
 ### Audit: the `amix_mode` / `a3000_amix_mode` gates under an 040 core
 
 Checked for 030-specific assumptions. All of these are CPU-model-independent and

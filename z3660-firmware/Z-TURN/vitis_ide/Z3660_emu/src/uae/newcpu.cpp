@@ -1916,6 +1916,7 @@ extern "C" { extern volatile int amix_mmu_on; }
 #define AMIX_XINT_FIRST 12                       /* interrupts logged in full before summarising */
 static int amix_xtrace_n = 0, amix_xint_logged = 0, amix_xint_sums = 0;
 static int amix_rte_probe_n = 0;   /* ISSUE-52 RTE frame probe, capped */
+static int amix_urte_probe_n = 0;  /* ISSUE-52 user-transition RTE probe (syscall-return capture), capped */
 static uae_u32 amix_int_n[8], amix_int_minsp[8], amix_int_total = 0;
 static uae_u32 amix_xt_minsp = 0xFFFFFFFFu;
 static int amix_xt_init = 0;
@@ -4636,6 +4637,34 @@ static void m68k_run_mmu040(void)
                                (unsigned long)get_long_mmu040(_a + 2),
                                (unsigned long)get_word_mmu040(_a + 6),
                                (unsigned long)regs.usp);
+               }
+            }
+
+            /* ISSUE-52 USER-TRANSITION RTE PROBE (diagnostic). Fires on ANY RTE (not just
+             * u-block-stacked) whose frame drops to USER mode -- the frame SR word at a7+0
+             * has the S bit (0x2000) CLEAR. This catches proc 1's launch RTE (firing #1) and
+             * the syscall RETURN from icode's trap #0 (firing #2), which the plain [RTE]
+             * u-block gate can conflate. The decisive field is `usp`: the value regs.usp
+             * holds NOW is what MakeFromSR will install into A7 when the S bit clears. A
+             * clean #1 usp (valid user stack) with a corrupt #2 usp (the kernel SSP
+             * 0x40001FC0, or garbage/odd like 0xCB7C0002) against an otherwise-correct
+             * kernel-built frame means the emulator's RTE-from-syscall isn't restoring USP
+             * (family #7). If instead the FRAME (pc/sr) is wrong, it is kernel-side.
+             * `ssp` is a7 before the pop; `usp` is read before MakeFromSR runs. Same reads
+             * RTE is about to do; capped, one line per slot. */
+            if (regs.opcode == 0x4E73 && regs.s && amix_mmu_on
+                && currprefs.mmu_model == 68040 && amix_urte_probe_n < 8) {
+               uaecptr _a = m68k_areg(regs, 7);
+               uae_u16 _fsr = (uae_u16)get_word_mmu040(_a);
+               if ((_fsr & 0x2000u) == 0) {   /* frame SR: S clear -> RTE drops to user */
+                  amix_urte_probe_n++;
+                  z3660_printf("[URTE%d] pc=%08lX sr=%04lX ssp=%08lX usp=%08lX fmt=%04lX\r\n",
+                               amix_urte_probe_n,
+                               (unsigned long)get_long_mmu040(_a + 2),
+                               (unsigned long)_fsr,
+                               (unsigned long)_a,
+                               (unsigned long)regs.usp,
+                               (unsigned long)get_word_mmu040(_a + 6));
                }
             }
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
