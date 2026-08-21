@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-08-21 — 040: split bus-misaligned MMU accesses (ISSUE-52, family #6) (4bf1f00)
+
+Round-3 metal overturned the prior "kernel-side" call: the frame holds `f_pc=0x80800000`
+(read back correct) yet PID 1 surfaces at `0x80000012` — bit 23 dropped. RTE reads right,
+delivers wrong.
+
+- `_start`'s format-0 frame puts the PC longword at `a7+2 = 0x40001FBA` — bus-misaligned,
+  same page. The 040 accessors split only on **page-crossing** (`is_unaligned_page`), so the
+  read handed a misaligned physical address to `memory_get_long`'s `swap32(*(uae_u32*)addr)`,
+  which the board's memory layer can't do — dropping bit 23 (`0x80800000 → 0x80000000`).
+- **Fix:** 040 data/instruction accessors split on **bus misalignment** (`is_unaligned_bus`),
+  so the physical layer only ever sees aligned pieces. `is_unaligned_page ⊂ is_unaligned_bus`
+  (nothing that split before stops); 68060 and 68030 untouched.
+- Host can't value-reproduce (flat buffer handles any alignment), so the guard pins the
+  routing invariant via a harness-only split counter; firmware binary unchanged. Non-vacuous
+  (reverting to the page gate fails all three routing checks). Harness 201 → **212**.
+- Corrects this file's earlier §10.8 "exception-return path clean" — that call rested on a
+  host value-assertion that structurally cannot see this bug; the metal round-3 capture broke
+  the tie.
+- **Predicts PID 1 executing** at `0x80800000` → init/getty/login. Last emulator gate; ninth
+  emulator fix, sixth in the never-exercised-040-path family.
+- `BOOT.BIN` 12,762,388 B, zlib crc32 `BDBA0BDE`. Warning-free.
+
 ## 2026-08-21 — 040: exception-return path clean; ISSUE-52 frame is pre-corrupted (f4d787b)
 
 Hypothesis was family member #6 — RTE reading the frame through the wrong accessor
