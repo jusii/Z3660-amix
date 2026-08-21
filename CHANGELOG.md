@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-08-21 — 040: [USTEP] probe; LEA path proven correct (ISSUE-52 round-5) (a3c6a0b)
+
+Hypothesis was family #7 — the 040 core mis-executing the icode's full-format PC-relative
+`lea` (`4FFB 0170 0000 0028`). **The emulator's lea path is correct** by every check:
+handler anchors `base = pc+2`, `x_get_disp_ea_020` full-format branch reads the 32-bit bd
+via the translating `x_next_ilong`, length is 8; all reads aligned; `MMU_ICACHE == 0`.
+New `test_mmu040_lea_pcrel_fullformat` runs the exact instruction on a table-walked mmu040
+page and asserts `A7=(pc+2)+0x28`, 8-byte length, clean next-fetch — **passes**. (A first
+draft failed on stale `x_next_*` from a prior `cpu_bringup(68030)`; correctly wired, it
+passes — recorded as the trap to avoid.) Harness 217 → **221**.
+
+- No named emulator defect ⇒ **no speculative fix**; ships the `[USTEP]` probe: pre-state
+  of the first ≤8 user-mode instructions (`pc/op/a7/d0`). Step-1 `a7` must be `0x8080002A`,
+  step-1 `pc` `0x80800008`.
+- Prediction: `[USTEP1]` shows the lea faithful, so `0xCB7C0002` was a timing-fragile
+  kernel-ring mis-read or later corruption. A wrong value = a new metal-only class.
+- `BOOT.BIN` 12,762,388 B, zlib crc32 `368993CA`. Warning-free.
+
 ## 2026-08-21 — 040: [URTE] syscall-return probe (ISSUE-52 round-4) (b89af61)
 
 The bus-misalign fix moved the fault past the launch RTE — PID 1 launches correctly
