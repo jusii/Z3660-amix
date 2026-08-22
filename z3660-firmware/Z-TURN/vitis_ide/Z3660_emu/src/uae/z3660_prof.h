@@ -491,8 +491,38 @@ enum {
    Z3660_PROF_C_STACK_OVF   = 18, /* phase-stack overflows; MUST be 0                  */
    Z3660_PROF_C_ATC_HIT     = 19, /* v2: translates satisfied WITHOUT a table walk     */
    Z3660_PROF_C_IFETCH_CALLS= 20, /* entries into the shared FETCHOP/FETCHEX bracket   */
-   Z3660_PROF_C_COUNT       = 21
+   Z3660_PROF_C_BLK_HIT     = 21, /* block-idiom fast-path CHUNKS serviced             */
+   Z3660_PROF_C_BLK_INSNS   = 22, /* ... guest instructions those chunks retired       */
+   Z3660_PROF_C_BLK_BYTES   = 23, /* ... bytes zeroed / copied / flushed by them       */
+   Z3660_PROF_C_COUNT       = 24
 };
+
+/* THE THREE `BLK_` COUNTERS ARE THE UTILISATION VERDICT, and they are three rather than
+ * one because each answers a different way for the change to disappoint.
+ *
+ * `BLK_INSNS / INSNS` is the share of the guest instruction stream the recognizer
+ * actually took. The map predicts 22.07 % of an AMIX boot for stage A alone and 31.80 %
+ * for A+B+C; a metal capture that shows 2 % is a recognizer that is not firing where the
+ * profile says the time is, and the map is explicit that the first thing to check then is
+ * the TRIGGER, not the host operation.
+ *
+ * `BLK_INSNS / BLK_HIT` is the mean chunk length, and it is what separates "firing" from
+ * "firing usefully". The fast path pays its recognizer test once per chunk, so a mean of
+ * 2 means the test is being paid per iteration and the whole saving is gone -- the exact
+ * failure mode §11.2 pre-registers for the decoded-op cache, arriving here first. Against
+ * a 256 chunk cap and 1024-longword page fills, healthy is a mean in the high hundreds
+ * once the ramp-in is amortised, and never below ~8.
+ *
+ * `BLK_BYTES` is the one that survives a change of idiom mix. It is comparable across
+ * workloads and across future stages in a way an instruction count is not, and it is what
+ * a "kernel zero-fill runs at N MB/s" figure is computed from -- the map's 5.17 MB/s
+ * being the number this whole rung exists to move.
+ *
+ * They are counters and not buckets on purpose. A bucket would need a phase transition
+ * around the fast path, and the fast path's entire value is that it does not pay
+ * per-instruction machinery; measuring it with the machinery it removes would be the
+ * §10.1 distortion applied to the one place it would be worst. Appended ids, no version
+ * bump -- see IFETCH_CALLS above for that reasoning, which is the same here. */
 
 /* WHY `IFETCH_CALLS` EXISTS, AND WHY IT IS THE ONE COUNTER WORTH ADDING.
  *
@@ -805,6 +835,10 @@ static __inline__ void z3660_prof_tick(uint32_t pc, uint16_t opcode, uint16_t fl
 #define Z3660_PROF_RETV(stmt)   do { stmt; z3660_prof_exit(); return; } while (0)
 #define Z3660_PROF_LOOP_RESET() z3660_prof_loop_reset()
 #define Z3660_PROF_UNWOUND()    z3660_prof_unwound()
+/* Add N at once. For an event that services many guest instructions in one go (the C2
+ * block-idiom fast path), N increments would price the counter at more than the work it
+ * is counting. */
+#define Z3660_PROF_CNT_ADD(c, n) do { z3660_prof_cnt[(c)] += (uint64_t)(n); } while (0)
 #define Z3660_PROF_MARK_OPFETCH() do { z3660_prof_opfetch_hint = 1; } while (0)
 /* Opcode fetch and extension fetch share one accessor; the mark decides which bucket.
  *
@@ -826,6 +860,7 @@ static __inline__ void z3660_prof_tick(uint32_t pc, uint16_t opcode, uint16_t fl
 #define Z3660_PROF_ENTER(b)     do { } while (0)
 #define Z3660_PROF_EXIT()       do { } while (0)
 #define Z3660_PROF_CNT(c)       do { } while (0)
+#define Z3660_PROF_CNT_ADD(c,n) do { } while (0)
 #define Z3660_PROF_RET(expr)    return (expr)
 #define Z3660_PROF_RETV(stmt)   do { stmt; return; } while (0)
 #define Z3660_PROF_LOOP_RESET() do { } while (0)

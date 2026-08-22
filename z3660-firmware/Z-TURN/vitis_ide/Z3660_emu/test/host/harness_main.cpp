@@ -2809,7 +2809,8 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_ctl),        0xD8, "prof_ctl        @ 0xFFFF00D8 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_hz),         0xDC, "prof_hz         @ 0xFFFF00DC (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, arm_wall_hz),     0xE0, "arm_wall_hz     @ 0xFFFF00E0 (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE4, "SHARED is 0xE4 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, blk_chunk),       0xE4, "blk_chunk       @ 0xFFFF00E4 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE8, "SHARED is 0xE8 bytes -- new fields go on the END");
 }
 
 /* ==================================================================
@@ -2899,7 +2900,10 @@ static void test_prof_wire_format(void)
 	 * would pass just as happily if someone had inserted one in the middle instead. */
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_ATC_HIT,      19, "counter ATC_HIT == 19 (v2's append)");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_IFETCH_CALLS, 20, "counter IFETCH_CALLS == 20 (appended)");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   21, "21 counters");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_HIT,      21, "counter BLK_HIT == 21 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_INSNS,    22, "counter BLK_INSNS == 22 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_BYTES,    23, "counter BLK_BYTES == 23 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   24, "24 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -3595,6 +3599,768 @@ static void test_prof_under_execution(void)
 }
 #endif /* Z3660_EMU_PROF */
 
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 0 -- THE BLOCK-IDIOM FAST PATH, BY STATE EQUIVALENCE
+ *
+ * The map's instruction for this test is precise and it is not "spot checks": for a
+ * corpus of start states, run the idiom once through the recognizer and once with the
+ * recognizer out, and assert the register file, the affected memory, the fault outcome
+ * and the guest pc are byte-identical.
+ *
+ * So that is what this is. Every case runs TWICE from an identical fixture -- once with
+ * SHARED.blk_chunk = Z3660_BLK_OFF, which is a pure passthrough returning before the
+ * recognizer has examined anything, and once with the chunk cap under test -- and the two
+ * outcomes are compared as whole objects:
+ *
+ *   - all sixteen registers, the pc, regs.instruction_pc, the SR (via MakeSR, so it is
+ *     the architectural word and not this host's flag representation), USP and ISP;
+ *   - a ONE MEGABYTE window of guest physical memory covering everything the fixture can
+ *     touch: the page tables, the code page, the vector table, the supervisor stack (and
+ *     therefore any exception frame built on it), and both source and both destination
+ *     pages. Compared with memcmp, so a single wrong byte anywhere in it fails -- including
+ *     a U or M descriptor bit set by a walk one path made and the other did not.
+ *
+ * The memory window is why the layout below is contiguous and why the physical frames sit
+ * next to the page tables: a comparison that only looks where the test expects damage is
+ * the comparison that misses the page-crossing DMA that ate an ELF header.
+ *
+ * The corpus the dispatch requires, and what each case is actually for:
+ *
+ *   n = 0, n = 1     the DBcc boundary. DBF from Dn.w == 0 runs the body ONE more time;
+ *                    an off-by-one here is invisible in a large fill and corrupts exactly
+ *                    four bytes past the end of every buffer in the system.
+ *   page crossing    both pages mapped: the fill must stop at the boundary, re-validate
+ *                    and continue, writing both pages identically.
+ *   second page      UNMAPPED: the 68040 write-back contract. Same fault pc, same faulted
+ *   unmapped         address, same A0/D1, same stacked frame -- compared as memory, so the
+ *                    frame is compared field by field without naming its fields.
+ *   non-RAM dest     the device gate: an emulated-device destination must decline to the
+ *                    interpreted path, and the guest must not be able to tell.
+ *   interrupt        the poll must still run mid-block. Measured, not asserted: the board
+ *   pending          stub counts every check_uae_int_request(), so "yields every `cap`
+ *                    iterations" is a number the test checks against `cap`.
+ *   misaligned       must decline (and still be correct).
+ *   supervisor/user  both, because the dpagecache is indexed by regs.s.
+ *
+ * Cap 1 and cap 1024 are run against the same cases as the default 256: a fast path whose
+ * answer depends on its chunk size has a boundary bug, and the cheapest way to find one is
+ * to move the boundary.
+ * ================================================================== */
+#include "z3660_blk.h"
+extern "C" unsigned z3660_blk_get(void);
+extern "C" unsigned z3660_blk_set(unsigned requested);
+
+/* Physical layout. Everything inside ONE megabyte starting at the generator's root table,
+ * so a single memcmp covers tables, code, vectors, stack and data. */
+#define BLKW_BASE   0x00180000u          /* == M4G_ROOT */
+#define BLKW_LEN    0x00100000u
+#define BLK_PCODE   0x00190000u
+#define BLK_PVEC    0x00191000u
+#define BLK_PCODE2  0x00193000u          /* the code page AFTER BLK_PCODE, for a straddling idiom */
+#define BLK_PSTK    0x00192000u
+#define BLK_PSRC0   0x001A0000u
+#define BLK_PSRC1   0x001A1000u
+#define BLK_PDST0   0x001B0000u
+#define BLK_PDST1   0x001B1000u
+
+#define BLK_VCODE   0x00400000u
+#define BLK_VVEC    0x00420000u          /* deliberately NOT adjacent to BLK_VCODE: the
+                                          * page after the code page has to be genuinely
+                                          * absent for the straddle case to mean anything */
+#define BLK_VSTK    0x40001000u
+#define BLK_VSRC    0x00500000u
+#define BLK_VDST    0x00600000u
+
+/* DONE is code_off + 6 (stages 1/2) or + 10 (stage 3); computed in blk_run. */
+#define BLK_FAULTPC (BLK_VCODE + 0x100u)
+
+struct blk_snap {
+	uae_u32 d[8], a[8];
+	uae_u32 pc, ipc, sr, usp, isp;
+	unsigned long polls;
+	int steps;
+	int reached;                 /* 0 = ran out of budget, 1 = DONE, 2 = fault handler */
+	uae_u8 mem[BLKW_LEN];
+};
+/* File scope, not automatic: two of these are 2 MB and the harness has no business
+ * putting that on the stack. */
+static struct blk_snap g_blk_ref, g_blk_fast;
+
+/* A destination bank that is NOT plain RAM. Same accessors as the harness RAM -- the
+ * bytes must land in the same place, or the comparison would be measuring the bank and
+ * not the fast path -- but without ABFLAG_RAM, which is the only thing the device gate
+ * looks at. */
+static uae_u32 REGPARAM2 blkio_lget(uaecptr a){ return hram_peek32(a); }
+static uae_u32 REGPARAM2 blkio_wget(uaecptr a){ return hram_peek16(a); }
+static uae_u32 REGPARAM2 blkio_bget(uaecptr a){ return hram_peek8(a); }
+static void REGPARAM2 blkio_lput(uaecptr a, uae_u32 v){ hram_poke32(a, v); }
+static void REGPARAM2 blkio_wput(uaecptr a, uae_u32 v){ hram_poke16(a, (uae_u16)v); }
+static void REGPARAM2 blkio_bput(uaecptr a, uae_u32 v){ hram_poke8 (a, (uae_u8)v); }
+static addrbank blk_io_bank = {
+	blkio_lget, blkio_wget, blkio_bget,
+	blkio_lput, blkio_wput, blkio_bput,
+	NULL, NULL, NULL, _T("blkio"), _T("Harness non-RAM"),
+	blkio_lget, blkio_wget,
+	ABFLAG_IO, 0, 0
+};
+
+struct blk_desc {
+	int      stage;      /* 1 = bzero, 2 = mcpy, 3 = CPUSHL loop */
+	uae_u32  n;          /* Dn.w at loop entry: the body runs n+1 times */
+	uae_u32  dst_off;    /* byte offset of the destination pointer into its first page */
+	uae_u32  src_off;
+	int      map_dst2;   /* map the second destination page? */
+	int      map_src2;
+	int      dst_io;     /* point the destination's bank at blk_io_bank */
+	int      user;       /* run in user mode */
+	int      prewarm;    /* establish the page-cache entries BEFORE the loop starts */
+	uae_u32  code_off;   /* where in the code page the idiom is planted */
+	int      map_code2;  /* map the SECOND code page (for a straddling idiom) */
+	int      badloop;    /* plant a DBcc displacement that does NOT target the head */
+	int      notdbf;     /* plant something that is not a DBcc after the MOVE */
+	uae_u16  dbcc;       /* override the DBcc opcode (0 = DBF, the idiom's own) */
+	int      adda_reg;   /* stage 3: make the ADDA advance a DIFFERENT register (1-7) */
+	int      trace;      /* run with T1 set: every instruction must be traced */
+	uae_s16  step;       /* stage 3: the ADDA.W immediate */
+	uae_u32  fill;       /* stage 1: the value in A1 */
+};
+
+static void blk_build(const struct blk_desc *c)
+{
+	mmu040_gen_init();                       /* resets RAM, brings up 68040 + MMU, S=1 */
+
+	mmu040_gen_map(BLK_VCODE, BLK_PCODE, 0);
+	if (c->map_code2) mmu040_gen_map(BLK_VCODE + 0x1000u, BLK_PCODE2, 0);
+	mmu040_gen_map(BLK_VVEC,  BLK_PVEC,  0);
+	mmu040_gen_map(BLK_VSTK,  BLK_PSTK,  0);
+	mmu040_gen_map(BLK_VSRC,             BLK_PSRC0, 0);
+	if (c->map_src2) mmu040_gen_map(BLK_VSRC + 0x1000u, BLK_PSRC1, 0);
+	mmu040_gen_map(BLK_VDST,             BLK_PDST0, 0);
+	if (c->map_dst2) mmu040_gen_map(BLK_VDST + 0x1000u, BLK_PDST1, 0);
+
+	/* Source pages get a pattern that is wrong everywhere if a copy shifts by one. */
+	for (uae_u32 i = 0; i < 0x2000u; i += 4)
+		hram_poke32(BLK_PSRC0 + i, 0x5EED0000u | i);
+	/* Destinations get a different one, so a MISSING write is as visible as a wrong one. */
+	for (uae_u32 i = 0; i < 0x2000u; i += 4)
+		hram_poke32(BLK_PDST0 + i, 0xD00D0000u | i);
+
+	/* Plant by VIRTUAL offset from the head, so an idiom that straddles the code page
+	 * lands correctly in the second frame instead of wrapping inside the first. */
+	{
+		#define BLK_POKE(off, w)                                                     \
+			do {                                                                     \
+				uae_u32 _a = c->code_off + (uae_u32)(off);                           \
+				if (_a < 0x1000u) hram_poke16(BLK_PCODE  + _a, (uae_u16)(w));         \
+				else              hram_poke16(BLK_PCODE2 + _a - 0x1000u, (uae_u16)(w)); \
+			} while (0)
+		if (c->stage == 3) {
+			BLK_POKE(0x00, 0xF468);                   /* CPUSHL (A0)   */
+			BLK_POKE(0x02, 0xD0FC | ((uae_u16)c->adda_reg << 9)); /* ADDA.W #n,An */
+			BLK_POKE(0x04, (uae_u16)c->step);
+			BLK_POKE(0x06, 0x51C9);                   /* DBF D1,-8     */
+			BLK_POKE(0x08, 0xFFF8);
+			BLK_POKE(0x0A, 0x4E71);                   /* DONE: nop     */
+		} else {
+			BLK_POKE(0x00, c->stage == 1 ? 0x20C9 : 0x22D8);
+			if (c->notdbf) {
+				BLK_POKE(0x02, 0x4E71);               /* nop -- not a DBcc at all */
+				BLK_POKE(0x04, 0x4E71);               /* nop */
+			} else {
+				BLK_POKE(0x02, c->dbcc ? c->dbcc : 0x51C9);   /* DBF D1,... */
+				BLK_POKE(0x04, c->badloop ? 0xFFFE    /* -> the DBcc itself */
+				                          : 0xFFFC);  /* -> the head: a loop */
+			}
+			BLK_POKE(0x06, 0x4E71);                   /* DONE: nop     */
+		}
+		#undef BLK_POKE
+	}
+	hram_poke16(BLK_PCODE + 0x100, 0x60FE);               /* FAULT: bra.s . */
+	hram_poke32(BLK_PVEC | 8,    BLK_FAULTPC);            /* vector 2: access fault */
+	hram_poke32(BLK_PVEC | 0x24, BLK_FAULTPC);            /* vector 9: trace         */
+
+	cpu_set_context(BLK_VCODE + c->code_off);
+	regs.vbr = BLK_VVEC;
+	regs.s = 1;
+	m68k_areg(regs, 7) = BLK_VSTK | 0xF00;
+
+	/* POISON THE WHOLE REGISTER FILE AND THE CCR before every run.
+	 *
+	 * The two runs of a case are sequential on one machine, so anything the fixture does
+	 * not set is inherited -- and what the first (reference) run leaves behind is exactly
+	 * the state the second run is being checked for producing. That makes a fast path
+	 * which FORGETS to write a register agree perfectly with the interpreter that wrote
+	 * it, and the comparison passes for the worst possible reason. Caught by mutation
+	 * testing: deleting stage A's CLEAR_CZNV/SET_ZFLG/SET_NFLG left the whole corpus
+	 * green, because the reference run had already put those exact flags there.
+	 *
+	 * Every register that the idiom does not itself set gets a distinct recognisable
+	 * value, so a fast path that scribbles on an unrelated register fails too; and the
+	 * CCR starts with EVERY flag set, so "did not update the flags" is maximally
+	 * different from every correct answer (the MOVE clears C and V and sets Z/N from the
+	 * source, so no correct outcome leaves all four standing). */
+	for (int i = 0; i < 8; i++) {
+		m68k_dreg(regs, i) = 0xD0D00000u | (uae_u32)i;
+		if (i != 7) m68k_areg(regs, i) = 0xA0A00000u | (uae_u32)i;
+	}
+	CLEAR_CZNV();
+	SET_CFLG(1); SET_VFLG(1); SET_ZFLG(1); SET_NFLG(1); SET_XFLG(1);
+	if (c->trace) { regs.t1 = 1; }
+	MakeSR();
+	MakeFromSR();            /* -> SPCFLAG_TRACE, the way a guest arming T1 would */
+
+	m68k_areg(regs, 0) = (c->stage == 2) ? (BLK_VSRC + c->src_off)
+	                                     : (BLK_VDST + c->dst_off);
+	m68k_areg(regs, 1) = (c->stage == 1) ? c->fill
+	                                     : (BLK_VDST + c->dst_off);
+	if (c->stage == 3) m68k_areg(regs, 0) = BLK_VDST + c->dst_off;
+	m68k_dreg(regs, 1) = 0xABCD0000u | c->n;   /* the high half must survive the DBcc */
+	MakeSR();
+
+	if (c->dst_io)
+		mem_banks[BLK_PDST0 >> 16] = &blk_io_bank;
+
+	if (c->user) {
+		regs.usp = BLK_VSTK | 0xE00;
+		regs.s = 0;
+		MakeSR();
+		m68k_areg(regs, 7) = regs.usp;
+	}
+
+	/* PRE-WARM: touch the pages from the host side so their data-page-cache entries
+	 * already exist when the loop starts.
+	 *
+	 * This is not a convenience, it is the case that makes the hoisted loop invariants
+	 * observable. Cold, the device gate declines the first iteration of every page, the
+	 * INTERPRETER runs it, and the flags/pc/mmu_restart it sets are the ones the whole
+	 * rest of the loop needs -- so a fast path that forgot to set any of them would still
+	 * come out right, and the corpus would agree about the wrong thing. Warm, the
+	 * recognizer engages on the very first pass and has to establish that state itself.
+	 *
+	 * Done through the ordinary accessors, at the same privilege the run will use (hence
+	 * after the user-mode switch, since the cache is indexed by regs.s), writing back the
+	 * value already there so memory is unchanged. The U/M descriptor bits it sets are set
+	 * identically in both runs of a case, so the memory comparison stays exact.
+	 *
+	 * It is also the REALISTIC case: a kernel bzero'ing a page it has just touched, or
+	 * mcpy'ing between two buffers it has just written, arrives with the entries warm. */
+	if (c->prewarm) {
+		SAVE_EXCEPTION;
+		TRY(pw) {
+			uaecptr d = BLK_VDST + c->dst_off;
+			put_long_mmu040(d, get_long_mmu040(d));
+			if (c->stage == 2) (void)get_long_mmu040(BLK_VSRC + c->src_off);
+		} CATCH(pw) { (void)pw; } ENDTRY
+		RESTORE_EXCEPTION;
+	}
+}
+
+static void blk_take(struct blk_snap *s, unsigned long polls0, int steps, int reached)
+{
+	MakeSR();
+	for (int i = 0; i < 8; i++) { s->d[i] = m68k_dreg(regs, i); s->a[i] = m68k_areg(regs, i); }
+	s->pc  = m68k_getpc();
+	s->ipc = (uae_u32)regs.instruction_pc;
+	s->sr  = (uae_u32)regs.sr;
+	s->usp = (uae_u32)regs.usp;
+	s->isp = (uae_u32)regs.isp;
+	s->polls = harness_ipl_polls - polls0;
+	s->steps = steps;
+	s->reached = reached;
+	memcpy(s->mem, hram_base() + BLKW_BASE, BLKW_LEN);
+}
+
+/* Build, set the knob THROUGH THE MAILBOX (do_specialties resyncs the knobs every 64th
+ * call, so a directly-poked variable would be clobbered mid-run), drive to completion or
+ * to the fault handler, snapshot. */
+static void blk_run(struct blk_snap *s, const struct blk_desc *c, unsigned knob, int budget)
+{
+	const uae_u32 done = BLK_VCODE + c->code_off + ((c->stage == 3) ? 0x0Au : 0x06u);
+	unsigned long polls0;
+	int steps = 0, reached = 0;
+
+	addrbank *saved_bank = mem_banks[BLK_PDST0 >> 16];
+
+	blk_build(c);
+	shared->blk_chunk = knob;
+	z3660_knobs_sync();
+
+	polls0 = harness_ipl_polls;
+	regs.spcflags |= Z_SPCFLAG_MODE_CHANGE;  /* the loop returns after each pass; OR, so
+	                                          * an armed SPCFLAG_TRACE survives */
+	while (steps < budget) {
+		uae_u32 pc = m68k_getpc();
+		if (pc == done)        { reached = 1; break; }
+		if (pc == BLK_FAULTPC) { reached = 2; break; }
+		m68k_run_mmu040();
+		steps++;
+	}
+	regs.spcflags = 0;
+
+	blk_take(s, polls0, steps, reached);
+
+	/* Leave the fixture as the firmware powers up. */
+	mem_banks[BLK_PDST0 >> 16] = saved_bank;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	mmu040_off();
+}
+
+static void blk_equal(const struct blk_snap *r, const struct blk_snap *f, const char *what)
+{
+	int bad = 0;
+	for (int i = 0; i < 8; i++) {
+		if (r->d[i] != f->d[i]) {
+			g_fail++; bad++;
+			printf("  FAIL: %s: D%d ref 0x%08x fast 0x%08x\n", what, i, r->d[i], f->d[i]);
+		}
+		if (r->a[i] != f->a[i]) {
+			g_fail++; bad++;
+			printf("  FAIL: %s: A%d ref 0x%08x fast 0x%08x\n", what, i, r->a[i], f->a[i]);
+		}
+	}
+	if (!bad) g_pass++;
+	CHECK_EQ32(f->pc,      r->pc,      what);
+	CHECK_EQ32(f->ipc,     r->ipc,     what);
+	CHECK_EQ32(f->sr,      r->sr,      what);
+	CHECK_EQ32(f->usp,     r->usp,     what);
+	CHECK_EQ32(f->isp,     r->isp,     what);
+	CHECK_EQ32((uae_u32)f->reached, (uae_u32)r->reached, what);
+	/* Anti-vacuity: two runs that both ran out of budget agree perfectly and prove
+	 * nothing. Every case must actually arrive somewhere. */
+	CHECK(r->reached != 0, "%s: the reference run finished (DONE or the fault handler), "
+	                       "so the comparison is not of two timeouts\n", what);
+	{
+		int off = -1;
+		for (uae_u32 i = 0; i < BLKW_LEN; i++)
+			if (r->mem[i] != f->mem[i]) { off = (int)i; break; }
+		if (off < 0) g_pass++;
+		else {
+			g_fail++;
+			printf("  FAIL: %s: guest memory differs at physical 0x%08x "
+			       "(ref 0x%02x, fast 0x%02x)\n",
+			       what, (unsigned)(BLKW_BASE + (uae_u32)off),
+			       r->mem[off], f->mem[off]);
+		}
+	}
+}
+
+/* One corpus entry: run it with the recognizer OFF and with `cap`, and demand they agree.
+ *
+ * `engage` says what the run-loop pass count must show, because "the two paths agree" is
+ * trivially true when the fast path silently never fired -- the failure a state-
+ * equivalence test is blindest to:
+ *
+ *   BLK_MUST    strictly fewer passes than the interpreter. The recognizer HAS to fire.
+ *   BLK_MAY     no MORE passes. Used where the whole loop is one iteration: the device
+ *               gate declines on a cold page, the interpreter runs that iteration and
+ *               warms the entry, and the loop is over before there is anything left to
+ *               fast-path. Correct, and the `<=` is the useful claim in its own right --
+ *               the recognizer must never make anything SLOWER, and a declined recognizer
+ *               that ate a pass would show up right here.
+ *   BLK_NEVER   exactly as many passes. The decline cases: non-RAM, misaligned, user-mode
+ *               CPUSHL. These must reach the interpreter untouched.
+ */
+#define BLK_NEVER 0
+#define BLK_MAY   1
+#define BLK_MUST  2
+static void blk_case(const struct blk_desc *c, unsigned cap, int engage,
+                     const char *what)
+{
+	char lbl[192];
+	int budget = (int)(c->n + 2u) * 4 + 64;
+
+	blk_run(&g_blk_ref,  c, Z3660_BLK_OFF, budget);
+	blk_run(&g_blk_fast, c, cap,           budget);
+
+	snprintf(lbl, sizeof lbl, "%s (cap %u)", what, cap);
+	blk_equal(&g_blk_ref, &g_blk_fast, lbl);
+
+	if (engage == BLK_MUST)
+		CHECK(g_blk_fast.steps < g_blk_ref.steps,
+		      "%s: the fast path took FEWER run-loop passes than the interpreter "
+		      "(%d vs %d) -- it actually engaged\n", lbl, g_blk_fast.steps, g_blk_ref.steps);
+	else if (engage == BLK_MAY)
+		CHECK(g_blk_fast.steps <= g_blk_ref.steps,
+		      "%s: the recognizer never costs a pass (%d vs %d)\n",
+		      lbl, g_blk_fast.steps, g_blk_ref.steps);
+	else
+		CHECK_EQ32((uae_u32)g_blk_fast.steps, (uae_u32)g_blk_ref.steps, lbl);
+}
+
+static void test_blk_state_equivalence(void)
+{
+	printf("[test] C2 block-idiom fast path: state equivalence against the interpreted path\n");
+
+	struct blk_desc c;
+	const unsigned CAPS[3] = { 1u, Z3660_BLK_DEFAULT, Z3660_BLK_MAX };
+
+	/* ---- stage A: bzero ------------------------------------------------------- */
+	for (int ci = 0; ci < 3; ci++) {
+		unsigned cap = CAPS[ci];
+
+		memset(&c, 0, sizeof c);
+		c.stage = 1; c.map_dst2 = 1; c.fill = 0;
+
+		c.n = 0;    blk_case(&c, cap, BLK_MAY,  "bzero n=0 (the DBcc boundary: ONE store, not zero)");
+		c.n = 1;    blk_case(&c, cap, BLK_MUST, "bzero n=1");
+		c.n = 7;    blk_case(&c, cap, BLK_MUST, "bzero n=7");
+		c.n = 255;  blk_case(&c, cap, BLK_MUST, "bzero n=255 (exactly the default cap)");
+		c.n = 1023; blk_case(&c, cap, BLK_MUST, "bzero n=1023 (a whole 4K page)");
+
+		/* PRE-WARMED, so the recognizer engages on the FIRST pass with no interpreted
+		 * iteration ahead of it to establish the loop invariants for it. Every case that
+		 * follows is run this way as well as cold, because cold hides a whole class of
+		 * defect: see blk_build()'s prewarm comment. */
+		c.prewarm = 1;
+		c.n = 0;    blk_case(&c, cap, BLK_MUST, "bzero n=0, page already WARM");
+		c.n = 1;    blk_case(&c, cap, BLK_MUST, "bzero n=1, page already WARM");
+		c.n = 1023; blk_case(&c, cap, BLK_MUST, "bzero n=1023, page already WARM");
+
+		/* A non-zero fill: MOVE.L sets N and Z from the SOURCE. Warm, because cold the
+		 * interpreter's own first iteration sets the flags and a fast path that forgets
+		 * them passes every zero-fill test there is. */
+		c.n = 5; c.fill = 0x80000000u;
+		blk_case(&c, cap, BLK_MUST, "bzero with a NEGATIVE fill value (N flag from the source)");
+		c.fill = 0x00000001u;
+		blk_case(&c, cap, BLK_MUST, "bzero with a non-zero positive fill (Z clear)");
+		c.fill = 0;
+		c.prewarm = 0;
+
+		c.n = 5; c.fill = 0x80000000u;
+		blk_case(&c, cap, BLK_MUST, "bzero with a negative fill, page cold");
+		c.fill = 0;
+
+		/* Page crossing, both pages present: must stop at the boundary, re-validate
+		 * and carry on. dst_off puts the last four longwords in page 0. */
+		c.n = 31; c.dst_off = 0x1000u - 16u;
+		blk_case(&c, cap, BLK_MUST, "bzero CROSSING a page boundary, second page mapped");
+
+		/* Page crossing with the second page UNMAPPED: the 68040 write-back fault. */
+		c.map_dst2 = 0;
+		blk_case(&c, cap, BLK_MUST, "bzero FAULTING on an unmapped second page "
+		                     "(write-back contract: same pc, same A0, same D1, same frame)");
+		CHECK_EQ32((uae_u32)g_blk_ref.reached, 2u,
+		           "...and it really did fault: the reference run reached vector 2");
+		CHECK_EQ32((uae_u32)g_blk_fast.reached, 2u,
+		           "...and so did the fast-path run");
+		/* Where the hand-off happened, spelled out. The device gate only fast-paths a
+		 * page whose data-page-cache entry a successful access already established, and
+		 * a chunk never leaves that page -- so the fast path runs the four longwords of
+		 * page 0 and then DECLINES on the cold, unmapped page 1, and the interpreter
+		 * takes the fault. That is why a fault inside a chunk is not reachable in this
+		 * design, and why the state the fault is reported against is the state the fast
+		 * path left: A0 one longword past the last successful store, D1 un-decremented
+		 * for the instruction that faulted. Compared against the interpreter above; named
+		 * here so the property is not something a reader has to re-derive. */
+		CHECK_EQ32(g_blk_fast.a[0], BLK_VDST + 0x1000u + 4u,
+		           "A0 stands one longword past the faulting store, as the 68040 "
+		           "write-back contract requires");
+		c.map_dst2 = 1; c.dst_off = 0;
+
+		/* Both again, warm. */
+		c.prewarm = 1; c.n = 31; c.dst_off = 0x1000u - 16u;
+		blk_case(&c, cap, BLK_MUST, "bzero CROSSING a page boundary, warm, second page mapped");
+		c.map_dst2 = 0;
+		blk_case(&c, cap, BLK_MUST, "bzero FAULTING on an unmapped second page, warm");
+		CHECK_EQ32((uae_u32)g_blk_ref.reached, 2u, "...and it really did fault");
+		c.map_dst2 = 1; c.dst_off = 0; c.prewarm = 0;
+
+		/* User mode: the data page cache is indexed by regs.s, so the gate has to be
+		 * asked the same question the accessor asks. */
+		c.n = 63; c.user = 1;
+		blk_case(&c, cap, BLK_MUST, "bzero in USER mode");
+		c.prewarm = 1;
+		blk_case(&c, cap, BLK_MUST, "bzero in USER mode, warm (the cache index carries S)");
+		c.prewarm = 0; c.user = 0;
+
+		/* Destination is not plain RAM: decline, and the guest cannot tell. */
+		c.n = 15; c.dst_io = 1;
+		blk_case(&c, cap, BLK_NEVER, "bzero to a NON-RAM destination falls back to the interpreter");
+		c.dst_io = 0;
+
+		/* Misaligned destination: decline. */
+		c.n = 15; c.dst_off = 2;
+		blk_case(&c, cap, BLK_NEVER, "bzero from a MISALIGNED destination declines");
+		c.dst_off = 0;
+
+		/* ---- THE TRIGGER IS EXACT: what must NOT be recognised ------------------
+		 * Two opcodes next to each other are not a loop. The recognizer's whole claim
+		 * to fire on any kernel's bzero -- rather than on a PC it was told about -- is
+		 * that it checks the SHAPE, so the shape has to be checked against things that
+		 * are nearly it. */
+		c.n = 5; c.prewarm = 1;
+		c.badloop = 1;
+		blk_case(&c, cap, BLK_NEVER,
+		         "MOVE.L An,(Ay)+ then a DBcc that branches to ITSELF is not a loop "
+		         "over the MOVE, and must not be collapsed as one");
+		c.badloop = 0;
+		c.notdbf = 1;
+		blk_case(&c, cap, BLK_NEVER,
+		         "MOVE.L An,(Ay)+ followed by a NOP is not an idiom at all");
+		c.notdbf = 0;
+
+		/* A CONDITIONAL DBcc is not a DBF. DBF's condition is false forever, so the loop
+		 * runs exactly Dn.w+1 times and the collapse is arithmetic. DBEQ terminates the
+		 * moment Z is set -- and the MOVE ahead of it sets Z from its source, so with a
+		 * zero fill this loop runs its body exactly ONCE. A recognizer that keyed on the
+		 * DBcc family rather than on DBF would fill the whole buffer. */
+		c.dbcc = 0x57C9; c.fill = 0; c.n = 40;
+		blk_case(&c, cap, BLK_NEVER,
+		         "DBEQ is not DBF: a CONDITIONAL DBcc must not be collapsed (its loop "
+		         "ends on a flag the body sets)");
+		c.fill = 0x00000001u;
+		blk_case(&c, cap, BLK_NEVER,
+		         "...and not when the condition happens to stay false either -- the "
+		         "trigger is the opcode, not the outcome");
+		c.dbcc = 0; c.fill = 0; c.n = 5;
+
+		/* TRACING must see every instruction. A collapsed chunk is one trace exception
+		 * where the guest asked for two per iteration, and a single-stepping debugger
+		 * that skips 512 instructions is worse than no debugger. */
+		c.trace = 1; c.n = 40;
+		blk_case(&c, cap, BLK_NEVER, "with T1 set the recognizer declines: a traced "
+		                             "instruction stream may not be collapsed");
+		c.trace = 0; c.n = 5;
+
+		/* The idiom STRADDLING an instruction page boundary. Reading past the opcode is
+		 * the recognizer's only speculative act; if it does that across a page it can
+		 * fault where the interpreted path would not have, at a completely different
+		 * point in the instruction. Both arms are checked: with the next code page
+		 * absent (where an unguarded peek faults early, before the MOVE has run) and
+		 * with it present (where an unguarded peek would merely be reading the right
+		 * bytes -- but the state must still match, and the recognizer must still
+		 * decline, because "it happens to work" is not the contract). */
+		c.code_off = 0x1000u - 2u;             /* MOVE at the last word of the page */
+		c.map_code2 = 0;
+		blk_case(&c, cap, BLK_NEVER,
+		         "an idiom straddling an instruction page with the NEXT page absent: the "
+		         "recognizer must not peek across and fault early");
+		CHECK_EQ32((uae_u32)g_blk_ref.reached, 2u,
+		           "...and the reference run really does fault, fetching the DBcc");
+		c.map_code2 = 1;
+		blk_case(&c, cap, BLK_NEVER,
+		         "...and with the next page present it still declines rather than "
+		         "relying on the peek having been safe");
+		c.map_code2 = 0; c.code_off = 0; c.prewarm = 0;
+
+		/* ---- stage B: mcpy --------------------------------------------------- */
+		memset(&c, 0, sizeof c);
+		c.stage = 2; c.map_dst2 = 1; c.map_src2 = 1;
+
+		c.n = 0;    blk_case(&c, cap, BLK_MAY,  "mcpy n=0");
+		c.n = 1;    blk_case(&c, cap, BLK_MUST, "mcpy n=1");
+		c.n = 1023; blk_case(&c, cap, BLK_MUST, "mcpy n=1023 (a whole 4K page)");
+		c.prewarm = 1;
+		c.n = 0;    blk_case(&c, cap, BLK_MUST, "mcpy n=0, both pages WARM");
+		c.n = 1;    blk_case(&c, cap, BLK_MUST, "mcpy n=1, both pages WARM");
+		c.n = 1023; blk_case(&c, cap, BLK_MUST, "mcpy n=1023, both pages WARM (the flags "
+		                                        "come from the LAST longword copied)");
+		c.prewarm = 0;
+
+		/* Source and destination crossing their pages at DIFFERENT offsets: the chunk
+		 * has to be bounded by whichever runs out first, and a fast path that only
+		 * bounds one of them writes past a page it never validated. */
+		c.n = 63; c.src_off = 0x1000u - 32u; c.dst_off = 0x1000u - 16u;
+		blk_case(&c, cap, BLK_MUST, "mcpy with source and destination crossing at DIFFERENT offsets");
+
+		/* Read fault: the source's second page is missing. */
+		c.map_src2 = 0;
+		blk_case(&c, cap, BLK_MUST, "mcpy FAULTING on an unmapped source page (a READ fault, "
+		                     "which leaves both pointers un-advanced)");
+		CHECK_EQ32((uae_u32)g_blk_ref.reached, 2u,
+		           "...and it really did fault: the reference run reached vector 2");
+		CHECK_EQ32((uae_u32)g_blk_fast.reached, 2u,
+		           "...and so did the fast-path run");
+		c.map_src2 = 1; c.src_off = 0; c.dst_off = 0;
+
+		/* ---- stage C: the CPUSHL cache-flush loop ---------------------------- */
+		memset(&c, 0, sizeof c);
+		c.stage = 3; c.step = 16;
+
+		c.n = 0;    blk_case(&c, cap, BLK_MUST, "CPUSHL loop n=0");
+		c.n = 1;    blk_case(&c, cap, BLK_MUST, "CPUSHL loop n=1");
+		c.n = 255;  blk_case(&c, cap, BLK_MUST, "CPUSHL loop n=255 (a 4K page at 16 bytes a line)");
+		c.step = -16;
+		blk_case(&c, cap, BLK_MUST, "CPUSHL loop walking BACKWARDS (negative ADDA immediate)");
+		c.step = 16;
+
+		c.user = 1;
+		blk_case(&c, cap, BLK_NEVER, "CPUSHL in USER mode declines (it must trap, not collapse)");
+		c.user = 0;
+
+		/* The ADDA must advance the register the CPUSHL walks. If it advances a
+		 * different one, this is not the cache-flush loop -- the flush pointer never
+		 * moves -- and collapsing it would step the wrong register. */
+		c.n = 20; c.adda_reg = 2;
+		blk_case(&c, cap, BLK_NEVER,
+		         "CPUSHL (A0) with an ADDA that advances A2 is not the idiom: the "
+		         "recognizer must decline rather than step A0");
+		c.adda_reg = 0; c.n = 5;
+	}
+
+	/* ---- yield granularity ---------------------------------------------------
+	 * The map's risk 2 is interrupt latency, and "the poll still runs at its normal
+	 * cadence" is unfalsifiable as prose. The board stub counts every
+	 * check_uae_int_request(), so it is a number: a 1024-longword fill at cap N must
+	 * poll about 1024/N times, and the interpreted path polls once per instruction.
+	 *
+	 * The ">= 1024/cap" side is the one that matters -- it is the assertion that the
+	 * fast path does NOT run the whole fill uninterruptibly. The extra polls come from
+	 * the interpreted instruction at each page entry (the gate's cold decline) and from
+	 * the loop's final fall-through. */
+	{
+		struct blk_snap *s = &g_blk_fast;
+		memset(&c, 0, sizeof c);
+		c.stage = 1; c.map_dst2 = 1; c.n = 1023;
+
+		blk_run(&g_blk_ref, &c, Z3660_BLK_OFF, 4200);
+		CHECK(g_blk_ref.polls >= 2048,
+		      "interpreted: 1024 iterations poll at least 2048 times (once per instruction, "
+		      "cadence 1) -- got %lu\n", g_blk_ref.polls);
+
+		blk_run(s, &c, 256u, 4200);
+		CHECK(s->polls >= 1024u / 256u,
+		      "cap 256: the fill yields to the poll at least 4 times, not once at the end "
+		      "-- got %lu\n", s->polls);
+		CHECK(s->polls <= 32,
+		      "cap 256: ...and not once per instruction either -- got %lu\n", s->polls);
+
+		blk_run(s, &c, 64u, 4200);
+		CHECK(s->polls >= 1024u / 64u,
+		      "cap 64: a smaller cap yields MORE often (>= 16) -- got %lu\n", s->polls);
+
+		blk_run(s, &c, Z3660_BLK_MAX, 4200);
+		CHECK(s->polls >= 2,
+		      "cap 1024: even at the ceiling the page bound forces a yield -- got %lu\n",
+		      s->polls);
+		CHECK(s->polls <= 12,
+		      "cap 1024: ...but only a handful -- got %lu\n", s->polls);
+
+		/* THE PAGE BOUND ITSELF. A fill that starts mid-page and runs 1024 longwords
+		 * spans two pages, so at a cap of 1024 the ONLY thing that can split it is the
+		 * page bound. Warm both pages first, so the gate's cold decline cannot be what
+		 * splits it instead and the assertion is about the bound and nothing else.
+		 *
+		 * This is the yield-granularity test doing double duty as the device gate's
+		 * REACH test: the gate's verdict is a property of one page, and a chunk that ran
+		 * past the page end would be applying a RAM verdict to memory it never asked
+		 * about. State equivalence cannot see that -- the same stores happen in the same
+		 * order either way -- so the poll count is where it has to be caught. */
+		c.dst_off = 0x800u;
+		c.prewarm = 1;
+		blk_run(s, &c, Z3660_BLK_MAX, 4200);
+		CHECK(s->polls >= 2,
+		      "a warm 1024-longword fill starting MID-PAGE splits at the page boundary "
+		      "even at cap 1024 -- got %lu poll(s), which would be 1 if the chunk ran "
+		      "past the end of the page its device gate actually validated\n", s->polls);
+		c.dst_off = 0; c.prewarm = 0;
+	}
+
+	/* ---- the OFF state is a PURE passthrough ---------------------------------
+	 * The whole corpus above compares against OFF, so OFF being subtly different from
+	 * "the firmware before this change" would make every comparison agree about the
+	 * wrong thing. It cannot be checked from inside, so check the two things that can
+	 * be: OFF costs exactly one run-loop pass per guest instruction (no chunking, no
+	 * declined recognizer eating a pass) and it polls exactly once per instruction. */
+	{
+		memset(&c, 0, sizeof c);
+		c.stage = 1; c.map_dst2 = 1; c.n = 9;
+		blk_run(&g_blk_ref, &c, Z3660_BLK_OFF, 200);
+		CHECK_EQ32((uae_u32)g_blk_ref.steps, 20u,
+		           "OFF: 10 iterations == 20 guest instructions == 20 run-loop passes");
+		CHECK_EQ32((uae_u32)g_blk_ref.polls, 20u,
+		           "OFF: ...and 20 interrupt polls, one per instruction at cadence 1");
+	}
+
+	/* ---- the resolution rule, every branch ----------------------------------- */
+	CHECK_EQ32(z3660_blk_resolve_chunk(Z3660_BLK_UNSET), Z3660_BLK_DEFAULT,
+	           "an unwritten mailbox word means the DEFAULT, never off");
+	CHECK_EQ32(z3660_blk_resolve_chunk(Z3660_BLK_OFF), 0u,
+	           "the off sentinel resolves to 0 == never fire");
+	CHECK_EQ32(z3660_blk_resolve_chunk(1u), 1u, "a cap of 1 is honoured");
+	CHECK_EQ32(z3660_blk_resolve_chunk(Z3660_BLK_MAX), Z3660_BLK_MAX, "the ceiling is honoured");
+	CHECK_EQ32(z3660_blk_resolve_chunk(Z3660_BLK_MAX + 1u), Z3660_BLK_MAX,
+	           "above the ceiling is clamped, not rejected and not wrapped");
+	CHECK_EQ32(z3660_blk_resolve_chunk(0xFFFFFFFEu), Z3660_BLK_MAX,
+	           "...including a value one below the off sentinel");
+
+	/* The knob reaches the loop, and the read-back tells the truth about it. */
+	CHECK_EQ32(z3660_blk_set(Z3660_BLK_OFF), 0u, "BLK OFF through the setter");
+	CHECK_EQ32(z3660_blk_get(), 0u, "...and the read-back agrees");
+	CHECK_EQ32(z3660_blk_set(Z3660_BLK_UNSET), Z3660_BLK_DEFAULT, "BLK default through the setter");
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	CHECK_EQ32(z3660_blk_get(), Z3660_BLK_DEFAULT,
+	           "the mailbox path resolves the same way the setter does");
+
+	harness_shared_defaults();
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * The BLK_ counters: the utilisation verdict a metal capture will be read through.
+ *
+ * A counter that is wired to the wrong quantity turns a working change into an
+ * unreadable one, and the map's whole judgement of this rung is `BLK_INSNS / INSNS`
+ * against a pre-registered 22.07 %. So the arithmetic is pinned here against a fill of
+ * known length rather than sanity-checked on metal.
+ * ================================================================== */
+#if Z3660_EMU_PROF
+static void test_blk_counters(void)
+{
+	printf("[test] C2 block-idiom counters: BLK_HIT / BLK_INSNS / BLK_BYTES mean what they say\n");
+
+	struct blk_desc c;
+	memset(&c, 0, sizeof c);
+	c.stage = 1; c.map_dst2 = 1; c.n = 1023;      /* 1024 iterations, 4096 bytes */
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+	blk_run(&g_blk_fast, &c, 256u, 4200);
+
+	/* 4092, not 4096, and the missing longword is the point: the device gate declines on
+	 * a cold page, so the FIRST iteration of each destination page is run by the
+	 * interpreter and is not the fast path's to claim. One page here, one longword. A
+	 * counter that read 4096 would be counting the loop rather than the fast path, and
+	 * BLK_INSNS/INSNS -- the map's utilisation verdict -- would be overstated by the ramp
+	 * -in on every page of every fill. */
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES], 4096u - 4u,
+	           "BLK_BYTES counts what the FAST PATH stored: 4096 less the one longword "
+	           "the interpreter ran to warm the page");
+	CHECK((uae_u32)z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS]
+	      == 2u * (uae_u32)(z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES] / 4u),
+	      "BLK_INSNS is two guest instructions per longword: the MOVE and the DBcc\n");
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_BLK_HIT] >= 4
+	      && z3660_prof_cnt[Z3660_PROF_C_BLK_HIT] <= 16,
+	      "BLK_HIT counts CHUNKS: 1024 iterations at a cap of 256 is a handful, not 1024 "
+	      "and not 1 -- got %llu\n",
+	      (unsigned long long)z3660_prof_cnt[Z3660_PROF_C_BLK_HIT]);
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS] / z3660_prof_cnt[Z3660_PROF_C_BLK_HIT] >= 16,
+	      "mean chunk length is high: a mean near 2 means the recognizer's test is being "
+	      "paid per iteration and the whole saving is gone\n");
+	/* The counters are of the FAST PATH only. INSNS counts what the run-loop tail
+	 * retired, and the tail runs once per chunk, so BLK_INSNS must EXCEED it here --
+	 * which is the arithmetic that makes BLK_INSNS/INSNS a share of the guest stream
+	 * rather than of the run loop's passes. */
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS] > z3660_prof_cnt[Z3660_PROF_C_INSNS],
+	      "BLK_INSNS counts GUEST instructions, INSNS counts run-loop passes\n");
+
+	/* With the recognizer off, none of them move at all. */
+	z3660_prof_zero();
+	blk_run(&g_blk_ref, &c, Z3660_BLK_OFF, 4200);
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_BLK_HIT],   0, "OFF: no chunks");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS], 0, "OFF: no instructions");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES], 0, "OFF: no bytes");
+
+	z3660_prof_zero();
+	harness_shared_defaults();
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+#endif /* Z3660_EMU_PROF */
+
 int main(int argc, char **argv)
 {
 	(void)argc; (void)argv;
@@ -3648,6 +4414,7 @@ int main(int argc, char **argv)
 	test_perf_line_clock();
 	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
+	test_blk_state_equivalence();
 	test_prof_wire_format();
 	test_prof_build_variant();
 #if Z3660_EMU_PROF
@@ -3658,6 +4425,7 @@ int main(int argc, char **argv)
 	test_prof_clock_source();
 	test_prof_translation_counters();
 	test_prof_ifetch_calls();
+	test_blk_counters();
 	test_prof_ring();
 	test_prof_under_execution();
 #endif

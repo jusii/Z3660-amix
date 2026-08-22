@@ -4707,6 +4707,15 @@ static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical 
 static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
 #endif
 
+/* CYBERSTORM C2 rung 0: iterations of a recognised block idiom per run-loop pass.
+ * 0 == the recognizer never fires (pure passthrough). Compiled into EVERY variant, unlike
+ * the two instruments above: this is an optimisation, not a diagnostic, and the lean
+ * production image is the one that most wants it. The knob exists so a metal session can
+ * A/B it on a live guest without reflashing -- and so the state-equivalence corpus in the
+ * host harness has an off state to compare against. See z3660_blk.h for the encoding. */
+#include "z3660_blk.h"
+static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
+
 #if Z3660_EMU_PERF
 /* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
  * disagree about it -- a read-back that recomputes the answer proves nothing about the
@@ -4729,6 +4738,17 @@ extern "C" void z3660_knobs_sync(void)
 #if Z3660_EMU_PROBES
    z3660_probes_on = shared->emu_probes ? 1 : 0;                                       // PROBES
 #endif
+   z3660_blk_chunk = z3660_blk_resolve_chunk((unsigned)shared->blk_chunk);             // BLK
+}
+
+/* Read-back + direct set for the host harness and the serial console. The setter takes a
+ * RAW mailbox value and runs it through the same resolution rule, so a console `BLK 9999`
+ * and a mailbox word of 9999 cannot mean two different things. */
+extern "C" unsigned z3660_blk_get(void) { return z3660_blk_chunk; }
+extern "C" unsigned z3660_blk_set(unsigned requested)
+{
+   z3660_blk_chunk = z3660_blk_resolve_chunk(requested);
+   return z3660_blk_chunk;
 }
 
 /* Read-back for the harness (and any future serial dump).
@@ -4865,6 +4885,447 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
       { static int serv_ctr = 0;                                               \
         if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } } \
    } while(0)
+
+/* ====================================================================================
+ * CYBERSTORM C2 RUNG 0 -- THE BLOCK-IDIOM FAST PATH
+ *
+ * WHAT THE MEASUREMENT SAID. The C2 map (amix-040-060-port/docs/C2-ATTACK-MAP.md §9.7)
+ * put a family of tight kernel block loops at 33.63 % of an AMIX boot, 25.11 % of a raw
+ * disk read and 10.57 % of dhrystone. `bzero` alone is 22.07 % of boot and it is two
+ * instructions at one PC:
+ *
+ *     0800032c   20c9   MOVE.L A1,(A0)+
+ *     0800032e   51c9   DBF    D1,-4
+ *
+ * Costed from the map's per-event table those two pay 850.5 ARM cycles per four bytes, of
+ * which the guest store is 162.7. Kernel zero-fill runs at 5.17 MB/s and 80.9 % of the
+ * price is interpreter machinery around a four-byte write.
+ *
+ * WHAT THIS DOES, AND -- MORE IMPORTANTLY -- WHAT IT DOES NOT.
+ *
+ * It recognises the loop at dispatch time and runs many iterations inside one pass of the
+ * run loop, so the opcode fetch, the dispatch, the tail, the sampler and the interrupt
+ * poll are paid once per CHUNK instead of once per guest instruction.
+ *
+ * IT DOES NOT REPLACE THE GUEST STORE. There is no `memset` here, no host block move, no
+ * direct pointer into guest memory. Every iteration calls `put_long_mmu040()` -- the exact
+ * function `op_20c8_31_ff` calls, with the same arguments in the same order -- so TTR
+ * matching, the data page cache, the ATC, the M and U descriptor bits, protection checks,
+ * bank dispatch and device side effects are preserved BY CONSTRUCTION rather than by
+ * argument. Three reasons, in order of weight:
+ *
+ *   1. It is the difference between a change whose correctness is *proved* and one whose
+ *      correctness is *reasoned about*. Risk 1 in the map's own ordering is fault
+ *      semantics, and this repository has paid for the general lesson: a page-crossing
+ *      DMA that clipped an unrelated frame stayed invisible until it ate an ELF header.
+ *   2. The arithmetic does not need it. The map pre-registers an 80 % reclaim, and 80 %
+ *      is what you get when the store stays and the machinery goes: 162.7 of 850.5 cycles
+ *      is 19.1 %. The pre-registered gain is exactly the gain of the safe design.
+ *   3. A host-pointer fast path could not be TESTED here. board_stubs.cpp leaves every
+ *      bank's `baseaddr` NULL on purpose (harness decision #6), so a `memset` over a
+ *      direct pointer would ship having never executed in the harness -- and the harness
+ *      is the whole evidence base for this change.
+ *
+ * SO WHAT IS ACTUALLY SAVED: FETCHOP, FETCHEX, HANDLER's dispatch, TAILADV, TAILPOLL,
+ * TAILSAMP and LOOP, once per chunk instead of once per instruction, twice over (the MOVE
+ * and the DBcc are both gone).
+ *
+ * ---------------------------------------------------------------------------------
+ * THE 68040 WRITE-BACK CONTRACT, which is the whole of the fault-semantics risk
+ * ---------------------------------------------------------------------------------
+ *
+ * `op_20c8_31_ff` is NOT instruction-restart. Read it: it increments the destination
+ * register, sets the flags, advances the pc to the DBcc, sets `regs.instruction_pc` to
+ * the DBcc, clears `mmu_restart`, DISARMS mmufixup -- and only then performs the store.
+ * A fault in that store is a 68040 write-back fault on an instruction that has already
+ * completed architecturally; the kernel's wb040.s replays the store and RTEs to the
+ * DBcc. Getting this backwards is what ISSUE-52 round 8 was, and it cost a boot.
+ *
+ * So the fast path does not "restart"; it reproduces that state exactly, and it does so
+ * by hoisting the loop-invariant half OUT of the loop rather than by re-deriving it:
+ * flags, pc, instruction_pc and mmu_restart are all constant across every iteration of a
+ * bzero, so they are set once before the first store and are correct at every store. What
+ * is left inside the loop is the post-increment, the store, and the DBcc's decrement --
+ * in the generated handler's order, so that at the instant of any store the machine holds
+ * exactly the state the interpreted path would hold.
+ *
+ * A fault therefore needs no unwinding and no fixup: the register file is already right,
+ * the run loop's CATCH sees `mmu_restart == false`, does not rewind, and raises. The
+ * harness compares this state byte-for-byte against the interpreted path (recognizer off)
+ * for a fill that faults on an unmapped second page.
+ *
+ * AND THEN THE HONEST PART, because two of the statements above are currently DEAD and a
+ * reader is entitled to know which. The device gate below only fast-paths a page whose
+ * data-page-cache entry a successful access has already established, and a chunk never
+ * leaves that page -- so a store inside a chunk cannot fault, and the two things that
+ * would only ever be read by a fault handler are unobservable:
+ *
+ *   - `mmu_restart = false` is overwritten by the run loop at the top of the next pass.
+ *   - the post-increment happening BEFORE the store rather than after is invisible,
+ *     because nothing can look at the machine between the two.
+ *
+ * Mutation testing says so rather than reasoning saying so: inverting either one leaves
+ * the whole 1594-assertion corpus green, while fifteen other deliberate defects in this
+ * function do not. They are written correctly anyway, and they stay, because the property
+ * that makes them dead is a property of TODAY'S gate. Widen the gate to translate cold
+ * pages itself, or hoist the store out of `put_long_mmu040`, and a mid-chunk fault becomes
+ * reachable in the same edit -- at which point these two lines are the difference between
+ * a page fault and a corrupted file system, and nobody will be looking at them.
+ *
+ * ---------------------------------------------------------------------------------
+ * THE DEVICE GATE -- z3660_blk_probe()
+ * ---------------------------------------------------------------------------------
+ *
+ * The map asks for a non-RAM destination to fall back to the slow path. With the store
+ * unchanged that is not a correctness question -- but it is a LATENCY question, and a
+ * sharp one: a burst of 256 writes to an emulated device with no interrupt poll between
+ * them is exactly how a core0 mailbox round trip would deadlock. So the destination bank
+ * is checked, once per chunk, and anything that is not plain RAM declines.
+ *
+ * The gate is STRICTLY NON-FAULTING and it never computes an address that is used for a
+ * store. It reads the TTR registers (a pure predicate) and the already-populated data
+ * page cache; on a cold entry it simply declines, the interpreter runs one ordinary
+ * instruction, and the entry that instruction populates lets the next pass through. That
+ * costs one interpreted instruction per page -- 0.1 % of a 1024-longword fill -- and buys
+ * a gate that cannot itself raise, cannot set an M or U bit the interpreted path would
+ * not have set, and cannot move a fault by one instruction.
+ *
+ * It also makes the page-boundary rule fall out of the same mechanism instead of being a
+ * second one: the gate's verdict is valid for one page, so the chunk is bounded by the
+ * page, so the fill stops at every boundary and re-validates. The map asks for exactly
+ * that ("chunk at the page boundary and never fast-path across one") and here it is not a
+ * rule bolted on but the reach of the evidence the gate collected.
+ *
+ * ---------------------------------------------------------------------------------
+ * YIELD GRANULARITY: ONE CHUNK
+ * ---------------------------------------------------------------------------------
+ *
+ * The fast path performs at most one chunk and then RETURNS TO THE RUN LOOP, leaving the
+ * pc on the head instruction if iterations remain. The tail therefore runs -- cycle
+ * accounting, sampler, `check_uae_int_request()` at its configured cadence,
+ * `do_specialties()` -- once per chunk, and the state at every chunk boundary is a state
+ * the interpreted path itself passes through, so an interrupt taken there is
+ * indistinguishable from one taken between two guest instructions.
+ *
+ * The chunk cap is the knob (z3660_blk.h): 256 iterations is a ~42 us window at 1.1 GHz,
+ * inside the 64 us of one 15.6 kHz hsync, which is the tightest cadence anything on this
+ * poll depends on (docs/AMIX.md's A3000-SCSI interrupt-delay pump).
+ *
+ * ---------------------------------------------------------------------------------
+ * WHY THE TRIGGER IS AN OPCODE PAIR AND NEVER A PC
+ * ---------------------------------------------------------------------------------
+ *
+ * The map is explicit: keyed on the opcode pair, never on a PC or a symbol. It must fire
+ * for any kernel that generates the same loop and it must not need to know it is looking
+ * at `bzero`. Hence the masked families below -- register fields are free, everything
+ * else is pinned -- and the DBcc's displacement is checked to actually target the head,
+ * which is what makes "these two opcodes" into "this is a loop".
+ *
+ * The cost of a miss is real and is worth naming: a `MOVE.L An,(Ay)+` that is NOT part of
+ * a loop pays two extra instruction-stream fetches before the recognizer gives up. That
+ * mode is rare in 68k code -- register saves use `-(SP)`, not `(An)+` -- and the masked
+ * compares that precede the fetches reject everything else for three ALU operations.
+ * ==================================================================================== */
+
+/* Opcode families. Masked, never literal (see above). Verified against the generated
+ * 68040-MMU dispatch table (cpustbl_mmu040.cpp): the register fields, and for CPUSHL the
+ * CACHE field, are the entries' don't-care bits. */
+#define Z3660_BLK_IS_MOVE_AN_INC(op)  (((op) & 0xF1F8u) == 0x20C8u) /* MOVE.L An,(Ay)+     */
+#define Z3660_BLK_IS_MOVE_INC_INC(op) (((op) & 0xF1F8u) == 0x20D8u) /* MOVE.L (Ax)+,(Ay)+  */
+#define Z3660_BLK_IS_DBF(op)          (((op) & 0xFFF8u) == 0x51C8u) /* DBF/DBRA Dn (cc=F)  */
+#define Z3660_BLK_IS_CPUSHL(op)       (((op) & 0xFF38u) == 0xF428u) /* CPUSHL <cache>,(An) */
+#define Z3660_BLK_IS_ADDA_W_IMM(op)   (((op) & 0xF1FFu) == 0xD0FCu) /* ADDA.W #imm,An      */
+
+/* The generated handlers' cycle returns, so the emulated-time accounting a chunk hands to
+ * adjust_cycles() is the sum of what the collapsed instructions would each have returned.
+ * Delivered in one lump instead of interleaved, which is exact for do_cycles_cpu_fastest()
+ * (a pure accumulator on this board) and bounded by the chunk cap for anything else. */
+#define Z3660_BLK_CYC_MOVE   ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_20c8 */
+#define Z3660_BLK_CYC_MOVE2  ((2 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_20d8 */
+#define Z3660_BLK_CYC_CPUSHL ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_f428 */
+#define Z3660_BLK_CYC_ADDA   ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_d0fc */
+#define Z3660_BLK_CYC_DBF_T  ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* branched */
+#define Z3660_BLK_CYC_DBF_F  ((1 * 4 * CYCLE_UNIT / 2 + 6 * CYCLE_UNIT / 2) * 4) /* fell through */
+
+/* Resolve a data address the way the ordinary accessor would, WITHOUT performing anything
+ * that can fault or that changes MMU state, and report whether it lands in plain RAM.
+ *
+ * Returns 1 and sets *gran (the address mask inside which the verdict stays valid) when
+ * the answer is "plain RAM, and here is how far that holds"; 0 for every other case,
+ * including "I could not tell". Declining is always safe: the interpreter runs the
+ * instruction.
+ *
+ * The three arms mirror mmu_put_long()/mmu_get_long()'s own address resolution and are
+ * kept in that order for that reason. The write-protected TTR window and the MMU-off
+ * write-once case both RAISE on the ordinary path, so they decline here rather than being
+ * modelled -- the ordinary path is then free to raise them exactly as it always has. */
+static int z3660_blk_probe(uaecptr addr, int write, uae_u32 *gran)
+{
+   uae_u32 phys;
+   uae_u32 g = 0xFFFFu;      /* bankindex() is addr >> 16: a bank verdict holds for 64 KB */
+
+   if (mmu_ttr_enabled) {
+      int res = mmu_match_ttr(addr, regs.s != 0, true);
+      if (res != TTR_NO_MATCH) {
+         if (write && res != TTR_OK_MATCH) return 0;   /* NO_WRITE: let the store raise */
+         phys = addr;
+         *gran = g;
+         return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+      }
+      /* TTR_NO_MATCH falls through to the MMU, exactly as the accessors do. */
+   }
+   if (!regs.mmu_enabled) {
+      if (write && (regs.tcr & MMU_TCR_DWO)) return 0; /* write-once: let the store raise */
+      phys = addr;
+      *gran = g;
+      return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+   }
+#if MMU_DPAGECACHE
+   {
+      uae_u32 idx1 = ((addr & mmu_pagemaski) >> mmu_pageshift1m) | regs.s;
+      uae_u32 idx2 = idx1 & (MMUFASTCACHE_ENTRIES - 1);
+      const struct mmufastcache *e = write ? &atc_data_cache_write[idx2]
+                                           : &atc_data_cache_read[idx2];
+      if (e->log != idx1)
+         return 0;           /* cold: decline, and let the ordinary access warm it */
+      phys = e->phys | (addr & mmu_pagemask);
+      if (mmu_pagemask < g) g = mmu_pagemask;
+      *gran = g;
+      return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+   }
+#else
+   (void)phys;
+   return 0;                 /* no page cache to read: never fast-path under translation */
+#endif
+}
+
+/* Longwords from `addr` to the end of its granule. `addr` is longword-aligned and the
+ * granule is a power-of-two-sized aligned window, so this is never zero. */
+static uae_u32 z3660_blk_room(uaecptr addr, uae_u32 gran)
+{
+   return ((gran + 1u) - (addr & gran)) >> 2;
+}
+
+/* The recognizer. Returns 1 if it serviced a chunk (the caller must NOT dispatch, and
+ * takes the emulated cycle count from *cycp); 0 to dispatch normally.
+ *
+ * `op` is the already-fetched opcode and the pc still stands on it. */
+static int z3660_blk_run(uae_u16 op, int *cycp)
+{
+   unsigned cap = z3660_blk_chunk;
+   uaecptr pc;
+   uae_u32 n, count, chunk;
+   uae_u16 opdb;
+   int dnreg, dn, idiom_len;
+   uae_s16 disp;
+
+   /* OFF is a PURE PASSTHROUGH and this is the line that makes it one: nothing has been
+    * examined, no state read, no fetch issued. The state-equivalence corpus compares
+    * against this path, so it has to be the untouched interpreter and not a second
+    * implementation that agrees with it. */
+   if (!cap) return 0;
+
+   /* Head discrimination first: three masked compares reject the entire rest of the
+    * instruction set before anything more expensive happens. */
+   if (Z3660_BLK_IS_MOVE_AN_INC(op) || Z3660_BLK_IS_MOVE_INC_INC(op))
+      idiom_len = 6;                                   /* MOVE + DBF + displacement */
+   else if (Z3660_BLK_IS_CPUSHL(op))
+      idiom_len = 10;                                  /* CPUSHL + ADDA.W #imm + DBF + disp */
+   else
+      return 0;
+
+   /* Trace has to see every instruction, and STOP/mode-change handling is per-instruction
+    * business the fast path is not entitled to skip. */
+   if (regs.t0 || regs.t1) return 0;
+
+   pc = (uaecptr)regs.instruction_pc;
+
+   /* The idiom's own words must lie inside ONE guest instruction page. Reading past the
+    * opcode is the recognizer's only speculative act, and this is what keeps it from
+    * faulting somewhere the interpreted path would not have: the page holding `pc` was
+    * just fetched successfully, so every word inside it is reachable. MMU off is exempt --
+    * the accessors are transparent there and an instruction fetch cannot fault. */
+   if (regs.mmu_enabled && ((pc ^ (pc + (uae_u32)idiom_len - 1u)) & mmu_pagemaski) != 0)
+      return 0;
+
+   if (idiom_len == 6) {
+      opdb = (uae_u16)get_iword_mmu040(2);
+      if (!Z3660_BLK_IS_DBF(opdb)) return 0;
+      disp = (uae_s16)get_iword_mmu040(4);
+      /* A DBcc's displacement is relative to its own extension word, so the target is
+       * (pc+2) + 2 + disp. "This is a two-instruction loop" == that target is the head. */
+      if ((uae_u32)(pc + 4u + (uae_u32)(uae_s32)disp) != pc) return 0;
+   } else {
+      uae_u16 opadd = (uae_u16)get_iword_mmu040(2);
+      if (!Z3660_BLK_IS_ADDA_W_IMM(opadd)) return 0;
+      /* The ADDA must advance the register the CPUSHL is walking, or this is not the
+       * cache-flush loop and the collapse would step the wrong pointer. */
+      if ((int)((opadd >> 9) & 7) != (int)(op & 7)) return 0;
+      opdb = (uae_u16)get_iword_mmu040(6);
+      if (!Z3660_BLK_IS_DBF(opdb)) return 0;
+      disp = (uae_s16)get_iword_mmu040(8);
+      if ((uae_u32)(pc + 8u + (uae_u32)(uae_s32)disp) != pc) return 0;
+      /* CPUSHL is privileged: in user mode op_f428_31_ff raises Exception(8), which is a
+       * per-instruction event and not ours to collapse. */
+      if (!regs.s) return 0;
+   }
+
+   /* DBF decrements only the low word and branches while it is not -1, so from Dn.w == n
+    * the body runs n+1 more times and Dn.w ends at 0xFFFF with the high half untouched.
+    * n == 0 is one more iteration, not zero: that is the boundary the corpus pins. */
+   dnreg = (int)(opdb & 7);
+   dn    = (int)m68k_dreg(regs, dnreg);
+   n     = (uae_u32)dn & 0xFFFFu;
+   count = n + 1u;
+
+   chunk = count;
+   if (chunk > cap) chunk = cap;
+
+   if (idiom_len == 6) {
+      int dstreg = (int)((op >> 9) & 7);
+      uaecptr dsta = (uaecptr)m68k_areg(regs, dstreg);
+      uae_u32 gdst;
+      int i;
+      int cyc;
+
+      /* Misaligned block moves are not a thing kernels do, and refusing them removes the
+       * split-access case entirely -- a longword straddling a page boundary is two
+       * accesses the fast path would have to reason about separately. */
+      if (dsta & 3u) return 0;
+      if (!z3660_blk_probe(dsta, 1, &gdst)) return 0;
+      {
+         uae_u32 room = z3660_blk_room(dsta, gdst);
+         if (chunk > room) chunk = room;
+      }
+
+      if (Z3660_BLK_IS_MOVE_AN_INC(op)) {
+         /* ---- STAGE A: bzero. `MOVE.L An,(Ay)+` / `DBF Dn,-4` ---------------------
+          * Source is an address register and never changes, so both the stored value and
+          * the flags it sets are loop invariants. */
+         uae_s32 src = (uae_s32)m68k_areg(regs, (int)(op & 7));
+
+         /* op_20c8_31_ff's pre-store state, hoisted: identical at every iteration. */
+         CLEAR_CZNV();
+         SET_ZFLG(src == 0);
+         SET_NFLG(src < 0);
+         m68k_setpci(pc + 2);              /* the handler leaves the pc on the DBcc */
+         regs.instruction_pc = pc + 2;
+         mmu_restart = false;              /* a 68040 write-back fault, not a restart */
+         mmufixup[0].reg = -1;             /* the handler disarms before its store */
+
+         for (i = 0; i < (int)chunk; i++) {
+            /* Post-increment BEFORE the store, exactly as the generated handler does, so
+             * a faulting store leaves Ay already advanced -- which is what wb040.s's
+             * replay expects and what the harness compares against. */
+            m68k_areg(regs, dstreg) = (uae_u32)dsta + 4u;
+            put_long_mmu040(dsta, (uae_u32)src);
+            dsta += 4;
+            /* ...then the DBcc's decrement. Not before: a fault above must leave Dn
+             * un-decremented, because the DBcc has not run yet. */
+            dn = (int)m68k_dreg(regs, dnreg);
+            m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu) | (((uae_u32)dn - 1u) & 0xFFFFu);
+         }
+         cyc = (int)chunk * (Z3660_BLK_CYC_MOVE + Z3660_BLK_CYC_DBF_T);
+         if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+         *cycp = cyc;
+         Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 2u * chunk);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES, 4u * chunk);
+      } else {
+         /* ---- STAGE B: mcpy. `MOVE.L (Ax)+,(Ay)+` / `DBF Dn,-4` ------------------- */
+         int srcreg = (int)(op & 7);
+         uaecptr srca = (uaecptr)m68k_areg(regs, srcreg);
+         uae_u32 gsrc;
+         uae_s32 src = 0;
+
+         if (srca & 3u) return 0;
+         if (!z3660_blk_probe(srca, 0, &gsrc)) return 0;
+         {
+            uae_u32 room = z3660_blk_room(srca, gsrc);
+            if (chunk > room) chunk = room;
+         }
+
+         m68k_setpci(pc + 2);
+         regs.instruction_pc = pc + 2;
+         mmu_restart = false;
+         mmufixup[0].reg = -1;
+
+         for (i = 0; i < (int)chunk; i++) {
+            /* op_20d8_31_ff's order: read the source, advance BOTH pointers, set the
+             * flags from what was read, THEN store. A fault in the read leaves both
+             * pointers un-advanced; a fault in the store leaves both advanced and the
+             * flags already set. Both are reproduced here by doing the same thing. */
+            src = (uae_s32)get_long_mmu040(srca);
+            m68k_areg(regs, srcreg) = (uae_u32)srca + 4u;
+            m68k_areg(regs, dstreg) = (uae_u32)dsta + 4u;
+            CLEAR_CZNV();
+            SET_ZFLG(src == 0);
+            SET_NFLG(src < 0);
+            put_long_mmu040(dsta, (uae_u32)src);
+            srca += 4;
+            dsta += 4;
+            dn = (int)m68k_dreg(regs, dnreg);
+            m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu) | (((uae_u32)dn - 1u) & 0xFFFFu);
+         }
+         cyc = (int)chunk * (Z3660_BLK_CYC_MOVE2 + Z3660_BLK_CYC_DBF_T);
+         if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+         *cycp = cyc;
+         Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 2u * chunk);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES, 4u * chunk);
+      }
+
+      /* Where the DBcc left the pc: back at the head if it branched, past the whole idiom
+       * if Dn.w reached -1 and it fell through. */
+      m68k_setpci((chunk == count) ? pc + 6u : pc);
+      return 1;
+   }
+
+   /* ---- STAGE C: the 68040 cache-flush loop ------------------------------------------
+    * `CPUSHL <cache>,(An)` / `ADDA.W #n,An` / `DBF Dn,-8`.
+    *
+    * The map's line about this one is the right one: it is a cache-maintenance loop and
+    * there is no cache to maintain. Everything op_f428_31_ff does to the machine --
+    * flush_cpu_caches_040(), flush_mmu040(), flush_icache() -- is a function of the
+    * OPCODE alone. flush_mmu040 discards its address argument outright; flush_cpu_caches
+    * _040 acts only at scope==3 (all), which this line-scope family never is; flush_icache
+    * is a no-op macro without the JIT. Every one of them is therefore idempotent, so
+    * performing them ONCE for the whole run is not an approximation of doing them N times,
+    * it is the same operation. That is what makes 7.79 % of an AMIX boot collapse into a
+    * few ARM instructions, and it is asserted in the harness rather than trusted here.
+    *
+    * No memory is touched, so there is no device gate, no page bound and nothing that can
+    * fault: the chunk cap alone bounds it, and it bounds it only for interrupt latency. */
+   {
+      int areg = (int)(op & 7);
+      uae_s16 step = (uae_s16)get_iword_mmu040(4);
+      int cyc;
+
+      flush_cpu_caches_040(op);
+      /* `opcode & 3` is upstream's own two-bit register decode here; reproduced verbatim
+       * because flush_mmu040() ignores the argument entirely and a "corrected" one would
+       * be a silent divergence from the interpreted path for no gain. */
+      flush_mmu040(m68k_areg(regs, op & 3), (op >> 6) & 3);
+      if (op & 0x80)
+         flush_icache((op >> 6) & 3);
+
+      m68k_areg(regs, areg) = (uae_u32)((uae_s32)m68k_areg(regs, areg)
+                                        + (uae_s32)step * (uae_s32)chunk);
+      dn = (int)m68k_dreg(regs, dnreg);
+      m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu)
+                             | (((uae_u32)dn - chunk) & 0xFFFFu);
+      m68k_setpci((chunk == count) ? pc + 10u : pc);
+
+      cyc = (int)chunk * (Z3660_BLK_CYC_CPUSHL + Z3660_BLK_CYC_ADDA + Z3660_BLK_CYC_DBF_T);
+      if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+      *cycp = cyc;
+      Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+      Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 3u * chunk);
+      Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES,
+                         (uae_u32)((step < 0 ? -(uae_s32)step : (uae_s32)step) * (uae_s32)chunk));
+      return 1;
+   }
+}
 
 // UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
 // (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
@@ -5060,9 +5521,28 @@ void m68k_run_mmu040(void)
             }
             }   /* if (z3660_probes_on) -- post-fetch probe group */
 #endif /* Z3660_EMU_PROBES */
-            Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
-            cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
-            Z3660_PROF_EXIT();
+            /* CYBERSTORM C2 rung 0. The block-idiom recognizer sits exactly here -- after
+             * the opcode is in hand, before the dispatch -- because that is the only place
+             * that knows both what the instruction is and that the run loop has not yet
+             * committed to executing one of it.
+             *
+             * It is deliberately NOT inside the HANDLER bucket. HANDLER's per-event cost
+             * is what the map divides by an instruction count to price a single guest
+             * instruction, and a chunk of 256 landing in it would corrupt exactly that
+             * figure. The fast path's own overhead falls to LOOP instead, where it is
+             * legible: LOOP is 0.51 % after probe subtraction today, so a post-change
+             * capture in which LOOP has grown is unambiguously this and nothing else. The
+             * guest stores it performs still pass through the WRITE bracket normally. */
+            {
+               int z3660_blk_cyc;
+               if (z3660_blk_run((uae_u16)regs.opcode, &z3660_blk_cyc)) {
+                  cpu_cycles = z3660_blk_cyc;
+               } else {
+                  Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
+                  cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+                  Z3660_PROF_EXIT();
+               }
+            }
 
             // Same IPL/cross-core poll throttle the 030 loop has, and for the same reason:
             // check_uae_int_request() runs z3660_tasks() + ipl_main_read() + (under AMIX)

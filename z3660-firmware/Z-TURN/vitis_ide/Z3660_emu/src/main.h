@@ -121,6 +121,7 @@ typedef struct {
    volatile uint32_t prof_ctl;            // 0xFFFF00D8  CYBERSTORM C1 profiler command word: cmd in bits 15..0, arg in 31..16 (Z3660_PROF_CTL_*). Core1 consumes and clears it in do_specialties(). Inert unless core1 is the PROFILING build.
    volatile uint32_t prof_hz;             // 0xFFFF00DC  CYBERSTORM C1 sampler rate in Hz, read when prof_ctl says ARM (PROF cmd; 1..20000, default 1000)
    volatile uint32_t arm_wall_hz;         // 0xFFFF00E0  ARM global-timer rate in Hz AS RETUNED AT RUNTIME (= counts_per_second, main.c). Core0 publishes it beside arm_freq_code; core1's profiler scales its measured PMU:timer ratio by it. Exists because COUNTS_PER_SECOND is a COMPILE-TIME BSP constant frozen at the 666.67 MHz default while arm_frequency retunes the PLL -- which made every rate the C1 profiler printed low by 1.65x on an 1100 MHz board. 0 = not published (older core0) -> core1 falls back to the constant and says so.
+   volatile uint32_t blk_chunk;           // 0xFFFF00E4  CYBERSTORM C2: iterations of a recognised block idiom (bzero/mcpy/CPUSHL loop) the 040 run loop services per pass. 0 = unset -> the built-in default; 0xFFFFFFFF = OFF (pure passthrough); anything else is the cap, clamped. The rule is z3660_blk.h's z3660_blk_resolve_chunk() and NOTHING else may re-implement it. Unset means DEFAULT, not off, so a core0 built before this field existed still runs the shipped behaviour.
 } SHARED;
 
 enum BOOTMODE{

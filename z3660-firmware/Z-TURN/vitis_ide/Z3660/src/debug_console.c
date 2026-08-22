@@ -31,6 +31,12 @@ int  piscsi_stats_reporting(void);
 #include "core0_stats.h"
 /* CYBERSTORM C1: the profiler command word core0 writes into SHARED.prof_ctl. */
 #include "prof_config.h"
+/* CYBERSTORM C2 rung 0. Included DIRECTLY rather than mirrored into a core0 copy the way
+ * prof_config.h mirrors z3660_prof.h -- z3660_prof.h drags in the emulator's headers and
+ * core0 cannot compile it, but z3660_blk.h is #defines and one static inline over
+ * `unsigned` and nothing else. A mirrored copy would only be a second place for the OFF
+ * sentinel to drift away from the one core1 tests against. */
+#include "../../Z3660_emu/src/uae/z3660_blk.h"
 typedef enum {
    A,
 
@@ -89,6 +95,8 @@ typedef enum {
    PROFR,   PROF_RING,
    PROFZ,   PROF_ZERO,
    PROFO,   PROF_OFF,      /* C2-prep: the lossless stop. See the case below. */
+   /* CYBERSTORM C2 rung 0: the block-idiom fast path. APPEND-ONLY, like everything above. */
+   BLK,     BLOCK_IDIOM,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -150,6 +158,7 @@ const char *command_names[] = {
       "PROFR",   "PROF RING",
       "PROFZ",   "PROF ZERO",
       "PROFO",   "PROF OFF",
+      "BLK",     "BLOCK IDIOM",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -612,6 +621,30 @@ int debug_thread(struct pt *pt)
                   case PROF_ZERO:
                      shared->prof_ctl=Z3660_PROF_CFG_CTL_ZERO;        // buckets, counters and ring
                      xil_printf("PROF ZERO requested (buckets, counters and ring)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case BLK:
+                  case BLOCK_IDIOM:
+                     {  /* CYBERSTORM C2 rung 0. Cycle the chunk cap OFF -> 64 -> 256 -> 1024 -> OFF.
+                        * A cap, not a toggle, because the cap is what bounds interrupt latency
+                        * (the run loop's poll runs once per chunk) -- so the one knob answers
+                        * both "is it on" and "how long a stall will this guest tolerate", and a
+                        * metal session can sweep it against a live workload. The rule that turns
+                        * this word into iterations is z3660_blk.h's z3660_blk_resolve_chunk();
+                        * core1 picks it up at its next knob resync, well under a second. */
+                        uint32_t c=shared->blk_chunk;
+                        if(c==Z3660_BLK_OFF)      c=64;
+                        else if(c==64)            c=256;
+                        else if(c==256)           c=1024;
+                        else if(c==1024)          c=Z3660_BLK_OFF;
+                        else                      c=Z3660_BLK_OFF;   /* unset/anything else */
+                        shared->blk_chunk=c;
+                        if(c==Z3660_BLK_OFF)
+                           xil_printf("BLOCK IDIOM OFF (bzero/mcpy/CPUSHL loops run one guest instruction at a time)\r\n");
+                        else
+                           xil_printf("BLOCK IDIOM %lu iterations/chunk (the interrupt poll runs once per chunk)\r\n",
+                                      (unsigned long)c);
+                     }
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:
@@ -1356,6 +1389,7 @@ void debug_console_help(void)
    xil_printf("'PROFD'   dumps stage buckets + counters (~40 lines)\r\n");
    xil_printf("'PROFR'   dumps the newest 4096 PC samples (~8 s of serial); 'PROF RING' dumps all 65535 (~2 min)\r\n");
    xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
+   xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

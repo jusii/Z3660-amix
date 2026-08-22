@@ -126,7 +126,12 @@ extern "C" void test_write_32(unsigned int a, unsigned int v){ hram_poke32(a, v)
  *  Misc board seams (chipset / IPL / reset / debug) — inert on host
  * ===================================================================== */
 extern "C" int  intlev(void){ return -1; }            /* no pending interrupt */
-extern "C" void ipl_main_read(void){ }
+/* The run loop's interrupt poll passes through here, so counting it is how the harness
+ * measures YIELD GRANULARITY -- how often the block-idiom fast path (CYBERSTORM C2) hands
+ * control back to the tail. A claim like "the poll still runs at its normal cadence" is
+ * otherwise unfalsifiable; this makes it a number. */
+unsigned long harness_ipl_polls = 0;
+extern "C" void ipl_main_read(void){ harness_ipl_polls++; }
 extern "C" void cpu_emulator_reset_core0(void){ }
 extern "C" void z3660_printf(const TCHAR *fmt, ...){ va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); }
 void z3660_tasks(void){ }

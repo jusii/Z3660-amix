@@ -33,6 +33,10 @@ uae_u16  hram_peek16(uae_u32 addr);
 uae_u8   hram_peek8 (uae_u32 addr);
 uae_u8  *hram_base(void);                  /* raw buffer pointer */
 
+/* Times the run loop's interrupt poll (check_uae_int_request -> ipl_main_read) has run.
+ * The yield-granularity measurement for the C2 block-idiom fast path. */
+extern unsigned long harness_ipl_polls;
+
 #ifdef __cplusplus
 }
 #endif

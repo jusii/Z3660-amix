@@ -39,7 +39,7 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    "IPAGE_HIT", "IPAGE_MISS", "DPAGE_RHIT", "DPAGE_RMISS",
    "DPAGE_WHIT", "DPAGE_WMISS", "XLATE", "XLATE_OK", "ATC_MISS",
    "MISALIGN_R", "MISALIGN_W", "FAULTS", "TRANSITIONS", "STACK_OVF",
-   "ATC_HIT", "IFETCH_CALLS"
+   "ATC_HIT", "IFETCH_CALLS", "BLK_HIT", "BLK_INSNS", "BLK_BYTES"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
