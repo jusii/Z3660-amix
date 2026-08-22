@@ -504,11 +504,26 @@ enum {
 /* THE THREE `BLK_` COUNTERS ARE THE UTILISATION VERDICT, and they are three rather than
  * one because each answers a different way for the change to disappoint.
  *
- * `BLK_INSNS / INSNS` is the share of the guest instruction stream the recognizer
- * actually took. The map predicts 22.07 % of an AMIX boot for stage A alone and 31.80 %
- * for A+B+C; a metal capture that shows 2 % is a recognizer that is not firing where the
- * profile says the time is, and the map is explicit that the first thing to check then is
- * the TRIGGER, not the host operation.
+ * `BLK_INSNS` is the guest instructions the recognizer took, and TURNING IT INTO A SHARE
+ * NEEDS ONE CORRECTION THAT THE OBVIOUS ARITHMETIC GETS WRONG. `INSNS` counts
+ * instructions retired through the run-loop TAIL, and the fast path runs a whole chunk
+ * per pass of that loop -- so a chunk contributes 1 to `INSNS` while contributing
+ * 2 x chunk (3 x for stage C) to `BLK_INSNS`. `BLK_INSNS` is therefore NOT a subset of
+ * `INSNS`, and the literal ratio is not a share of anything. The guest stream is
+ *
+ *     (INSNS - BLK_HIT) + BLK_INSNS
+ *
+ * and the share is `BLK_INSNS` over that. The 2026-08-22 metal boot reads 37.25 % that
+ * way and 59.28 % the literal way, against a map prediction of 31.80 % -- so the literal
+ * ratio does not merely inflate the answer, it puts it outside the range in which the
+ * prediction could be judged at all. The reconstruction cross-checks: it puts that boot
+ * at 286.27 M guest instructions against the pre-change capture's directly measured
+ * 276.65 M, 3.5 % apart, the same workload counted two ways.
+ *
+ * The map predicts 22.07 % of an AMIX boot for stage A alone and 31.80 % for A+B+C; a
+ * metal capture that shows 2 % is a recognizer that is not firing where the profile says
+ * the time is, and the map is explicit that the first thing to check then is the TRIGGER,
+ * not the host operation.
  *
  * `BLK_INSNS / BLK_HIT` is the mean chunk length, and it is what separates "firing" from
  * "firing usefully". The fast path pays its recognizer test once per chunk, so a mean of

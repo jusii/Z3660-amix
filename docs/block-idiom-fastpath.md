@@ -127,10 +127,23 @@ the pre-change image.
 
 Profiling build only, appended counter ids 21–23, reported by `PROFD`.
 
-- **`BLK_INSNS / INSNS`** — the share of the guest instruction stream the recognizer took.
-  The map predicts 22.07 % of a boot for stage A alone, 31.80 % for A+B+C. *A capture that
-  shows 2 % is a recognizer not firing where the profile says the time is, and the first
-  thing to check is the trigger, not the host operation.*
+- **`BLK_INSNS`** — the guest instructions the recognizer took. The map predicts 22.07 % of a
+  boot for stage A alone, 31.80 % for A+B+C. *A capture that shows 2 % is a recognizer not
+  firing where the profile says the time is, and the first thing to check is the trigger, not
+  the host operation.*
+
+  **Do not compute the share as `BLK_INSNS / INSNS`.** `INSNS` counts instructions retired
+  through the run-loop *tail*, and the fast path runs a whole chunk per pass of that loop — so
+  a chunk contributes **1** to `INSNS` while contributing `2 × chunk` (`3 ×` for stage C) to
+  `BLK_INSNS`. `BLK_INSNS` is not a subset of `INSNS`. The guest stream is
+
+      (INSNS − BLK_HIT) + BLK_INSNS
+
+  and the share is `BLK_INSNS` over that. The 2026-08-22 boot reads **37.25 %** that way and
+  59.28 % the literal way, against a prediction of 31.80 % — the literal ratio does not merely
+  inflate the answer, it puts it outside the range in which the prediction could be judged.
+  The reconstruction cross-checks: 286.27 M guest instructions against the pre-change
+  capture's directly measured 276.65 M, 3.5 % apart, the same workload counted two ways.
 - **`BLK_INSNS / BLK_HIT`** — the mean chunk length, which separates "firing" from "firing
   usefully". A mean near 2 means the recognizer's test is being paid per iteration and the
   whole saving is gone. Healthy is the high hundreds; never below ~8.
@@ -153,9 +166,52 @@ From the map §11.1, at its stated 80 % reclaim:
 | dhrystone | 4486 | **~4543** | **~4862** |
 | raw disk read | ~797–829 kB/s | **~844 kB/s** | **~925 kB/s** |
 
+> **Measured 2026-08-22, for the reader who arrives after the verdict.** Boot HIT (−43.6 %
+> on the AMIX phase, −29.9 % on the operator-latency-free window, scaling 163.8 s to
+> ~114.9 s and beating the A+B+C target). Dhrystone MISS: **−0.8 %** against a
+> pre-registered **+8.4 %** — the recognizer's per-dispatch test is paid across the whole
+> stream and dhrystone's hot loop contains no block idiom, so the 10.4 % it does catch
+> cannot repay it. Raw disk read: no effect, and unjudgeable besides — its pre-registered
+> baseline was taken on the profiling build, not the lean one. **The dhrystone tax is what
+> rung 1's cached idiom verdict is designed to give back**; see
+> `docs/decoded-op-cache.md`.
+
 Plus the bench guard, which is the stronger check because it says the time went away *from
-the place the map said it was*: re-take the boot profile and **`bzero`'s share must fall
-below 3 %**.
+the place the map said it was*: re-take the boot profile and check `bzero`'s share of the
+boot.
+
+### The threshold, corrected — it was arithmetically impossible against its own model
+
+**The original guard said "below 3 %", and no correct implementation of this design could
+ever have passed it.** The model it is drawn from is an 80 % reclaim of a 22.08 % share, and
+22.08 % × (1 − 0.80) = **4.42 %**. A *perfectly* successful change, exactly as this document
+models it, lands at 4.42 % and fails a 3 % gate. The threshold was the thing that was wrong,
+not the change — 3 % implies an 86.4 % reclaim, which is above the 80 % every other number
+on this page is derived from.
+
+The 2026-08-22 metal capture landed at **4.46 % of busy boot time**, a **79.8 % reclaim**,
+confirming the 80 % model to within 0.2 points — and was scored a MISS, because the
+pre-registration is the pre-registration.
+
+**The corrected guard is `bzero` below 5 % of BUSY boot time**, and both halves of that
+sentence are load-bearing:
+
+| threshold | implied reclaim | verdict |
+|---|---|---|
+| 3 % (original) | 86.4 % | unreachable — above the document's own model |
+| 4.42 % | 80.0 % | the model exactly; no tolerance at all |
+| **5 %** | **77.4 %** | the model with ~3 points of headroom |
+
+At 5 % the guard still fails a reclaim below 77 %, which is a real test of the 80 % claim,
+while a correct implementation passes it with margin rather than by luck.
+
+**"Busy" is the second correction and it is not a detail.** A boot ring contains idle
+samples — `swtch` + `idle` were 8.47 % of the post-change capture — and a share taken over
+the whole ring is diluted by however much idle the boot happened to contain, which is not a
+property of the change. The same capture reads **4.08 % of the ring** and **4.46 % of busy
+time**; against a 5 % gate they agree, but a guard that does not say which it means can be
+made to pass by a slower boot. **Compute the share over busy samples, with `swtch` and
+`idle` excluded, and say so in the capture.**
 
 **A result below the stage-A boot figure means the recognizer is not firing where the
 profile says the time is.** Check `BLK_INSNS / INSNS` first, and then the trigger.
