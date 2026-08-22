@@ -99,6 +99,7 @@ static int       z3660_prof_probecyc = -1;  /* cost of ONE transition, not of a 
  * wrong landing model, and the ratio between these two is exactly what says which. */
 static uint32_t  z3660_prof_cal_armed;      /* PAIRS enter/exit with the buckets armed  */
 static uint32_t  z3660_prof_cal_unarmed;    /* ...the identical loop, buckets off       */
+static uint32_t  z3660_prof_cal_empty;      /* ...the same loop with NO calls at all    */
 static int       z3660_prof_inited;
 
 /* Span bookkeeping. cyc_base extends PMCCNTR to 64 bits by accumulating the delta at
@@ -358,6 +359,54 @@ static void z3660_prof_calibrate_probe(void)
    }
    u1 = z3660_prof_cycles();
 
+   /* THE THIRD PASS: the same loop with NO CALLS IN IT (C2 riding item a).
+    *
+    * Two prices are defensible here and they answer different questions, and until this
+    * pass existed neither could be computed from the boot line:
+    *
+    *   MARGINAL      (armed - unarmed) / 2N. The probe BODIES: the PMCCNTR read, the
+    *                 64-bit accumulate, the transition counter, the stack push/pop, the
+    *                 timestamp store. This is what disappears if `PROFB` gates the bodies
+    *                 off, and it is the figure this build reports and subtracts.
+    *   IN-BUCKET     (armed - empty) / 2N. The bodies PLUS the call scaffolding -- the
+    *                 `bl`, the prologue, the `if (!bucket_on)` predicate, the epilogue and
+    *                 the `bx lr`. Every one of those instructions is also inside a bucket,
+    *                 because enter() reads the cycle counter at its FIRST line and stamps
+    *                 `last` with that reading, so its own epilogue and the following call
+    *                 into exit() are charged to the bucket that was just entered, and
+    *                 exit()'s epilogue is charged to the parent. This is the price if the
+    *                 instrumentation calls go away entirely.
+    *
+    * The empty loop isolates the ONE term that belongs to neither: the `for` compare,
+    * branch and increment, which exist only in this calibration and never in the
+    * interpreter. Without it, `unarmed` conflates the call scaffolding (real, and inside
+    * the buckets) with the loop scaffolding (an artefact of measuring), and the in-bucket
+    * price cannot be computed at all.
+    *
+    * WHY THIS MATTERS, concretely: the 2026-08-22 metal capture read armed 89894 /
+    * unarmed 22623 over 1024 pairs, so the marginal price was 32.85 and the whole armed
+    * call was 43.89 cyc/transition. The C2 map compared 32 against a floor of 45.5 and
+    * called it an undershoot -- but 45.5 is v1's 91 cyc/PAIR halved, and v1's 91 was
+    * measured with the probes INLINED and timed the whole loop. It is a whole-cost,
+    * inlined quantity, and 32 is a marginal, out-of-line one. They are not the same
+    * measurement and neither is a bound on the other. What the third pass establishes is
+    * the bracket both ends of which are now MEASURED, and the consequence: even the
+    * in-bucket price sits below the 50.59 at which the map's span exhausts `LOOP`, so
+    * "LOOP is empty" does not follow from this instrument at any defensible price.
+    *
+    * The volatile asm keeps the loop from being optimised out without adding work to it. */
+   {
+      uint32_t e0, e1;
+      e0 = z3660_prof_cycles();
+      for (i = 0; i < Z3660_PROF_CAL_PAIRS; i++) {
+#if defined(__GNUC__)
+         __asm__ __volatile__("" ::: "memory");
+#endif
+      }
+      e1 = z3660_prof_cycles();
+      z3660_prof_cal_empty = (uint32_t)(e1 - e0);
+   }
+
    armed   = (uint32_t)(a1 - a0);
    unarmed = (uint32_t)(u1 - u0);
    z3660_prof_cal_armed   = armed;
@@ -487,11 +536,21 @@ extern "C" void z3660_prof_init(void)
     * both terms to say so. The unarmed span is the call, the predicate and the loop
     * scaffolding -- all of which SURVIVE in the machine the probe subtraction is meant to
     * leave behind, which is why they are no longer inside the price. */
-   z3660_printf("[PROF] probe calibration: armed %lu cyc, unarmed %lu cyc, %u pairs "
-                "-> %d cyc/transition marginal\r\n",
+   z3660_printf("[PROF] probe calibration: armed %lu cyc, unarmed %lu cyc, empty %lu cyc, "
+                "%u pairs -> %d cyc/transition marginal, %d in-bucket\r\n",
                 (unsigned long)z3660_prof_cal_armed,
                 (unsigned long)z3660_prof_cal_unarmed,
-                (unsigned)Z3660_PROF_CAL_PAIRS, z3660_prof_probecyc);
+                (unsigned long)z3660_prof_cal_empty,
+                (unsigned)Z3660_PROF_CAL_PAIRS, z3660_prof_probecyc,
+                z3660_prof_probe_cyc_in_bucket());
+   /* The two prices, side by side, because a capture priced at one of them and read as if
+    * it were the other is exactly the confusion the C2 map's "45.5 floor" came out of.
+    * MARGINAL is what this build subtracts; IN-BUCKET is what a reader who wants the
+    * lean interpreter's shares should sweep to. Neither is a correction of the other. */
+   z3660_printf("[PROF] price bracket: %d (bodies only, what PROFB gates) .. %d (bodies + "
+                "the call scaffolding, which is inside the buckets too) cyc/transition -- "
+                "sweep it, do not pick\r\n",
+                z3660_prof_probecyc, z3660_prof_probe_cyc_in_bucket());
 }
 
 extern "C" void z3660_prof_zero(void)
@@ -550,10 +609,25 @@ extern "C" void z3660_prof_set_buckets(int on)
 extern "C" unsigned z3660_prof_cpu_hz(void)  { return z3660_prof_cpuhz; }
 extern "C" unsigned z3660_prof_wall_hz(void) { return z3660_prof_wallhz; }
 extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return z3660_prof_probecyc; }
-extern "C" void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed)
+extern "C" void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed,
+                                              uint32_t *empty)
 {
    if (armed)   *armed   = z3660_prof_cal_armed;
    if (unarmed) *unarmed = z3660_prof_cal_unarmed;
+   if (empty)   *empty   = z3660_prof_cal_empty;
+}
+/* The other end of the bracket: bodies PLUS the call scaffolding that shares their span.
+ * Clamped at the marginal figure rather than allowed to go below it -- on a host with a
+ * frozen or coarse clock the empty span can measure larger than it is, and a price below
+ * the marginal one would be arithmetic nonsense rather than a measurement. */
+extern "C" int      z3660_prof_probe_cyc_in_bucket(void)
+{
+   uint32_t span;
+   int v;
+   if (z3660_prof_cal_armed <= z3660_prof_cal_empty) return z3660_prof_probecyc;
+   span = z3660_prof_cal_armed - z3660_prof_cal_empty;
+   v = (int)(span / (2u * Z3660_PROF_CAL_PAIRS));
+   return (v < z3660_prof_probecyc) ? z3660_prof_probecyc : v;
 }
 extern "C" int      z3660_prof_present(void) { return 1; }
 
@@ -832,8 +906,9 @@ extern "C" void     z3660_prof_poll_cmd(void)        { }
 extern "C" unsigned z3660_prof_cpu_hz(void)          { return 0; }
 extern "C" unsigned z3660_prof_wall_hz(void)         { return 0; }
 extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return -1; }
-extern "C" void     z3660_prof_probe_cal_spans(uint32_t *a, uint32_t *u)
-                                                     { if (a) *a = 0; if (u) *u = 0; }
+extern "C" int      z3660_prof_probe_cyc_in_bucket(void)       { return -1; }
+extern "C" void     z3660_prof_probe_cal_spans(uint32_t *a, uint32_t *u, uint32_t *e)
+                                                     { if (a) *a = 0; if (u) *u = 0; if (e) *e = 0; }
 extern "C" int      z3660_prof_present(void)         { return 0; }
 
 #endif /* Z3660_EMU_PROF */

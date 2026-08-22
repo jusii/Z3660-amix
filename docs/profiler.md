@@ -359,23 +359,91 @@ the hit counter beside it that was not.
    quantity `TRANSITIONS × probe_cyc` is meant to name. Both spans are now printed on the
    boot line:
 
-       [PROF] probe calibration: armed <n> cyc, unarmed <n> cyc, 1024 pairs -> <n> cyc/transition marginal
+       [PROF] probe calibration: armed <n> cyc, unarmed <n> cyc, empty <n> cyc, 1024 pairs -> <n> cyc/transition marginal, <n> in-bucket
+       [PROF] price bracket: <n> (bodies only, what PROFB gates) .. <n> (bodies + the call scaffolding, which is inside the buckets too) cyc/transition -- sweep it, do not pick
 
    so the subtraction can be checked rather than taken on faith. The host harness asserts
    the arithmetic exactly against the injectable clock (`test_prof_probe_calibration`):
    armed span `= STEP × (2·PAIRS + 1)`, unarmed `= STEP`, difference over `2·PAIRS` `=
    STEP` on the nose.
 
-   **A prediction, stated in advance so that it can be wrong.** The terms removed are one
-   call, one predicate and three or four loop instructions, so the reported figure should
-   fall by roughly 8–14 cycles — from 59 into the 45–51 region, at or below the 50.59 at
-   which `LOOP` is exhausted, and close to the **50** the C2 map independently picked as
-   the highest price at which every bucket stays positive. If instead the figure barely
-   moves, the price was never the problem and the *landing model* is; that is the other
-   half of map §10.3 and it is **not** settled here. (The map's leading candidate for it —
-   that the shared ifetch bracket is entered fewer times than `FETCH` counts — is refuted
-   by the source: all five `Z3660_PROF_ENTER_IFETCH` sites increment `FETCH` exactly once,
-   so `IFETCH_CALLS == FETCH` identically. The new counter id 20 makes a capture say so.)
+   **The prediction was stated in advance so that it could be wrong, and it was wrong.**
+   It said the reported figure should fall by roughly 8–14 cycles, from 59 into the 45–51
+   region. Metal 2026-08-22 came back at **32** — armed 89894, unarmed 22623, 1024 pairs,
+   `(89894 − 22623) / 2048 = 32.85`, self-consistent and a fall of 27 cycles, not 8–14.
+   See *the price bracket* (2c) immediately below for what that means and what a capture should
+   actually be priced at; the short version is that **45.5 was never a floor for this
+   quantity**, and the third calibration pass added for it now measures both ends of the
+   range instead of predicting one.
+
+   (The landing-model half of map §10.3 remains open either way. The map's leading
+   candidate for it — that the shared ifetch bracket is entered fewer times than `FETCH`
+   counts — is refuted by the source: all five `Z3660_PROF_ENTER_IFETCH` sites increment
+   `FETCH` exactly once, so `IFETCH_CALLS == FETCH` identically. The new counter id 20
+   makes a capture say so.)
+
+   **2c. The price bracket — what a capture should actually be priced at.**
+
+   **The 45.5 floor and the 32 measurement are not the same quantity, and neither bounds the
+   other.** 45.5 is v1's `91 cyc/pair` halved. v1's 91 was measured with the probes **inlined**
+   and timed the **whole** loop — a whole-cost, inlined number. 32 is a **marginal**,
+   **out-of-line** number: the difference between two identical loops that differ only in the
+   `z3660_prof_bucket_on` bit. Comparing them is comparing a total against a difference, and
+   "32 is below 45.5, so the subtraction now under-corrects" does not follow.
+
+   Nor is the unarmed loop compiling differently, which is the other thing worth ruling out
+   explicitly: `z3660_prof_probe_call_enter/_exit` are `noinline` and the flag is a global read
+   **inside the callee**, so both passes execute the *same machine code at the same addresses*.
+   The only difference is a branch outcome inside the callee — and the memory traffic and the
+   `PMCCNTR` coprocessor read that the taken arm performs, which are the probe body and belong
+   in the figure.
+
+   What *is* true is that the marginal figure is not the whole of what the probes put inside
+   the buckets, and the reason is the order inside `enter()`:
+
+   ```
+   z3660_prof_enter():   now = z3660_prof_cycles();   <-- the span for the entered bucket starts HERE
+                         acc[cur] += now - last;  TRANSITIONS++;  push;  cur = bucket;
+                         last = now;                   <-- stamped with the PRE-body reading
+                         <epilogue, bx lr>              <-- still inside the entered bucket's span
+                         ... the accessor's real work ...
+                         <bl exit, prologue, if (!bucket_on)>   <-- also inside it
+   z3660_prof_exit():    now = z3660_prof_cycles();   <-- the span ends HERE
+   ```
+
+   So `enter()`'s epilogue and return, and the `bl`/prologue/predicate on the way into
+   `exit()`, are **inside a bucket** and are **absent from the marginal difference**, because
+   they are identical in the armed and unarmed passes. Symmetrically, `exit()`'s own body and
+   epilogue land in the *parent* bucket. Every instruction of the pair lands in some bucket;
+   only some of them are in the marginal price.
+
+   Hence the third calibration pass, added 2026-08-23: **the same loop with no calls in it at
+   all**. It isolates the one term that belongs to neither — the `for` compare, branch and
+   increment, which exist in this calibration and nowhere in the interpreter — and turns
+   `unarmed` from a single conflated number into two separable ones:
+
+   | quantity | arithmetic | what it names | metal 2026-08-22 |
+   |---|---|---|---|
+   | **marginal** | `(armed − unarmed) / 2N` | the probe **bodies**: the `PMCCNTR` read, the 64-bit accumulate, `TRANSITIONS++`, the stack push/pop, the timestamp store. What `PROFB` gates off. | **32.8** |
+   | call scaffolding | `(unarmed − empty) / 2N` | the `bl`, prologue, predicate, epilogue and `bx lr` — inside the buckets, and still there when the bodies are gone | ~9.8 (est.) |
+   | **in-bucket** | `(armed − empty) / 2N` | bodies **plus** scaffolding: the price if the instrumentation calls go away entirely | ~**42.6** (est.) |
+   | whole armed call | `armed / 2N` | everything the armed loop pays, loop scaffolding included | 43.9 |
+
+   (The three metal figures marked *est.* are reconstructed from `armed`/`unarmed` and a
+   1–1.5 cyc/transition allowance for the loop scaffolding; the next capture measures `empty`
+   directly and replaces them.)
+
+   **What to price a capture at: sweep `[marginal, in-bucket]`, exactly as the C2 map swept
+   50 → 59, and report the range.** Do not pick an end, and do not treat one as a correction of
+   the other — the marginal figure is right for "the prof build with the probe bodies gated
+   off", the in-bucket figure is right for "the prof build without the instrumentation calls",
+   and the map's readers usually want the second while the firmware subtracts the first.
+
+   **And one consequence that matters to the C2 map.** Even the *upper* end of the bracket,
+   and even the whole armed call at 43.9, sit **below** the 50.59 at which the map's span
+   exhausts `LOOP` and the 54.11 at which it exhausts `TAILADV`. So §8.3's conclusion that
+   "`LOOP` is empty" is reached at a price this instrument does not support at either end.
+   `LOOP`'s share is small but it is not established to be zero, and the C2 map should say so.
 3. **A guest page fault is a C++ throw** and unwinds past every pending probe exit. The
    `CATCH` charges the abandoned span to `FAULT` and resets the phase stack. `FAULT` is
    therefore "the fault path plus a fragment of whatever stage it interrupted" —
@@ -470,6 +538,14 @@ they **asked for**. The discriminator is the boot line the profiling image print
 
 ```
 [PROF] profiling build v2: ARM clock 1100000000 Hz (clk=cfg, PMU:wall 2.00), probe 46 cyc/transition (92 cyc/pair), ring 65536 x 8 B
+```
+
+The two calibration lines follow it and are part of the same record — the second one is new
+as of 2026-08-23 and is what a capture should be priced against (§2c):
+
+```
+[PROF] probe calibration: armed 89894 cyc, unarmed 22623 cyc, empty <n> cyc, 1024 pairs -> 32 cyc/transition marginal, <n> in-bucket
+[PROF] price bracket: 32 .. <n> cyc/transition -- sweep it, do not pick
 ```
 
 No `[PROF]` reply to a command means core1 is not the profiling image.
@@ -725,16 +801,20 @@ a different flash, which is what makes the deltas trustworthy.
 > transitions × 91 cyc)`. The 91 was cycles per *pair* against a per-*transition* count, so
 > the true share was 41.33 %; and the 91 itself was measured with the probes *inlined*,
 > where production calls them, so it was also an under-estimate of the real per-call price.
-> v2 reports cycles per transition, calibrated out of line — expect a number **above** 45.5
-> and **below** roughly 58, the point at which `LOOP`'s corrected share reaches zero.
+> v2 reports cycles per transition, calibrated out of line. The band this paragraph used to
+> quote — "above 45.5 and below roughly 58" — **has been withdrawn**: 45.5 is v1's
+> `91 cyc/pair` halved, and v1's 91 was measured with the probes *inlined* and timed the
+> whole loop, so it is a whole-cost inlined quantity and not a floor for a marginal
+> out-of-line one. See **bias note 2c, the price bracket**, above.
 >
-> **The first v2 metal calibration came back at 59 — above that band, and above the 50.59
-> at which the C2 span exhausts `LOOP` — and the band was right.** The calibration was
-> timing the armed loop alone and charging the call, the predicate and the loop
-> scaffolding to the probe, all of which stay in the machine the subtraction leaves
-> behind. It now differences the armed loop against the identical unarmed one; see bias
-> note 2's *marginal cost* paragraph for the arithmetic and for the pre-registered
-> expectation (45–51) that the next metal capture will confirm or refute.
+> **The first v2 metal calibration came back at 59**, above the 50.59 at which the C2 span
+> exhausts `LOOP`, because it was timing the armed loop alone and charging the call, the
+> predicate and the loop scaffolding to the probe — all of which stay in the machine the
+> subtraction leaves behind. It now differences the armed loop against the identical
+> unarmed one and came back at **32** (metal 2026-08-22), a fall of 27 rather than the
+> predicted 8–14. A third pass over the same loop with no calls in it now measures the
+> other end of the bracket too, so a capture can be swept across `[marginal, in-bucket]`
+> instead of priced at a number chosen from one end.
 > Also note that both the v1 header example and this document once showed `11` cyc where
 > metal measured `91`: anyone sizing bucket inflation from the documented example would
 > have understated it ~8×. The examples in this file are now taken from real metal output.

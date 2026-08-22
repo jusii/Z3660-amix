@@ -935,7 +935,32 @@ int      z3660_prof_probe_cyc_per_transition(void);
  * figure came back at 59 cyc/transition, above the point at which the C2 map's subtraction
  * stops being arithmetically possible. Reported on the boot line so a reader can check the
  * subtraction rather than take the quotient on faith. Both 0 in a non-profiling build. */
-void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed);
+void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed, uint32_t *empty);
+/* The OTHER end of the price bracket, and the C2 riding item that put it here.
+ *
+ * The marginal figure above is the probe BODIES. It is not the whole of what the probes
+ * put inside the buckets, because enter() reads the cycle counter at its FIRST line and
+ * stamps `last` with that reading -- so its own epilogue, its `bx lr`, the caller's `bl`
+ * into exit() and exit()'s prologue and predicate all fall INSIDE the span charged to the
+ * bucket just entered, and exit()'s epilogue falls inside the parent's. Those are call
+ * scaffolding: identical in the armed and unarmed passes, therefore absent from the
+ * marginal difference, and present in the buckets all the same.
+ *
+ * `empty` -- a third pass over the same loop with no calls in it at all -- separates the
+ * scaffolding that is real (the calls, inside the buckets) from the scaffolding that is
+ * an artefact of measuring (the `for` compare and branch, which exist nowhere in the
+ * interpreter). (armed - empty) / 2N is then the price if the instrumentation calls go
+ * away entirely, which is the question a reader who wants the LEAN interpreter's shares
+ * is actually asking.
+ *
+ * WHICH TO USE: the marginal figure is what this build subtracts, and it is correct for
+ * what it names. A map that wants the lean machine should SWEEP the bracket [marginal,
+ * in-bucket] exactly as the C2 map swept 50->59, and report the range. Do not treat
+ * either end as a correction of the other; they answer different questions. And do not
+ * compare either against 45.5: that number is v1's 91 cyc/PAIR halved, and v1's 91 was
+ * measured with the probes INLINED and timed the whole loop, so it is a whole-cost,
+ * inlined quantity that neither of these is a bound on. -1 in a non-profiling build. */
+int      z3660_prof_probe_cyc_in_bucket(void);
 int      z3660_prof_present(void);              /* 1 in a profiling build, else 0        */
 
 #ifdef __cplusplus

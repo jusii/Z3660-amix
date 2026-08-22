@@ -3204,8 +3204,8 @@ static void test_prof_probe_calibration(void)
 	 * difference over 2*PAIRS is STEP on the nose. The old single-pass formula landed on
 	 * the same integer only because the excess 1/2048 rounded away. */
 	{
-		uae_u32 armed = 0, unarmed = 0;
-		z3660_prof_probe_cal_spans(&armed, &unarmed);
+		uae_u32 armed = 0, unarmed = 0, empty = 0;
+		z3660_prof_probe_cal_spans(&armed, &unarmed, &empty);
 		CHECK(armed > unarmed,
 		      "the armed pass costs more than the identical unarmed one\n");
 		CHECK_EQ32(armed, STEP * (2 * 1024 + 1),
@@ -3215,6 +3215,29 @@ static void test_prof_probe_calibration(void)
 		           "the clock read, so the calls and the loop are timed but the BODY is not");
 		CHECK_EQ32((armed - unarmed) / (2 * 1024), STEP,
 		           "the DIFFERENCE over 2*PAIRS is the marginal per-transition cost, exactly");
+
+		/* THE THIRD SPAN (C2 riding item a): the same loop with no calls in it, which is
+		 * what separates the call scaffolding -- real, and inside the buckets, because
+		 * enter() stamps `last` before its own epilogue runs -- from the `for` loop's own
+		 * compare and branch, which exist only in this calibration.
+		 *
+		 * On the host both the unarmed and the empty pass make exactly the two bracketing
+		 * clock reads and nothing else, so they measure the SAME span; the in-bucket price
+		 * therefore collapses onto the marginal one here, and the clamp is what makes that
+		 * the reported answer instead of a spurious difference. On metal the two differ by
+		 * the call scaffolding and the bracket opens. What is testable here is the
+		 * ORDERING and the arithmetic, and those are the things that would silently
+		 * invert if a future edit moved the cycle read inside enter(). */
+		CHECK_EQ32(empty, STEP,
+		           "empty span == the two bracketing reads: an uncalled loop reads no clock");
+		CHECK(armed >= unarmed && unarmed >= empty,
+		      "the three spans are ordered armed >= unarmed >= empty\n");
+		CHECK_EQ32((uae_u32)z3660_prof_probe_cyc_in_bucket(),
+		           (uae_u32)z3660_prof_probe_cyc_per_transition(),
+		           "with no measurable call scaffolding the bracket is a point, and the "
+		           "in-bucket price clamps to the marginal one rather than going below it");
+		CHECK((armed - empty) / (2 * 1024) >= (armed - unarmed) / (2 * 1024),
+		      "the in-bucket price can never be BELOW the marginal one\n");
 	}
 
 	/* The other half of the fix, and the one that made LOOP's share a bracket rather
