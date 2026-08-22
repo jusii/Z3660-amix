@@ -3171,6 +3171,39 @@ static void test_prof_probe_calibration(void)
 	CHECK(z3660_prof_probe_cyc_per_transition() != (int)(2 * STEP),
 	      "...and NOT at 128 -- which is what dividing a pair-batch by the pair count gives\n");
 
+	/* THE THIRD UNIT ERROR (C2 riding item c): the price must be the MARGINAL cost of an
+	 * armed transition, not the cost of the whole call.
+	 *
+	 * The map found 59 cyc/transition arithmetically impossible -- at 59 the subtraction
+	 * demands 4.2 G cycles that LOOP and TAILADV do not contain, and both clamp. LOOP is
+	 * exhausted at 50.59 and TAILADV at 54.11, so 59 is above the whole usable range and
+	 * above the 45.5-58 band this firmware's own docs predicted. The cause is that the
+	 * calibration used to time the armed loop ALONE and charge the `bl`, the prologue, the
+	 * `if (!bucket_on)` test and the for-loop scaffolding to the probe -- all of which
+	 * SURVIVE in the machine the subtraction is meant to leave behind (map §10.1: probe
+	 * subtraction removes the probe BODIES; the instrumented accessors' out-of-line calls
+	 * stay, and docs/profiler.md prices those separately at -23.2 %). Subtracting them as
+	 * probe and leaving them in the machine is a double count.
+	 *
+	 * So the two spans are timed and differenced. The injectable clock makes that exact
+	 * rather than approximate: it advances on every READ, the armed pass makes 2*PAIRS
+	 * reads plus its two bracketing ones, the unarmed pass makes only the two, and the
+	 * difference over 2*PAIRS is STEP on the nose. The old single-pass formula landed on
+	 * the same integer only because the excess 1/2048 rounded away. */
+	{
+		uae_u32 armed = 0, unarmed = 0;
+		z3660_prof_probe_cal_spans(&armed, &unarmed);
+		CHECK(armed > unarmed,
+		      "the armed pass costs more than the identical unarmed one\n");
+		CHECK_EQ32(armed, STEP * (2 * 1024 + 1),
+		           "armed span == one clock read per transition, plus the two bracketing reads");
+		CHECK_EQ32(unarmed, STEP,
+		           "unarmed span == the two bracketing reads only: enter/exit return before "
+		           "the clock read, so the calls and the loop are timed but the BODY is not");
+		CHECK_EQ32((armed - unarmed) / (2 * 1024), STEP,
+		           "the DIFFERENCE over 2*PAIRS is the marginal per-transition cost, exactly");
+	}
+
 	/* The other half of the fix, and the one that made LOOP's share a bracket rather
 	 * than a number: the probes are called, not inlined, during calibration. A frozen
 	 * clock cannot time that, but it CAN show the calibration went through the real

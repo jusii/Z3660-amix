@@ -93,6 +93,11 @@ static uint32_t  z3660_prof_wallhz;    /* global-timer rate ACTUALLY in force   
 static uint32_t  z3660_prof_clksrc = Z3660_PROF_CLK_BSP;  /* ...and where it came from */
 static uint32_t  z3660_prof_ratio_q8; /* measured PMCCNTR:global-timer, x256         */
 static int       z3660_prof_probecyc = -1;  /* cost of ONE transition, not of a pair */
+/* The two spans the per-transition figure is the DIFFERENCE of. Kept rather than
+ * discarded because "59" alone gave the C2 map no way to tell an over-measurement from a
+ * wrong landing model, and the ratio between these two is exactly what says which. */
+static uint32_t  z3660_prof_cal_armed;      /* PAIRS enter/exit with the buckets armed  */
+static uint32_t  z3660_prof_cal_unarmed;    /* ...the identical loop, buckets off       */
 static int       z3660_prof_inited;
 
 /* Span bookkeeping. cyc_base extends PMCCNTR to 64 bits by accumulating the delta at
@@ -277,26 +282,94 @@ static Z3660_PROF_NOINLINE void z3660_prof_probe_call_exit(void)
 
 #define Z3660_PROF_CAL_PAIRS 1024
 
+/* THE THIRD THING IT GETS RIGHT (C2 riding item c): IT MEASURES THE MARGINAL COST OF AN
+ * ARMED TRANSITION, NOT THE COST OF THE WHOLE CALL.
+ *
+ * The C2 map found the v2 figure -- 59 cyc/transition -- arithmetically impossible: at 59
+ * the modelled probe cost exceeds the cycles actually present in `LOOP` by 3.0 G and in
+ * `TAILADV` by 1.2 G, 4.42 % of the whole span with nowhere to go, and the symbolizer
+ * clamps two buckets and says the shares are untrustworthy. Sweeping the price, `LOOP` is
+ * exhausted at 50.59 and `TAILADV` at 54.11, so 59 sits above both. It also sits above the
+ * 45.5-58 band docs/profiler.md predicted for an out-of-line calibration. The map worked
+ * around it by using 50 and bracketing to 59.
+ *
+ * The over-measurement is structural and it is right here. WHAT THE SUBTRACTION IS FOR
+ * (map §10.1, and this file's own contract) is to describe *the prof-build interpreter
+ * with its probe bodies removed*. It is explicitly NOT trying to describe the lean
+ * interpreter: the lean build does not make these out-of-line accessor calls at all, and
+ * docs/profiler.md prices that separately at -23.2 %. But the previous calibration timed
+ * the WHOLE loop -- the `bl`, the prologue, the `if (!z3660_prof_bucket_on)` test, the
+ * epilogue, the `bx lr`, and the for-loop's own compare and branch -- and charged all of
+ * it to the per-transition figure. Every one of those survives in the machine the
+ * subtraction is supposed to leave behind. Subtracting them once as "probe" and having
+ * them still be there is exactly the double count that made the arithmetic impossible.
+ *
+ * So time the SAME loop twice, differing in one bit: `z3660_prof_bucket_on`. Unarmed, the
+ * calls still happen, the branch is still predicted, the loop scaffolding is still paid --
+ * and enter/exit return at their first line, before the cycle read. The difference is the
+ * probe BODY and nothing else: the PMCCNTR read, the 64-bit accumulate, the transition
+ * counter, the stack push/pop and the timestamp store. That is the quantity `TRANSITIONS x
+ * probe_cyc` is meant to name.
+ *
+ * The host harness proves the arithmetic exactly rather than approximately, which is why
+ * the injectable clock exists. z3660_prof_host_cycles advances by `step` on every READ:
+ * the armed pass makes 2*PAIRS reads plus the two bracketing ones, the unarmed pass makes
+ * only the two, and the difference divided by 2*PAIRS is `step` on the nose -- where the
+ * old single-pass formula came out at step*(2*PAIRS+1)/(2*PAIRS), i.e. right only because
+ * integer division rounded the excess away.
+ *
+ * IF THE DIFFERENCE COMES OUT NON-POSITIVE the old figure is reported unchanged and the
+ * boot line still prints something. A frozen host clock (step 0) is the ordinary case of
+ * that, and it must keep answering 0 rather than underflowing into a huge unsigned. */
 static void z3660_prof_calibrate_probe(void)
 {
    int saved_on = z3660_prof_bucket_on;
-   uint32_t c0, c1;
+   uint32_t a0, a1, u0, u1, armed, unarmed;
    int i;
 
-   z3660_prof_bucket_on = 1;
    z3660_prof_sp = 0;
    z3660_prof_cur = Z3660_PROF_B_LOOP;
    z3660_prof_last = z3660_prof_cycles();
 
-   c0 = z3660_prof_cycles();
+   /* Warm the call sites and the branch predictor so the ARMED pass is not the one that
+    * pays for first touch. Unarmed, so it costs no transitions and no accumulator motion. */
+   z3660_prof_bucket_on = 0;
    for (i = 0; i < Z3660_PROF_CAL_PAIRS; i++) {
       z3660_prof_probe_call_enter();
       z3660_prof_probe_call_exit();
    }
-   c1 = z3660_prof_cycles();
+
+   z3660_prof_bucket_on = 1;
+   z3660_prof_last = z3660_prof_cycles();
+   a0 = z3660_prof_cycles();
+   for (i = 0; i < Z3660_PROF_CAL_PAIRS; i++) {
+      z3660_prof_probe_call_enter();
+      z3660_prof_probe_call_exit();
+   }
+   a1 = z3660_prof_cycles();
+
+   /* Textually the same loop. The ONLY difference is the flag, which is the point. */
+   z3660_prof_bucket_on = 0;
+   u0 = z3660_prof_cycles();
+   for (i = 0; i < Z3660_PROF_CAL_PAIRS; i++) {
+      z3660_prof_probe_call_enter();
+      z3660_prof_probe_call_exit();
+   }
+   u1 = z3660_prof_cycles();
+
+   armed   = (uint32_t)(a1 - a0);
+   unarmed = (uint32_t)(u1 - u0);
+   z3660_prof_cal_armed   = armed;
+   z3660_prof_cal_unarmed = unarmed;
 
    /* 2 x pairs: one transition per enter, one per exit. */
-   z3660_prof_probecyc = (int)(((uint32_t)(c1 - c0)) / (2u * Z3660_PROF_CAL_PAIRS));
+   if (armed > unarmed)
+      z3660_prof_probecyc = (int)((armed - unarmed) / (2u * Z3660_PROF_CAL_PAIRS));
+   else
+      z3660_prof_probecyc = (int)(armed / (2u * Z3660_PROF_CAL_PAIRS));
+
+   z3660_prof_sp = 0;
+   z3660_prof_cur = Z3660_PROF_B_LOOP;
    z3660_prof_bucket_on = saved_on;
 }
 
@@ -408,6 +481,16 @@ extern "C" void z3660_prof_init(void)
       z3660_printf("[PROF] WARNING: clk=bsp -- core0 published no ARM rate, so this is the "
                    "COMPILE-TIME constant. If the board retuned its PLL, every Hz and every "
                    "seconds figure below is wrong by that ratio.\r\n");
+   /* Show the subtraction, not just its result. probe_cyc is now (armed - unarmed) over
+    * 2 x PAIRS, and a reader who suspects the price rather than the landing model needs
+    * both terms to say so. The unarmed span is the call, the predicate and the loop
+    * scaffolding -- all of which SURVIVE in the machine the probe subtraction is meant to
+    * leave behind, which is why they are no longer inside the price. */
+   z3660_printf("[PROF] probe calibration: armed %lu cyc, unarmed %lu cyc, %u pairs "
+                "-> %d cyc/transition marginal\r\n",
+                (unsigned long)z3660_prof_cal_armed,
+                (unsigned long)z3660_prof_cal_unarmed,
+                (unsigned)Z3660_PROF_CAL_PAIRS, z3660_prof_probecyc);
 }
 
 extern "C" void z3660_prof_zero(void)
@@ -466,6 +549,11 @@ extern "C" void z3660_prof_set_buckets(int on)
 extern "C" unsigned z3660_prof_cpu_hz(void)  { return z3660_prof_cpuhz; }
 extern "C" unsigned z3660_prof_wall_hz(void) { return z3660_prof_wallhz; }
 extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return z3660_prof_probecyc; }
+extern "C" void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed)
+{
+   if (armed)   *armed   = z3660_prof_cal_armed;
+   if (unarmed) *unarmed = z3660_prof_cal_unarmed;
+}
 extern "C" int      z3660_prof_present(void) { return 1; }
 
 /* ------------------------------------------------------------------ dumps */
@@ -743,6 +831,8 @@ extern "C" void     z3660_prof_poll_cmd(void)        { }
 extern "C" unsigned z3660_prof_cpu_hz(void)          { return 0; }
 extern "C" unsigned z3660_prof_wall_hz(void)         { return 0; }
 extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return -1; }
+extern "C" void     z3660_prof_probe_cal_spans(uint32_t *a, uint32_t *u)
+                                                     { if (a) *a = 0; if (u) *u = 0; }
 extern "C" int      z3660_prof_present(void)         { return 0; }
 
 #endif /* Z3660_EMU_PROF */

@@ -859,6 +859,15 @@ unsigned z3660_prof_wall_hz(void);              /* global-timer rate actually in
  * separately, and v1 got that wrong by naming it after the thing it timed rather than
  * after the thing it is divided into. */
 int      z3660_prof_probe_cyc_per_transition(void);
+/* The two spans that figure is the DIFFERENCE of: PAIRS enter/exit calls with the buckets
+ * ARMED, and the textually identical loop with them OFF. Only their difference is the
+ * probe body; everything the two share -- the call, the predicate, the loop scaffolding --
+ * survives in the machine the probe subtraction is meant to leave behind, so charging it
+ * as "probe" would subtract it once and leave it there. That double count is why the v2
+ * figure came back at 59 cyc/transition, above the point at which the C2 map's subtraction
+ * stops being arithmetically possible. Reported on the boot line so a reader can check the
+ * subtraction rather than take the quotient on faith. Both 0 in a non-profiling build. */
+void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed);
 int      z3660_prof_present(void);              /* 1 in a profiling build, else 0        */
 
 #ifdef __cplusplus

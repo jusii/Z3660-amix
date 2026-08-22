@@ -306,6 +306,53 @@ the hit counter beside it that was not.
    call to a real out-of-line body. It is still an *estimate* (different register pressure,
    friendlier branch prediction than a real call site); what it is no longer is a *known*
    under-estimate.
+
+   **And it is the MARGINAL cost of an armed transition, not the cost of the call that
+   carries it.** This is the third unit error in the same number and it is the one the C2
+   map ran into. The first v2 calibration timed the armed loop *alone*, charging the `bl`,
+   the callee prologue, the `if (!bucket_on)` predicate, the epilogue and the `for` loop's
+   own compare-and-branch to the probe, and reported **59 cyc/transition**. At 59 the
+   subtraction is arithmetically impossible: the modelled probe cost exceeds what `LOOP`
+   holds by 3.0 G cycles and what `TAILADV` holds by 1.2 G — 4.42 % of the whole span with
+   nowhere to put it — and the symbolizer clamps two buckets and disowns every share
+   derived from them. Sweeping the price finds `LOOP` exhausted at 50.59 and `TAILADV` at
+   54.11, so 59 sits above the entire usable range, and above the 45.5–58 band predicted
+   at the end of this document.
+
+   It is a double count, and it follows from what the subtraction is *for*. Probe
+   subtraction describes **the prof-build interpreter with its probe bodies removed** — it
+   is explicitly not trying to describe the lean interpreter, which does not make these
+   out-of-line accessor calls at all and whose separate cost is priced at −23.2 % under
+   *What the profiling build costs* below. Every term in that list survives in the machine
+   the subtraction leaves behind. Charging them as probe subtracts them once and leaves
+   them there.
+
+   So the calibration now times the **same loop twice**, differing in one bit
+   (`z3660_prof_bucket_on`), and reports the difference over `2 × PAIRS`. Unarmed, the
+   calls still happen, the branch is still predicted and the loop is still paid;
+   `enter`/`exit` return at their first line, before the cycle read. What survives in the
+   difference is the probe body alone — the `PMCCNTR` read, the 64-bit accumulate, the
+   transition counter, the stack push/pop, the timestamp store — which is exactly the
+   quantity `TRANSITIONS × probe_cyc` is meant to name. Both spans are now printed on the
+   boot line:
+
+       [PROF] probe calibration: armed <n> cyc, unarmed <n> cyc, 1024 pairs -> <n> cyc/transition marginal
+
+   so the subtraction can be checked rather than taken on faith. The host harness asserts
+   the arithmetic exactly against the injectable clock (`test_prof_probe_calibration`):
+   armed span `= STEP × (2·PAIRS + 1)`, unarmed `= STEP`, difference over `2·PAIRS` `=
+   STEP` on the nose.
+
+   **A prediction, stated in advance so that it can be wrong.** The terms removed are one
+   call, one predicate and three or four loop instructions, so the reported figure should
+   fall by roughly 8–14 cycles — from 59 into the 45–51 region, at or below the 50.59 at
+   which `LOOP` is exhausted, and close to the **50** the C2 map independently picked as
+   the highest price at which every bucket stays positive. If instead the figure barely
+   moves, the price was never the problem and the *landing model* is; that is the other
+   half of map §10.3 and it is **not** settled here. (The map's leading candidate for it —
+   that the shared ifetch bracket is entered fewer times than `FETCH` counts — is refuted
+   by the source: all five `Z3660_PROF_ENTER_IFETCH` sites increment `FETCH` exactly once,
+   so `IFETCH_CALLS == FETCH` identically. The new counter id 20 makes a capture say so.)
 3. **A guest page fault is a C++ throw** and unwinds past every pending probe exit. The
    `CATCH` charges the abandoned span to `FAULT` and resets the phase stack. `FAULT` is
    therefore "the fault path plus a fragment of whatever stage it interrupted" —
@@ -657,6 +704,14 @@ a different flash, which is what makes the deltas trustworthy.
 > where production calls them, so it was also an under-estimate of the real per-call price.
 > v2 reports cycles per transition, calibrated out of line — expect a number **above** 45.5
 > and **below** roughly 58, the point at which `LOOP`'s corrected share reaches zero.
+>
+> **The first v2 metal calibration came back at 59 — above that band, and above the 50.59
+> at which the C2 span exhausts `LOOP` — and the band was right.** The calibration was
+> timing the armed loop alone and charging the call, the predicate and the loop
+> scaffolding to the probe, all of which stay in the machine the subtraction leaves
+> behind. It now differences the armed loop against the identical unarmed one; see bias
+> note 2's *marginal cost* paragraph for the arithmetic and for the pre-registered
+> expectation (45–51) that the next metal capture will confirm or refute.
 > Also note that both the v1 header example and this document once showed `11` cyc where
 > metal measured `91`: anyone sizing bucket inflation from the documented example would
 > have understated it ~8×. The examples in this file are now taken from real metal output.
