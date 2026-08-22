@@ -19,6 +19,11 @@ extern "C" {
 void harness_mem_init(void);
 void harness_mem_reset(void);              /* zero the buffer */
 
+/* Restore the cross-core SHARED knobs to the firmware's power-on state
+ * (service_cadence 1, perf_stats ON, emu_probes ON). harness_mem_init() calls it;
+ * a test that flips a knob calls it again to leave the fixture clean. */
+void harness_shared_defaults(void);
+
 /* Direct big-endian buffer poke/peek for test setup/inspection (bypasses banks). */
 void     hram_poke32(uae_u32 addr, uae_u32 v);
 void     hram_poke16(uae_u32 addr, uae_u16 v);

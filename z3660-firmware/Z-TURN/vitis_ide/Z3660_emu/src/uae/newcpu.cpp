@@ -3491,8 +3491,14 @@ void doint(void)
       set_special (SPCFLAG_DOINT);
 }
 
+/* CYBERSTORM C3: run-loop knob resync (defined with the perf block further down).
+ * Called from do_specialties() only -- i.e. only when regs.spcflags != 0 -- so it is
+ * free on the per-instruction path. See the comment on z3660_knobs_poll(). */
+static void z3660_knobs_poll(void);
+
 static int do_specialties (int cycles)
 {
+   z3660_knobs_poll();   /* SERV / PERFS / PROBES reach the run loops from here */
 
    if (regs.spcflags & SPCFLAG_MODE_CHANGE)
       return 1;
@@ -4564,9 +4570,85 @@ static void amix_dump_wild(uae_u32 wildpc)
 #include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
 static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
+
+/* ===== CYBERSTORM C3: run-loop overhead knobs =========================================
+ *
+ * WHY. C0STAT on the 040 AMIX metal runs reports ~64% of the CORE0 cooperative loop
+ * going to things that are not the mailbox service, and core1 hard-spins inside every
+ * mailbox round trip -- so overhead on either core is guest throughput not delivered.
+ * Before anything is optimised, the overhead has to be SWITCHABLE, so a metal session
+ * can measure the delta instead of arguing about it.
+ *
+ * These two knobs are core1's half. Both default to 1 = EXACTLY today's behaviour, so a
+ * config with neither key, and a board whose SHARED mailbox has never been written, run
+ * the loops they have always run.
+ *
+ *   z3660_perf_on     the per-instruction perf accumulator + its ~1 Hz [PERF] tick.
+ *   z3660_probes_on   the ISSUE-52-era run-loop diagnostic probes ([ROMENT] [RTE] [URTE]
+ *                     [USTEP] [IDCMP] on 040; the wild-PC detector + retired-instruction
+ *                     ring on 030). ISSUE-52 is closed, but the instruments stay: this
+ *                     GATES them, it does not delete them.
+ *
+ * COSTS, read out of the generated ARM for m68k_run_mmu040() rather than estimated
+ * (arm-none-eabi, -O3, the shipped flags). Each gate is an address load, a value load,
+ * a compare and a branch that is perfectly predicted because the flag does not change:
+ *
+ *   gate                     costs   skips when taken
+ *   ROMENT (pre-fetch)         4       44 instructions
+ *   post-fetch probe group     3       11 on the straight line, more in user mode
+ *                                      (the [USTEP]/[IDCMP] arms are out of line)
+ *   perf accumulator           4       11 (the 64-bit read-modify-write and its test)
+ *
+ * So the DEFAULT path (everything on) grows by 11 ARM instructions per emulated
+ * instruction, and switching all three off removes substantially more than that. The
+ * point of the switches is that the metal now measures this instead of us guessing it.
+ *
+ * Z3660_EMU_PROBES=0 additionally compiles the probes out entirely, for a lean build.
+ * Default 1: the shipped build keeps the instruments one flash away.
+ * ==================================================================================== */
+#ifndef Z3660_EMU_PROBES
+#define Z3660_EMU_PROBES 1
+#endif
+static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical behaviour)
+static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
+
+/* Resample every run-loop knob from the cross-core mailbox. Not static: the host harness
+ * calls it directly rather than waiting for a resync point. */
+extern "C" void z3660_knobs_sync(void)
+{
+   int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // SERV
+   z3660_perf_on   = shared->perf_stats ? 1 : 0;                                       // PERFS
+   z3660_probes_on = shared->emu_probes ? 1 : 0;                                       // PROBES
+}
+
+/* Read-back for the harness (and any future serial dump). */
+extern "C" void z3660_knobs_get(int *perf_on, int *probes_on, int *cadence)
+{
+   if(perf_on)   *perf_on   = z3660_perf_on;
+   if(probes_on) *probes_on = z3660_probes_on;
+   if(cadence)   *cadence   = z3660_service_cadence;
+}
+extern "C" uae_u64 z3660_perf_count_get(void) { return z3660_perf_count; }
+
+/* Knob resync point that survives perf_stats OFF.
+ *
+ * z3660_perf_tick() -- which is where the SERV knob has always been picked up -- only
+ * runs while the perf accumulator runs. With perf_stats off it does not, so SERV/PERFS/
+ * PROBES would stop reaching the loop and could never be turned back on. This hook lives
+ * in do_specialties(), which the run loops call ONLY when regs.spcflags != 0: it
+ * therefore costs exactly zero instructions on the per-instruction path, at either
+ * setting. Under a running guest spcflags fires on every interrupt (60 Hz and up), so
+ * a knob turned on the serial console reaches the loop in well under a second. */
+static void z3660_knobs_poll(void)
+{
+   static int n = 0;
+   if((++n & 0x3F) != 0) return;
+   z3660_knobs_sync();
+}
+
 static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
 {
-   int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // pick up the runtime knob (SERV)
+   z3660_knobs_sync();                    // pick up the runtime knobs (SERV / PERFS / PROBES)
    static uae_u64 lastcnt = 0; static XTime last = 0;
    XTime now; XTime_GetTime(&now);
    XTime el = now - last;
@@ -4579,6 +4661,24 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
       lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
    }
 }
+
+/* The per-instruction tail both MMU run loops share, so the two cannot drift.
+ *
+ * A macro, not an inline function, precisely so each loop keeps its OWN serv_ctr -- that
+ * is what the two loops have today, and sharing one would silently couple their poll
+ * phase across a mode change.
+ *
+ * With perf_stats ON this is instruction-for-instruction what the loops did before the
+ * knob existed; the only addition is the `if (z3660_perf_on)` around the accumulator. */
+#define Z3660_RUNLOOP_TAIL()                                                  \
+   do {                                                                       \
+      if (z3660_perf_on) {                                                     \
+         z3660_perf_count++;                                                   \
+         if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();             \
+      }                                                                        \
+      { static int serv_ctr = 0;                                               \
+        if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } } \
+   } while(0)
 
 // UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
 // (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
@@ -4613,7 +4713,14 @@ void m68k_run_mmu040(void)
             mmu_restart = true;
             regs.instruction_pc = m68k_getpc();
 
+#if Z3660_EMU_PROBES
             // ROM-ENTRY PROBE (diagnostic, AMIX-040 only, first few hits then silent).
+            // Gated by z3660_probes_on (CYBERSTORM C3). gcc evaluates the volatile
+            // amix_mmu_on arm first, so a non-AMIX boot pays nothing at all and an
+            // AMIX boot pays 4 instructions to skip 44. It matters more than it looks
+            // -- the amix_mmu_on arm below is TRUE for every instruction of an AMIX-040
+            // boot, so the pc masks, the two compares and the prev_pc store ran on every
+            // guest instruction for the whole run, long after rom_hits was exhausted.
             // The F87F6FA7 trace put the failure at 0x00F80B4C -- the `rts` at the tail of
             // AmigaOS exec's CPU-exception dispatcher in KS 2.04, which jumps to
             // ExecBase->ThisTask->tc_TrapCode read from ABSOLUTE ADDRESS 4. The kernel's own
@@ -4622,7 +4729,7 @@ void m68k_run_mmu040(void)
             // interrupts, so NO exception vectored there. Control was transferred by a
             // pointer. This names the source pc and the pushed return address, which is the
             // one fact the kernel binary cannot supply and the emulator can.
-            if (amix_mmu_on && currprefs.mmu_model == 68040) {
+            if (z3660_probes_on && amix_mmu_on && currprefs.mmu_model == 68040) {
                static uae_u32 prev_pc = 0; static int rom_hits = 0;
                uae_u32 pc_now = (uae_u32)regs.instruction_pc;
                int in_rom  = (pc_now  & 0xFFF80000u) == 0x00F80000u;
@@ -4637,6 +4744,7 @@ void m68k_run_mmu040(void)
                }
                prev_pc = pc_now;
             }
+#endif /* Z3660_EMU_PROBES */
 
             do_cycles(cpu_cycles);
 
@@ -4644,6 +4752,17 @@ void m68k_run_mmu040(void)
             mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
             count_instr(regs.opcode);
 
+#if Z3660_EMU_PROBES
+            /* CYBERSTORM C3: the three post-fetch ISSUE-52 probes collapsed behind ONE
+             * gate -- 3 ARM instructions for the whole group instead of a per-probe
+             * compare chain, and the branch is perfectly predicted. [USTEP]
+             * is the reason this is worth doing: its first term is `!regs.s`, which is
+             * TRUE for every user-mode instruction, so an AMIX-040 user-space workload
+             * paid the full four-term chain on the majority of its instructions with the
+             * cap long since exhausted. Nothing is deleted -- PROBES/emu_probes turns
+             * the whole set back on, and Z3660_EMU_PROBES=0 compiles it out for a lean
+             * build. */
+            if (z3660_probes_on) {
             /* ISSUE-52 RTE PROBE (diagnostic). The harness proves RTE delivers a
              * table-walked frame's PC exactly (test_mmu040_rte_delivers_pc), so
              * "fed 0x80800000, delivered 0x80000012" cannot happen inside the core --
@@ -4744,6 +4863,8 @@ void m68k_run_mmu040(void)
                                (unsigned long)regs.srp, (unsigned long)regs.urp);
                }
             }
+            }   /* if (z3660_probes_on) -- post-fetch probe group */
+#endif /* Z3660_EMU_PROBES */
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             cpu_cycles = adjust_cycles(cpu_cycles);
 
@@ -4754,10 +4875,7 @@ void m68k_run_mmu040(void)
             // per-instruction (STOP/trace/mode-change correctness). cadence 1 -- the
             // default and what the env sets today -- is byte-for-byte the old behaviour;
             // this only makes the existing SERV knob reach the 040 loop as well.
-            z3660_perf_count++;
-            if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();
-            { static int serv_ctr = 0;
-              if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } }
+            Z3660_RUNLOOP_TAIL();
             if (regs.spcflags) {
                if (do_specialties(cpu_cycles))
                   return;
@@ -4795,9 +4913,14 @@ static void m68k_run_mmu030(void)
 insretry:
             regs.instruction_pc = m68k_getpc();
             mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
+#if Z3660_EMU_PROBES
             // wip-030-mmu-buserror: about to fetch from a wild USER pc (user mode + PC below the AMIX
             // user base 0x80000000 = jumped into the kernel/low region). Dump the corruptor once,
             // BEFORE the fetch faults, so the retired-insn ring still holds the instruction that did it.
+            // CYBERSTORM C3: one gate for the whole detector pair, including the volatile
+            // amix_wild_rte_pending clear (a store on every instruction). With PROBES off the
+            // flag simply stays set until the next re-arm; it drives nothing else.
+            if (z3660_probes_on) {
             if (amix_mmu_on && !regs.s && regs.instruction_pc < 0x80000000u && !amix_wild_latched) {
                amix_wild_latched = 1;
                amix_dump_wild((uae_u32)regs.instruction_pc);
@@ -4808,6 +4931,8 @@ insretry:
                amix_dump_wild(amix_wild_rte_pc);
             }
             amix_wild_rte_pending = 0;
+            }
+#endif /* Z3660_EMU_PROBES */
             f = regs.ccrflags;
 
             mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
@@ -4856,7 +4981,10 @@ insretry:
             // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the
             // PC it left behind = branch target for control transfers) so the wild-PC detector above
             // can show what corrupted the user PC. AMIX-gated; mmu030_opcode still holds the opcode here.
-            if (amix_mmu_on) {
+            // CYBERSTORM C3: this is the 030 loop's heaviest per-instruction probe -- five stores
+            // and a getpc() on EVERY instruction of an AMIX-030 boot -- so it gets the probe gate.
+#if Z3660_EMU_PROBES
+            if (z3660_probes_on && amix_mmu_on) {
                uae_u32 h = amix_rring_h & (AMIX_RRING - 1);
                amix_rring_pc[h]  = (uae_u32)mmu030_insn_start_pc;
                amix_rring_op[h]  = (uae_u16)mmu030_opcode;
@@ -4864,6 +4992,7 @@ insretry:
                amix_rring_s[h]   = (uae_u8)regs.s;
                amix_rring_h++;
             }
+#endif /* Z3660_EMU_PROBES */
 
             mmu030_opcode = -1;
             cpu_cycles = adjust_cycles(cpu_cycles);
@@ -4871,10 +5000,7 @@ insretry:
             // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
             // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
             // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
-            z3660_perf_count++;
-            if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();
-            { static int serv_ctr = 0;
-              if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } }
+            Z3660_RUNLOOP_TAIL();
             if (regs.spcflags) {
                if (do_specialties(cpu_cycles))
                   return;

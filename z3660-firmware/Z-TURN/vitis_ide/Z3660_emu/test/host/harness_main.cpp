@@ -18,6 +18,8 @@
 #include "cpummu030.h"
 #include "cpummu.h"        /* 68040 MMU: mmu_translate, mmu_set_tc, mmu_match_ttr, TTR/descriptor defines */
 #include "harness.h"
+#include "main.h"          /* the cross-core SHARED struct -- ABI guard below */
+extern SHARED *shared;     /* board_stubs.cpp; the tests write knobs through it */
 
 /* 68030 TT-register bits (#defined privately in cpummu030.cpp). */
 #define Z_TT_FC_MASK   0x00000007u
@@ -27,6 +29,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstddef>      /* offsetof -- the SHARED mailbox ABI guard */
 
 extern "C" void harness_set_x_funcs(void);   /* HOST_TEST_HARNESS hook in newcpu.cpp */
 extern void build_cpufunctbl(void);          /* defined in newcpu.cpp (no header decl) */
@@ -2480,6 +2483,160 @@ static void test_mmu030_multifault_continuation(void)
 }
 
 /* ================================================================== */
+/* ==================================================================
+ * CYBERSTORM C3: the run-loop overhead switches.
+ *
+ * What has to be true, and what a metal calibration session is entitled to assume:
+ *
+ *   1. DEFAULTS ARE TODAY. With the mailbox at its power-on state the accumulator
+ *      counts every retired instruction and the probes are armed -- i.e. absent
+ *      config keys reproduce the loop the firmware has always run.
+ *   2. OFF IS REACHABLE, AND IT IS ACTUALLY OFF. perf_stats 0 must stop the counter
+ *      dead: not slow it, stop it. That is the whole point -- a knob that only
+ *      reduces the cost cannot separate "overhead reclaimed" from "noise".
+ *   3. THE KNOBS STILL REACH THE LOOP WITH perf_stats OFF. z3660_perf_tick() is
+ *      where SERV was picked up, and it no longer runs; if the resync did not move
+ *      somewhere free, turning perf_stats off would be a one-way door.
+ *   4. service_cadence REACHES THE 040 LOOP and is clamped (dispatch item 2c).
+ *
+ * Driven through the REAL m68k_run_mmu040(), one instruction per call via
+ * SPCFLAG_MODE_CHANGE, on a plain MMU-off machine: the knobs are orthogonal to
+ * translation, and this keeps the test about the loop tail and nothing else.
+ * ================================================================== */
+extern "C" void    z3660_knobs_sync(void);
+extern "C" void    z3660_knobs_get(int *perf_on, int *probes_on, int *cadence);
+extern "C" uae_u64 z3660_perf_count_get(void);
+
+/* Run `n` instructions through the genuine 040 run loop. Returns how far the perf
+ * accumulator moved across them. */
+static uae_u64 run040_steps(uae_u32 start, int n)
+{
+	cpu_set_context(start);
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;   /* -> one instruction per run-loop call */
+	uae_u64 before = z3660_perf_count_get();
+	for (int i = 0; i < n; i++)
+		m68k_run_mmu040();
+	regs.spcflags = 0;
+	return z3660_perf_count_get() - before;
+}
+
+static void test_runloop_overhead_switches(void)
+{
+	printf("[test] run-loop overhead switches: perf_stats / emu_probes / service_cadence\n");
+
+	cpu_bringup(68040);
+	currprefs.mmu_model = 0;                 /* MMU off: the tail is what is under test */
+	const uae_u32 CODE = 0x00010000u;
+	for (uae_u32 i = 0; i < 64; i += 2)
+		hram_poke16(CODE + i, 0x4E71);       /* a field of NOPs */
+
+	/* ---- 1. defaults reproduce today ---- */
+	harness_shared_defaults();
+	z3660_knobs_sync();
+	{
+		int perf = -1, probes = -1, cad = -1;
+		z3660_knobs_get(&perf, &probes, &cad);
+		CHECK_EQ32(perf,   1, "power-on default: perf_stats is ON");
+		CHECK_EQ32(probes, 1, "power-on default: emu_probes is ON");
+		CHECK_EQ32(cad,    1, "power-on default: service_cadence is 1 (poll every instruction)");
+	}
+	CHECK_EQ32((uae_u32)run040_steps(CODE, 8), 8,
+	           "perf_stats ON: the accumulator counts every retired instruction");
+
+	/* ---- 2. off is reachable and is a hard stop ---- */
+	shared->perf_stats = 0;
+	z3660_knobs_sync();
+	{
+		int perf = -1; z3660_knobs_get(&perf, NULL, NULL);
+		CHECK_EQ32(perf, 0, "perf_stats 0 reaches the run loop");
+	}
+	CHECK_EQ32((uae_u32)run040_steps(CODE, 8), 0,
+	           "perf_stats OFF: the accumulator does not move at all");
+
+	/* ---- 3. the knobs still reach the loop while perf_stats is off ----
+	 * do_specialties() is the resync point, and the loop calls it every step here
+	 * (SPCFLAG_MODE_CHANGE), so a knob written to the mailbox must take effect
+	 * WITHOUT any explicit z3660_knobs_sync() call by the test. The poll is
+	 * rate-divided, so give it more steps than the divisor. */
+	shared->perf_stats = 1;
+	run040_steps(CODE, 200);                 /* no manual sync: do_specialties must do it */
+	{
+		int perf = -1; z3660_knobs_get(&perf, NULL, NULL);
+		CHECK_EQ32(perf, 1,
+		           "perf_stats can be turned back ON with the accumulator stopped "
+		           "(resync is not hostage to perf_tick)");
+	}
+
+	/* ---- 4. emu_probes is a live, two-way switch ---- */
+	shared->emu_probes = 0;
+	z3660_knobs_sync();
+	{
+		int probes = -1; z3660_knobs_get(NULL, &probes, NULL);
+		CHECK_EQ32(probes, 0, "emu_probes 0 reaches the run loop");
+	}
+	CHECK_EQ32((uae_u32)run040_steps(CODE, 4), 4,
+	           "probes OFF changes no emulation: the same instructions still retire");
+	shared->emu_probes = 1;
+	z3660_knobs_sync();
+	{
+		int probes = -1; z3660_knobs_get(NULL, &probes, NULL);
+		CHECK_EQ32(probes, 1, "emu_probes is a two-way switch -- the instruments come back");
+	}
+
+	/* ---- 5. service_cadence reaches the 040 loop, and is clamped ---- */
+	shared->service_cadence = 8;
+	z3660_knobs_sync();
+	{
+		int cad = -1; z3660_knobs_get(NULL, NULL, &cad);
+		CHECK_EQ32(cad, 8, "service_cadence reaches the 040 loop (dispatch item 2c)");
+	}
+	shared->service_cadence = 0;             /* nonsense value */
+	z3660_knobs_sync();
+	{
+		int cad = -1; z3660_knobs_get(NULL, NULL, &cad);
+		CHECK_EQ32(cad, 1, "service_cadence 0 is clamped to 1, never used as a divisor");
+	}
+	shared->service_cadence = 0xFFFFFFFFu;   /* -1 through the int cast */
+	z3660_knobs_sync();
+	{
+		int cad = -1; z3660_knobs_get(NULL, NULL, &cad);
+		CHECK_EQ32(cad, 1, "a negative service_cadence is clamped to 1");
+	}
+
+	/* Leave the fixture exactly as the firmware powers up. */
+	harness_shared_defaults();
+	z3660_knobs_sync();
+	currprefs.mmu_model = 0;
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * Cross-core SHARED ABI guard.
+ *
+ * The beta-21 resync collided head-on with this struct once already: upstream
+ * appended eight floppy fields at 0xFFFF009C..0xFFFF00B8, exactly where this fork's
+ * debug_emu/amix_mode/service_cadence/perf_report sat, and a mis-merge would have
+ * aliased service_cadence onto write_floppy_data with no diagnostic whatsoever
+ * (docs/piscsi-service-path.md 5). The two copies of SHARED -- Z3660/src/main.h and
+ * Z3660_emu/src/main.h -- are edited by hand and are only ever checked by the two
+ * cores agreeing at runtime, on metal, silently.
+ *
+ * So pin the offsets. This is the copy core1 compiles; the numbers are the addresses
+ * the comments in BOTH headers claim.
+ * ================================================================== */
+static void test_shared_mailbox_offsets(void)
+{
+	printf("[test] cross-core SHARED mailbox: the knob fields sit where both headers say\n");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, debug_emu),       0xBC, "debug_emu       @ 0xFFFF00BC");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, amix_mode),       0xC0, "amix_mode       @ 0xFFFF00C0");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, service_cadence), 0xC4, "service_cadence @ 0xFFFF00C4");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, perf_report),     0xC8, "perf_report     @ 0xFFFF00C8");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, amix_ram),        0xCC, "amix_ram        @ 0xFFFF00CC");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, perf_stats),      0xD0, "perf_stats      @ 0xFFFF00D0 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, emu_probes),      0xD4, "emu_probes      @ 0xFFFF00D4 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xD8, "SHARED is 0xD8 bytes -- new fields go on the END");
+}
+
 int main(int argc, char **argv)
 {
 	(void)argc; (void)argv;
@@ -2529,6 +2686,8 @@ int main(int argc, char **argv)
 	test_mmu030_demand_page_read();
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
+	test_runloop_overhead_switches();
+	test_shared_mailbox_offsets();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

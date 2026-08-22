@@ -107,6 +107,11 @@ typedef struct {
    int amix_mode;
    int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
    int service_cadence;
+   /* CYBERSTORM C3 run-loop overhead switches. -1 = unset -> 1 = the historical
+    * behaviour, so an absent key changes nothing. See docs/AMIX.md. */
+   int perf_stats;      // core1 MMU run loops: per-instruction perf accounting
+   int emu_probes;      // core1 MMU run loops: ISSUE-52-era diagnostic probes
+   int core0_stats;     // core0 cooperative loop: C0STAT span stamping
    int mount_sd_0x76;
    int mount_sd_root;
    float resistor;
@@ -155,6 +160,11 @@ typedef struct {
    int amix_mode;
    int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
    int service_cadence;
+   /* CYBERSTORM C3 run-loop overhead switches. -1 = unset -> 1 = the historical
+    * behaviour, so an absent key changes nothing. See docs/AMIX.md. */
+   int perf_stats;      // core1 MMU run loops: per-instruction perf accounting
+   int emu_probes;      // core1 MMU run loops: ISSUE-52-era diagnostic probes
+   int core0_stats;     // core0 cooperative loop: C0STAT span stamping
    int mount_sd_0x76;
    int mount_sd_root;
    int kickstart;
@@ -306,6 +316,9 @@ enum CONFITEM {
    CONFITEM_AMIX_MODE,
    CONFITEM_SERVICE_CADENCE,
    CONFITEM_AMIX_RAM,
+   CONFITEM_PERF_STATS,
+   CONFITEM_EMU_PROBES,
+   CONFITEM_CORE0_STATS,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50

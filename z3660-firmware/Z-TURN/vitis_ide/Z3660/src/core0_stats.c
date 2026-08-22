@@ -63,6 +63,10 @@ static uint32_t c0_block_n, c0_block_lines;
 
 static int      c0_armed;             /* c0stat_init() has run                  */
 int             core0_stats_report = 1;
+/* CYBERSTORM C3 runtime gate on the MEASUREMENT itself (not just the printing).
+ * 1 = the historical behaviour. Read straight from the C0_* macros, so an off
+ * state never even reaches this translation unit. See core0_stats.h. */
+int             core0_stats_enabled = 1;
 
 /* Derived from counts_per_second, refreshed whenever the ARM clock is retuned. */
 static uint32_t c0_cps = 1;
@@ -342,8 +346,12 @@ void c0stat_init(void)
    c0_iter_start = c0chain.t;
    c0_iter_excl  = 0;
    c0_armed      = 1;
-   printf("[C0STAT] core0 loop accounting ON: %d spans, window %ds, block>=%luus; "
-          "cost/boundary %luns (timer read %luns) -- PSTAT/PSTATC/PSTATZ\n",
+   /* The calibration above runs even when the instrument is switched OFF, on
+    * purpose: cost/boundary is exactly the number a calibration session wants to
+    * know before deciding whether the instrument is worth its price. */
+   printf("[C0STAT] core0 loop accounting %s: %d spans, window %ds, block>=%luus; "
+          "cost/boundary %luns (timer read %luns) -- PSTAT/PSTATC/PSTATZ/CSTAT\n",
+      core0_stats_enabled ? "ON" : "OFF (core0_stats NO / CSTAT)",
       (int)C0T_NUM, (int)CORE0_STATS_PERIOD_S, (unsigned long)CORE0_STATS_BLOCK_US,
       (unsigned long)(c0_bound_cost * 1000000000ULL / (uint64_t)c0_cps),
       (unsigned long)(c0_probe      * 1000000000ULL / (uint64_t)c0_cps));
@@ -352,6 +360,35 @@ void c0stat_init(void)
 void core0_stats_set_report(int on)
 {
    core0_stats_report = on ? 1 : 0;
+}
+
+/* Turn the stamping itself on/off (CSTAT, and the core0_stats config key).
+ *
+ * Re-enabling RE-ARMS the chain cursor and the iteration cursor. Without that,
+ * the first stamp after a re-enable would charge the entire disabled interval --
+ * minutes, potentially -- to whichever task happened to be stamped first, which
+ * would poison max_single, the worst-ever latch and every subsequent ratio.
+ * Cumulative totals are deliberately NOT zeroed: a disable/enable pair is a
+ * measurement gap, not a reset, and PSTATZ is the reset. */
+void core0_stats_set_enabled(int on)
+{
+   int want = on ? 1 : 0;
+   if(want == core0_stats_enabled) return;
+   if(want && c0_armed)
+   {
+      XTime now;
+      XTime_GetTime(&now);
+      c0chain.t     = now;
+      c0chain.x     = c0stat_excl;
+      c0_iter_start = now;
+      c0_iter_excl  = c0stat_excl;
+   }
+   core0_stats_enabled = want;
+}
+
+int core0_stats_is_enabled(void)
+{
+   return core0_stats_enabled;
 }
 
 void core0_stats_dump(void)
@@ -370,6 +407,10 @@ void core0_stats_dump(void)
    up = (uint64_t)(now - c0_up_start);
    if(up == 0) up = 1;
 
+   if(!core0_stats_enabled)
+      printf("[C0STAT] *** stamping is currently OFF (CSTAT / core0_stats NO) -- the "
+             "totals below stopped accruing when it was switched off; %%up is against "
+             "full uptime and therefore reads LOW ***\n");
    printf("[C0STAT] --- core0 loop cumulative --- up %lus it=%lu (%lu/s) cps=%lu\n",
       (unsigned long)(up / (uint64_t)c0_cps), (unsigned long)c0_iters_tot,
       (unsigned long)((uint64_t)c0_iters_tot * (uint64_t)c0_cps / up),
@@ -434,5 +475,7 @@ void core0_stats_zero(void)
 void core0_stats_dump(void)          { printf("[C0STAT] not compiled in (CORE0_STATS=0)\n"); }
 void core0_stats_zero(void)          { printf("[C0STAT] not compiled in (CORE0_STATS=0)\n"); }
 void core0_stats_set_report(int on)  { (void)on; }
+void core0_stats_set_enabled(int on) { (void)on; }
+int  core0_stats_is_enabled(void)    { return 0; }
 
 #endif /* CORE0_STATS */

@@ -116,6 +116,8 @@ typedef struct {
    volatile uint32_t service_cadence;     // 0xFFFF00C4  030-MMU run loop: instructions between IPL/cross-core polls (1=every; perf knob, SERV cmd)
    volatile uint32_t perf_report;         // 0xFFFF00C8  030-MMU run loop: 1=print instr/sec to serial ~1Hz (PERF cmd)
    volatile uint32_t amix_ram;            // 0xFFFF00CC  AMIX main-RAM window size in MiB (16 = the historical default; bounds in Z3660/src/amix_ram.h)
+   volatile uint32_t perf_stats;          // 0xFFFF00D0  MMU run loops: 1=per-instruction perf accounting ON (the historical default), 0=off (perf_stats key, PERFS cmd)
+   volatile uint32_t emu_probes;          // 0xFFFF00D4  MMU run loops: 1=run-loop diagnostic probes ON (the historical default), 0=off (emu_probes key, PROBES cmd)
 } SHARED;
 
 enum BOOTMODE{

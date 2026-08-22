@@ -66,8 +66,24 @@ addrbank hram_bank = {
 
 void harness_mem_reset(void){ if (g_ram) memset(g_ram, 0, HRAM_SIZE); }
 
+/* The firmware's power-on state for the cross-core knobs, reproduced here.
+ *
+ * On the board core0's config parser ALWAYS publishes these (resolve_amix_ram /
+ * resolve_overhead_switches), so core1 never sees the zeroed struct. In the harness
+ * SHARED is a plain BSS global, so without this the harness would run with every knob
+ * off and quietly stop covering the default path -- which is the path that has to stay
+ * byte-identical. Tests that want an off state set it explicitly. */
+void harness_shared_defaults(void)
+{
+	_harness_shared.service_cadence = 1;   /* poll every instruction */
+	_harness_shared.perf_stats      = 1;   /* per-instruction perf accounting ON */
+	_harness_shared.emu_probes      = 1;   /* run-loop diagnostic probes ON */
+	_harness_shared.perf_report     = 0;   /* [PERF] serial line OFF (as debug_console_init) */
+}
+
 void harness_mem_init(void)
 {
+	harness_shared_defaults();
 	if (!g_ram) {
 		g_ram = (uae_u8 *)calloc(1, HRAM_SIZE);
 		if (!g_ram) { fprintf(stderr, "[harness] OOM allocating %u bytes RAM\n", HRAM_SIZE); abort(); }

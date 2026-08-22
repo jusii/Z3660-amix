@@ -46,7 +46,7 @@ SCSI_CD_BIN := $(BUILD)/scsi_cd_test
 # bug that killed the first AMIX-040 metal boot: a boot mode that core0 does not
 # recognise as emulated, so core1 is never started.
 BOOTMODE_BIN := $(BUILD)/bootmode_test
-CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h
+CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhead_switches.h
 
 # AMIX RAM-window sizing guard. Compiles ONLY Z3660/src/amix_ram.h (self-contained by
 # design, exactly like config_file.h above), because that header is the SINGLE copy of

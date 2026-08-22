@@ -23,6 +23,7 @@
 
 extern "C" {
 #include "../../../Z3660/src/config_file.h"
+#include "../../../Z3660/src/overhead_switches.h"
 }
 
 static int g_pass = 0, g_fail = 0;
@@ -81,6 +82,46 @@ int main(void)
    CHECK(UAE_040_MMU == 8, "UAE_040_MMU == 8\n");
    CHECK(BOOTMODE_NUM == 9, "BOOTMODE_NUM == 9 -- if this fires, a mode was appended: put it\n"
                             "        in the right bucket above and update every replica\n");
+
+   /* 4. CYBERSTORM C3 config keys: the CONFITEM enum is APPEND-ONLY.
+    *    config_item_names[] is indexed by this enum, so an entry inserted in the middle
+    *    shifts every name after it and the parser silently writes the WRONG config field
+    *    for the rest of the file -- no error, no diagnostic, just a config that means
+    *    something else. (config_file.c carries a compile-time tripwire for a MISSING
+    *    name; this one pins the ORDER, which no compiler can see.)
+    *    The upstream-merge hazard is live here: beta 21 inserted 48 entries mid-enum. */
+   printf("[test] CONFITEM is append-only: this fork's keys sit at the tail\n");
+   CHECK(CONFITEM_AMIX_MODE       + 1 == CONFITEM_SERVICE_CADENCE, "amix_mode -> service_cadence\n");
+   CHECK(CONFITEM_SERVICE_CADENCE + 1 == CONFITEM_AMIX_RAM,        "service_cadence -> amix_ram\n");
+   CHECK(CONFITEM_AMIX_RAM        + 1 == CONFITEM_PERF_STATS,      "amix_ram -> perf_stats\n");
+   CHECK(CONFITEM_PERF_STATS      + 1 == CONFITEM_EMU_PROBES,      "perf_stats -> emu_probes\n");
+   CHECK(CONFITEM_EMU_PROBES      + 1 == CONFITEM_CORE0_STATS,     "emu_probes -> core0_stats\n");
+   CHECK(CONFITEM_CORE0_STATS     + 1 == CONFITEM_NUM,
+         "core0_stats is the LAST item -- append new keys after it, never before\n");
+
+   /* 5. The overhead switches resolve the way the whole feature promises they do.
+    *
+    *    The load-bearing guarantee for a metal calibration session is the NEGATIVE one:
+    *    a config file that mentions none of these keys must produce the firmware that
+    *    existed before they did. That is one line of code (overhead_switches.h) and it
+    *    is the line that must never quietly flip. */
+   printf("[test] overhead switches: an absent key reproduces the historical behaviour\n");
+   CHECK(z3660_ovh_resolve(Z3660_OVH_UNSET) == 1,
+         "unset -> ON: absent perf_stats/emu_probes/core0_stats keys change nothing\n");
+   CHECK(z3660_ovh_is_default(z3660_ovh_resolve(Z3660_OVH_UNSET)),
+         "and the resolved default IS the default, so the config printer stays silent\n");
+   CHECK(z3660_ovh_resolve(YES) == 1, "YES -> ON\n");
+   CHECK(z3660_ovh_resolve(NO)  == 0, "NO  -> OFF\n");
+   CHECK(z3660_ovh_resolve(0)   == 0, "an explicit off is reachable -- the switch is a real switch\n");
+   CHECK(!z3660_ovh_is_default(z3660_ovh_resolve(NO)), "NO is not the default\n");
+   /* Anything that is neither the sentinel nor 0/1 is coerced, not propagated: these
+    * values go straight into the cross-core mailbox, which core1 tests for truth. */
+   CHECK(z3660_ovh_resolve(7)   == 1, "a junk truthy value is coerced to exactly 1\n");
+   /* The sentinel and the default are literals that config_file.c writes and compares
+    * against by name; pin them, because a config path that initialises to some other
+    * "unset" value would resolve every absent key to OFF. */
+   CHECK(Z3660_OVH_UNSET   == -1, "the unset sentinel is -1 (what both config paths write)\n");
+   CHECK(Z3660_OVH_DEFAULT ==  1, "the default is ON\n");
 
    printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
    return g_fail ? 1 : 0;

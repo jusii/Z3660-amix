@@ -76,10 +76,14 @@ typedef enum {
    PSTATR,  PISCSI_STATS_RESET,
    PSTATC,  CORE0_LOOP_DUMP,
    PSTATZ,  CORE0_LOOP_ZERO,
+   PERFS,   PERF_STATS,
+   PROBES,  EMU_PROBES,
+   CSTAT,   CORE0_LOOP_STATS,
 
    NUM_COMMANDS
 } COMMANDS;
-const char *command_names[NUM_COMMANDS] = {
+/* Deliberately UNSIZED -- see the completeness tripwire below. */
+const char *command_names[] = {
       "A",
 
       "DRTG",    "DEBUG RTG",
@@ -127,7 +131,14 @@ const char *command_names[NUM_COMMANDS] = {
       "PSTATR",  "PISCSI STATS RESET",
       "PSTATC",  "CORE0 LOOP DUMP",
       "PSTATZ",  "CORE0 LOOP ZERO",
+      "PERFS",   "PERF STATS",
+      "PROBES",  "EMU PROBES",
+      "CSTAT",   "CORE0 LOOP STATS",
 };
+/* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
+ * string shifts every command after it -- typing one name would run a different one. */
+typedef char z3660_command_names_complete[
+   (sizeof(command_names)/sizeof(command_names[0]) == NUM_COMMANDS) ? 1 : -1];
 extern clock_data cd[];
 extern CONFIG config;
 
@@ -369,6 +380,32 @@ int debug_thread(struct pt *pt)
                   case DEBUG_EMU:
                      shared->debug_emu=!shared->debug_emu;   // emulator-core debug spam: [PC]/[RTE-B-IF]/fixup (+ AMIX strand trace)
                      xil_printf("DEBUG EMU %s\r\n", shared->debug_emu?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  /* CYBERSTORM C3 overhead switches. These toggle DIAGNOSTIC COST only --
+                   * no emulation behaviour changes either way -- so they are safe to
+                   * flip live under a running guest during a calibration sweep. */
+                  case PERFS:
+                  case PERF_STATS:
+                     shared->perf_stats=!shared->perf_stats;   // core1 per-instruction perf accounting
+                     xil_printf("PERF STATS %s (core1 run-loop accounting; reaches the loop within ~1s)\r\n",
+                                shared->perf_stats?"ON":"OFF");
+                     if(!shared->perf_stats)
+                        xil_printf("  note: [PERF] kIPS needs PERF STATS ON\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROBES:
+                  case EMU_PROBES:
+                     shared->emu_probes=!shared->emu_probes;   // core1 run-loop diagnostic probes
+                     xil_printf("EMU PROBES %s (ROMENT/RTE/URTE/USTEP on 040, wild-PC ring on 030)\r\n",
+                                shared->emu_probes?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case CSTAT:
+                  case CORE0_LOOP_STATS:
+                     core0_stats_set_enabled(!core0_stats_is_enabled());   // core0 C0STAT span stamping
+                     xil_printf("CORE0 LOOP STATS %s (span stamping; PSTAT only gates the printing)\r\n",
+                                core0_stats_is_enabled()?"ON":"OFF");
                      debug_console.subcmd=0;
                      break;
                   case PERF:
@@ -1139,5 +1176,8 @@ void debug_console_help(void)
    xil_printf("'PSTATR'  or 'PISCSI STATS RESET' dumps piscsi cumulative totals + CLMT state, resets\r\n");
    xil_printf("'PSTATC'  or 'CORE0 LOOP DUMP' dumps per-task core0 loop totals (who blocks, how long)\r\n");
    xil_printf("'PSTATZ'  or 'CORE0 LOOP ZERO' zeroes the core0 loop totals and worst-call latch\r\n");
+   xil_printf("'PERFS'   or 'PERF STATS' toggles core1 per-instruction perf accounting (EMU)\r\n");
+   xil_printf("'PROBES'  or 'EMU PROBES' toggles the core1 run-loop diagnostic probes (EMU)\r\n");
+   xil_printf("'CSTAT'   or 'CORE0 LOOP STATS' toggles core0 C0STAT span STAMPING (not just printing)\r\n");
 }
 #endif

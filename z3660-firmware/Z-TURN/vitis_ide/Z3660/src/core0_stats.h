@@ -58,9 +58,27 @@
  *   PSTATC  dump core0 per-task cumulative totals -- non-destructive
  *   PSTATZ  zero the core0 cumulative totals and the worst-ever latch
  *   PSTATR  (pre-existing) dump piscsi cumulative totals and reset them
+ *   CSTAT   toggle the MEASUREMENT ITSELF on/off at runtime (CYBERSTORM C3)
  *
  * Set CORE0_STATS to 0 to compile every span, counter and report out.
- */
+ *
+ * ---------------------------------------------------------------------------
+ * CYBERSTORM C3: the instrument is itself overhead, so it has a runtime switch.
+ *
+ * `core0_stats_report` has always gated only the PRINTING. The stamping never
+ * stopped: a loop iteration takes ~8 XTime_GetTime() reads of the SCU global
+ * timer plus the c0stat_acc() bookkeeping behind each, and that whole cost sits
+ * on the critical path of every one of the TEN cross-core round trips a 2 KB
+ * guest READ costs (docs/piscsi-service-path.md 1.3). Every report already
+ * carries the measured price as its `ovh=` figure -- c0_bound_cost is calibrated
+ * on the metal at the live ARM clock -- but until now there was no way to run
+ * the loop WITHOUT paying it short of a rebuild.
+ *
+ * core0_stats_enabled gates the stamping. Default 1 = exactly today's behaviour;
+ * `core0_stats NO` in z3660cfg.txt / a preset, or CSTAT on the serial console,
+ * turns it off. Turning it back on re-arms the chain cursor, so the first
+ * iteration after a re-enable is not charged the whole disabled interval.
+ * --------------------------------------------------------------------------- */
 #ifndef CORE0_STATS_H
 #define CORE0_STATS_H
 
@@ -111,6 +129,8 @@ typedef enum {
 void core0_stats_dump(void);        /* PSTATC */
 void core0_stats_zero(void);        /* PSTATZ */
 void core0_stats_set_report(int on);
+void core0_stats_set_enabled(int on);   /* CSTAT / core0_stats config key */
+int  core0_stats_is_enabled(void);
 
 #if CORE0_STATS
 
@@ -131,16 +151,23 @@ void c0stat_iter_end(void);
 void c0stat_excl_open(C0_SPAN_T *s);
 void c0stat_excl_close(const C0_SPAN_T *s);
 
+/* 1 = stamp (today's behaviour), 0 = the loop runs unmeasured. Read directly by
+ * the macros below so an off state costs one load and one predictable branch --
+ * never a call into core0_stats.c. */
+extern int core0_stats_enabled;
+
 /* Loop chain: arm once before the loop, then one stamp per timed callee. */
 #define C0_INIT()          c0stat_init()
-#define C0_STAMP(id)       c0stat_chain_stamp(id)
-#define C0_ITER()          c0stat_iter_end()
-/* Nested span for a callee reached from inside a timed callee. */
-#define C0_SPAN(v)         C0_SPAN_T v; c0stat_span_open(&(v))
-#define C0_SPAN_END(v,id)  c0stat_span_close(&(v),(id))
+#define C0_STAMP(id)       do { if(core0_stats_enabled) c0stat_chain_stamp(id); } while(0)
+#define C0_ITER()          do { if(core0_stats_enabled) c0stat_iter_end(); } while(0)
+/* Nested span for a callee reached from inside a timed callee. The variable is
+ * zero-initialised so a span opened while disabled and closed while enabled (or
+ * vice versa) cannot read an indeterminate start stamp. */
+#define C0_SPAN(v)         C0_SPAN_T v = {0,0}; if(core0_stats_enabled) c0stat_span_open(&(v))
+#define C0_SPAN_END(v,id)  do { if(core0_stats_enabled) c0stat_span_close(&(v),(id)); } while(0)
 /* Bracket blocking console output so it is charged to no span at all. */
-#define C0_EXCL(v)         C0_SPAN_T v; c0stat_excl_open(&(v))
-#define C0_EXCL_END(v)     c0stat_excl_close(&(v))
+#define C0_EXCL(v)         C0_SPAN_T v = {0,0}; if(core0_stats_enabled) c0stat_excl_open(&(v))
+#define C0_EXCL_END(v)     do { if(core0_stats_enabled) c0stat_excl_close(&(v)); } while(0)
 
 #else  /* !CORE0_STATS */
 
