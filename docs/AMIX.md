@@ -184,12 +184,15 @@ How many emulated instructions run between emulator interrupt-service polls. Low
 interrupt latency; higher = more CPU throughput.
 
 - **Default:** `1` (poll every instruction). Values `< 1` are clamped to `1`.
-- **Throughput:** raising it speeds the emulated CPU up to roughly **+1.3×** near a knee around 8;
-  disk I/O throughput is essentially flat across the range.
+- **Throughput:** raising it speeds the emulated CPU up — measured **+27 %** at cadence 4 and
+  **+34 %** at cadence 8 (dhrystone, 68040 AMIX on metal, 2026-08-22), knee at 8 as documented.
+- **⚠️ It is not free for disk I/O.** On a root disk served by the emulated A3000 SCSI, raw-device
+  read throughput **fell 16 %** going from cadence 1 to cadence 8 in the same session. See
+  *“Cadence costs real disk throughput”* below before raising it on an I/O-bound workload.
 - **⚠️ AMIX boot-safety:** the AMIX A3000-SCSI bootstrap is sensitive to INT2 latency.
   Cadence **2 and 4 boot; cadence 8 hangs the bootstrap.** **Use `service_cadence 4`** as the
-  boot-time sweet spot (it captures most of the gain). You can raise it to `8` *after* boot via
-  the serial **SERV** runtime menu if you want maximum throughput once AMIX is up.
+  boot-time sweet spot for CPU-bound work; it must be raised to `8` *after* boot via the serial
+  **SERV** menu, never in the config.
 - **⚠️** A very high cadence combined with an unthrottled network flood (e.g. a fast telnet
   transfer) has been observed to panic AMIX — keep boot-time cadence ≤ 4.
 
@@ -208,16 +211,79 @@ calibration session knows what it is looking at when something breaks:
 
 Things that are **not** coupled, and should not be blamed when they move:
 
-- **piscsi.** The mailbox has no interrupt at all — completion is the blocking bus cycle, and
-  `z3660intr()` is an empty stub. During a round trip core1 is spinning in
-  `while(shared->write_scsi==1){NOP;}` and the cadence counter is not even advancing. Disk
-  throughput measured flat across the whole 1→64 range. (`docs/piscsi-service-path.md` §2.)
+- **The piscsi mailbox.** It has no interrupt at all — completion is the blocking bus cycle, and
+  the native driver's `z3660intr()` is an empty stub that is never even registered. During a round
+  trip core1 is spinning in `while(shared->write_scsi==1){NOP;}` and the cadence counter is not
+  advancing. (`docs/piscsi-service-path.md` §2.) **This is still true, and it is still not a
+  statement about “disk throughput” — see the next section for why those are two different
+  things.**
 - **The serial console.** It is core0's `debug_thread`, not core1's poll.
 - **`do_specialties()`**, which stays per-instruction at every cadence: STOP, trace and mode-change
   remain exactly as responsive as they were.
 
-So the shape to expect from a sweep is guest throughput rising to a knee near 8 while disk I/O
-stays flat — and if disk I/O moves with cadence, the model is wrong and that is the finding.
+### Cadence costs real disk throughput (measured 2026-08-22 — corrects an earlier claim)
+
+An earlier revision of this file said disk throughput was *“measured flat across the whole 1→64
+range”* and offered that flatness as confirmation of the piscsi model. **Both halves were wrong,
+and in different ways.** The 2026-08-22 overhead-calibration run on A4000 + Z3660 metal (firmware
+CRC-32 `3435373F`, 68040 AMIX at 128 MiB, all rungs inside one boot) measured:
+
+| cadence | dhrystone | raw-device read (`/dev/rdsk`, 8 MiB span) |
+|---|---|---|
+| 1 | baseline | **665.4 KB/s** (661.5 / 661.5 / 673.3) |
+| 4 | **+27 %** | — |
+| 8 | **+34 %** | **557.6 KB/s** (559.2 / 544.9 / 570.9 / 555.4) — **−16.2 %** |
+
+Reproducible, and the two sample sets do not overlap. Cadence raises guest CPU **and lowers real
+disk throughput at the same time.**
+
+**Where the flatness claim came from: an invalid test.** The benchmark row that was believed to
+measure disk (`disk.seq.read.16384` against a file under `/tmp`) does **zero** device reads at
+128 MiB — the scratch file is entirely buffer-cache resident, and the firmware's own C0STAT task
+counters show it: `EMU>SCSIR 0c` across a window containing a full run. That row tracks guest CPU,
+so it *rose* with cadence and was read as “flat/fine”. **A file-backed benchmark at ≥128 MiB of
+guest RAM is not a disk benchmark.** Use a raw device, or a working set larger than the cache.
+
+**Where the “piscsi is uncoupled” claim came from: the wrong device.** The piscsi mailbox really is
+uncoupled — but the AMIX root disk in this configuration is **not on it**. `/dev/dsk/c6d0s1` is
+controller 0 / target 6 of the **emulated A3000 SCSI**, served by AMIX's own `sd`/a3091 driver;
+the binding is stated in the emulation itself (`Z3660_emu/src/uae/a3000_scsi.cpp`, the
+`drvnum_for_target()` comment). piscsi is only the *backend* the emulation reads through. So
+“piscsi is not cadence-coupled” and “disk throughput is not cadence-coupled” were being treated as
+the same sentence, and they are not.
+
+**The mechanism, which the table above this section already half-named.** The WD33C93 interrupt
+**countdown** is advanced by `a3000_scsi_hsync()`, and the only thing that calls it is
+`check_uae_int_request()` — the function the cadence gates:
+
+```c
+/* Z3660_emu/src/uae/newcpu.cpp, check_uae_int_request() */
+if(a3000_amix_mode){ amix_tick++; static int scsi_hctr=0;
+                     if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
+```
+
+so **one pump tick costs `256 × service_cadence` emulated instructions.** Under a live AMIX kernel
+the per-status delay is honoured rather than zeroed (`a3000_scsi.cpp` `set_status()`:
+`int eff = (wd_delay_mode || amix_mmu_on) ? delay : 0;`), `wd_check_interrupt()` decrements that
+countdown by exactly **one per pump tick** and delivers only at 1, and after each delivery the next
+queued status is re-armed to 2 ticks. Every SELECT / SRV_REQ / phase / completion interrupt of
+every block command therefore waits on the pump. At cadence 8 a pump tick is 8× longer in
+instructions and ~6.5× longer in wall-clock (guest IPS rose only ~1.23×), so per-command interrupt
+latency grows while the SD transfer underneath it does not get any faster — and thousands of
+requests later that is the 16 %.
+
+This is the *same* coupling the cadence table above names for the A3000-SCSI **bootstrap**. What
+was missed is that it does not stop after `sd` open: the pump governs A3000-SCSI interrupt pacing
+for the entire session. The failure mode of a too-high cadence is “a missed or late interrupt
+somewhere” exactly as documented — it just shows up here as throughput rather than a hang.
+
+**Guidance until the pump is decoupled from the instruction cadence:** keep `service_cadence 1`
+for I/O-bound work on an A3000-SCSI root. Cadence 4/8 is worth it for CPU-bound work, and costs
+nothing measurable on a workload that does not touch that disk.
+
+**Sweeping it properly.** Raw device only; several samples per rung (the guest's 60 Hz clock
+quantises a ~4 s run into ~250 ticks, so one tick is ~0.4 % and a single sample cannot resolve a
+few percent); every rung inside one boot, because DRAM layout varies between boots on this machine.
 
 ### `perf_stats YES|NO`, `emu_probes YES|NO`, `core0_stats YES|NO` — run-loop overhead switches
 
@@ -247,6 +313,53 @@ Notes:
 - As with every YES/NO key here, a value that is neither `YES` nor `NO` is reported as an error in
   red and read as `NO` — so a typo switches an instrument **off**, it does not fall back to the
   default.
+
+#### What the switches actually cost (measured 2026-08-22, metal, one boot)
+
+Eight rungs against a live 68040 AMIX at 128 MiB, firmware CRC-32 `3435373F`. Repeatability of the
+baseline was 0.7 %, so anything above ~1 % below is real:
+
+| Switched off | dhrystone vs. defaults-on |
+|---|---|
+| `perf_stats` alone | **+2.0 %** |
+| `emu_probes` alone | **+7.9 %** ← the dominant cost |
+| `core0_stats` alone | **+0.1 %** — nil |
+| all three | **+9.1 %** |
+
+Three results worth carrying:
+
+- **`emu_probes` is the expensive one**, and the reason is `[USTEP]`: its first term is `!regs.s`,
+  true for *every user-mode instruction*, so a user-space workload paid the whole chain on the
+  majority of its instructions long after the output cap was exhausted.
+- **`core0_stats` buys the guest nothing, and `ovh=` must not be used to argue otherwise.** C0STAT
+  honestly reports `ovh = 57–59 %`, but that is a share of **core0 loop time**, and core0 is not the
+  bottleneck — it free-runs at ~900 k iterations/s with `ITERATION 99.7 % of uptime`. The guest is
+  core1-bound. Removing 57 % of core0's work frees time nothing was waiting on. Leave C0STAT on.
+- **Defaults-on is ~3.6 % SLOWER than the old hard-wired build.** Making the instrumentation
+  switchable replaced unconditional code with a per-instruction predicate that the hard-wired build
+  never paid. The switches only pay once one is actually thrown.
+
+#### The lean build — `make lean`
+
+That last point is what the **lean** firmware variant exists for. `make lean` builds core1 with
+`-DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0` and emits **`sd_card/BOOT-lean.BIN`** beside the normal
+`BOOT.BIN`: the instruments *and the predicates that gate them* are compiled out, which is strictly
+less than either the old hard-wired build or all three switches thrown. Measured on the generated
+ARM, `m68k_run_mmu040` goes from **376 instructions to 101** (0x5E0 → 0x194 bytes) and loses all
+five `z3660_printf` probe calls, both `mmu_translate` calls and the `z3660_perf_tick` call; the
+only calls left out of the loop body are `check_uae_int_request`, `do_specialties`, `Exception` and
+`cpu_restore_fixup`. The `z3660_perf_count` / `z3660_perf_on` / `z3660_probes_on` symbols are not
+in the binary at all. `service_cadence` is **not** an instrument and survives in both variants —
+the A3000-SCSI interrupt pump rides on the poll it gates (see above), so removing it would change
+emulation, not just measurement.
+
+- **Production = lean; diagnostics = the default build, one flash away.** Both come out of one
+  tree, and the two core1 objects never share a build directory (`Z3660_emu/build` vs
+  `Z3660_emu/build-lean`) because a `-D` is not a tracked dependency.
+- The variants are told apart by the boot menu's **CRC** of `Z3660.bin`, not by a banner — the
+  default image is byte-for-byte the firmware it has always been.
+- `Z3660_emu/src/uae/runloop_build.h` is the single copy of the rule, and the host harness asserts
+  both shapes (`make run` and `make run-lean` under `Z3660_emu/test/host`).
 
 ### `isoN <file>` — CD-ROM images (upstream's key, with a trap)
 

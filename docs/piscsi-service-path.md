@@ -226,9 +226,21 @@ Three reasons it cannot be the crawl:
 3. It was `1` on the clean 08-14 run **and** on every crawling run. It is constant across exactly the
    comparison that needs explaining.
 
-The documented hardware sweep agrees: cadence 1->64 buys up to ~1.3x CPU with **disk I/O essentially
-flat**, knee around 8; cadence 2 and 4 boot, 8 hangs the A3000-SCSI bootstrap. The 1.3x ceiling is
-also an upper bound on how much of *any* workload this knob can move — nowhere near 13x.
+The documented hardware sweep agrees on the CPU half: cadence 1->64 buys up to ~1.3x CPU, knee
+around 8; cadence 2 and 4 boot, 8 hangs the A3000-SCSI bootstrap. That ceiling is also an upper
+bound on how much of *any* workload this knob can move — nowhere near 13x, which is the point being
+made here and it stands.
+
+> **CORRECTION 2026-08-22.** This paragraph used to add "with **disk I/O essentially flat**", citing
+> `docs/AMIX.md`, which in turn cited this section. It was circular, and it was wrong. A raw-device
+> sweep on metal measured real disk throughput **falling 16 %** from cadence 1 to cadence 8. The
+> three numbered reasons above are all still correct **about the piscsi mailbox** — but the AMIX root
+> disk is on the emulated **A3000 SCSI**, whose WD33C93 interrupt countdown is advanced by
+> `a3000_scsi_hsync()` from inside the very function the cadence gates. `service_cadence` is
+> therefore not on the *piscsi* path and *is* on the *disk* path; those were being treated as one
+> sentence. See `docs/AMIX.md`, "Cadence costs real disk throughput", for the mechanism and the
+> file:line. Nothing about the 13x crawl verdict changes: cadence was `1` throughout that evidence
+> set, and a 16 % effect at cadence 8 cannot produce a 13x slowdown at cadence 1.
 
 ---
 
