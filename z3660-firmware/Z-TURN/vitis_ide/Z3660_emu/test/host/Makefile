@@ -68,6 +68,24 @@ OBJS      := $(UAE_OBJS) $(HOST_OBJS)
 
 BIN := $(BUILD)/mmu_harness
 
+# THE DEFAULT GOAL, PINNED -- and this is not a style preference.
+#
+# GNU make takes .DEFAULT_GOAL from the first target of the first rule it READS, and an
+# `include` counts: the generated .d files below are rules, so once they exist the default
+# goal silently becomes whichever object file happens to sort first. A first build (no .d
+# files yet) makes `all`; every build after it made ONE object and stopped, printed
+# "'...m68kcpu.o' is up to date", and exited 0.
+#
+# The parent Makefile invokes this one with no goal ($(MAKE) -C Z3660_emu -j 4), so the
+# consequence was that `make bootbin` stopped rebuilding core1 entirely: bootgen happily
+# packed a MONTHS-OLD Z3660_emu.elf into a fresh-looking BOOT.BIN, with a green build log
+# and no warning anywhere. Found during CYBERSTORM C2 by disassembling the shipped lean
+# image and noticing z3660_knobs_sync() did not read a mailbox word that had just been
+# added to it.
+#
+# Pinning it costs one line and removes the entire class.
+.DEFAULT_GOAL := all
+
 # The generated header-dependency files (see -MMD above). Missing on a first build, which
 # is exactly when they are not needed, hence the leading '-'.
 -include $(OBJS:.o=.d)
