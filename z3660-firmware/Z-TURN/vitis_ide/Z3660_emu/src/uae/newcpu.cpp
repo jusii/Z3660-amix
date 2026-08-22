@@ -4707,6 +4707,17 @@ static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical 
 static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
 #endif
 
+#if Z3660_EMU_PERF
+/* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
+ * disagree about it -- a read-back that recomputes the answer proves nothing about the
+ * code that prints the line. See z3660_perf_tick() for why this is not COUNTS_PER_SECOND. */
+static uint32_t z3660_perf_wall_hz(uint32_t *clksrc)
+{
+   return z3660_prof_pick_wall_hz(shared ? (uint32_t)shared->arm_wall_hz : 0u,
+                                  (uint32_t)COUNTS_PER_SECOND, clksrc);
+}
+#endif
+
 /* Resample every run-loop knob from the cross-core mailbox. Not static: the host harness
  * calls it directly rather than waiting for a resync point. */
 extern "C" void z3660_knobs_sync(void)
@@ -4747,6 +4758,23 @@ extern "C" uae_u64 z3660_perf_count_get(void) { return z3660_perf_count; }
 extern "C" uae_u64 z3660_perf_count_get(void) { return 0; }   /* no accumulator to report */
 #endif
 
+/* Read-back of the clock the [PERF] line divides by -- the harness's only way to assert
+ * that the ~1 Hz window and the kIPS numerator come from the RETUNED rate and not from
+ * the frozen BSP constant. Same "compiled out reports 0" rule as z3660_knobs_get(): on a
+ * lean build there is no [PERF] line, so there is no rate to report. */
+extern "C" void z3660_perf_clock_get(uae_u32 *wall_hz, int *clk_cfg)
+{
+#if Z3660_EMU_PERF
+   uint32_t src = Z3660_PROF_CLK_BSP;
+   uint32_t hz  = z3660_perf_wall_hz(&src);
+   if(wall_hz) *wall_hz = (uae_u32)hz;
+   if(clk_cfg) *clk_cfg = (src == Z3660_PROF_CLK_CFG) ? 1 : 0;
+#else
+   if(wall_hz) *wall_hz = 0;
+   if(clk_cfg) *clk_cfg = 0;
+#endif
+}
+
 /* Knob resync point that survives perf_stats OFF.
  *
  * z3660_perf_tick() -- which is where the SERV knob has always been picked up -- only
@@ -4764,17 +4792,43 @@ static void z3660_knobs_poll(void)
 }
 
 #if Z3660_EMU_PERF
+/* [PERF] instructions per second, against the clock the board is ACTUALLY running.
+ *
+ * This line was low by 1.65x for the whole life of the instrument, and the C2 map had to
+ * carry a `CLOCK-CORRECTION.txt` to undo it before any number in the map could be read.
+ * The cause is the same one z3660_prof.h documents for the profiler: COUNTS_PER_SECOND is
+ * a COMPILE-TIME BSP constant baked at the 666.67 MHz default, while `arm_frequency` is a
+ * config key that ps7_init_custom() applies to the PLL at boot -- 1100 MHz on the bench
+ * board. It appears TWICE here and both uses were wrong in the same direction, which is
+ * why the error was a clean scale factor rather than noise: once as the ~1 Hz window
+ * length (so the "second" was really 1.65 s) and once as the numerator of the rate.
+ *
+ * The fix is the path the profiler already publishes and already tests: core0 writes the
+ * retuned global-timer rate to SHARED.arm_wall_hz (main.c), and z3660_prof_pick_wall_hz()
+ * -- a rule, in a header, with host coverage of every branch -- decides whether to
+ * believe it. Below 1 MHz means "no core0 ever wrote it" (an older image, or the host
+ * harness), and then the BSP constant takes over.
+ *
+ * The line SAYS WHICH IT USED. The old text said "uncalibrated, use as relative", which
+ * was true and useless: two sessions on differently-clocked boards produced numbers that
+ * were not comparable and nothing said so. `clk=cfg` is a calibrated kIPS; `clk=bsp` is
+ * the old caveat, now stated only when it actually applies. */
 static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
 {
    z3660_knobs_sync();                    // pick up the runtime knobs (SERV / PERFS / PROBES)
    static uae_u64 lastcnt = 0; static XTime last = 0;
+   uint32_t clksrc = Z3660_PROF_CLK_BSP;
+   uint32_t wallhz = z3660_perf_wall_hz(&clksrc);
    XTime now; XTime_GetTime(&now);
    XTime el = now - last;
-   if(el >= (XTime)COUNTS_PER_SECOND){           // ~1 Hz window
+   if(el >= (XTime)wallhz){                      // ~1 Hz window, in REAL timer ticks
       if(shared->perf_report && last != 0){
          uae_u64 di = z3660_perf_count - lastcnt;
-         uint32_t kips = (uint32_t)(di * (uae_u64)COUNTS_PER_SECOND / (uae_u64)el / 1000u);
-         z3660_printf("[PERF] ~%lu kIPS (uncalibrated, use as relative) cadence=%d\r\n",(unsigned long)kips, z3660_service_cadence);
+         uint32_t kips = (uint32_t)(di * (uae_u64)wallhz / (uae_u64)el / 1000u);
+         z3660_printf("[PERF] ~%lu kIPS (clk=%s wall_hz=%lu) cadence=%d\r\n",
+                      (unsigned long)kips,
+                      clksrc == Z3660_PROF_CLK_CFG ? "cfg" : "bsp (UNCALIBRATED)",
+                      (unsigned long)wallhz, z3660_service_cadence);
       }
       lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
    }

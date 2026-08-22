@@ -2653,6 +2653,82 @@ static void test_runloop_overhead_switches(void)
 }
 
 /* ==================================================================
+ * The [PERF] line's clock (C2 riding item a).
+ *
+ * z3660_perf_tick() used COUNTS_PER_SECOND twice -- as the ~1 Hz window length and as
+ * the kIPS numerator -- and COUNTS_PER_SECOND is a COMPILE-TIME BSP constant frozen at
+ * the 666.67 MHz default while ps7_init_custom() retunes the PLL from the config. On the
+ * 1100 MHz bench board every [PERF] figure was therefore low by exactly 1.65x, and the
+ * C2 map had to ship a CLOCK-CORRECTION.txt to undo it before the map could be read.
+ *
+ * The same defect was fixed in the profiler by publishing the retuned rate in
+ * SHARED.arm_wall_hz and choosing between it and the constant with
+ * z3660_prof_pick_wall_hz(). This asserts the [PERF] path now walks that same road --
+ * both branches of it, because the fallback is what a board with an older core0 gets and
+ * a fallback nobody exercises is a fallback nobody has.
+ *
+ * A scale error is invisible to any test that only checks a number is "reasonable", which
+ * is why the assertion is on the RATE THE CODE DIVIDES BY rather than on a printed kIPS.
+ * ================================================================== */
+extern "C" void z3660_perf_clock_get(uae_u32 *wall_hz, int *clk_cfg);
+#include "xtime_l.h"     /* COUNTS_PER_SECOND -- the constant that WAS the bug */
+
+static void test_perf_line_clock(void)
+{
+	printf("[test] the [PERF] kIPS line divides by the RETUNED ARM clock, not the BSP constant\n");
+
+	const uae_u32 SAVED = (uae_u32)shared->arm_wall_hz;
+
+	/* (a) core0 published a retuned rate -- the 1100 MHz bench board's global timer. */
+	shared->arm_wall_hz = 550000000u;
+	{
+		uae_u32 hz = 0; int cfg = -1;
+		z3660_perf_clock_get(&hz, &cfg);
+#if Z3660_EMU_PERF
+		CHECK_EQ32(hz, 550000000u,
+		           "[PERF] measures against SHARED.arm_wall_hz when core0 published one");
+		CHECK_EQ32((uae_u32)cfg, 1, "...and says so: clk=cfg");
+		CHECK(hz != (uae_u32)COUNTS_PER_SECOND,
+		      "...and it is NOT the frozen BSP constant -- that was the 1.65x\n");
+#else
+		CHECK_EQ32(hz, 0, "LEAN build: no [PERF] line, so no rate to report");
+		CHECK_EQ32((uae_u32)cfg, 0, "LEAN build: clk source reported as absent, not as 'bsp'");
+#endif
+	}
+
+	/* (b) an older core0 that never wrote the field: the constant, and the caveat. */
+	shared->arm_wall_hz = 0;
+	{
+		uae_u32 hz = 0; int cfg = -1;
+		z3660_perf_clock_get(&hz, &cfg);
+#if Z3660_EMU_PERF
+		CHECK_EQ32(hz, (uae_u32)COUNTS_PER_SECOND,
+		           "unpublished rate falls back to the BSP constant rather than to zero");
+		CHECK_EQ32((uae_u32)cfg, 0, "...and the line is labelled bsp (UNCALIBRATED)");
+#else
+		CHECK_EQ32(hz, 0, "LEAN build: still nothing to report");
+#endif
+	}
+
+	/* (c) a mailbox word that is not a clock rate. Below 1 MHz is 'absent', never
+	 *     'plausible' -- a rate of 3 would make kIPS a divide-by-nothing. */
+	shared->arm_wall_hz = 3u;
+	{
+		uae_u32 hz = 0; int cfg = -1;
+		z3660_perf_clock_get(&hz, &cfg);
+#if Z3660_EMU_PERF
+		CHECK_EQ32(hz, (uae_u32)COUNTS_PER_SECOND,
+		           "a sub-1 MHz mailbox word is 'absent', not a clock rate");
+		CHECK_EQ32((uae_u32)cfg, 0, "...reported as bsp");
+#else
+		CHECK_EQ32(hz, 0, "LEAN build: nothing to report");
+#endif
+	}
+
+	shared->arm_wall_hz = SAVED;
+}
+
+/* ==================================================================
  * Build-variant contract (CYBERSTORM C3 follow-up).
  *
  * runloop_build.h is the single copy of "which instruments is this binary carrying",
@@ -3449,6 +3525,7 @@ int main(int argc, char **argv)
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
 	test_runloop_overhead_switches();
+	test_perf_line_clock();
 	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
 	test_prof_wire_format();
