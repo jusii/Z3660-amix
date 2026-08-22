@@ -2894,7 +2894,18 @@ static void test_prof_wire_format(void)
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_HANDLER, 7,  "bucket HANDLER == 7");
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   14, "14 buckets");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_INSNS,   0,  "counter INSNS == 0");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   20, "20 counters");
+	/* Appended ids, pinned individually: the whole safety of an append is that every id
+	 * BELOW it still means what a v2 symbolizer thinks it means, and a bare count check
+	 * would pass just as happily if someone had inserted one in the middle instead. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_ATC_HIT,      19, "counter ATC_HIT == 19 (v2's append)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_IFETCH_CALLS, 20, "counter IFETCH_CALLS == 20 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   21, "21 counters");
+	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
+	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
+	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
+	 * tool refuse a capture it can read correctly. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_VERSION,   2,
+	           "wire version stays 2: an APPEND changes no existing id's meaning");
 
 	/* v2's four new/renamed ids. These are the whole reason the version moved, so pin the
 	 * numbers a symbolizer will hard-code AND the names it will print beside them -- an
@@ -3303,6 +3314,82 @@ static void test_prof_translation_counters(void)
 }
 
 /* ==================================================================
+ * IFETCH_CALLS, and the map hypothesis it closes (C2 riding item b).
+ *
+ * The C2 landing model's +10.25 % transition overshoot had one surviving candidate: that
+ * `FETCH` counts instruction-stream WORDS while the shared FETCHOP/FETCHEX bracket is
+ * entered once per accessor CALL, so a longword fetch would be two words and one entry.
+ * If that held, the model over-charged probe cycles to the two ifetch buckets and rung
+ * 1's share was understated by up to 4.3 points.
+ *
+ * It does not hold, and this is where that is asserted rather than argued. Every one of
+ * the five ENTER_IFETCH sites in the tree is followed immediately by exactly one
+ * Z3660_PROF_CNT(C_FETCH), so the two are the same count -- a longword instruction fetch
+ * increments FETCH once. The counter exists to make that an identity a metal capture
+ * carries, and to fail HERE on the day someone adds a sixth fetch site to one path only.
+ *
+ * The word/long asymmetry is the whole point of the fixture: an iword and an ilong fetch
+ * must both move both counters by exactly one, and a naive "FETCH counts words" reading
+ * predicts two for the ilong.
+ * ================================================================== */
+static void test_prof_ifetch_calls(void)
+{
+	printf("[test] IFETCH_CALLS == FETCH: the shared ifetch bracket counts CALLS, not words\n");
+
+	const uae_u32 VA = 0x00408000, PA = 0x0A000000;
+	mmu040_map1(VA, PA, 0, false);
+	regs.s = 1;
+	hram_poke32(PA + 0x40, 0xDEADBEEFu);
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+
+	bool faulted = false;
+	uae_u16 w = 0; uae_u32 l = 0;
+	SAVE_EXCEPTION;
+	TRY(f1) { w = uae_mmu040_get_iword(VA + 0x40); } CATCH(f1) { faulted = true; (void)f1; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "the word instruction fetch completed\n");
+	CHECK_EQ32(w, 0xDEAD, "...and returned the mapped word");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS], 1,
+	           "one word fetch == one bracket entry");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_FETCH], 1,
+	           "...and one FETCH");
+
+	SAVE_EXCEPTION;
+	TRY(f2) { l = uae_mmu040_get_ilong(VA + 0x40); } CATCH(f2) { faulted = true; (void)f2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "the LONG instruction fetch completed\n");
+	CHECK_EQ32(l, 0xDEADBEEFu, "...and returned the mapped longword");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS], 2,
+	           "a longword fetch is ONE bracket entry, not two");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_FETCH], 2,
+	           "...and ONE FETCH -- so FETCH has never counted words");
+
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS],
+	           (uae_u32)z3660_prof_cnt[Z3660_PROF_C_FETCH],
+	           "IFETCH_CALLS == FETCH identically: the map's recon-B is refuted by this source");
+
+	/* And it is genuinely the BRACKET being counted, not a bystander: with the buckets
+	 * armed the same two fetches must move the two ifetch buckets' transition count. */
+	z3660_prof_zero();
+	z3660_prof_set_buckets(1);
+	z3660_prof_loop_reset();
+	SAVE_EXCEPTION;
+	TRY(f3) { (void)uae_mmu040_get_ilong(VA + 0x40); } CATCH(f3) { (void)f3; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS], 1,
+	           "the counter lives inside the bracket, so an armed run still counts it once");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 2,
+	           "...and the bracket really opened and closed: one enter, one exit");
+	CHECK_EQ32((uae_u32)z3660_prof_sp, 0, "the phase stack is back at the floor");
+
+	z3660_prof_set_buckets(0);
+	mmu040_off();
+	z3660_prof_zero();
+}
+
+/* ==================================================================
  * CYBERSTORM C2-prep -- where the absolute ARM clock comes from.
  *
  * The measurable part (the PMCCNTR : global-timer RATIO) is fixed at 2:1 in silicon and
@@ -3537,6 +3624,7 @@ int main(int argc, char **argv)
 	test_prof_probe_calibration();
 	test_prof_clock_source();
 	test_prof_translation_counters();
+	test_prof_ifetch_calls();
 	test_prof_ring();
 	test_prof_under_execution();
 #endif

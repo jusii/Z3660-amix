@@ -490,8 +490,63 @@ enum {
    Z3660_PROF_C_TRANSITIONS = 17, /* phase transitions -- multiply by PROBE_CYC        */
    Z3660_PROF_C_STACK_OVF   = 18, /* phase-stack overflows; MUST be 0                  */
    Z3660_PROF_C_ATC_HIT     = 19, /* v2: translates satisfied WITHOUT a table walk     */
-   Z3660_PROF_C_COUNT       = 20
+   Z3660_PROF_C_IFETCH_CALLS= 20, /* entries into the shared FETCHOP/FETCHEX bracket   */
+   Z3660_PROF_C_COUNT       = 21
 };
+
+/* WHY `IFETCH_CALLS` EXISTS, AND WHY IT IS THE ONE COUNTER WORTH ADDING.
+ *
+ * The C2 map's landing model reproduces the firmware's own `TRANSITIONS` count and then
+ * distributes the measured probe cost across the buckets by that shape. Under v1 it
+ * predicted the count to 12 parts per million -- the single strongest piece of evidence
+ * in v1. Under v2 it overshoots by +10.25 %, which is inside the tool's tolerance but is
+ * a four-order-of-magnitude degradation, and the overshoot is 1.166 transitions per guest
+ * instruction: suspiciously close to "one bracket that is entered fewer times than the
+ * model thinks".
+ *
+ * The map (§10.3b) tested two explanations against this source and refuted both: neither
+ * TAILSAMP nor TAILPOLL is cadence-gated, so the tail split is not where the shortfall
+ * is. The remaining candidate is right here. `FETCHOP` and `FETCHEX` share ONE bracket
+ * (Z3660_PROF_ENTER_IFETCH, with a hint flag choosing the bucket), entered once per
+ * accessor CALL -- while the model derives their entry counts from `FETCH`, which counts
+ * WORDS. A longword extension fetch is one call and two words, and would produce exactly
+ * this shape.
+ *
+ * That is a hypothesis and nothing in a v2 capture could distinguish it from the
+ * alternatives, because the quantity it turns on -- calls -- was never measured. So
+ * measure it.
+ *
+ * AND THE SOURCE ALREADY ANSWERS IT, WHICH IS WORTH SAYING BEFORE THE FIRST CAPTURE
+ * COMES BACK. There are exactly five ENTER_IFETCH sites in this tree -- two in
+ * include/cpummu.h (uae_mmu040_get_iword, uae_mmu040_get_ilong) and three in
+ * include/cpummu030.h (uae_mmu030_get_ilong/_iword/_ibyte) -- and every one of them is
+ * followed IMMEDIATELY by a single Z3660_PROF_CNT(Z3660_PROF_C_FETCH). One bracket entry,
+ * one FETCH increment, at all five. So `FETCH` has never counted words: it counts the
+ * same accessor CALLS the bracket counts, and a longword instruction fetch increments it
+ * once, not twice. `IFETCH_CALLS == FETCH` identically.
+ *
+ * So the ifetch reconciliation (map §10.3, recon-B) is REFUTED by this source, in the
+ * same way and for the same reason the two cadence-gating candidates before it were: the
+ * firmware does not do the thing the model needed it to do. The model's shortfall is
+ * elsewhere and is still open. Note the direction this closes off: recon-B was the column
+ * that moved rung 1's share UP by 4.3 points, so removing it narrows the bracket rather
+ * than raising the estimate.
+ *
+ * The counter still ships, for three reasons that outlive the question that prompted it.
+ * It turns a reading of this file into an identity a capture ASSERTS. It makes the
+ * ifetch bucket's entry count directly available to the landing model instead of derived.
+ * And on the day the two figures diverge, a fetch site was added to one path and not the
+ * other -- which is exactly the drift no reviewer would catch.
+ *
+ * THE VERSION IS DELIBERATELY NOT BUMPED. The header's rule is to bump when a record
+ * layout, a bucket id, a counter id or the dump grammar changes -- and v2 bumped for two
+ * RENAMES and a changed probe_cyc unit, i.e. for ids whose MEANING moved under a reader's
+ * feet. A pure APPEND moves nothing: every id 0..19 still counts exactly what a v2
+ * symbolizer believes it counts, the binary header layout is untouched, and the ASCII
+ * counter line carries its own name. The host symbolizer already handles an id past the
+ * end of its table by reporting it uninterpreted rather than by mis-labelling it, which
+ * is the behaviour that makes appends safe. Bumping to v3 would instead make every
+ * existing v2 tool REFUSE a capture that it can read correctly. */
 
 /* THE `ATC_HIT` DEFECT, AND THE THREE IDENTITIES THAT REPLACE IT.
  *
@@ -751,13 +806,19 @@ static __inline__ void z3660_prof_tick(uint32_t pc, uint16_t opcode, uint16_t fl
 #define Z3660_PROF_LOOP_RESET() z3660_prof_loop_reset()
 #define Z3660_PROF_UNWOUND()    z3660_prof_unwound()
 #define Z3660_PROF_MARK_OPFETCH() do { z3660_prof_opfetch_hint = 1; } while (0)
-/* Opcode fetch and extension fetch share one accessor; the mark decides which bucket. */
+/* Opcode fetch and extension fetch share one accessor; the mark decides which bucket.
+ *
+ * IFETCH_CALLS counts entries into THIS bracket -- calls, not words. The C2 landing model
+ * derives the two ifetch buckets' entry counts from `FETCH`, which counts words, and the
+ * gap between the two is the leading candidate for the model's +10.25 % transition
+ * overshoot. See the counter enum for why that matters and which way it moves rung 1. */
 #define Z3660_PROF_ENTER_IFETCH()                                             \
    do {                                                                       \
       int z3660_b_ = z3660_prof_opfetch_hint ? Z3660_PROF_B_FETCHOP           \
                                              : Z3660_PROF_B_FETCHEX;          \
       z3660_prof_opfetch_hint = 0;                                            \
       z3660_prof_enter(z3660_b_);                                             \
+      z3660_prof_count(Z3660_PROF_C_IFETCH_CALLS);                            \
    } while (0)
 
 #else /* !Z3660_EMU_PROF -- the default and lean builds see none of the above */
