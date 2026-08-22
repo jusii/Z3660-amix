@@ -1,6 +1,18 @@
 /Alfa/*
 !/Alfa/
+# The boot-image descriptors, one per build variant. Everything else under Alfa/ is a
+# generated artefact (BOOT*.BIN, sd_card contents), but these three are SOURCE: without
+# them the matching make target cannot assemble an image at all.
+#
+# Name each one explicitly rather than writing `!/Alfa/*.bif`. The lean bif survived only
+# because it was force-added, and the profiling bif then did not survive at all -- it was
+# left untracked when `make profile` landed, so that target worked on exactly one machine
+# and would have failed on any fresh clone with a mkbootimage error naming a file the repo
+# does not contain. An ignore rule that has to be defeated by `git add -f` is a rule that
+# will eventually not be defeated.
 !/Alfa/system_cli.bif
+!/Alfa/system_cli_lean.bif
+!/Alfa/system_cli_prof.bif
 /Debug/
 /ReleaseAlfa/
 /Beta/
