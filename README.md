@@ -12,7 +12,9 @@
 > - **68030 PMMU emulation** — new `bootmode UAE_030_MMU` (a 68030 interpreter *with* a working PMMU).
 > - **Emulated A3000 SCSI** — AMIX's kernel bootstrap path (SuperDMAC + WD33C93).
 > - **New config knobs** — `amix_mode` (AMIX memory contract) and `service_cadence` (emulator
->   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating.
+>   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating and the
+>   `perf_stats`/`emu_probes`/`core0_stats` run-loop overhead switches (all default to the
+>   unchanged behaviour).
 > - **Guest-side AMIX drivers** — `amix-z3660scsi` / `amix-z3660net` (SCSI + ethernet inside AMIX)
 >   live in the companion **[amix-kerntools](https://github.com/jusii/amix-kerntools)** repo.
 >

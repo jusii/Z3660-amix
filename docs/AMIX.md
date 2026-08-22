@@ -32,6 +32,7 @@ existing list. Upstream Z3660 behaviour is unchanged.
 | **Native AMIX drivers** | [`amix-z3660scsi` / `amix-z3660net`](https://github.com/jusii/amix-kerntools) run inside AMIX against the Z3660 PISCSI + ethernet register protocol this repo owns — they live in the companion **amix-kerntools** repo. |
 | **AMIX warm-reboot fix** | A clean Zynq reboot on an AMIX `reboot`, instead of the register-flood / data-abort the naïve path produced. |
 | **Emulator perf + debug knobs** | `service_cadence` (CPU throughput vs. interrupt latency) and per-category debug gating (`DEMU` / `DSCSI`) to silence the emulator's debug floods. |
+| **Run-loop overhead switches** | `perf_stats` / `emu_probes` / `core0_stats` turn off the firmware's own per-instruction and per-loop-iteration instrumentation at runtime, so its cost can be measured rather than assumed. All default to on (unchanged behaviour). |
 | **Sizable AMIX RAM window** | `amix_ram <MiB>` sizes the single contiguous window the AMIX memory contract presents (default 16, bounded at 128 by the combo board window). |
 
 ---
@@ -93,6 +94,12 @@ A minimal AMIX `z3660cfg.txt` looks like:
 bootmode UAE_030_MMU          # 68030 + PMMU
 amix_mode YES                 # AMIX memory contract + A3000-SCSI bootstrap (default ON for this bootmode)
 service_cadence 4             # AMIX-safe perf; see below
+
+# Optional: switch off the firmware's own instrumentation (diagnostics only -- emulation
+# is unaffected). All three default YES; see "run-loop overhead switches" below.
+#perf_stats NO
+#emu_probes NO
+#core0_stats NO
 
 # Map an A3000-variant Kickstart (you supply the .rom file):
 kickstart5 kicks/A3kKS31.rom
@@ -185,6 +192,61 @@ interrupt latency; higher = more CPU throughput.
   the serial **SERV** runtime menu if you want maximum throughput once AMIX is up.
 - **⚠️** A very high cadence combined with an unthrottled network flood (e.g. a fast telnet
   transfer) has been observed to panic AMIX — keep boot-time cadence ≤ 4.
+
+### Sweeping `service_cadence` on metal — what to watch
+
+The knob trades interrupt **latency** for CPU **throughput**, so the failure mode of a too-high
+cadence is never "slower" — it is a missed or late interrupt somewhere. Named couplings, so a
+calibration session knows what it is looking at when something breaks:
+
+| Cadence | Status | Coupling that breaks first |
+|---|---|---|
+| 1 | default | none — maximum responsiveness, minimum throughput |
+| 2–4 | **known good**, boots and runs | — |
+| 8 | boots **only after** AMIX is up (set it with `SERV`, not in the config) | the **A3000-SCSI bootstrap**: `sd` open steps through SELECT and SRV_REQ **INT2**s, and at cadence 8 the emulator notices them too late — the bootstrap hangs before the kernel is loaded |
+| 16–64 | throughput ceiling ~1.3× vs cadence 1, knee around 8 | **network RX under flood** (a fast telnet transfer has panicked AMIX); INT2/INT6 latency generally |
+
+Things that are **not** coupled, and should not be blamed when they move:
+
+- **piscsi.** The mailbox has no interrupt at all — completion is the blocking bus cycle, and
+  `z3660intr()` is an empty stub. During a round trip core1 is spinning in
+  `while(shared->write_scsi==1){NOP;}` and the cadence counter is not even advancing. Disk
+  throughput measured flat across the whole 1→64 range. (`docs/piscsi-service-path.md` §2.)
+- **The serial console.** It is core0's `debug_thread`, not core1's poll.
+- **`do_specialties()`**, which stays per-instruction at every cadence: STOP, trace and mode-change
+  remain exactly as responsive as they were.
+
+So the shape to expect from a sweep is guest throughput rising to a knee near 8 while disk I/O
+stays flat — and if disk I/O moves with cadence, the model is wrong and that is the finding.
+
+### `perf_stats YES|NO`, `emu_probes YES|NO`, `core0_stats YES|NO` — run-loop overhead switches
+
+Three switches that remove **measurement and tracing**, never emulation. Off, the guest sees the
+same machine; it just gets more of the ARM's time. All three default to `YES` = exactly what this
+firmware has always done, so a config that omits them is unchanged.
+
+| Key | Core | What it costs when ON | Serial toggle |
+|---|---|---|---|
+| `perf_stats` | core1 | the per-instruction instruction-rate accumulator (a 64-bit read-modify-write per emulated instruction) and its ~1 Hz tick | `PERFS` |
+| `emu_probes` | core1 | the ISSUE-52-era run-loop probes: `[ROMENT]` `[RTE]` `[URTE]` `[USTEP]` `[IDCMP]` on the 040 loop, the wild-PC detector and retired-instruction ring on the 030 loop. Their output caps are long since exhausted on a normal boot — what remains is the per-instruction *test* | `PROBES` |
+| `core0_stats` | core0 | C0STAT per-task span stamping: ~8 ARM global-timer reads per cooperative-loop iteration, on the critical path of every one of the ten cross-core round trips a 2 KB guest read costs | `CSTAT` |
+
+Notes:
+
+- **`PSTAT` and `CSTAT` are different things.** `PSTAT` has always gated only the *printing*;
+  the stamping never stopped. `CSTAT` gates the stamping itself. C0STAT calibrates its own
+  cost on the metal at the live ARM clock and prints it as the `ovh=` figure in every report and
+  as `cost/boundary` at startup — read those first to decide whether it is worth switching off.
+- **`emu_probes NO` is not deletion.** The instruments are one flash away — or one `PROBES` away,
+  live. Building with `-DZ3660_EMU_PROBES=0` compiles them out entirely for a lean build; the
+  default build keeps them.
+- **`perf_stats NO` stops `[PERF]` kIPS**, obviously — the counter it reports is the counter being
+  switched off. `SERV`, `PERFS` and `PROBES` all still reach the run loop with it off (the resync
+  moved to `do_specialties()`, which runs only when there is already something to do).
+- Toggling any of these live is safe under a running guest: they are read-only diagnostics.
+- As with every YES/NO key here, a value that is neither `YES` nor `NO` is reported as an error in
+  red and read as `NO` — so a typo switches an instrument **off**, it does not fall back to the
+  default.
 
 ### `isoN <file>` — CD-ROM images (upstream's key, with a trap)
 
