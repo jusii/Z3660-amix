@@ -156,6 +156,18 @@ machinery. The fast path's own overhead lands in `LOOP`, which after probe subtr
 0.51 % today — so a post-change capture in which `LOOP` has grown is unambiguously this and
 nothing else.
 
+> **`LOOP`'s post-change share is still an OPEN CAPTURE ITEM.** The 2026-08-22 metal
+> session ran with the stage buckets off (`prof_buckets NO`) for its whole length, so the
+> "did `LOOP` grow?" check above has never been performed. It is the natural next
+> stage-attribution capture and it is the thing that would price §3b's measured ~1 %
+> dhrystone cost **directly**, instead of inferring it from a wall-clock A/B. Two further
+> reasons it is worth taking rather than dropping: `LOOP` is also where the decoded-op
+> cache's own hit-path work lands (`docs/decoded-op-cache.md`), so the two rungs are now
+> sharing one bucket and only a capture can separate them; and §8.3's "`LOOP` is empty"
+> conclusion is drawn at a probe price the instrument cannot justify (see
+> `docs/profiler.md` on the price bracket), so `LOOP`'s *pre*-change share is not settled
+> either.
+
 ## PRE-REGISTERED — judge the change against these, not against what it produces
 
 From the map §11.1, at its stated 80 % reclaim:
@@ -230,7 +242,10 @@ of boot and 25.11 % of the IO workload — would take boot to ~120 s and the dis
    flash".
 3. Flash `BOOT-lean.BIN` for the timings — boot to login, dhrystone, `dd` from `ced0s1` —
    and compare against the table above.
-4. The bench guard last: re-take the boot profile and check `bzero`'s share.
+4. The bench guard last: re-take the boot profile and check `bzero`'s share of **busy** boot
+   time against the corrected 5 % threshold above. Take this capture with the stage buckets
+   **on** (`PROFB`) — the 2026-08-22 session took it with them off, which is why `LOOP`'s
+   post-change share is still an open item.
 
 ## What is not covered, stated plainly
 
