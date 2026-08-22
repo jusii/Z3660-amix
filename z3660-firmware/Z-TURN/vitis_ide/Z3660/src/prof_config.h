@@ -58,6 +58,14 @@
 #define Z3660_PROF_CFG_HZ_MIN       1
 #define Z3660_PROF_CFG_HZ_MAX       20000
 
+/* Ring capacity, mirrored from Z3660_PROF_RING_ENTRIES for the same reason and with the
+ * same guard. core0 needs it to answer the only question that matters when arming at an
+ * explicit rate: how many seconds of history fits before the ring wraps. Two of the three
+ * C1 workload captures wrapped and retained a tail that was recorded AFTER the benchmark
+ * ended, so they profiled the scheduler idle loop and had to be thrown away -- a number
+ * the console prints at arm time is the cheapest possible defence against repeating it. */
+#define Z3660_PROF_CFG_RING_ENTRIES 65536
+
 /* The cross-core command word core0 writes into SHARED.prof_ctl. These MIRROR
  * Z3660_PROF_CTL_* in Z3660_emu/src/uae/z3660_prof.h, which core0 cannot include (core1
  * C++, inside the UAE include tree, and pulling that in would drag the whole emulator's
@@ -105,6 +113,54 @@ static inline int z3660_prof_cfg_buckets(int requested)
 static inline int z3660_prof_cfg_is_default(int hz, int buckets)
 {
    return hz == Z3660_PROF_CFG_HZ_DEFAULT && buckets == Z3660_PROF_CFG_BUCKETS_DEF;
+}
+
+/* ---------------------------------------------------------------------------
+ * What a bare `PROF` press does next -- the rate-cycling ladder, and its one rule that
+ * is not a ladder step at all.
+ *
+ * THE LADDER: off -> 250 -> 1000 -> 4000 -> off. Every rung ARMS, and arming zeroes the
+ * ring, the buckets and the counters -- which is harmless while the ladder is the only
+ * way in, because then you always know what the next press will destroy.
+ *
+ * THE RULE: an armed rate that is NOT one of the ladder's own values did not come from
+ * the ladder. It came from `prof_hz` in z3660cfg.txt (the boot profile, the one capture
+ * the console structurally cannot take) or from an explicit `PROF <hz>`. Stepping over
+ * such a rate arms on top of it and destroys it, and for the boot profile that means
+ * another cold boot to retake something that took minutes to collect. So the press STOPS
+ * instead, which is lossless and is what somebody who armed deliberately would want.
+ *
+ * This cost a real capture in the 2026-08-22 C1 metal session: armed at 200 Hz from the
+ * config file, the first PROF press mapped 200 into the `< 1000` arm and re-armed at
+ * 1000 Hz. There was no press that meant "stop" -- which is also why `PROF OFF` now
+ * exists as a command in its own right rather than as an emergent property of a ladder.
+ *
+ * It lives here, next to the bounds, because it is a RULE rather than a keystroke: the
+ * host guard compiles this header and asserts every transition, where the console code
+ * it drives needs the Xilinx BSP and cannot be compiled on the host at all.
+ * --------------------------------------------------------------------------- */
+#define Z3660_PROF_CFG_LADDER_A     250
+#define Z3660_PROF_CFG_LADDER_B     1000
+#define Z3660_PROF_CFG_LADDER_C     4000
+
+static inline int z3660_prof_cfg_is_ladder_rate(int hz)
+{
+   return hz == 0 || hz == Z3660_PROF_CFG_LADDER_A
+                  || hz == Z3660_PROF_CFG_LADDER_B
+                  || hz == Z3660_PROF_CFG_LADDER_C;
+}
+
+/* Returns the rate the next `PROF` press should arm at; 0 means "stop, keeping the data".
+ * Callers must ALSO consult z3660_prof_cfg_is_ladder_rate() to tell an ordinary
+ * ladder-wrap stop (4000 -> off) from an off-ladder refusal, because the two want
+ * different words on the console even though they take the same action. */
+static inline int z3660_prof_cfg_next_rate(int armed_hz)
+{
+   if(!z3660_prof_cfg_is_ladder_rate(armed_hz)) return 0;   /* deliberate: stop, do not arm */
+   if(armed_hz == 0)                       return Z3660_PROF_CFG_LADDER_A;
+   if(armed_hz <  Z3660_PROF_CFG_LADDER_B) return Z3660_PROF_CFG_LADDER_B;
+   if(armed_hz <  Z3660_PROF_CFG_LADDER_C) return Z3660_PROF_CFG_LADDER_C;
+   return 0;
 }
 
 #endif /* SRC_PROF_CONFIG_H_ */

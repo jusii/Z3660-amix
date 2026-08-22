@@ -9,6 +9,7 @@
 #include "config_clk.h"
 #include "config_file.h"
 #include <stdlib.h>
+#include <string.h>
 
 void debug_console_help(void);
 void dump_mmu(void);
@@ -87,6 +88,7 @@ typedef enum {
    PROFD,   PROF_DUMP,
    PROFR,   PROF_RING,
    PROFZ,   PROF_ZERO,
+   PROFO,   PROF_OFF,      /* C2-prep: the lossless stop. See the case below. */
 
    NUM_COMMANDS
 } COMMANDS;
@@ -147,6 +149,7 @@ const char *command_names[] = {
       "PROFD",   "PROF DUMP",
       "PROFR",   "PROF RING",
       "PROFZ",   "PROF ZERO",
+      "PROFO",   "PROF OFF",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -241,6 +244,60 @@ void dump_mem(uint32_t address, uint32_t length, int swap)
       }
    }
 }
+/* `PROF <hz>` -- arm the interpreter sampler at an EXPLICIT rate.
+ *
+ * The command table is an exact-string match over the whole input line, so a command
+ * with a numeric argument cannot live in it. This runs from the not-found path instead,
+ * which costs nothing until somebody types something the table does not have.
+ *
+ * It exists for the same reason `PROF OFF` does. The rate-cycling `PROF` offers three
+ * rates and no way to ask for a fourth, so a session that wanted the C2 map's
+ * recommended 250 Hz (a wrap-free window long enough to CONTAIN a dhrystone run rather
+ * than the idle loop after it) had to arm at 1000 and accept a ring that wrapped before
+ * the workload ended. Two of the three C1 workload captures were lost exactly that way.
+ *
+ * Returns 1 if the line was consumed, 0 to let the caller report an unknown command.
+ * Rate bounds are core1's (z3660_prof.h, mirrored in prof_config.h) and are CLAMPED
+ * rather than refused, matching the config key -- the rate actually used is recorded in
+ * the dump header either way, so a typo produces a labelled profile rather than none.
+ */
+static int prof_try_explicit_rate(const char *cmd)
+{
+   uint32_t hz=0;
+   int i;
+
+   if(strncmp(cmd,"PROF ",5)!=0) return 0;
+   for(i=5; cmd[i]!=0; i++)
+   {
+      if(cmd[i]<'0' || cmd[i]>'9') return 0;      /* not a number -> not ours */
+      if(hz > 99999u) hz = 99999u;                /* saturate rather than wrap */
+      else hz = hz*10u + (uint32_t)(cmd[i]-'0');
+   }
+   if(i==5) return 0;                             /* bare "PROF " with no digits */
+
+   if(hz==0)
+   {
+      /* `PROF 0` is a rate of nothing, which is a stop -- and a stop must not zero. */
+      shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+      shared->prof_hz=0;
+      debug_console.prof_buckets=0;
+      xil_printf("PROF OFF requested (via 'PROF 0'): sampler and buckets frozen, data KEPT\r\n");
+      return 1;
+   }
+   if(hz<(uint32_t)Z3660_PROF_CFG_HZ_MIN) hz=(uint32_t)Z3660_PROF_CFG_HZ_MIN;
+   if(hz>(uint32_t)Z3660_PROF_CFG_HZ_MAX) hz=(uint32_t)Z3660_PROF_CFG_HZ_MAX;
+   shared->prof_hz=hz;
+   shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM,0);
+   /* The wrap-free window is printed with the rate, because it is the number that
+    * decides whether the capture will contain its workload or the idle loop after it,
+    * and nobody computes it in their head at the console. */
+   xil_printf("PROF ARM %lu Hz requested -- ZEROES buckets, counters and ring "
+              "(PROFILING build only; %lu samples = %lu s before the ring wraps)\r\n",
+              (unsigned long)hz, (unsigned long)Z3660_PROF_CFG_RING_ENTRIES,
+              (unsigned long)((uint32_t)Z3660_PROF_CFG_RING_ENTRIES/hz));
+   return 1;
+}
+
 #define ESC 27
 #include "pt/pt.h"
 int debug_thread(struct pt *pt)
@@ -474,22 +531,50 @@ int debug_thread(struct pt *pt)
                    * happened, and the absence of a [PROF] reply IS the answer. */
                   case PROF:
                   case PROF_ARM:
-                     {  // cycle the sampler rate: off -> 250 -> 1000 -> 4000 -> off
-                        uint32_t hz=shared->prof_hz;
-                        if(hz==0)         hz=250;
-                        else if(hz<1000)  hz=1000;
-                        else if(hz<4000)  hz=4000;
-                        else              hz=0;
-                        shared->prof_hz=hz;
+                     {  // Cycle the sampler rate: off -> 250 -> 1000 -> 4000 -> off, with
+                        // one exception -- an armed rate that is NOT on the ladder came
+                        // from z3660cfg.txt or from an explicit 'PROF <hz>', so the press
+                        // STOPS it losslessly rather than arming (and zeroing) over a
+                        // capture somebody set up deliberately. The rule and the reason
+                        // live in prof_config.h, where the host guard can test them; this
+                        // is only the keystroke that runs it.
+                        int armed=(int)shared->prof_hz;
+                        int off_ladder=!z3660_prof_cfg_is_ladder_rate(armed);
+                        int hz=z3660_prof_cfg_next_rate(armed);
+                        shared->prof_hz=(uint32_t)hz;
                         if(hz) {
                            shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM,0);
                            xil_printf("PROF ARM %lu Hz requested (zeroes the ring; PROFILING build only)\r\n",
                                       (unsigned long)hz);
                         } else {
                            shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
-                           xil_printf("PROF STOP requested (data kept -- PROFD/PROFR still read it)\r\n");
+                           debug_console.prof_buckets=0;   // core1's stop clears both
+                           if(off_ladder) {
+                              xil_printf("PROF STOP requested: armed at %lu Hz, which is not a PROF "
+                                         "ladder rate (250/1000/4000) -- stopping rather than arming "
+                                         "over a capture somebody set up on purpose.\r\n",
+                                         (unsigned long)armed);
+                              xil_printf("  data KEPT: PROFD / PROFR / 'PROF RING' read it. "
+                                         "'PROF <hz>' re-arms (and zeroes).\r\n");
+                           } else {
+                              xil_printf("PROF STOP requested (data kept -- PROFD/PROFR still read it)\r\n");
+                           }
                         }
                      }
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFO:
+                  case PROF_OFF:
+                     /* The direct, unambiguous, always-available lossless stop. Freezes
+                      * the sampler AND the stage buckets and keeps every byte, from any
+                      * armed state whatsoever -- config-armed, ladder-armed or explicitly
+                      * armed. This is the command a metal session reaches for when the
+                      * workload has just finished and the ring must not move again. */
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+                     shared->prof_hz=0;
+                     debug_console.prof_buckets=0;
+                     xil_printf("PROF OFF requested: sampler and buckets frozen, data KEPT "
+                                "(PROFD / PROFR / 'PROF RING' read it)\r\n");
                      debug_console.subcmd=0;
                      break;
                   case PROFB:
@@ -822,6 +907,8 @@ int debug_thread(struct pt *pt)
                   break;
                }
             }
+            if(command_found==0)
+               command_found=prof_try_explicit_rate(debug_console.cmd_buf);
             if(command_found==0)
             {
                xil_printf("Unknown command '%s'. Type 'help' or 'h' for help.\r\n",debug_console.cmd_buf);
@@ -1263,10 +1350,14 @@ void debug_console_help(void)
    xil_printf("'CSTAT'   or 'CORE0 LOOP STATS' toggles core0 C0STAT span STAMPING (not just printing)\r\n");
    xil_printf("--- CYBERSTORM C1 interpreter profiler (PROFILING build only; that image says so at boot) ---\r\n");
    xil_printf("'PROF'    cycles the guest-PC sampler: off -> 250 -> 1000 -> 4000 Hz -> off (arming zeroes the data)\r\n");
+   xil_printf("'PROF <hz>' arms at an EXPLICIT rate, 1..20000 (also zeroes). Prints the wrap-free window\r\n");
+   xil_printf("'PROFO'   or 'PROF OFF' freezes sampler AND buckets and KEEPS the data -- the lossless stop\r\n");
    xil_printf("'PROFB'   toggles the interpreter STAGE BUCKETS -- costly: read the shares, not the rate\r\n");
-   xil_printf("'PROFD'   dumps stage buckets + counters (~35 lines)\r\n");
+   xil_printf("'PROFD'   dumps stage buckets + counters (~40 lines)\r\n");
    xil_printf("'PROFR'   dumps the newest 4096 PC samples (~8 s of serial); 'PROF RING' dumps all 65535 (~2 min)\r\n");
    xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
+   xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
+   xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");
 }
 #endif

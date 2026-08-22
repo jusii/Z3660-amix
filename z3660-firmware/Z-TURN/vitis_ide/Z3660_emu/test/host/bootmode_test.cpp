@@ -180,6 +180,34 @@ int main(void)
          == Z3660_PROF_CTL_ARM, "core1 decodes the command core0 packed\n");
    CHECK(Z3660_PROF_CTL_ARG(Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM, 1)) == 1,
          "...and its argument, which is how a config-armed boot profile gets its buckets\n");
+   CHECK((unsigned)Z3660_PROF_CFG_RING_ENTRIES == (unsigned)Z3660_PROF_RING_ENTRIES,
+         "RING_ENTRIES agrees -- core0 prints the wrap-free window when arming\n");
+
+   /* CYBERSTORM C2-prep: the `PROF` ladder, and the rule that a rate off the ladder means
+    * STOP rather than step-up.
+    *
+    * Every rung ARMS, and arming ZEROES the ring, the buckets and the counters. The C1
+    * metal session armed a boot profile at 200 Hz from z3660cfg.txt and then had no
+    * keystroke that meant "stop": the first PROF press mapped 200 into the `< 1000` arm
+    * and destroyed a multi-minute capture that could only be retaken by cold-booting.
+    * The rule lives in prof_config.h precisely so it can be asserted here -- the console
+    * code that runs it needs the Xilinx BSP and cannot be compiled on the host. */
+   printf("[test] profiler: the PROF rate ladder, and what it does with a rate it did not set\n");
+   CHECK(z3660_prof_cfg_next_rate(0)    == 250,  "off -> 250\n");
+   CHECK(z3660_prof_cfg_next_rate(250)  == 1000, "250 -> 1000\n");
+   CHECK(z3660_prof_cfg_next_rate(1000) == 4000, "1000 -> 4000\n");
+   CHECK(z3660_prof_cfg_next_rate(4000) == 0,    "4000 -> off (the ladder wraps to a stop)\n");
+   CHECK(z3660_prof_cfg_is_ladder_rate(0) && z3660_prof_cfg_is_ladder_rate(250) &&
+         z3660_prof_cfg_is_ladder_rate(1000) && z3660_prof_cfg_is_ladder_rate(4000),
+         "the four ladder rates are recognised as its own\n");
+   CHECK(!z3660_prof_cfg_is_ladder_rate(200),
+         "200 Hz -- the C1 boot-profile rate -- is NOT one of them\n");
+   CHECK(z3660_prof_cfg_next_rate(200) == 0,
+         "...so PROF at 200 Hz STOPS (lossless) instead of arming over the capture\n");
+   CHECK(z3660_prof_cfg_next_rate(2000) == 0 && z3660_prof_cfg_next_rate(20000) == 0,
+         "the same for any other explicitly-chosen rate, above or below a rung\n");
+   CHECK(z3660_prof_cfg_next_rate(999) == 0,
+         "a rate just under a rung is still off-ladder -- proximity is not membership\n");
 
    printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
    return g_fail ? 1 : 0;
