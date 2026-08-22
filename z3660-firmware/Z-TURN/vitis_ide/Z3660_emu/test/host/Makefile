@@ -8,7 +8,24 @@ CXX      := g++
 ROOT     := ../..
 SRC      := $(ROOT)/src
 UAE      := $(SRC)/uae
-BUILD    := build
+
+# ---- Build variant, mirroring Z3660_emu/Makefile ---------------------------
+# Z3660_LEAN=1 compiles the SAME sources the lean (production) firmware is built
+# from: -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0. Its own build dir, for the same
+# reason as the firmware's -- a -D is not a tracked dependency, so sharing one dir
+# would let the two variants' objects mix. `make run-lean` runs the suites against
+# it; harness_main.cpp branches its expectations on runloop_build.h, so the lean
+# firmware's contract is asserted, not merely compiled.
+# Z3660_LEAN_EXPECTED tells the harness which variant it is SUPPOSED to be, so a
+# stale/mixed build is a test failure rather than a quietly relabelled pass.
+Z3660_LEAN ?= 0
+ifeq ($(Z3660_LEAN),1)
+BUILD        := build-lean
+VARIANT_DEFS := -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_LEAN_EXPECTED=1
+else
+BUILD        := build
+VARIANT_DEFS :=
+endif
 
 # Stubs dir FIRST so it shadows the absent Xilinx BSP headers.
 INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) -I$(UAE) -I.
@@ -17,7 +34,7 @@ INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) 
 # SDL_strcasecmp macro (sysconfig.h) -> libc strcasecmp. Exceptions ON (TRY/CATCH).
 CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions \
             -DSDL_strcasecmp=strcasecmp -DHOST_TEST_HARNESS \
-            -Wno-write-strings -Wno-narrowing $(INCLUDES)
+            -Wno-write-strings -Wno-narrowing $(VARIANT_DEFS) $(INCLUDES)
 
 # Portable core subset (relative to $(UAE)). All six cpuemu_* are required because
 # cpustbl.cpp's op_smalltbl_N[] arrays reference handlers across all of them.
@@ -54,7 +71,7 @@ CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhe
 AMIX_RAM_BIN := $(BUILD)/amix_ram_test
 CORE0_AMIX_RAM_H := $(ROOT)/../Z3660/src/amix_ram.h
 
-.PHONY: all clean objs run run-scsi run-bootmode run-amix-ram
+.PHONY: all clean objs run run-lean run-scsi run-bootmode run-amix-ram
 all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 
 $(BIN): $(OBJS)
@@ -94,6 +111,11 @@ run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 	@$(SCSI_CD_BIN)
 	@$(BOOTMODE_BIN)
 	@$(AMIX_RAM_BIN)
+
+# The lean (production) firmware's core1, through the same suites. scsi_cd/bootmode/
+# amix_ram do not touch the run loop, so the variant that matters is the MMU harness.
+run-lean:
+	@$(MAKE) Z3660_LEAN=1 run
 
 run-scsi: $(SCSI_CD_BIN)
 	@$(SCSI_CD_BIN)

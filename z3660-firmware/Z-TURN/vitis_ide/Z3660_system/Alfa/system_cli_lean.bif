@@ -1,0 +1,14 @@
+/* Z3660 command-line boot image -- LEAN (production) variant.
+ *
+ * Identical to system_cli.bif except for the core1 ELF: Z3660_emu/build-lean/ instead
+ * of Z3660_emu/build/. Core0 (Z3660.elf), the FSBL and the bitstream are shared -- the
+ * lean variant changes core1's run loop only, so rebuilding core0 for it would be
+ * noise. Produced by `make lean` -> sd_card/BOOT-lean.BIN.
+ */
+the_ROM_image:
+{
+  [bootloader] design_1_wrapper/zynq_fsbl/fsbl.elf
+  design_1_wrapper/hw/design_1_wrapper.bit
+  Z3660/build/Z3660.elf
+  Z3660_emu/build-lean/Z3660_emu.elf
+}

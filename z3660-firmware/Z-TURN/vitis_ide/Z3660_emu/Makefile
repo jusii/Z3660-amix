@@ -10,8 +10,27 @@ SIZE    := $(CROSS_COMPILE)size
 
 ROOT    := $(abspath .)
 SRCDIR  := $(ROOT)/src
-BUILDDIR:= $(ROOT)/build
 LDSCRIPT:= $(SRCDIR)/lscript.ld
+
+# ---- Build variant (CYBERSTORM C3) -----------------------------------------
+# Z3660_LEAN=1 builds the LEAN (production) core1: the run-loop diagnostics are
+# compiled OUT rather than merely switched off at runtime, so the hot path carries
+# neither the instruments nor the predicates that gate them. See
+# src/uae/runloop_build.h for what that buys and why both variants exist.
+#
+# It builds into its OWN directory ON PURPOSE. The variant is selected by -D flags
+# and NOTHING tracks a -D as a dependency: sharing one build dir would let a
+# variant switch leave half the objects from the other one in place, and the link
+# would happily succeed. Separate dirs make that impossible instead of merely
+# unlikely, and let both BOOT.BINs exist at once for an A/B re-flash pair.
+Z3660_LEAN ?= 0
+ifeq ($(Z3660_LEAN),1)
+BUILDDIR    := $(ROOT)/build-lean
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0
+else
+BUILDDIR    := $(ROOT)/build
+VARIANT_DEFS:=
+endif
 
 # Xilinx BSP include paths for Core 1 (ps7_cortexa9_1)
 BSP_CORE1_INC := $(ROOT)/../design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp/ps7_cortexa9_1/include
@@ -33,7 +52,8 @@ INCLUDES:= -I$(SRCDIR) \
 CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 \
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
-           -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY
+           -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY \
+           $(VARIANT_DEFS)
 #-Wall -Wextra -marm
 
 # Additional C++ flags

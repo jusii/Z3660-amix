@@ -4568,8 +4568,11 @@ static void amix_dump_wild(uae_u32 wildpc)
 
 // ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
 #include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
+#include "runloop_build.h"   // Z3660_EMU_PROBES / Z3660_EMU_PERF: which instruments this binary carries
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
+#if Z3660_EMU_PERF
 static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
+#endif
 
 /* ===== CYBERSTORM C3: run-loop overhead knobs =========================================
  *
@@ -4603,32 +4606,61 @@ static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mm
  * instruction, and switching all three off removes substantially more than that. The
  * point of the switches is that the metal now measures this instead of us guessing it.
  *
- * Z3660_EMU_PROBES=0 additionally compiles the probes out entirely, for a lean build.
- * Default 1: the shipped build keeps the instruments one flash away.
+ * THE LEAN BUILD. Everything above is the cost of being able to switch at RUNTIME. The
+ * 2026-08-22 metal calibration priced that: rung F (all three switched off) bought +9.1 %,
+ * but defaults-on was -3.6 % against the old hard-wired build, because the hard-wired
+ * build never paid a predicate. -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 (`make lean`)
+ * compiles both instruments out, and the predicates go with them -- so the lean loop has
+ * neither the instrument nor its test, which is strictly less than either the old
+ * hard-wired build or rung F. Defaults are 1: the shipped diagnostic build keeps the
+ * instruments one flash away. The contract lives in runloop_build.h.
  * ==================================================================================== */
-#ifndef Z3660_EMU_PROBES
-#define Z3660_EMU_PROBES 1
-#endif
+#if Z3660_EMU_PERF
 static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical behaviour)
+#endif
+#if Z3660_EMU_PROBES
 static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
+#endif
 
 /* Resample every run-loop knob from the cross-core mailbox. Not static: the host harness
  * calls it directly rather than waiting for a resync point. */
 extern "C" void z3660_knobs_sync(void)
 {
    int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // SERV
+#if Z3660_EMU_PERF
    z3660_perf_on   = shared->perf_stats ? 1 : 0;                                       // PERFS
+#endif
+#if Z3660_EMU_PROBES
    z3660_probes_on = shared->emu_probes ? 1 : 0;                                       // PROBES
+#endif
 }
 
-/* Read-back for the harness (and any future serial dump). */
+/* Read-back for the harness (and any future serial dump).
+ *
+ * On the lean build an instrument that is COMPILED OUT reports 0 whatever the mailbox
+ * says, because that is the truth about the loop: the switch has nothing left to switch.
+ * Reporting the mailbox bit instead would let a metal session believe an instrument is
+ * armed when the binary does not contain it. service_cadence is NOT an instrument -- it
+ * is a functional knob, it survives in both variants, and it is read back as-is. */
 extern "C" void z3660_knobs_get(int *perf_on, int *probes_on, int *cadence)
 {
+#if Z3660_EMU_PERF
    if(perf_on)   *perf_on   = z3660_perf_on;
+#else
+   if(perf_on)   *perf_on   = 0;
+#endif
+#if Z3660_EMU_PROBES
    if(probes_on) *probes_on = z3660_probes_on;
+#else
+   if(probes_on) *probes_on = 0;
+#endif
    if(cadence)   *cadence   = z3660_service_cadence;
 }
+#if Z3660_EMU_PERF
 extern "C" uae_u64 z3660_perf_count_get(void) { return z3660_perf_count; }
+#else
+extern "C" uae_u64 z3660_perf_count_get(void) { return 0; }   /* no accumulator to report */
+#endif
 
 /* Knob resync point that survives perf_stats OFF.
  *
@@ -4646,6 +4678,7 @@ static void z3660_knobs_poll(void)
    z3660_knobs_sync();
 }
 
+#if Z3660_EMU_PERF
 static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
 {
    z3660_knobs_sync();                    // pick up the runtime knobs (SERV / PERFS / PROBES)
@@ -4661,6 +4694,22 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
       lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
    }
 }
+#endif /* Z3660_EMU_PERF */
+
+/* The accumulator half of the tail. On the DEFAULT build this is exactly what the loops
+ * have always run, plus the `if (z3660_perf_on)` predicate the runtime switch needs. On
+ * the LEAN build it expands to NOTHING -- not to a predicate that is always false, to
+ * nothing -- which is the whole point: the lean loop does not test a switch it does not
+ * have. */
+#if Z3660_EMU_PERF
+#define Z3660_RUNLOOP_PERF()                                                  \
+      if (z3660_perf_on) {                                                    \
+         z3660_perf_count++;                                                  \
+         if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();            \
+      }
+#else
+#define Z3660_RUNLOOP_PERF()   /* lean build: no accumulator, and so no predicate either */
+#endif
 
 /* The per-instruction tail both MMU run loops share, so the two cannot drift.
  *
@@ -4668,14 +4717,12 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
  * is what the two loops have today, and sharing one would silently couple their poll
  * phase across a mode change.
  *
- * With perf_stats ON this is instruction-for-instruction what the loops did before the
- * knob existed; the only addition is the `if (z3660_perf_on)` around the accumulator. */
+ * The service-cadence poll is NOT part of the instrumentation and survives in both build
+ * variants: it is functional (interrupt detection, and -- see docs/AMIX.md -- the A3000
+ * SCSI interrupt-delay pump rides on it), not diagnostic. */
 #define Z3660_RUNLOOP_TAIL()                                                  \
    do {                                                                       \
-      if (z3660_perf_on) {                                                     \
-         z3660_perf_count++;                                                   \
-         if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();             \
-      }                                                                        \
+      Z3660_RUNLOOP_PERF()                                                    \
       { static int serv_ctr = 0;                                               \
         if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } } \
    } while(0)

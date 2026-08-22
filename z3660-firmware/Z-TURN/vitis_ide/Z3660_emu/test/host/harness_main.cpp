@@ -2507,6 +2507,17 @@ extern "C" void    z3660_knobs_sync(void);
 extern "C" void    z3660_knobs_get(int *perf_on, int *probes_on, int *cadence);
 extern "C" uae_u64 z3660_perf_count_get(void);
 
+/* THE SAME SOURCE PROVES BOTH BUILD VARIANTS.
+ *
+ * The lean (production) firmware is this tree compiled with -DZ3660_EMU_PROBES=0
+ * -DZ3660_EMU_PERF=0, and its correct behaviour is NOT the default build's: an
+ * instrument that is compiled out cannot be switched on, and the accumulator cannot
+ * count. Asserting the default contract against a lean build would fail for a good
+ * reason, and asserting nothing would let the lean build ship untested. So the
+ * expectations below branch on the same header the run loop compiled against, and the
+ * suite is run twice -- `make run` and `make run-lean`. */
+#include "runloop_build.h"
+
 /* Run `n` instructions through the genuine 040 run loop. Returns how far the perf
  * accumulator moved across them. */
 static uae_u64 run040_steps(uae_u32 start, int n)
@@ -2536,10 +2547,11 @@ static void test_runloop_overhead_switches(void)
 	{
 		int perf = -1, probes = -1, cad = -1;
 		z3660_knobs_get(&perf, &probes, &cad);
-		CHECK_EQ32(perf,   1, "power-on default: perf_stats is ON");
-		CHECK_EQ32(probes, 1, "power-on default: emu_probes is ON");
+		CHECK_EQ32(perf,   Z3660_EMU_PERF   ? 1 : 0, "power-on default: perf_stats is ON (0 if compiled out)");
+		CHECK_EQ32(probes, Z3660_EMU_PROBES ? 1 : 0, "power-on default: emu_probes is ON (0 if compiled out)");
 		CHECK_EQ32(cad,    1, "power-on default: service_cadence is 1 (poll every instruction)");
 	}
+#if Z3660_EMU_PERF
 	CHECK_EQ32((uae_u32)run040_steps(CODE, 8), 8,
 	           "perf_stats ON: the accumulator counts every retired instruction");
 
@@ -2566,21 +2578,50 @@ static void test_runloop_overhead_switches(void)
 		           "perf_stats can be turned back ON with the accumulator stopped "
 		           "(resync is not hostage to perf_tick)");
 	}
+#else
+	/* LEAN: the accumulator is not there to move, and the switch cannot resurrect it.
+	 * Assert BOTH -- a lean build whose counter still ticks is not lean, and a lean
+	 * build that reports perf_stats ON would lie to a metal session. */
+	CHECK_EQ32((uae_u32)run040_steps(CODE, 8), 0,
+	           "LEAN: no accumulator exists, so nothing counts");
+	shared->perf_stats = 1;
+	z3660_knobs_sync();
+	{
+		int perf = -1; z3660_knobs_get(&perf, NULL, NULL);
+		CHECK_EQ32(perf, 0, "LEAN: perf_stats cannot be switched on -- it is compiled out");
+	}
+	CHECK_EQ32((uae_u32)run040_steps(CODE, 8), 0,
+	           "LEAN: and asking for it on still counts nothing");
+#endif
 
-	/* ---- 4. emu_probes is a live, two-way switch ---- */
+	/* ---- 4. emu_probes: a live two-way switch by default, absent when compiled out.
+	 * The invariant that holds in BOTH variants is the load-bearing one: the probes
+	 * change no emulation, so the same instructions retire either way. */
 	shared->emu_probes = 0;
 	z3660_knobs_sync();
 	{
 		int probes = -1; z3660_knobs_get(NULL, &probes, NULL);
 		CHECK_EQ32(probes, 0, "emu_probes 0 reaches the run loop");
 	}
-	CHECK_EQ32((uae_u32)run040_steps(CODE, 4), 4,
-	           "probes OFF changes no emulation: the same instructions still retire");
+	{	/* pc-based, not accumulator-based: the accumulator is one of the things that
+		 * can be compiled away, and this assertion has to mean something in the lean
+		 * build too -- it is the one that says the switch is a DIAGNOSTIC switch. */
+		cpu_set_context(CODE);
+		regs.spcflags = Z_SPCFLAG_MODE_CHANGE;
+		for (int i = 0; i < 4; i++)
+			m68k_run_mmu040();
+		regs.spcflags = 0;
+		CHECK_EQ32((uae_u32)m68k_getpc(), CODE + 8,
+		           "probes OFF changes no emulation: four NOPs still retire (pc advanced by 8)");
+	}
 	shared->emu_probes = 1;
 	z3660_knobs_sync();
 	{
 		int probes = -1; z3660_knobs_get(NULL, &probes, NULL);
-		CHECK_EQ32(probes, 1, "emu_probes is a two-way switch -- the instruments come back");
+		CHECK_EQ32(probes, Z3660_EMU_PROBES ? 1 : 0,
+		           Z3660_EMU_PROBES
+		             ? "emu_probes is a two-way switch -- the instruments come back"
+		             : "LEAN: emu_probes cannot be switched on -- it is compiled out");
 	}
 
 	/* ---- 5. service_cadence reaches the 040 loop, and is clamped ---- */
@@ -2608,6 +2649,60 @@ static void test_runloop_overhead_switches(void)
 	z3660_knobs_sync();
 	currprefs.mmu_model = 0;
 	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * Build-variant contract (CYBERSTORM C3 follow-up).
+ *
+ * runloop_build.h is the single copy of "which instruments is this binary carrying",
+ * and it is read by the run loop, by this harness, and (as -D flags) by the Makefile.
+ * The thing that must never drift is the DEFAULT: an unflagged build has to be the
+ * firmware this fork has always shipped, instruments in and switchable. If someone
+ * ever flips a default to make a benchmark look better, that is a silent loss of every
+ * diagnostic on the card, and it should fail here rather than on the metal at 2 a.m.
+ *
+ * The lean arm asserts the mirror image, so `make run-lean` is not merely "it still
+ * compiles": the production binary's contract is stated and checked.
+ * ================================================================== */
+static void test_runloop_build_variant(void)
+{
+	printf("[test] run-loop build variant: %s\n",
+	       Z3660_RUNLOOP_BUILD_IS_LEAN ? "LEAN (diagnostics compiled out)"
+	                                   : "DEFAULT (diagnostics compiled in)");
+
+	/* The flags word is what a build script / a future serial dump would key off. */
+	CHECK_EQ32((uae_u32)Z3660_RUNLOOP_BUILD_FLAGS,
+	           (uae_u32)((Z3660_EMU_PROBES ? 1 : 0) | (Z3660_EMU_PERF ? 2 : 0)),
+	           "build flags word agrees with the two -D switches that produced it");
+	CHECK_EQ32((uae_u32)Z3660_RUNLOOP_BUILD_IS_LEAN,
+	           (uae_u32)(!Z3660_EMU_PROBES && !Z3660_EMU_PERF),
+	           "'lean' means BOTH instruments out, never just one");
+
+#if !defined(Z3660_LEAN_EXPECTED)
+	/* Unflagged build: this is the shipped diagnostic firmware. Both must be 1. */
+	CHECK_EQ32((uae_u32)Z3660_EMU_PROBES, 1,
+	           "DEFAULT build: emu_probes compiled IN (absent -D must not change the loop)");
+	CHECK_EQ32((uae_u32)Z3660_EMU_PERF, 1,
+	           "DEFAULT build: perf accumulator compiled IN (absent -D must not change the loop)");
+	CHECK_EQ32((uae_u32)Z3660_RUNLOOP_BUILD_FLAGS, 3,
+	           "DEFAULT build: flags == 3, the historical shape");
+#else
+	CHECK_EQ32((uae_u32)Z3660_EMU_PROBES, 0, "LEAN build: emu_probes compiled OUT");
+	CHECK_EQ32((uae_u32)Z3660_EMU_PERF,   0, "LEAN build: perf accumulator compiled OUT");
+	CHECK_EQ32((uae_u32)Z3660_RUNLOOP_BUILD_FLAGS, 0, "LEAN build: flags == 0");
+#endif
+
+	/* service_cadence is NOT an instrument. It survives every variant, because the
+	 * A3000-SCSI interrupt-delay pump rides on the poll it gates (docs/AMIX.md) --
+	 * compiling it away would change emulation, not just measurement. */
+	shared->service_cadence = 4;
+	z3660_knobs_sync();
+	{
+		int cad = -1; z3660_knobs_get(NULL, NULL, &cad);
+		CHECK_EQ32(cad, 4, "service_cadence reaches the loop in EVERY build variant");
+	}
+	harness_shared_defaults();
+	z3660_knobs_sync();
 }
 
 /* ==================================================================
@@ -2687,6 +2782,7 @@ int main(int argc, char **argv)
 	test_mmu030_demand_page_write();
 	test_mmu030_multifault_continuation();
 	test_runloop_overhead_switches();
+	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
