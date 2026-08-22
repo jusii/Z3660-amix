@@ -2091,7 +2091,23 @@ static uae_u32 mmu030_get_atc_generic(uaecptr addr, int l, uae_u32 fc, int flags
  * the 040 -- reaching it at all means the tier-0 page cache missed. So one probe here
  * yields both numbers: XLATE counts page-cache misses, and the bucket span covers the ATC
  * search proper. The table walk it does not cover is charged separately in
- * mmu030_table_search. */
+ * mmu030_table_search.
+ *
+ * C2-prep note, and it is the OPPOSITE of the 040's. The ATC_HIT increment below is a
+ * GENUINE ATC hit and always was -- this function returns an index only on a usable tag
+ * match -- so when ATC_HIT moved to its own counter id, this site needed no edit at all;
+ * the 040's did, because there a walk falls through the same return. Two things an 030
+ * capture must nevertheless be read with:
+ *
+ *   - XLATE_OK is NOT counted on this path. The 030 translate is this bare function
+ *     called from fourteen accessors with no single success point to hang a counter on,
+ *     and threading one through all fourteen is a lot of edits to a fork of someone
+ *     else's emulator on the path that is not the optimisation target. It reads zero,
+ *     and zero here means absent.
+ *   - XLATE OVER-COUNTS on the miss path. The accessors call this function, get -1, walk
+ *     the tables, and then call it AGAIN to pick up the refilled line -- so every 030
+ *     table walk costs two XLATE increments and one ATC_HIT. The 030's hit and walk rates
+ *     are internally consistent but are NOT comparable to the 040's. */
 static int mmu030_logical_is_in_atc(uaecptr addr, uae_u32 fc, bool write) {
     uaecptr logical_addr = 0;
     uae_u32 addr_mask = mmu030.translation.page.imask;

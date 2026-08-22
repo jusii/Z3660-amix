@@ -2732,7 +2732,8 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, emu_probes),      0xD4, "emu_probes      @ 0xFFFF00D4 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_ctl),        0xD8, "prof_ctl        @ 0xFFFF00D8 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_hz),         0xDC, "prof_hz         @ 0xFFFF00DC (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE0, "SHARED is 0xE0 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, arm_wall_hz),     0xE0, "arm_wall_hz     @ 0xFFFF00E0 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE4, "SHARED is 0xE4 bytes -- new fields go on the END");
 }
 
 /* ==================================================================
@@ -2776,8 +2777,28 @@ static void test_prof_wire_format(void)
 	CHECK_EQ32((uae_u32)Z3660_PROF_HDR_SIZE, 80, "...and that is 80 (four uint64_t force 8-byte alignment)");
 	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, samples), 32,
 	           "the 64-bit block starts at 32 -- eight leading uint32_t, no hidden padding");
-	CHECK_EQ32((uae_u32)Z3660_PROF_MAGIC, 0x5A335031u, "magic is 'Z3P1'");
-	CHECK_EQ32((uae_u32)Z3660_PROF_VERSION, 1u, "version 1");
+	CHECK_EQ32((uae_u32)Z3660_PROF_MAGIC, 0x5A335032u, "magic is 'Z3P2'");
+	CHECK_EQ32((uae_u32)Z3660_PROF_VERSION, 2u, "version 2");
+	/* The magic ENCODES the version, and that is load-bearing rather than decorative: a
+	 * symbolizer that only greps the magic must still refuse a grammar it does not know.
+	 * Derived here from the version so bumping one and forgetting the other fails. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_MAGIC,
+	           0x5A335030u + (uae_u32)Z3660_PROF_VERSION,
+	           "magic tracks the version -- 'Z3P' + the version digit");
+	CHECK(strcmp(Z3660_PROF_MAGIC_STR, "Z3P2") == 0,
+	      "...and the ASCII dump spells the same magic the binary header carries\n");
+
+	/* v2 spent the two reserved words rather than resizing the header. If a future field
+	 * ever grows it past 80, every symbolizer that slices the binary layout by offset
+	 * breaks silently -- so pin the two new fields where they landed. */
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, wall_hz),    64, "hdr.wall_hz    @ 64");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, build_flags),68, "hdr.build_flags@ 68");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, probe_cyc),  72,
+	           "hdr.probe_cyc  @ 72 -- v2, in the first of v1's two reserved words");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, clk_src),    76,
+	           "hdr.clk_src    @ 76 -- v2, in the second; the header is still 80 bytes");
+	CHECK_EQ32((uae_u32)Z3660_PROF_CLK_BSP, 0u, "clk_src 0 = the compile-time BSP constant");
+	CHECK_EQ32((uae_u32)Z3660_PROF_CLK_CFG, 1u, "clk_src 1 = the rate core0 published at runtime");
 
 	/* Flag bits. Spelled as literals on purpose: re-deriving them from the macros would
 	 * assert only that the macros equal themselves. */
@@ -2795,9 +2816,37 @@ static void test_prof_wire_format(void)
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_LOOP,    0,  "bucket LOOP == 0");
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_FETCHOP, 1,  "bucket FETCHOP == 1");
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_HANDLER, 7,  "bucket HANDLER == 7");
-	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   11, "11 buckets");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   14, "14 buckets");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_INSNS,   0,  "counter INSNS == 0");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   19, "19 counters");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   20, "20 counters");
+
+	/* v2's four new/renamed ids. These are the whole reason the version moved, so pin the
+	 * numbers a symbolizer will hard-code AND the names it will print beside them -- an
+	 * id that keeps its number while its meaning moves is exactly the ATC_HIT defect,
+	 * and it took a metal session and a cross-check on someone else's tool to catch. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_TAIL,     8,  "bucket 8 is the tail RESIDUE in v2");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_PROF,     10, "bucket PROF == 10 (v1 ids did not move)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_TAILSAMP, 11, "bucket TAILSAMP == 11 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_TAILPOLL, 12, "bucket TAILPOLL == 12 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_TAILSPEC, 13, "bucket TAILSPEC == 13 (appended)");
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_TAIL], "TAILADV") == 0,
+	      "bucket 8 is NAMED TAILADV -- v1's 'TAIL' meant the whole tail, so the name "
+	      "moves with the meaning rather than covering both\n");
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_TAILSAMP], "TAILSAMP") == 0,
+	      "names line up with ids (TAILSAMP)\n");
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_TAILSPEC], "TAILSPEC") == 0,
+	      "names line up with ids (TAILSPEC)\n");
+
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_XLATE,    11, "counter XLATE == 11 (unmoved)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_XLATE_OK, 12,
+	           "counter 12 is XLATE_OK -- same id, same site, the name now says what it counts");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_ATC_MISS, 13, "counter ATC_MISS == 13 (unmoved)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_ATC_HIT,  19,
+	           "counter ATC_HIT == 19 -- APPENDED, because the real thing needed a new id");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_XLATE_OK], "XLATE_OK") == 0,
+	      "names line up with ids (XLATE_OK)\n");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_ATC_HIT], "ATC_HIT") == 0,
+	      "names line up with ids (ATC_HIT, at its new id)\n");
 	CHECK_EQ32((uae_u32)Z3660_PROF_RING_ENTRIES, 65536u, "ring holds 65536 samples");
 	CHECK((Z3660_PROF_RING_ENTRIES & Z3660_PROF_RING_MASK) == 0,
 	      "ring capacity is a power of two (the head is masked, not divided)\n");
@@ -2996,6 +3045,232 @@ static void test_prof_ret_macro_ordering(void)
 	z3660_prof_set_buckets(0);
 }
 
+/* ==================================================================
+ * CYBERSTORM C2-prep -- the probe calibration reports a PER-TRANSITION cost.
+ *
+ * This is the defect that inverted the top of the C2 attack map, and it is worth being
+ * precise about why no existing test could see it. v1 timed a batch of N enter/exit
+ * PAIRS, divided by N, and handed the result to a reporting line that multiplied it by
+ * TRANSITIONS -- a counter that increments in enter() AND in exit(). Two numbers of the
+ * right TYPE and the wrong UNIT, so every arithmetic check downstream agreed with itself
+ * while the answer was exactly 2x too big; big enough that the model demanded 43.8 G
+ * cycles of probe out of a bucket containing 28.0 G, and the host tool clamped rather
+ * than complained.
+ *
+ * The harness could not catch it because on a frozen injected clock the calibration
+ * measures a span of zero, and zero divided by N and by 2N are the same zero. So the
+ * host cycle source can now STEP: each read advances it by z3660_prof_host_step, which
+ * gives the probe a known price and turns the divisor into something observable.
+ *
+ * With a step of S, each clock READ costs S. The calibration reads once for `last`, once
+ * for c0, twice per pair inside the loop, and once for c1 -- so c1-c0 spans (2*pairs+1)
+ * reads and the per-transition answer is S*(2*pairs+1)/(2*pairs), which is S for any
+ * realistic batch. A v1-style divide-by-pairs would give 2S, and that is the assertion.
+ * ================================================================== */
+static void test_prof_probe_calibration(void)
+{
+	printf("[test] profiler probe calibration: the unit is ONE transition, not a pair\n");
+
+	const uae_u32 STEP = 64;
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+	prof_clock(0);
+	z3660_prof_host_step = STEP;
+	z3660_prof_recalibrate_probe_for_test();
+	z3660_prof_host_step = 0;
+
+	CHECK_EQ32((uae_u32)z3660_prof_probe_cyc_per_transition(), STEP,
+	           "a probe costing 64 cycles per clock read is priced at 64 cyc/TRANSITION");
+	CHECK(z3660_prof_probe_cyc_per_transition() != (int)(2 * STEP),
+	      "...and NOT at 128 -- which is what dividing a pair-batch by the pair count gives\n");
+
+	/* The other half of the fix, and the one that made LOOP's share a bracket rather
+	 * than a number: the probes are called, not inlined, during calibration. A frozen
+	 * clock cannot time that, but it CAN show the calibration went through the real
+	 * phase machine -- the wrappers move the accumulators and the transition count
+	 * exactly as the interpreter's own probes do. */
+	z3660_prof_zero();
+	prof_clock(0);
+	z3660_prof_set_buckets(1);
+	z3660_prof_loop_reset();
+	z3660_prof_recalibrate_probe_for_test();
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS] > 0,
+	      "the calibration drives the genuine enter/exit path, not a transcription of it\n");
+	CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS] & 1u), 0,
+	           "...and leaves an EVEN transition count: every enter found its exit");
+	CHECK_EQ32((uae_u32)z3660_prof_sp, 0, "the phase stack is back at the floor afterwards");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_STACK_OVF], 0,
+	           "and the calibration never overflows it");
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+}
+
+/* ==================================================================
+ * CYBERSTORM C2-prep -- the tail split.
+ *
+ * The map's single highest-value instrument ask: TAIL was 20 % of guest time with no
+ * internal breakdown. What has to hold is what holds for every other nested stage --
+ * exclusive attribution -- plus the one thing that is new here, that the four ids add
+ * back up to the figure v1 called TAIL, so a v2 capture can still be compared with a v1
+ * one.
+ * ================================================================== */
+static void test_prof_tail_split(void)
+{
+	printf("[test] profiler tail split: four ids, exclusive, and they re-sum to v1's TAIL\n");
+
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	prof_clock(1000);
+	z3660_prof_loop_reset();
+
+	/* Walk one tail exactly as the run loop does: open TAIL, then the three sub-stages
+	 * in order, then close. Spans chosen distinct so a mis-attribution cannot alias. */
+	prof_clock(1010);
+	z3660_prof_enter(Z3660_PROF_B_TAIL);       /* 10 cycles of LOOP closed here      */
+	prof_clock(1013);                          /* 3 cycles of TAILADV (adjust_cycles)*/
+	z3660_prof_enter(Z3660_PROF_B_TAILSAMP);
+	prof_clock(1020); z3660_prof_exit();       /* 7 of TAILSAMP                      */
+	z3660_prof_enter(Z3660_PROF_B_TAILPOLL);
+	prof_clock(1040); z3660_prof_exit();       /* 20 of TAILPOLL                     */
+	z3660_prof_enter(Z3660_PROF_B_TAILSPEC);
+	prof_clock(1100); z3660_prof_exit();       /* 60 of TAILSPEC                     */
+	prof_clock(1105); z3660_prof_exit();       /* 5 more of TAILADV, tail closed     */
+
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAILSAMP], 7,  "TAILSAMP gets its 7");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAILPOLL], 20, "TAILPOLL gets its 20");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAILSPEC], 60, "TAILSPEC gets its 60");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAIL], 8,
+	           "TAILADV keeps only the RESIDUE (3 + 5), not the sub-stages nested in it");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 10,
+	           "...and LOOP keeps only what ran before the tail opened");
+	{
+		uae_u64 tail = z3660_prof_acc[Z3660_PROF_B_TAIL]
+		             + z3660_prof_acc[Z3660_PROF_B_TAILSAMP]
+		             + z3660_prof_acc[Z3660_PROF_B_TAILPOLL]
+		             + z3660_prof_acc[Z3660_PROF_B_TAILSPEC];
+		CHECK_EQ32((uae_u32)tail, 95,
+		           "the four ids re-sum to the whole tail -- which is what v1 reported as TAIL");
+		uae_u64 total = 0; int i;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
+		CHECK_EQ32((uae_u32)total, 105,
+		           "and the split changes no total: sum(buckets) is still the elapsed span");
+	}
+	/* Four extra transitions per instruction is what the split costs, and the cost has
+	 * to be VISIBLE in the transition count or the probe subtraction under-corrects. */
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 8,
+	           "one tail = 8 transitions (v1's 2, plus 3 sub-stage pairs)");
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+}
+
+/* ==================================================================
+ * CYBERSTORM C2-prep -- ATC_HIT counts ATC hits.
+ *
+ * The v1 counter sat on mmu_translate()'s success return, which is reached BOTH by an
+ * ATC tag match and by `goto atc_retry` after a table walk -- so it counted successful
+ * translates and carried no ATC information at all. Nothing failed: `ATC_HIT + ATC_MISS`
+ * was simply a meaningless sum that four metal captures dutifully reported.
+ *
+ * The test is the smallest thing that discriminates: translate the same page twice. The
+ * first must walk, the second must hit. Under v1 both increments landed on ATC_HIT and
+ * this test would report 2 where it wants 1.
+ * ================================================================== */
+static void test_prof_translation_counters(void)
+{
+	printf("[test] profiler translation counters: a walk is not a hit\n");
+
+	const uae_u32 VA = 0x00408678, PA = 0x0A000000;
+	mmu040_map1(VA, PA, 0, false);
+	regs.s = 1;
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+
+	uae_u32 p1 = 0, p2 = 0; bool faulted = false;
+	SAVE_EXCEPTION;
+	TRY(t1) { p1 = mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(t1) { faulted = true; (void)t1; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "first translate completed (it had to walk)\n");
+
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_XLATE], 1, "one call into mmu_translate");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_ATC_MISS], 1, "...which walked the tables");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_ATC_HIT], 0,
+	           "...and was NOT an ATC hit -- the v1 counter said it was");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_XLATE_OK], 1,
+	           "...but it did return an address, which is what XLATE_OK counts");
+
+	SAVE_EXCEPTION;
+	TRY(t2) { p2 = mmu_translate(VA, 0, true, true, false, sz_long); }
+	CATCH(t2) { faulted = true; (void)t2; } ENDTRY
+	RESTORE_EXCEPTION;
+	CHECK(!faulted, "second translate of the same page completed\n");
+	CHECK_EQ32(p2, p1, "...to the same physical address");
+
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_XLATE], 2, "two calls now");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_ATC_MISS], 1,
+	           "...still one walk: the second was served from the ATC");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_ATC_HIT], 1,
+	           "...and THAT is the one ATC hit (v1 would have counted two)");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_XLATE_OK], 2, "both returned an address");
+
+	/* The identity the C2 audit had to reconstruct by hand, now true by construction. */
+	CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_ATC_HIT]
+	                   + z3660_prof_cnt[Z3660_PROF_C_ATC_MISS]),
+	           (uae_u32)z3660_prof_cnt[Z3660_PROF_C_XLATE],
+	           "ATC_HIT + ATC_MISS == XLATE, no translate having faulted");
+
+	mmu040_off();
+	z3660_prof_zero();
+}
+
+/* ==================================================================
+ * CYBERSTORM C2-prep -- where the absolute ARM clock comes from.
+ *
+ * The measurable part (the PMCCNTR : global-timer RATIO) is fixed at 2:1 in silicon and
+ * so says nothing about the PLL; the absolute rate has to be taken from the running
+ * configuration. v1 took it from a compile-time BSP constant instead, and every rate and
+ * duration it printed for a whole metal session was low by exactly 1.65 on a board
+ * configured for 1100 MHz. The selection is a RULE, so it is testable here even though
+ * the measurement around it -- which needs a global timer that runs -- is not.
+ * ================================================================== */
+static void test_prof_clock_source(void)
+{
+	printf("[test] profiler clock source: the runtime rate wins, and the dump says which\n");
+
+	const uae_u32 BSP  = 333333343u;    /* COUNTS_PER_SECOND at the 666.67 MHz default */
+	const uae_u32 REAL = 550000000u;    /* what an 1100 MHz board's timer really ticks  */
+	uae_u32 src = 0xFFFFFFFFu;
+
+	CHECK_EQ32(z3660_prof_pick_wall_hz(REAL, BSP, &src), REAL,
+	           "a published runtime rate is believed over the compile-time constant");
+	CHECK_EQ32(src, (uae_u32)Z3660_PROF_CLK_CFG, "...and is labelled clk=cfg");
+
+	src = 0xFFFFFFFFu;
+	CHECK_EQ32(z3660_prof_pick_wall_hz(0, BSP, &src), BSP,
+	           "an unwritten mailbox word falls back to the BSP constant");
+	CHECK_EQ32(src, (uae_u32)Z3660_PROF_CLK_BSP,
+	           "...and is labelled clk=bsp, so a stale clock is visible IN THE CAPTURE");
+
+	src = 0xFFFFFFFFu;
+	CHECK_EQ32(z3660_prof_pick_wall_hz(999999u, BSP, &src), BSP,
+	           "a sub-MHz 'rate' is a stale mailbox word, not a clock");
+	CHECK_EQ32(src, (uae_u32)Z3660_PROF_CLK_BSP, "...and is labelled as the fallback it is");
+
+	/* The 1.65 the C2 audit had to apply by hand, expressed as the thing that produced
+	 * it -- so a future regression fails here rather than in a document. Stated over the
+	 * CPU rates the two timer rates are halves of, because that is where the constant
+	 * comes from: XPAR_..._CORE_CLOCK_FREQ_HZ against the configured arm_frequency.
+	 * The exact ratio is 1.64999995 -- the BSP constant is 666666687, not 666666666 --
+	 * so it is asserted rounded to two decimals rather than floored, which is also how
+	 * every document that quotes "x1.65" arrived at the figure. */
+	CHECK_EQ32((uae_u32)((((uae_u64)1100000000u * 100u) + 666666687u/2) / 666666687u), 165u,
+	           "the C1 rig's error factor was 1100 MHz / the BSP's 666666687 = 1.65");
+	CHECK_EQ32(REAL * 2u, 1100000000u, "...and the timer rate is exactly half the CPU rate");
+}
+
 static void test_prof_ring(void)
 {
 	printf("[test] profiler ring: wrap, drop accounting and sample weight\n");
@@ -3181,6 +3456,10 @@ int main(int argc, char **argv)
 #if Z3660_EMU_PROF
 	test_prof_bucket_arithmetic();
 	test_prof_ret_macro_ordering();
+	test_prof_tail_split();
+	test_prof_probe_calibration();
+	test_prof_clock_source();
+	test_prof_translation_counters();
 	test_prof_ring();
 	test_prof_under_execution();
 #endif

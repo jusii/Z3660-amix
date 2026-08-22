@@ -723,9 +723,11 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
  * copy per translation unit. Verified against the shipped objects: cpuemu_31.o carries
  * exactly one uae_mmu040_get_iword with 920 call relocations into it.
  *
- * So a probe here is ~10 code sites in the whole firmware rather than 3000, which is what
- * keeps BOOT.BIN under the ~12 MB SD/TFTP threshold that a naive instrumentation of the
- * named accessors would have blown straight through.
+ * So a probe here is ~10 code sites in the whole firmware rather than 3000. (This used to
+ * be justified by the "~12 MB SD/TFTP write threshold", which is retired -- but the choice
+ * was never really about the size gate: 3000 inlined probe sites would also have wrecked
+ * the icache behaviour of the very loop being measured, which is a worse failure than a
+ * large image because it changes the answer rather than the deploy.)
  *
  * The Z3660_PROF_RET idiom exists so the NON-profiling expansion is textually the
  * original `return expr;` -- default and lean must be byte-identical to the build before

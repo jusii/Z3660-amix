@@ -78,12 +78,35 @@
  * 2. THE BUCKETS CHARGE THE PROBE'S OWN COST TO THE BUCKETS. Each phase transition is a
  *    cycle-counter read, a subtract, a 64-bit accumulate and a stack push/pop. That cost
  *    lands partly in the bucket being left and partly in the one being entered, and there
- *    are eight to fourteen transitions per emulated instruction. The profiler MEASURES
- *    this at arm time (z3660_prof_calibrate() times an empty enter/exit pair) and reports
+ *    are twelve to eighteen transitions per emulated instruction (v2's tail split added
+ *    four to v1's eight-to-fourteen). The profiler MEASURES this at arm time and reports
  *    it as PROBE_CYC together with the total transition count, so a reader can compute
  *    the inflation and, if they care, subtract transitions x PROBE_CYC from each bucket.
  *    The instrumented instruction rate will be well below the lean rate. That is the
  *    instrument, not the interpreter.
+ *
+ *    THE UNIT IS ONE TRANSITION. Say it out loud, because v1 did not and the mistake
+ *    survived a whole metal session: TRANSITIONS increments in enter() AND in exit(), so
+ *    the cost that multiplies it has to be the cost of ONE of them. v1 calibrated a
+ *    PAIR, multiplied it by a per-transition count, and reported a probe overhead of
+ *    82.65 % where the honest figure was 41.33 % -- an over-subtraction so large that it
+ *    demanded more probe cycles out of LOOP than LOOP contained, and inverted the top of
+ *    the ranking the instrument exists to produce. Two numbers of the right type and the
+ *    wrong unit multiply to a plausible answer, and nothing in an arithmetic check ever
+ *    objects. z3660_prof_calibrate_probe() now times a batch and divides by 2 x N.
+ *
+ *    AND IT IS PRICED OUT OF LINE, because that is how the interpreter pays for it.
+ *    v1 calibrated with enter/exit INLINED into the calibration loop while the real
+ *    accessors reach them through a `bl` (bias note 2b) -- so the calibrated figure was
+ *    an under-estimate of the production cost by an unknown amount, and "unknown" was
+ *    load-bearing: at 45.5 cyc/transition LOOP holds 9.82 % of guest time and at 58.24
+ *    it holds none, which is the difference between a rung worth attacking and one that
+ *    does not exist. The calibration now calls through __attribute__((noinline))
+ *    wrappers, so what is timed is a real call to a real out-of-line body -- the same
+ *    shape the accessors pay. It is still not identical to an accessor's call site (a
+ *    different register pressure, a different branch-predictor history), so treat it as
+ *    a good estimate rather than an exact price; it is no longer a KNOWN under-estimate,
+ *    which is the part that mattered.
  *
  * 2b. AND THE CALLS ARE PAID EVEN WHEN THE BUCKETS ARE OFF. Counted out of the generated
  *    ARM, not estimated: every instrumented accessor makes THREE out-of-line calls --
@@ -111,18 +134,51 @@
  *    the fault path plus a fragment of whatever stage was interrupted -- deliberately not
  *    split finer, because the split would be a guess.
  *
- * 5. PMCCNTR IS 32 BITS and wraps every 2^32 ARM cycles (~6.4 s at 666 MHz). Every span
+ * 5. PMCCNTR IS 32 BITS and wraps every 2^32 ARM cycles (~3.9 s at 1.1 GHz). Every span
  *    this profiler measures is bounded by a run-loop iteration, so modular 32-bit
  *    subtraction is exact for the buckets. The long-run cycle base is extended to 64 bits
- *    at each sample; if core1 ever leaves the run loop for longer than one wrap the base
- *    loses 2^32 cycles silently. That is why the dump reports BOTH the PMU span and the
- *    independent ARM global-timer (XTime) span: if they disagree by more than a percent,
- *    a wrap was missed and the cycle totals are short by a multiple of 2^32.
+ *    at each sample AND at every z3660_prof_poll_cmd() -- i.e. from do_specialties(),
+ *    which a running guest reaches on every interrupt -- so the base stays fresh even
+ *    with the sampler off, which is the case a bucket-only run puts it in. If core1 ever
+ *    leaves the run loop for longer than one wrap the base still loses 2^32 cycles
+ *    silently. That is why the dump reports BOTH the PMU span and the independent ARM
+ *    global-timer (XTime) span: if they disagree by more than a percent, a wrap was
+ *    missed and the cycle totals are short by a multiple of 2^32.
  *
- * 6. THE ARM CLOCK IS MEASURED, NOT ASSUMED. z3660_prof_calibrate() times PMCCNTR against
- *    the global timer over ~10 ms and reports the result as CPU_HZ. A firmware that
- *    changed the ARM clock after arming would invalidate the Hz-to-cycles conversion; the
- *    dump reports the clock it calibrated at so that is visible rather than assumed.
+ *    v2 STAMPS cyc_span AT DUMP TIME, not at the last sample. v1 reported the cycle base
+ *    as it stood after the final sample while wall_ticks ran on to the dump, so the two
+ *    spans covered different intervals and the "divergence over 1 % means a missed wrap"
+ *    rule fired on the gap between the workload ending and a human typing PROFR. The
+ *    firmware closes the gap itself now rather than asking the reader to allow for it.
+ *
+ * 6. THE ARM CLOCK IS TAKEN FROM THE RUNNING CONFIGURATION, AND THE RATIO IS MEASURED.
+ *    These are two different claims and v1 conflated them, at a cost of 65 %.
+ *
+ *    What z3660_prof_calibrate() can actually measure is the RATIO of PMCCNTR to the ARM
+ *    global timer. On this part that ratio is a FIXED 2:1 in hardware -- the CPU runs at
+ *    CPU_6x4x and the global timer at CPU_3x2x -- so the measurement always returns ~2.0
+ *    and carries no information about the absolute rate. The absolute rate has to come
+ *    from somewhere else, and v1's somewhere-else was COUNTS_PER_SECOND: a BSP constant
+ *    baked at XPAR_CPU_CORTEXA9_CORE_CLOCK_FREQ_HZ / 2 = 333 333 343, frozen at the
+ *    666.67 MHz default. But arm_frequency is a CONFIG KEY and ps7_init_custom retunes
+ *    the ARM PLL at boot -- to 1100 MHz on the C1 rig -- so the constant was wrong by
+ *    1.65x and every Hz, every seconds figure and every actual sample rate in that
+ *    session's captures was low by exactly that factor.
+ *
+ *    WHY NOTHING CAUGHT IT, which is the part worth remembering. The wrap cross-check in
+ *    note 5 compares cyc_span against wall_ticks / wall_hz x cpu_hz. Because CPU:global
+ *    timer is a fixed 2:1, cyc_span and wall_ticks scale TOGETHER and the erroneous
+ *    constant cancels out of the ratio: the check passes, to three decimal places, while
+ *    the clock is 65 % wrong. A WRAP CHECK IS NOT A CLOCK CHECK. The only tell was that
+ *    the boot line said 666.67 MHz seven seconds after the board's own log said 1100.
+ *
+ *    So core0 -- which is where arm_frequency is resolved and where the PLL is actually
+ *    retuned -- publishes the resulting global-timer rate in SHARED.arm_wall_hz, and this
+ *    profiler scales its measured ratio by THAT. The header reports the rate and its
+ *    source (clk_src / the `clk=` key), so a future stale-constant is visible in the
+ *    capture instead of being inferred from a boot log two minutes earlier. If the
+ *    mailbox says nothing the BSP constant is still the fallback, and the dump says
+ *    `clk=bsp` when it is.
  *
  * ==========================================================================
  * WHAT DOES *NOT* RIDE THE DEFAULT BUILD
@@ -160,18 +216,76 @@
 #endif
 
 /* Bumped whenever a record layout, a bucket id, a counter id or the ASCII dump grammar
- * changes. A symbolizer must refuse a version it does not know rather than guess. */
-#define Z3660_PROF_VERSION      1u
+ * changes. A symbolizer must refuse a version it does not know rather than guess.
+ *
+ * ==========================================================================
+ * VERSION 2 -- what changed, and why a v1 tool must refuse a v2 capture
+ * ==========================================================================
+ *
+ * The C1 metal session took four captures with the v1 instrument and the C2 map audit
+ * (amix-040-060-port/docs/C2-ATTACK-MAP.md) found three labelling defects in them. All
+ * three are fixed here, and every one of them changes what a printed number MEANS
+ * without changing its type -- which is precisely the failure a version number exists
+ * to catch, because nothing else would.
+ *
+ *   1. probe_cyc IS NOW PER TRANSITION, NOT PER PAIR. v1 calibrated one enter+exit PAIR
+ *      and then multiplied that figure by TRANSITIONS -- a count that increments on
+ *      EACH of enter and exit. Every v1 capture therefore over-priced the instrument by
+ *      exactly 2x, which was large enough to invert the bucket ranking (LOOP came out
+ *      first at 26.35 % raw and lands fifth at 9.8 % corrected). v2 reports the cost of
+ *      ONE transition and the multiplication is honest. The calibration also now runs
+ *      the probes OUT OF LINE, which is how the interpreter actually pays for them.
+ *
+ *   2. cpu_hz AND wall_hz ARE NOW THE RUNTIME CLOCK. v1 scaled its measurement by
+ *      COUNTS_PER_SECOND, a BSP constant frozen at the 666.67 MHz default, while
+ *      ps7_init retunes the ARM PLL at boot -- on the C1 rig to 1100 MHz. Every v1 Hz
+ *      and every v1 seconds figure is low by exactly 1.65 on that rig. See the clock
+ *      section below for why the header's own wrap cross-check is structurally unable
+ *      to notice this.
+ *
+ *   3. COUNTER 12 IS `XLATE_OK`, NOT `ATC_HIT`. It counts translates that SUCCEEDED,
+ *      which is not an ATC lookup outcome at all, so `ATC_HIT + ATC_MISS` was a
+ *      meaningless sum in v1. The genuine ATC-hit counter is new id 19.
+ *
+ * And one addition rather than a correction:
+ *
+ *   4. TAIL IS SPLIT. v1's `TAIL` (id 8) was the whole run-loop tail, 20 % of guest time
+ *      with no internal breakdown -- the largest un-attackable share in the map. v2
+ *      names its parts: id 8 is now `TAILADV` (the PC-advance / cycle-accounting
+ *      residue) and ids 11/12/13 are the sampler hook, the interrupt poll and
+ *      do_specialties(). The v1 whole-tail figure is TAILADV+TAILSAMP+TAILPOLL+TAILSPEC.
+ *
+ * Ids are APPEND-ONLY as always: nothing was renumbered, two were renamed to say what
+ * they always counted, and four are new. The SAMPLE RECORD AND ITS FLAG BITS ARE
+ * UNCHANGED -- a v1 symbolizer's per-sample decoding is still correct; it is the header
+ * and the PROFD block that moved.
+ */
+#define Z3660_PROF_VERSION      2u
 
 /* 'Z3P' + version. Little-endian on the wire, because the ARM writes it and the host
- * reads it; the ASCII dump spells it out as a string so a serial capture is greppable. */
-#define Z3660_PROF_MAGIC        0x5A335031u   /* "Z3P1" */
+ * reads it; the ASCII dump spells it out as a string so a serial capture is greppable.
+ *
+ * The magic tracks the version deliberately. A symbolizer that checks only the magic
+ * (the cheap grep) still refuses a capture whose grammar it does not know, instead of
+ * parsing v2 numbers with v1 meanings and printing a plausible wrong answer. */
+#define Z3660_PROF_MAGIC        0x5A335032u   /* "Z3P2" */
+#define Z3660_PROF_MAGIC_STR    "Z3P2"        /* the ASCII dump's spelling of the above */
 
 /* Ring capacity, in samples. 64K x 8 B = 512 KB and it lives in core1's .bss, which the
- * FSBL zeroes and which contributes NOTHING to BOOT.BIN -- so the ring is free in the one
- * budget that is actually tight here (the ~12 MB SD/TFTP write threshold). At 1 kHz it
- * holds 65 s of history; the limit on a profiling session is the serial dump, not this.
- * Must stay a power of two: the head advances with a mask, not a modulo. */
+ * FSBL zeroes and which contributes NOTHING to BOOT.BIN -- so the ring costs nothing in
+ * the image at all. At 1 kHz it holds 65 s of history; the limit on a profiling session
+ * is the serial dump, not this. Must stay a power of two: the head advances with a mask,
+ * not a modulo.
+ *
+ * SIZE THE CAPTURE AGAINST THE RING, NOT AGAINST THE CLOCK YOU MEANT TO SET. Both C1
+ * workload rings wrapped and retained a tail that landed AFTER the benchmark had
+ * finished, on the scheduler idle loop -- 86 % and 93 % of their samples overwritten --
+ * so two of the three captures described an idle machine and had to be discarded. The
+ * arithmetic was done against the nominal rate, which the v1 clock defect made 1.65x
+ * too slow; a ring believed to hold 65 s held 40. With v2's true clock the nominal
+ * numbers are the real ones again, but the rule stands on its own: the wrap-free window
+ * is RING_ENTRIES / hz seconds, arm at the LOWEST rate that still resolves the question,
+ * and confirm `drops=0` in the header before believing a share. */
 #define Z3660_PROF_RING_ENTRIES 65536u
 #define Z3660_PROF_RING_MASK    (Z3660_PROF_RING_ENTRIES - 1u)
 
@@ -229,16 +343,54 @@ typedef struct {
    uint64_t drops;         /* samples overwritten by wrap = samples the dump lost      */
    uint64_t cyc_span;      /* PMU cycles from arm to dump                             */
    uint64_t wall_ticks;    /* ARM global-timer ticks over the same span (wrap check)   */
-   uint32_t wall_hz;       /* COUNTS_PER_SECOND for wall_ticks                         */
+   uint32_t wall_hz;       /* global-timer rate -- RUNTIME in v2, not the BSP constant */
    uint32_t build_flags;   /* Z3660_PROF_BUILD_* -- which variant produced this        */
-   uint32_t reserved[2];   /* zero in version 1 -- room for a v2 field without a resize*/
+   uint32_t probe_cyc;     /* v2: ARM cycles per ONE transition (v1 reported a PAIR)   */
+   uint32_t clk_src;       /* v2: Z3660_PROF_CLK_* -- where wall_hz came from          */
 } z3660_prof_hdr_t;
+
+/* Where the absolute clock came from. This is reported rather than assumed because the
+ * v1 instrument got it wrong silently for a whole metal session: it is exactly the kind
+ * of fact whose absence looks identical to its presence. */
+#define Z3660_PROF_CLK_BSP      0u   /* the compile-time BSP constant -- STALE if the
+                                      * firmware retuned the ARM PLL, which it does     */
+#define Z3660_PROF_CLK_CFG      1u   /* the rate core0 published after retuning it      */
+
+/* Which absolute rate to believe, and what to call it. A rule rather than a measurement,
+ * so it lives in the header where the host harness can test every branch -- the
+ * measurement wrapped around it needs a running global timer and cannot be tested at all.
+ *
+ * `published` is SHARED.arm_wall_hz. Anything below 1 MHz is not a clock rate, it is an
+ * unwritten mailbox word (a core0 from before this field existed, or the host harness),
+ * and the BSP constant takes over with clk_src saying so. The threshold is deliberately
+ * far below any real Zynq global-timer rate -- the slowest supported ARM frequency here
+ * is 667 MHz, i.e. a 333 MHz timer -- so it separates "absent" from "plausible" rather
+ * than trying to validate the value. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+static __inline__ uint32_t z3660_prof_pick_wall_hz(uint32_t published, uint32_t bsp,
+                                                   uint32_t *src)
+{
+   if (published >= 1000000u) {
+      if (src) *src = Z3660_PROF_CLK_CFG;
+      return published;
+   }
+   if (src) *src = Z3660_PROF_CLK_BSP;
+   return bsp;
+}
+#ifdef __cplusplus
+}
+#endif
 
 /* 80 and not a rounder-looking 64: the four uint64_t fields force 8-byte alignment, so
  * eight leading uint32_t put them at offset 32 and the struct ends at 80 on both ARM EABI
  * and x86-64. Pinned by a compile-time assertion in z3660_prof.cpp AND by the host
  * harness, because this is a wire format read by a symbolizer that will never be
- * rebuilt in step with the firmware. */
+ * rebuilt in step with the firmware.
+ *
+ * v2 spent the two `reserved` words rather than resizing, which is what they were put
+ * there for. The struct is still 80 bytes. */
 #define Z3660_PROF_HDR_SIZE     80u
 
 /* build_flags: the low two bits mirror runloop_build.h's, so one word identifies the
@@ -263,11 +415,52 @@ enum {
    Z3660_PROF_B_XLATE   = 5,  /* mmu_translate/ATC search, excluding the table walk    */
    Z3660_PROF_B_WALK    = 6,  /* the descriptor table walk itself                      */
    Z3660_PROF_B_HANDLER = 7,  /* handler body remainder (dispatch minus the above)     */
-   Z3660_PROF_B_TAIL    = 8,  /* service poll + do_specialties                         */
+   Z3660_PROF_B_TAIL    = 8,  /* v2 "TAILADV": the tail RESIDUE -- see the split below */
    Z3660_PROF_B_FAULT   = 9,  /* last transition -> the run loop's CATCH (see bias 4)  */
    Z3660_PROF_B_PROF    = 10, /* the profiler's own dump work, kept out of the rest    */
-   Z3660_PROF_B_COUNT   = 11
+   /* --- v2: the tail split. The three below NEST INSIDE id 8, so id 8 keeps only the
+    * residue and the whole tail is the sum of all four. ------------------------------ */
+   Z3660_PROF_B_TAILSAMP = 11, /* the profiler's OWN sampler hook + INSNS counters     */
+   Z3660_PROF_B_TAILPOLL = 12, /* the service-cadence interrupt poll                   */
+   Z3660_PROF_B_TAILSPEC = 13, /* do_specialties(): trace / STOP / mode change         */
+   Z3660_PROF_B_COUNT   = 14
 };
+
+/* WHY THE TAIL IS SPLIT, AND WHAT ID 8 NOW MEANS.
+ *
+ * The C2 map measured the tail at 110.8 ARM cycles per guest instruction -- the most
+ * disproportionate figure in the whole table, for what ought to be a PC advance and a
+ * cheap event test -- and could not act on it, because a 20 % bucket with no internal
+ * breakdown is a 20 % bucket nobody can attack safely. Naming the parts is the cheapest
+ * measurement that turns it into a target.
+ *
+ * The four parts, in the order the tail runs them:
+ *
+ *   id  8  TAILADV   the residue: adjust_cycles() + the cadence counter's own test +
+ *                    whatever the loop does between the handler and the next fetch.
+ *                    This is the "PC advance" share.
+ *   id 11  TAILSAMP  the profiler's sampler tick and the INSNS/INSNS_SUPER counters.
+ *                    THIS IS INSTRUMENT COST, NOT INTERPRETER COST. It is bucketed
+ *                    separately precisely so it can be subtracted outright rather than
+ *                    quietly inflating the tail -- in v1 it was charged to LOOP, so no
+ *                    v1 capture could see it at all.
+ *   id 12  TAILPOLL  check_uae_int_request() when the service cadence lets it through
+ *                    (and, on the DEFAULT build only, the perf accumulator).
+ *   id 13  TAILSPEC  do_specialties(), entered only when regs.spcflags != 0 -- so this
+ *                    is rare per instruction and is the trace/STOP/mode-change share.
+ *
+ * COST OF THE SPLIT, stated rather than discovered: two of the three sub-stages fire on
+ * EVERY instruction, so the split adds four phase transitions per instruction to the
+ * eight-to-fourteen already there. The instrument therefore distorts MORE in v2 than in
+ * v1. That is the trade -- the shares inside the tail are unobtainable any other way,
+ * and shares survive the distortion (bias note 2), which is the whole reason the
+ * transition count is reported.
+ *
+ * The id-8 RENAME is deliberate and is the lesson of the ATC_HIT defect: a bucket whose
+ * name does not say what it counts is a trap that survives every test. v1's `TAIL` was
+ * the whole tail; v2's id 8 is the residue. Rather than leave one name covering two
+ * meanings across a version boundary, the name moves with the meaning -- and because
+ * the name tables are emitted in every dump, a capture says which it is. */
 
 /* ---------------------------------------------------------------------------
  * Counters. All 64-bit: a 32-bit counter overflows in ~7 minutes of hot interpretation,
@@ -288,15 +481,56 @@ enum {
    Z3660_PROF_C_DPAGE_WHIT  = 9,  /* ... write                                         */
    Z3660_PROF_C_DPAGE_WMISS = 10,
    Z3660_PROF_C_XLATE       = 11, /* mmu_translate entries == page-cache misses        */
-   Z3660_PROF_C_ATC_HIT     = 12, /* ... satisfied by the 4-way ATC                    */
+   Z3660_PROF_C_XLATE_OK    = 12, /* ... that RETURNED an address (v1 called this      *
+                                   *     ATC_HIT, which it never was -- see below)     */
    Z3660_PROF_C_ATC_MISS    = 13, /* ... that had to walk the tables                   */
    Z3660_PROF_C_MISALIGN_R  = 14, /* misaligned reads split into aligned sub-accesses  */
    Z3660_PROF_C_MISALIGN_W  = 15, /* ... writes                                        */
    Z3660_PROF_C_FAULTS      = 16, /* run-loop CATCH entries                            */
    Z3660_PROF_C_TRANSITIONS = 17, /* phase transitions -- multiply by PROBE_CYC        */
    Z3660_PROF_C_STACK_OVF   = 18, /* phase-stack overflows; MUST be 0                  */
-   Z3660_PROF_C_COUNT       = 19
+   Z3660_PROF_C_ATC_HIT     = 19, /* v2: translates satisfied WITHOUT a table walk     */
+   Z3660_PROF_C_COUNT       = 20
 };
+
+/* THE `ATC_HIT` DEFECT, AND THE THREE IDENTITIES THAT REPLACE IT.
+ *
+ * v1's id 12 was named ATC_HIT and was incremented on mmu_translate()'s success return.
+ * On the 68040 that return is reached BOTH by an ATC hit AND, via `goto atc_retry`, by
+ * every translate that had just walked the descriptor tables -- so it counted "the
+ * translate returned an address", carried no ATC information whatsoever, and made
+ * `ATC_HIT + ATC_MISS` a sum of a thing and part of itself. The C2 audit caught it the
+ * only way it could be caught, by noticing that `ATC_HIT + FAULTS == XLATE` held exactly
+ * in four independent seven-digit spans.
+ *
+ * So id 12 is renamed to what it always counted, and a real ATC-hit counter is appended:
+ *
+ *   XLATE      calls into mmu_translate  ==  tier-0 page-cache misses
+ *   XLATE_OK   ... that returned an address        (id 12, renamed, same site)
+ *   ATC_MISS   ... that walked the descriptor tables            (id 13, unchanged)
+ *   ATC_HIT    ... that returned WITHOUT walking                (id 19, new)
+ *
+ * Useful identities, all checkable in a dump:
+ *
+ *   IPAGE_MISS + DPAGE_RMISS + DPAGE_WMISS  ==  XLATE     (tier 0 feeds tier 1)
+ *   XLATE_OK + <translates that faulted>    ==  XLATE
+ *   ATC_HIT + ATC_MISS                      ==  XLATE     whenever no translate faulted,
+ *                                                         and short by exactly the ones
+ *                                                         that did otherwise
+ *   true ATC hit rate = ATC_HIT / XLATE     walk rate = ATC_MISS / XLATE
+ *
+ * The walk rate the v1 firmware printed (ATC_MISS / XLATE) was always correct; it was
+ * the hit counter beside it that was not.
+ *
+ * 68030 CAVEAT, and it is not the same caveat as the tier-0 one. On the 030 path the
+ * ATC_HIT site is a GENUINE ATC hit and always was, so id 19 is right there for free.
+ * But `XLATE_OK` has no single site to hang on -- the 030 translate is a bare
+ * `mmu030_logical_is_in_atc()` called from fourteen accessors -- so it is NOT counted on
+ * the 030 and reads zero. Absent, not zero-valued by accident. Worse, and worth knowing
+ * before comparing an 030 capture to an 040 one: the 030 miss path calls
+ * mmu030_logical_is_in_atc() TWICE (once to fail, once after the walk), so an 030 `XLATE`
+ * over-counts tier-0 misses by one for every walk. The 030 rates are internally
+ * consistent and are NOT comparable to the 040's. */
 
 /* Name tables. Deliberately UNSIZED so a missing name is a compile error rather than a
  * silently NULL-padded array -- the same tripwire config_item_names[] needed. */
@@ -337,7 +571,30 @@ static __inline__ uint32_t z3660_prof_cycles(void)
 }
 #else
 extern uint32_t z3660_prof_host_cycles;      /* host harness: set it, then call */
-static __inline__ uint32_t z3660_prof_cycles(void) { return z3660_prof_host_cycles; }
+/* ...and, for the one thing a clock you set by hand cannot express, a clock that MOVES.
+ *
+ * z3660_prof_host_step is added to the counter on every read, so a host test can give
+ * the probe itself a known price and then check what the calibration makes of it. It
+ * defaults to 0, which is exactly the frozen counter every other test relies on -- the
+ * bucket-arithmetic tests set the clock to literal values and assert literal spans, and
+ * they must stay that way.
+ *
+ * This exists because the alternative was a defect that no test could see: v1's
+ * calibration divided a batch of enter/exit PAIRS by the number of pairs and reported
+ * the result as a per-TRANSITION cost, and every host test still passed, because on a
+ * frozen clock the measured span is zero and zero divided by anything is zero. A unit
+ * error in a measurement is invisible to a harness that never lets the measurement
+ * measure anything. */
+extern uint32_t z3660_prof_host_step;
+static __inline__ uint32_t z3660_prof_cycles(void)
+{
+   uint32_t v = z3660_prof_host_cycles;
+   z3660_prof_host_cycles += z3660_prof_host_step;
+   return v;
+}
+/* Host harness only: re-run the probe calibration against the current host clock.
+ * z3660_prof_init() is idempotent and has long since run by the time a test wants this. */
+void z3660_prof_recalibrate_probe_for_test(void);
 #endif
 
 /* Phase-machine state. Extern rather than accessor-wrapped because these are touched on
@@ -535,7 +792,12 @@ void     z3660_prof_dump_stats(void);           /* buckets + counters, ~30 seria
 void     z3660_prof_dump_ring(unsigned n);      /* header + the newest n samples         */
 void     z3660_prof_poll_cmd(void);             /* mailbox command pickup (do_specialties)*/
 unsigned z3660_prof_cpu_hz(void);               /* the calibrated ARM clock, 0 if unarmed*/
-int      z3660_prof_probe_cyc(void);            /* measured cost of one enter/exit pair  */
+unsigned z3660_prof_wall_hz(void);              /* global-timer rate actually in use     */
+/* Cost of ONE phase transition -- not of an enter/exit pair. The name carries the unit
+ * because the caller multiplies it by TRANSITIONS, which counts each enter and each exit
+ * separately, and v1 got that wrong by naming it after the thing it timed rather than
+ * after the thing it is divided into. */
+int      z3660_prof_probe_cyc_per_transition(void);
 int      z3660_prof_present(void);              /* 1 in a profiling build, else 0        */
 
 #ifdef __cplusplus
@@ -547,8 +809,18 @@ int      z3660_prof_present(void);              /* 1 in a profiling build, else 
  * one field per command, because SHARED is hand-maintained in two headers and every new
  * field is another chance to mis-merge it (docs/piscsi-service-path.md 5). */
 #define Z3660_PROF_CTL_NONE      0u
-#define Z3660_PROF_CTL_ARM       1u   /* arm at SHARED.prof_hz                           */
-#define Z3660_PROF_CTL_STOP      2u
+#define Z3660_PROF_CTL_ARM       1u   /* arm at SHARED.prof_hz -- ZEROES everything      */
+#define Z3660_PROF_CTL_STOP      2u   /* freeze BOTH instruments, keep every byte of data
+                                       * -- the only lossless way out of an armed state.
+                                       * The console's `PROF OFF` is exactly this, and it
+                                       * exists because the rate-cycling `PROF` cannot be
+                                       * one: every step of that ladder ARMS, and arming
+                                       * zeroes. A boot profile requested from
+                                       * z3660cfg.txt is armed at a rate the ladder does
+                                       * not contain, so before v2 the only way to stop
+                                       * it was to arm over the top of it and destroy the
+                                       * capture that was the whole point of arming from
+                                       * config in the first place.                      */
 #define Z3660_PROF_CTL_ZERO      3u
 #define Z3660_PROF_CTL_DUMPSTATS 4u
 #define Z3660_PROF_CTL_DUMPRING  5u   /* count in the high 16 bits, 0 = a default slice  */

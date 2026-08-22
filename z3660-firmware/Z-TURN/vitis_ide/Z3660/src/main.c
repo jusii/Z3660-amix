@@ -1300,6 +1300,15 @@ int main()
    }
 
    shared->arm_freq_code=config.arm_frequency;
+   /* CYBERSTORM C2-prep: publish the rate the global timer ACTUALLY runs at, next to the
+    * code that selected it. core1's profiler cannot work this out for itself -- the
+    * CPU:global-timer ratio is a fixed 2:1 in silicon, so measuring it tells you nothing
+    * about the PLL -- and the BSP's COUNTS_PER_SECOND is a compile-time constant frozen
+    * at the 666.67 MHz default. Reading that constant on an 1100 MHz board is what made
+    * every Hz and every duration in the 2026-08-22 C1 profiling session low by exactly
+    * 1.65x. This is the same value the switch above just computed, published rather than
+    * recomputed, so the two cannot drift. */
+   shared->arm_wall_hz=counts_per_second;
 
 //ps7_ddr_init_custom(1); // DDR a 667 MHz  
 //ps7_ddr_init_custom(2); // DDR a 800 MHz

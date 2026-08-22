@@ -129,6 +129,7 @@ typedef struct {
    volatile uint32_t emu_probes;          // 0xFFFF00D4  MMU run loops: 1=run-loop diagnostic probes ON (the historical default), 0=off (emu_probes key, PROBES cmd)
    volatile uint32_t prof_ctl;            // 0xFFFF00D8  CYBERSTORM C1 profiler command word: cmd in bits 15..0, arg in 31..16 (Z3660_PROF_CTL_*). Core1 consumes and clears it in do_specialties(). Inert unless core1 is the PROFILING build.
    volatile uint32_t prof_hz;             // 0xFFFF00DC  CYBERSTORM C1 sampler rate in Hz, read when prof_ctl says ARM (PROF cmd; 1..20000, default 1000)
+   volatile uint32_t arm_wall_hz;         // 0xFFFF00E0  ARM global-timer rate in Hz AS RETUNED AT RUNTIME (= counts_per_second, main.c). Core0 publishes it beside arm_freq_code; core1's profiler scales its measured PMU:timer ratio by it. Exists because COUNTS_PER_SECOND is a COMPILE-TIME BSP constant frozen at the 666.67 MHz default while arm_frequency retunes the PLL -- which made every rate the C1 profiler printed low by 1.65x on an 1100 MHz board. 0 = not published (older core0) -> core1 falls back to the constant and says so.
 } SHARED;
 extern SHARED *shared;
 #define REG_BASE_ADDRESS XPAR_Z3660_0_BASEADDR

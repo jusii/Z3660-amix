@@ -861,6 +861,16 @@ static void mmu_add_cache(uaecptr addr, uaecptr phys, bool super, bool data, boo
  * to walk the descriptor tables. Three tiers, three numbers, one out-of-line function
  * each -- which is why the whole translate path costs two probe sites and not thirty.
  *
+ * C2-prep correction. There are now FOUR counters here and the fourth is the reason:
+ * this function has TWO ways to reach its success return -- an ATC tag match, and the
+ * `goto atc_retry` a table walk ends with -- so the counter that sat on that return
+ * counted every successful translate, not every ATC hit, whatever its name said. It is
+ * now XLATE_OK, which is what it always was; ATC_HIT is a separate counter guarded by a
+ * `walked` flag, and ATC_HIT + ATC_MISS is finally a partition of the translates rather
+ * than a sum of a set with one of its own subsets. Nothing about the ATTRIBUTION of
+ * cycles changed -- this was a labelling defect, and every bucket total the C1 session
+ * measured is still good.
+ *
  * The bucket wrapper is a scope around the WHOLE body including the mmu_bus_error()
  * exits; those THROW, so the exit() is skipped and the span is recovered by the run
  * loop's CATCH into FAULT. That is the correct attribution: a translate that faults did
@@ -871,6 +881,15 @@ uaecptr mmu_translate(uaecptr addr, uae_u32 val, bool super, bool data, bool wri
 	struct mmu_atc_line *l;
 	uae_u32 status060 = 0;
 	uae_u32 tag = ((super ? 0x80000000 : 0x00000000) | (addr >> 1)) & mmu_tagmask;
+#if Z3660_EMU_PROF
+	/* C2-prep: did THIS translate walk the tables? The success return below is reached
+	 * two ways -- straight from an ATC tag match, and again via `goto atc_retry` after a
+	 * walk -- so without this flag a counter incremented there cannot tell an ATC hit
+	 * from a refill. v1 had no flag, called the counter ATC_HIT, and it silently counted
+	 * both: "the translate succeeded", which is not an ATC outcome at all and made
+	 * ATC_HIT + ATC_MISS a sum of a thing with part of itself. */
+	bool z3660_walked = false;
+#endif
 
 	Z3660_PROF_ENTER(Z3660_PROF_B_XLATE);
 	Z3660_PROF_CNT(Z3660_PROF_C_XLATE);
@@ -925,7 +944,11 @@ atc_retry:
 				mmu_add_cache(addr, l->phys, super, data, write);
 
 				// return translated addr
-				Z3660_PROF_CNT(Z3660_PROF_C_ATC_HIT);
+#if Z3660_EMU_PROF
+				/* A genuine ATC hit only if we did not get here through the walk. */
+				if (!z3660_walked) Z3660_PROF_CNT(Z3660_PROF_C_ATC_HIT);
+#endif
+				Z3660_PROF_CNT(Z3660_PROF_C_XLATE_OK);
 				Z3660_PROF_RET(l->phys | (addr & mmu_pagemask));
 			} else {
 				way_invalid = way;
@@ -941,6 +964,9 @@ atc_retry:
 	// then initiate table search and create a new entry
 	l = &mmu_atc_array[data][index][way];
 	Z3660_PROF_CNT(Z3660_PROF_C_ATC_MISS);
+#if Z3660_EMU_PROF
+	z3660_walked = true;
+#endif
 	Z3660_PROF_ENTER(Z3660_PROF_B_WALK);
 	mmu_fill_atc(addr, super, tag, write, l, &status060);
 	Z3660_PROF_EXIT();

@@ -31,13 +31,15 @@ extern SHARED *shared;
  * tripwires below turn a forgotten name into a compile error instead of a NULL. */
 extern "C" const char * const z3660_prof_bucket_names[] = {
    "LOOP", "FETCHOP", "FETCHEX", "READ", "WRITE",
-   "XLATE", "WALK", "HANDLER", "TAIL", "FAULT", "PROF"
+   "XLATE", "WALK", "HANDLER", "TAILADV", "FAULT", "PROF",
+   "TAILSAMP", "TAILPOLL", "TAILSPEC"
 };
 extern "C" const char * const z3660_prof_counter_names[] = {
    "INSNS", "INSNS_SUPER", "FETCH", "READ", "WRITE",
    "IPAGE_HIT", "IPAGE_MISS", "DPAGE_RHIT", "DPAGE_RMISS",
-   "DPAGE_WHIT", "DPAGE_WMISS", "XLATE", "ATC_HIT", "ATC_MISS",
-   "MISALIGN_R", "MISALIGN_W", "FAULTS", "TRANSITIONS", "STACK_OVF"
+   "DPAGE_WHIT", "DPAGE_WMISS", "XLATE", "XLATE_OK", "ATC_MISS",
+   "MISALIGN_R", "MISALIGN_W", "FAULTS", "TRANSITIONS", "STACK_OVF",
+   "ATC_HIT"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -71,20 +73,26 @@ uint32_t z3660_prof_deadline  = 0;
 uint32_t z3660_prof_period    = 0;
 
 #if !(defined(__arm__) || defined(__thumb__))
-uint32_t z3660_prof_host_cycles = 0;   /* host harness drives the clock by hand */
+uint32_t z3660_prof_host_cycles = 0;   /* host harness drives the clock by hand   */
+uint32_t z3660_prof_host_step   = 0;   /* ...or lets it run, at this rate per read */
 #endif
 
 /* The ring lives in .bss. That is not an implementation detail -- .bss is zeroed by the
- * FSBL and occupies NOTHING in BOOT.BIN, so 512 KB of ring costs nothing in the budget
- * that is actually tight here (the ~12 MB SD/TFTP write threshold, CLAUDE.md). */
+ * FSBL and occupies NOTHING in BOOT.BIN, so 512 KB of ring costs nothing in the image at
+ * all. (The old "~12 MB SD/TFTP write threshold" this used to cite is retired; every
+ * variant has exceeded it since the beta-21 resync and deploys CRC-clean. The ring's
+ * freeness is a property of .bss, not of that rule, so the reasoning stands either way.) */
 static z3660_prof_sample_t z3660_prof_ring[Z3660_PROF_RING_ENTRIES];
 static uint32_t  z3660_prof_head;      /* next slot to write, free-running & masked */
 static uint64_t  z3660_prof_samples;   /* total taken since zero                     */
 static uint64_t  z3660_prof_drops;     /* overwritten by wrap                        */
 
 static uint32_t  z3660_prof_hz;        /* nominal rate the ring was filled at        */
-static uint32_t  z3660_prof_cpuhz;     /* MEASURED ARM clock (see calibrate)         */
-static int       z3660_prof_probecyc = -1;  /* measured cost of one enter/exit pair  */
+static uint32_t  z3660_prof_cpuhz;     /* ARM clock, ratio measured x runtime rate   */
+static uint32_t  z3660_prof_wallhz;    /* global-timer rate ACTUALLY in force        */
+static uint32_t  z3660_prof_clksrc = Z3660_PROF_CLK_BSP;  /* ...and where it came from */
+static uint32_t  z3660_prof_ratio_q8; /* measured PMCCNTR:global-timer, x256         */
+static int       z3660_prof_probecyc = -1;  /* cost of ONE transition, not of a pair */
 static int       z3660_prof_inited;
 
 /* Span bookkeeping. cyc_base extends PMCCNTR to 64 bits by accumulating the delta at
@@ -147,21 +155,42 @@ static void z3660_prof_pmu_enable(void)
 static void z3660_prof_pmu_enable(void) { }
 #endif
 
-/* Measure the ARM clock rather than believe a config key.
+/* Establish the ARM clock: measure what can be measured, take the rest from the running
+ * configuration, and report which is which.
  *
- * The board's ARM frequency is settable (arm_freq_code) and the sweeps this profiler
- * exists to support change it. Timing PMCCNTR against the global timer over ~10 ms costs
- * 10 ms once, at arm time, and makes CPU_HZ a measurement that appears in the dump
- * header -- so a reader can see the clock the periods were computed from instead of
- * assuming one.
+ * THE PART THAT CAN BE MEASURED is the RATIO of PMCCNTR to the ARM global timer, and it
+ * is timed here over ~10 ms. THE PART THAT CANNOT is the absolute rate: on this silicon
+ * the global timer is hard-wired at CPU/2, so the ratio comes back ~2.0 no matter what
+ * the PLL is doing and contains no information about it.
  *
- * COUNTS_PER_SECOND is the global timer's rate (CPU/2 on this part); it is a BSP
- * constant, not something this code gets to be wrong about. */
+ * v1 got the absolute rate from COUNTS_PER_SECOND -- and that is a COMPILE-TIME BSP
+ * constant, baked at the 666.67 MHz default, while `arm_frequency` is a config key that
+ * ps7_init_custom() applies to the PLL at boot. On a board configured for 1100 MHz the
+ * constant is wrong by 1.65x, so every rate and every duration the v1 instrument printed
+ * was low by 65 % -- and the header's own wrap cross-check could not notice, because a
+ * fixed 2:1 ratio cancels the error out of exactly that comparison (bias note 6).
+ *
+ * So the absolute rate comes from core0, which is where arm_frequency is resolved and
+ * where the PLL is retuned: SHARED.arm_wall_hz is the global-timer rate that is really
+ * in force. The BSP constant remains the fallback for a core0 that never published one
+ * (an older image, or the host harness), and the dump says `clk=bsp` when that happens
+ * instead of leaving the reader to infer it from a boot log. */
 static void z3660_prof_calibrate(void)
 {
    XTime w0, w1;
    uint32_t c0, c1;
-   XTime want = (XTime)COUNTS_PER_SECOND / 100;   /* ~10 ms */
+   XTime want;
+
+   /* The runtime rate first: the spin window below is expressed in global-timer ticks,
+    * so it has to be sized against the rate the timer actually runs at. `shared` is live
+    * long before the emulator core starts (init_shared() runs in core1's main()), but
+    * guard it anyway -- this is called from the emulator bring-up path and a null
+    * dereference here would be a card that boots to nothing. */
+   z3660_prof_wallhz = z3660_prof_pick_wall_hz(shared ? (uint32_t)shared->arm_wall_hz : 0u,
+                                               (uint32_t)COUNTS_PER_SECOND,
+                                               &z3660_prof_clksrc);
+
+   want = (XTime)z3660_prof_wallhz / 100;   /* ~10 ms */
    /* The spin is BOUNDED as well as timed, and the bound is load-bearing rather than
     * defensive. A spin that only ends when the global timer advances is an infinite loop
     * on any board where that timer is not running -- and this runs during core1's
@@ -186,8 +215,14 @@ static void z3660_prof_calibrate(void)
    {
       uint64_t dc = (uint64_t)(uint32_t)(c1 - c0);
       uint64_t dw = (uint64_t)(w1 - w0);
-      if (dw)
-         z3660_prof_cpuhz = (uint32_t)(dc * (uint64_t)COUNTS_PER_SECOND / dw);
+      if (dw) {
+         z3660_prof_cpuhz    = (uint32_t)(dc * (uint64_t)z3660_prof_wallhz / dw);
+         /* The ratio is reported alongside the rate. It should be 2.00 (512 in Q8) on
+          * this part; anything else means the CPU:global-timer relation this arithmetic
+          * rests on is not what it is believed to be, and THAT is worth seeing rather
+          * than averaging away into a Hz figure that looks fine. */
+         z3660_prof_ratio_q8 = (uint32_t)(dc * 256u / dw);
+      }
    }
    /* No usable clock (the host harness, or a board whose global timer is stopped): fall
     * back to a nominal figure so the arithmetic downstream is exercised rather than
@@ -196,10 +231,52 @@ static void z3660_prof_calibrate(void)
    if (z3660_prof_cpuhz < 1000000u) z3660_prof_cpuhz = 666666666u;
 }
 
-/* Price one enter/exit pair, so the inflation the buckets introduce is a reported number
- * rather than an apology. Measured with the buckets temporarily armed and the result
- * discarded -- the pair is timed as a batch of 256 to swamp the single-read granularity,
- * then the accumulators are wiped by the caller. */
+/* Price ONE PHASE TRANSITION, out of line, so the inflation the buckets introduce is a
+ * reported number rather than an apology -- and so that the number is in the unit it is
+ * later multiplied in.
+ *
+ * TWO THINGS THIS GETS RIGHT THAT v1 DID NOT, both of which changed a conclusion:
+ *
+ * 1. THE UNIT. The batch below performs N enter/exit PAIRS, which is 2N transitions, and
+ *    the divisor is 2N. TRANSITIONS increments in enter() and again in exit(), so
+ *    `TRANSITIONS x probecyc` is only an overhead if probecyc is a per-transition cost.
+ *    v1 divided by N and reported a pair, doubling every probe subtraction downstream --
+ *    enough to demand more probe cycles out of LOOP than LOOP contained.
+ *
+ * 2. OUT OF LINE. z3660_prof_enter/_exit are `static __inline__`, and in the calibration
+ *    loop gcc duly inlined them -- while every real accessor reaches them through a `bl`
+ *    to a single out-of-line copy (docs/profiler.md counts 51 and 44 ARM instructions
+ *    there). v1 therefore priced a cheaper probe than production pays, by an unknown
+ *    margin, and the margin was load-bearing: LOOP's corrected share falls to zero at a
+ *    per-transition cost only 28 % above v1's figure, so "is the dispatch loop worth
+ *    attacking" had no answer at all. The two wrappers here are noinline, so what is
+ *    timed is a genuine call to a genuine out-of-line body -- the same shape, with the
+ *    same prologue and epilogue, that the accessors pay.
+ *
+ *    It is still an ESTIMATE, and honestly so: a wrapper called from this loop has
+ *    different register pressure and a friendlier branch-predictor history than an
+ *    accessor's call site. What it is no longer is a known under-estimate.
+ *
+ * The batch is 1024 rather than 256 to swamp the single-read granularity now that the
+ * per-iteration cost is divided by twice as much; it runs once, at init, with the buckets
+ * temporarily armed and the accumulators wiped by the caller. */
+#if defined(__GNUC__)
+#define Z3660_PROF_NOINLINE __attribute__((noinline))
+#else
+#define Z3660_PROF_NOINLINE
+#endif
+
+static Z3660_PROF_NOINLINE void z3660_prof_probe_call_enter(void)
+{
+   z3660_prof_enter(Z3660_PROF_B_PROF);
+}
+static Z3660_PROF_NOINLINE void z3660_prof_probe_call_exit(void)
+{
+   z3660_prof_exit();
+}
+
+#define Z3660_PROF_CAL_PAIRS 1024
+
 static void z3660_prof_calibrate_probe(void)
 {
    int saved_on = z3660_prof_bucket_on;
@@ -212,14 +289,51 @@ static void z3660_prof_calibrate_probe(void)
    z3660_prof_last = z3660_prof_cycles();
 
    c0 = z3660_prof_cycles();
-   for (i = 0; i < 256; i++) {
-      z3660_prof_enter(Z3660_PROF_B_PROF);
-      z3660_prof_exit();
+   for (i = 0; i < Z3660_PROF_CAL_PAIRS; i++) {
+      z3660_prof_probe_call_enter();
+      z3660_prof_probe_call_exit();
    }
    c1 = z3660_prof_cycles();
 
-   z3660_prof_probecyc = (int)(((uint32_t)(c1 - c0)) / 256u);
+   /* 2 x pairs: one transition per enter, one per exit. */
+   z3660_prof_probecyc = (int)(((uint32_t)(c1 - c0)) / (2u * Z3660_PROF_CAL_PAIRS));
    z3660_prof_bucket_on = saved_on;
+}
+
+#if !(defined(__arm__) || defined(__thumb__))
+/* Host harness only -- see z3660_prof.h. Not reachable on the board at all. */
+extern "C" void z3660_prof_recalibrate_probe_for_test(void)
+{
+   z3660_prof_calibrate_probe();
+}
+#endif
+
+/* ------------------------------------------------------------------ cycle base */
+
+/* Fold PMCCNTR's elapsed 32 bits into the 64-bit span, and say what time it is now.
+ *
+ * v1 advanced this ONLY from z3660_prof_sample_slow(), which has two consequences the C2
+ * audit had to work around by hand:
+ *
+ *   - `cyc_span` stopped at the LAST SAMPLE while `wall_ticks` ran on to the dump, so the
+ *     two spans covered different intervals. The wrap cross-check the header asks a
+ *     symbolizer to perform then fires on the gap between "the workload ended" and "a
+ *     human typed PROFR" -- 91 s on one C1 capture -- and reports a missed PMU wrap that
+ *     never happened. A cross-check that cries wolf on ordinary operator latency is a
+ *     cross-check nobody will believe on the day it is right.
+ *   - With the sampler OFF (a bucket-only run) it never advanced at all, so a span longer
+ *     than one 32-bit wrap was simply wrong rather than merely late.
+ *
+ * Calling it from z3660_prof_poll_cmd() fixes both: that runs from do_specialties(),
+ * which a live guest reaches on every interrupt -- many times a second, at no
+ * per-instruction cost, whatever the instruments are set to. The dumps call it too, so
+ * `cyc_span` is stamped at the moment of the dump. */
+static uint32_t z3660_prof_cyc_advance(void)
+{
+   uint32_t now = z3660_prof_cycles();
+   z3660_prof_cyc_base += (uint64_t)(uint32_t)(now - z3660_prof_cyc_last);
+   z3660_prof_cyc_last  = now;
+   return now;
 }
 
 /* ------------------------------------------------------------------ sampler */
@@ -276,9 +390,24 @@ extern "C" void z3660_prof_init(void)
    z3660_prof_calibrate();
    z3660_prof_calibrate_probe();
    z3660_prof_zero();
-   z3660_printf("[PROF] profiling build: ARM clock %lu Hz (measured), enter/exit pair %d cyc, ring %lu x %u B\r\n",
-                (unsigned long)z3660_prof_cpuhz, z3660_prof_probecyc,
+   /* Every unit on this line is spelled out, and the clock's SOURCE is on it. Both are
+    * scars: the v1 line said "enter/exit pair 91 cyc" next to a per-transition count, and
+    * "ARM clock 666667585 Hz (measured)" seven seconds after the same console printed
+    * "ARM PLL successfully configured for 1100 MHz". Neither was catchable from the line
+    * itself, which is the only place a reader looks. */
+   z3660_printf("[PROF] profiling build v%u: ARM clock %lu Hz (clk=%s, PMU:wall %lu.%02lu), "
+                "probe %d cyc/transition (%d cyc/pair), ring %lu x %u B\r\n",
+                (unsigned)Z3660_PROF_VERSION,
+                (unsigned long)z3660_prof_cpuhz,
+                z3660_prof_clksrc == Z3660_PROF_CLK_CFG ? "cfg" : "bsp",
+                (unsigned long)(z3660_prof_ratio_q8 / 256u),
+                (unsigned long)(((z3660_prof_ratio_q8 % 256u) * 100u) / 256u),
+                z3660_prof_probecyc, z3660_prof_probecyc * 2,
                 (unsigned long)Z3660_PROF_RING_ENTRIES, (unsigned)Z3660_PROF_REC_SIZE);
+   if (z3660_prof_clksrc != Z3660_PROF_CLK_CFG)
+      z3660_printf("[PROF] WARNING: clk=bsp -- core0 published no ARM rate, so this is the "
+                   "COMPILE-TIME constant. If the board retuned its PLL, every Hz and every "
+                   "seconds figure below is wrong by that ratio.\r\n");
 }
 
 extern "C" void z3660_prof_zero(void)
@@ -314,9 +443,12 @@ extern "C" void z3660_prof_arm(unsigned hz)
 
 extern "C" void z3660_prof_stop(void)
 {
+   /* Close the span before freezing, so a capture stopped here and dumped a minute later
+    * reports the cycles it actually covered rather than the cycles up to its last tick. */
+   z3660_prof_cyc_advance();
    z3660_prof_sample_on = 0;
    z3660_prof_bucket_on = 0;
-   z3660_printf("[PROF] stopped: %s samples, %s dropped\r\n",
+   z3660_printf("[PROF] stopped: %s samples, %s dropped (data KEPT -- PROFD/PROFR read it)\r\n",
                 z3660_prof_u64(z3660_prof_samples), z3660_prof_u64(z3660_prof_drops));
 }
 
@@ -332,7 +464,8 @@ extern "C" void z3660_prof_set_buckets(int on)
 }
 
 extern "C" unsigned z3660_prof_cpu_hz(void)  { return z3660_prof_cpuhz; }
-extern "C" int      z3660_prof_probe_cyc(void) { return z3660_prof_probecyc; }
+extern "C" unsigned z3660_prof_wall_hz(void) { return z3660_prof_wallhz; }
+extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return z3660_prof_probecyc; }
 extern "C" int      z3660_prof_present(void) { return 1; }
 
 /* ------------------------------------------------------------------ dumps */
@@ -361,19 +494,23 @@ extern "C" void z3660_prof_dump_stats(void)
    int i;
 
    z3660_prof_enter(Z3660_PROF_B_PROF);
+   z3660_prof_cyc_advance();
 
    for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
    XTime_GetTime(&wall);
 
    z3660_printf("[PROF] === stage attribution ===\r\n");
-   z3660_printf("[PROF] ver=%u build=0x%02X cpu_hz=%lu hz=%lu period_cyc=%lu probe_cyc=%d\r\n",
+   z3660_printf("[PROF] ver=%u build=0x%02X cpu_hz=%lu clk=%s hz=%lu period_cyc=%lu "
+                "probe_cyc_per_transition=%d\r\n",
                 (unsigned)Z3660_PROF_VERSION, (unsigned)z3660_prof_build_flags(),
-                (unsigned long)z3660_prof_cpuhz, (unsigned long)z3660_prof_hz,
+                (unsigned long)z3660_prof_cpuhz,
+                z3660_prof_clksrc == Z3660_PROF_CLK_CFG ? "cfg" : "bsp",
+                (unsigned long)z3660_prof_hz,
                 (unsigned long)z3660_prof_period, z3660_prof_probecyc);
    z3660_printf("[PROF] total_cyc=%s wall_ticks=%s wall_hz=%s\r\n",
                 z3660_prof_u64(total),
                 z3660_prof_u64((uint64_t)(wall - z3660_prof_wall0)),
-                z3660_prof_u64((uint64_t)COUNTS_PER_SECOND));
+                z3660_prof_u64((uint64_t)z3660_prof_wallhz));
 
    if (!z3660_prof_bucket_on && total == 0)
       z3660_printf("[PROF] (stage buckets have not been on -- PROFB arms them)\r\n");
@@ -386,15 +523,39 @@ extern "C" void z3660_prof_dump_stats(void)
                    z3660_prof_u64(z3660_prof_acc[i]), ip, fp);
    }
 
-   /* The instrument's own weight, stated rather than left to be discovered. */
+   /* The whole tail, so the v2 split can be compared against a v1 capture without the
+    * reader having to know which four ids to add up. */
+   if (total) {
+      uint64_t tail = z3660_prof_acc[Z3660_PROF_B_TAIL]
+                    + z3660_prof_acc[Z3660_PROF_B_TAILSAMP]
+                    + z3660_prof_acc[Z3660_PROF_B_TAILPOLL]
+                    + z3660_prof_acc[Z3660_PROF_B_TAILSPEC];
+      unsigned ip, fp;
+      z3660_prof_pct(tail, total, &ip, &fp);
+      z3660_printf("[PROF] t whole tail (TAILADV+TAILSAMP+TAILPOLL+TAILSPEC) cyc=%s %3u.%02u%% "
+                   "-- this is what v1 reported as TAIL\r\n",
+                   z3660_prof_u64(tail), ip, fp);
+   }
+
+   /* The instrument's own weight, stated rather than left to be discovered.
+    *
+    * PER TRANSITION, and the line says so twice: once in the unit and once in the
+    * arithmetic it shows. TRANSITIONS counts each enter and each exit, so pairing it
+    * with a per-PAIR cost -- which is what v1 did -- doubles the answer, and a doubled
+    * probe subtraction is not a conservative error. It moved LOOP from first place to
+    * arithmetically impossible. */
    if (z3660_prof_probecyc > 0 && total) {
       uint64_t probe = z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS] * (uint64_t)z3660_prof_probecyc;
       unsigned ip, fp;
       z3660_prof_pct(probe, total, &ip, &fp);
       z3660_printf("[PROF] probe overhead inside the totals: %s cyc = %u.%02u%% "
-                   "(%s transitions x %d cyc) -- subtract per bucket by its share of transitions\r\n",
+                   "(%s transitions x %d cyc/TRANSITION, out-of-line calibrated) "
+                   "-- subtract per bucket by its share of transitions\r\n",
                    z3660_prof_u64(probe), ip, fp,
                    z3660_prof_u64(z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS]), z3660_prof_probecyc);
+      if (probe > total)
+         z3660_printf("[PROF] WARNING: the modelled probe cost EXCEEDS the measured total. "
+                      "The calibration or the transition count is wrong; do not subtract.\r\n");
    }
 
    z3660_printf("[PROF] === counters ===\r\n");
@@ -412,6 +573,8 @@ extern "C" void z3660_prof_dump_stats(void)
       uint64_t wm = z3660_prof_cnt[Z3660_PROF_C_DPAGE_WMISS];
       uint64_t xl = z3660_prof_cnt[Z3660_PROF_C_XLATE];
       uint64_t am = z3660_prof_cnt[Z3660_PROF_C_ATC_MISS];
+      uint64_t ah = z3660_prof_cnt[Z3660_PROF_C_ATC_HIT];
+      uint64_t xo = z3660_prof_cnt[Z3660_PROF_C_XLATE_OK];
       uint64_t in = z3660_prof_cnt[Z3660_PROF_C_INSNS];
       uint64_t su = z3660_prof_cnt[Z3660_PROF_C_INSNS_SUPER];
       unsigned ip, fp;
@@ -421,9 +584,29 @@ extern "C" void z3660_prof_dump_stats(void)
       z3660_printf("[PROF] r dpagecache read hit %u.%02u%%\r\n", ip, fp);
       z3660_prof_pct(wh, wh + wm, &ip, &fp);
       z3660_printf("[PROF] r dpagecache write hit %u.%02u%%\r\n", ip, fp);
+      /* The walk rate was correct in v1 and is unchanged. The line beside it is the one
+       * that could not be printed before: a genuine ATC hit rate, out of a counter that
+       * counts ATC hits. v1's `ATC_HIT` counted successful translates, so the obvious
+       * ATC_HIT/(ATC_HIT+ATC_MISS) a reader would form from it was meaningless. */
       z3660_prof_pct(am, xl, &ip, &fp);
       z3660_printf("[PROF] r of %s translates, %u.%02u%% had to walk the tables\r\n",
                    z3660_prof_u64(xl), ip, fp);
+      z3660_prof_pct(ah, xl, &ip, &fp);
+      z3660_printf("[PROF] r ...and %u.%02u%% were satisfied from the ATC without a walk\r\n",
+                   ip, fp);
+      /* Silent on the 030, where XLATE_OK has no site (see z3660_prof.h). A zero here
+       * would be read as "every translate faulted", which is a worse answer than none. */
+      if (xo) {
+         z3660_prof_pct(xo, xl, &ip, &fp);
+         z3660_printf("[PROF] r ...and %u.%02u%% returned an address (the rest faulted)\r\n",
+                      ip, fp);
+      }
+      /* The identity, computed here so a capture carries its own consistency check
+       * rather than relying on a host tool to think of forming it. */
+      if (xl && ah + am != xl)
+         z3660_printf("[PROF] r note: ATC_HIT+ATC_MISS=%s vs XLATE=%s -- the difference is "
+                      "translates that faulted before the walk decision\r\n",
+                      z3660_prof_u64(ah + am), z3660_prof_u64(xl));
       z3660_prof_pct(su, in, &ip, &fp);
       z3660_printf("[PROF] r supervisor instructions %u.%02u%% of %s\r\n",
                    ip, fp, z3660_prof_u64(in));
@@ -433,13 +616,25 @@ extern "C" void z3660_prof_dump_stats(void)
    z3660_prof_exit();
 }
 
-/* Ring dump. Grammar, frozen at version 1 (docs/profiler.md holds the same text):
+/* Ring dump. Grammar, VERSION 2 (docs/profiler.md holds the same text):
  *
- *   [PROF] ring hdr <16 space-separated key=value pairs, in z3660_prof_hdr_t order>
+ *   [PROF] ring hdr magic=Z3P2 version=2 rec_size=8 rec_count=<n> ring_entries=65536
+ *                   hz=<nominal> period_cyc=<n> cpu_hz=<n>
+ *   [PROF] ring hdr samples=<n> drops=<n> cyc_span=<n> wall_ticks=<n> wall_hz=<n>
+ *                   build=0x04 probe_cyc=<n> clk=cfg|bsp
  *   [PROF] ring begin
  *   S pppppppp oooo ffff        <- one per sample, oldest first
  *   ...
  *   [PROF] ring end n=<count>
+ *
+ * Changes from v1, all on the second header line and all additive except the magic:
+ *   - magic Z3P1 -> Z3P2, so a v1 tool refuses rather than mis-reads;
+ *   - wall_hz is the RUNTIME global-timer rate, not COUNTS_PER_SECOND;
+ *   - cpu_hz is scaled by that, so it is the clock the board is really running;
+ *   - probe_cyc is new here and is PER TRANSITION, so a ring capture carries the
+ *     calibration instead of requiring the PROFD block or the boot line beside it;
+ *   - clk= says where the absolute rate came from.
+ * THE SAMPLE LINES ARE UNCHANGED. A v1 decoder for `S` records is still correct.
  *
  * Fixed-width lowercase hex, no 0x prefix, oldest first. Fixed width so a symbolizer can
  * slice by column and a truncated serial capture is detectable rather than merely
@@ -453,20 +648,27 @@ extern "C" void z3660_prof_dump_ring(unsigned n)
    unsigned i;
 
    z3660_prof_enter(Z3660_PROF_B_PROF);
+   /* Stamp the cycle span at the DUMP, so it covers the same interval wall_ticks does
+    * and the symbolizer's wrap cross-check compares like with like. */
+   z3660_prof_cyc_advance();
 
    if (n == 0 || (uint64_t)n > have) n = (unsigned)have;
    XTime_GetTime(&wall);
 
-   z3660_printf("[PROF] ring hdr magic=Z3P1 version=%u rec_size=%u rec_count=%u ring_entries=%lu "
+   z3660_printf("[PROF] ring hdr magic=%s version=%u rec_size=%u rec_count=%u ring_entries=%lu "
                 "hz=%lu period_cyc=%lu cpu_hz=%lu\r\n",
+                Z3660_PROF_MAGIC_STR,
                 (unsigned)Z3660_PROF_VERSION, (unsigned)Z3660_PROF_REC_SIZE, n,
                 (unsigned long)Z3660_PROF_RING_ENTRIES, (unsigned long)z3660_prof_hz,
                 (unsigned long)z3660_prof_period, (unsigned long)z3660_prof_cpuhz);
-   z3660_printf("[PROF] ring hdr samples=%s drops=%s cyc_span=%s wall_ticks=%s wall_hz=%lu build=0x%02X\r\n",
+   z3660_printf("[PROF] ring hdr samples=%s drops=%s cyc_span=%s wall_ticks=%s wall_hz=%lu "
+                "build=0x%02X probe_cyc=%d clk=%s\r\n",
                 z3660_prof_u64(z3660_prof_samples), z3660_prof_u64(z3660_prof_drops),
                 z3660_prof_u64(z3660_prof_cyc_base),
                 z3660_prof_u64((uint64_t)(wall - z3660_prof_wall0)),
-                (unsigned long)COUNTS_PER_SECOND, (unsigned)z3660_prof_build_flags());
+                (unsigned long)z3660_prof_wallhz, (unsigned)z3660_prof_build_flags(),
+                z3660_prof_probecyc,
+                z3660_prof_clksrc == Z3660_PROF_CLK_CFG ? "cfg" : "bsp");
    z3660_printf("[PROF] ring begin\r\n");
 
    start = z3660_prof_head - n;
@@ -489,6 +691,13 @@ extern "C" void z3660_prof_poll_cmd(void)
 {
    uint32_t w = shared->prof_ctl;
    uint32_t cmd = Z3660_PROF_CTL_CMD(w);
+
+   /* Keep the 64-bit cycle base fresh whether or not anything is armed. This is the one
+    * place that runs often (every interrupt) and costs nothing per instruction, which is
+    * exactly what a 32-bit counter wrapping every ~3.9 s needs. With the sampler off,
+    * nothing else advances it at all -- and a bucket-only run is precisely the case
+    * where the span matters and the sampler is off. */
+   z3660_prof_cyc_advance();
 
    if (cmd == Z3660_PROF_CTL_NONE) return;
    shared->prof_ctl = Z3660_PROF_CTL_NONE;      /* consume before acting: a dump takes seconds */
@@ -532,7 +741,8 @@ extern "C" void     z3660_prof_dump_stats(void)      { }
 extern "C" void     z3660_prof_dump_ring(unsigned n) { (void)n; }
 extern "C" void     z3660_prof_poll_cmd(void)        { }
 extern "C" unsigned z3660_prof_cpu_hz(void)          { return 0; }
-extern "C" int      z3660_prof_probe_cyc(void)       { return -1; }
+extern "C" unsigned z3660_prof_wall_hz(void)         { return 0; }
+extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return -1; }
 extern "C" int      z3660_prof_present(void)         { return 0; }
 
 #endif /* Z3660_EMU_PROF */

@@ -4588,6 +4588,23 @@ static void amix_dump_wild(uae_u32 wildpc)
  *
  * Expands to NOTHING outside the profiling build: no tick, and so no predicate either,
  * which is the same rule runloop_build.h established for the other two instruments. */
+/* CYBERSTORM C2-prep: the tail is now SUB-BUCKETED, and these three macros are where.
+ *
+ * The C2 map measured the run-loop tail at 20.01 % of guest time and 110.8 ARM cycles
+ * per instruction -- for what ought to be a PC advance and a cheap event test -- and had
+ * to leave it alone, because a fifth of the profile with no internal breakdown cannot be
+ * attacked without guessing which part of it to attack. So the tail's three identifiable
+ * pieces get their own bucket ids and whatever is left stays in id 8 (TAILADV).
+ *
+ * The sampler hook is bucketed FIRST among them and deliberately: it is the profiler's
+ * own cost, it fires on every instruction, and in v1 it was charged to LOOP -- so no v1
+ * capture could see it at all and the tail's 110.8 cycles never included it. Separating
+ * it means a reader can subtract the instrument instead of ranking it.
+ *
+ * All three expand to NOTHING outside the profiling build -- not to a false predicate, to
+ * nothing -- so the default and lean loops are textually what they were. That is the same
+ * rule runloop_build.h set for the other two instruments, and it is checked by objdump
+ * rather than trusted. */
 #if Z3660_EMU_PROF
 #define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)                      \
    do {                                                                       \
@@ -4595,12 +4612,47 @@ static void amix_dump_wild(uae_u32 wildpc)
                                  | (regs.mmu_enabled ? Z3660_PROF_F_MMU : 0)  \
                                  | (amix_mmu_on ? Z3660_PROF_F_AMIX : 0)      \
                                  | ((is040) ? Z3660_PROF_F_CPU040 : 0));      \
+      z3660_prof_enter(Z3660_PROF_B_TAILSAMP);                                \
       z3660_prof_count(Z3660_PROF_C_INSNS);                                   \
       if (regs.s) z3660_prof_count(Z3660_PROF_C_INSNS_SUPER);                 \
       z3660_prof_tick((uae_u32)(pcexpr), (uae_u16)(opexpr), z3660_f_);        \
+      z3660_prof_exit();                                                      \
    } while (0)
+/* The interrupt poll, cadence gate and all. */
+#define Z3660_PROF_TAIL_POLL()                                                \
+   do {                                                                       \
+      z3660_prof_enter(Z3660_PROF_B_TAILPOLL);                                \
+      Z3660_RUNLOOP_TAIL();                                                   \
+      z3660_prof_exit();                                                      \
+   } while (0)
+/* do_specialties(): trace, STOP, mode change. Kept behind the spcflags gate rather than
+ * bracketed unconditionally, because it is entered rarely and two transitions per
+ * instruction to measure a bucket that is usually empty would cost more than it reports.
+ *
+ * The macro CONTAINS A RETURN, which is worth flagging rather than hiding: the run loop
+ * returns when do_specialties() says the mode changed, and the profiling arm has to close
+ * TAILSPEC and then TAILADV on the way out. The non-profiling arm is textually the code
+ * that was here before this macro existed. */
+#define Z3660_PROF_TAIL_SPECIALTIES(cyc)                                      \
+   if (regs.spcflags) {                                                       \
+      int z3660_spec_;                                                        \
+      z3660_prof_enter(Z3660_PROF_B_TAILSPEC);                                \
+      z3660_spec_ = do_specialties(cyc);                                      \
+      z3660_prof_exit();                                                      \
+      if (z3660_spec_) {                                                      \
+         z3660_prof_exit();                                                   \
+         return;                                                              \
+      }                                                                       \
+   }
 #else
 #define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)  do { } while (0)
+#define Z3660_PROF_TAIL_POLL()   Z3660_RUNLOOP_TAIL()
+#define Z3660_PROF_TAIL_SPECIALTIES(cyc)                                      \
+   if (regs.spcflags) {                                                       \
+      if (do_specialties(cyc)) {                                              \
+         return;                                                              \
+      }                                                                       \
+   }
 #endif
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
 #if Z3660_EMU_PERF
@@ -4957,7 +5009,6 @@ void m68k_run_mmu040(void)
             Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
             Z3660_PROF_EXIT();
-            cpu_cycles = adjust_cycles(cpu_cycles);
 
             // Same IPL/cross-core poll throttle the 030 loop has, and for the same reason:
             // check_uae_int_request() runs z3660_tasks() + ipl_main_read() + (under AMIX)
@@ -4966,15 +5017,16 @@ void m68k_run_mmu040(void)
             // per-instruction (STOP/trace/mode-change correctness). cadence 1 -- the
             // default and what the env sets today -- is byte-for-byte the old behaviour;
             // this only makes the existing SERV knob reach the 040 loop as well.
-            Z3660_PROF_RUNLOOP_SAMPLE(regs.instruction_pc, z3660_prof_op, 1);
+            //
+            // C2-prep: the bucket opens BEFORE adjust_cycles() and the sampler hook, so
+            // the tail's own accounting work is inside it. In v1 both sat outside and
+            // were charged to LOOP, which is part of why LOOP looked like the largest
+            // bucket in the whole profile.
             Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
-            Z3660_RUNLOOP_TAIL();
-            if (regs.spcflags) {
-               if (do_specialties(cpu_cycles)) {
-                  Z3660_PROF_EXIT();
-                  return;
-               }
-            }
+            cpu_cycles = adjust_cycles(cpu_cycles);
+            Z3660_PROF_RUNLOOP_SAMPLE(regs.instruction_pc, z3660_prof_op, 1);
+            Z3660_PROF_TAIL_POLL();
+            Z3660_PROF_TAIL_SPECIALTIES(cpu_cycles);
             Z3660_PROF_EXIT();
          }
       } CATCH(prb) {
@@ -5105,20 +5157,17 @@ insretry:
 #endif /* Z3660_EMU_PROBES */
 
             mmu030_opcode = -1;
-            cpu_cycles = adjust_cycles(cpu_cycles);
             // perf investigation: instruction-rate benchmark + tunable IPL/cross-core poll cadence.
             // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
             // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
             // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
-            Z3660_PROF_RUNLOOP_SAMPLE(mmu030_insn_start_pc, z3660_prof_op, 0);
+            // C2-prep: same tail split as the 040 loop -- spelled through the same three
+            // macros so the two loops cannot drift in what they attribute where.
             Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
-            Z3660_RUNLOOP_TAIL();
-            if (regs.spcflags) {
-               if (do_specialties(cpu_cycles)) {
-                  Z3660_PROF_EXIT();
-                  return;
-               }
-            }
+            cpu_cycles = adjust_cycles(cpu_cycles);
+            Z3660_PROF_RUNLOOP_SAMPLE(mmu030_insn_start_pc, z3660_prof_op, 0);
+            Z3660_PROF_TAIL_POLL();
+            Z3660_PROF_TAIL_SPECIALTIES(cpu_cycles);
             Z3660_PROF_EXIT();
          }
       } CATCH(prb) {
