@@ -388,11 +388,29 @@ are the answer, their *rate* is not. The firmware measures its own probe cost at
 prints it next to the totals so the inflation is subtractable rather than merely acknowledged.
 
 Config keys `prof_hz` / `prof_buckets` arm it from power-on (both default to off), which is the
-only way to profile the boot itself; the serial console has `PROF` / `PROFB` / `PROFD` / `PROFR` /
-`PROFZ` for everything after that. The **[full reference, wire format and recommended metal
-session are in `docs/profiler.md`](profiler.md)** — including the bias statement, which is not
-optional reading: samples are taken at instruction boundaries and carry a `WEIGHT` field that a
-reader must honour, or the stalls this instrument exists to find are the exact thing it deletes.
+only way to profile the boot itself; the serial console has `PROF` / `PROF <hz>` / `PROF OFF` /
+`PROFB` / `PROFD` / `PROFR` / `PROFZ` for everything after that. The **[full reference, wire
+format and recommended metal session are in `docs/profiler.md`](profiler.md)** — including the
+bias statement, which is not optional reading: samples are taken at instruction boundaries and
+carry a `WEIGHT` field that a reader must honour, or the stalls this instrument exists to find are
+the exact thing it deletes.
+
+**Wire format v2** (`Z3P2`). The first metal session with this instrument, 2026-08-22, produced
+four captures in which three printed numbers did not mean what they said — a probe cost priced per
+*pair* but multiplied by a per-*transition* count, an ARM clock read from a compile-time constant
+on a board that had retuned its PLL, and a counter called `ATC_HIT` that counted successful
+translates. All three are fixed and the version is bumped; a v1 symbolizer must refuse a v2
+capture. `docs/profiler.md` carries the full v1→v2 table and the correction factors for reading
+an existing v1 capture.
+
+Three operating rules, all learned from that session and all in `docs/profiler.md`:
+
+- **`PROF OFF` is the lossless stop.** Every rung of the `PROF` rate ladder *arms*, and arming
+  *zeroes* — so before v2 there was no keystroke that could freeze a config-armed boot profile
+  without destroying it.
+- **Size the ring to contain the workload** (`65536 / hz` seconds; `PROF <hz>` prints it). Two of
+  three C1 workload captures wrapped and profiled the idle loop that followed the benchmark.
+- **`PSTAT` off before any long dump** — see the runtime-toggle section below.
 
 ### `isoN <file>` — CD-ROM images (upstream's key, with a trap)
 
@@ -433,6 +451,36 @@ runtime from the serial **C** (console) menu — they are *not* `z3660cfg.txt` o
 - **`DSCSI`** — gates the `[PISCSI]` SCSI register-trace flood.
 
 Both default to off (quiet) in normal operation.
+
+#### One UART, two cores: turn `PSTAT` off before any long dump
+
+Core0 and core1 print through the **same UART behind the same semaphore**
+(`SHARED.uart_semaphore`), taken and released around *every* `printf`. A core1 profiler ring dump
+is ~65 500 sequential acquisitions spread over about two minutes.
+
+For the whole of that, core0's periodic `PSTAT` piscsi and `C0STAT` loop reports are contending
+for the same semaphore — and **core0 spins while it waits**, so the cooperative loop that services
+piscsi requests is starved for as long as the dump runs. Two consequences, and the second is the
+one that bites silently:
+
+- interleaved lines break the dump's fixed-width grammar and a symbolizer rejects the capture;
+- **guest I/O latency degrades for the duration**, which is invisible in the dump itself.
+
+So: `PSTAT` off → dump → `PSTAT` on. The same contention is why a ring dump's first header line
+arrives with its `[PROF] ` prefix eaten by the console echo of the command that requested it.
+
+#### `PERFS` / `PROBES` answer even when there is nothing to switch
+
+Both commands are handled by **core0**, which cannot tell which core1 image is running. On
+`BOOT-lean.BIN` and `BOOT-prof.BIN` the instruments they gate are compiled **out**: the mailbox
+bit flips, the console prints `PERF STATS ON`, and nothing happens. The same is true of `prof_hz`
+/ `prof_buckets` on a non-profiling image and of every `PROF*` command.
+
+That is deliberate — one `z3660cfg.txt` is shared across a flash of any variant, and a key that
+made the default firmware refuse to boot would be far worse than one that quietly does nothing —
+but **the console echo is not evidence that an instrument is armed**. The boot banner is. A sweep
+that flips `PERFS`/`PROBES` on a lean image is measuring nothing, and will report the resulting
+flat line as a result.
 
 ---
 
