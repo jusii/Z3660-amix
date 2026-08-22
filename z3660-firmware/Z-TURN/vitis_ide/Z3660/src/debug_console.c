@@ -28,6 +28,8 @@ void piscsi_stats_dump(void);
 int  piscsi_stats_reporting(void);
 /* core0 cooperative-loop per-task duration accounting */
 #include "core0_stats.h"
+/* CYBERSTORM C1: the profiler command word core0 writes into SHARED.prof_ctl. */
+#include "prof_config.h"
 typedef enum {
    A,
 
@@ -79,6 +81,12 @@ typedef enum {
    PERFS,   PERF_STATS,
    PROBES,  EMU_PROBES,
    CSTAT,   CORE0_LOOP_STATS,
+   /* CYBERSTORM C1 profiler. APPEND-ONLY: command_names[] is indexed by this enum. */
+   PROF,    PROF_ARM,
+   PROFB,   PROF_BUCKETS,
+   PROFD,   PROF_DUMP,
+   PROFR,   PROF_RING,
+   PROFZ,   PROF_ZERO,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -134,6 +142,11 @@ const char *command_names[] = {
       "PERFS",   "PERF STATS",
       "PROBES",  "EMU PROBES",
       "CSTAT",   "CORE0 LOOP STATS",
+      "PROF",    "PROF ARM",
+      "PROFB",   "PROF BUCKETS",
+      "PROFD",   "PROF DUMP",
+      "PROFR",   "PROF RING",
+      "PROFZ",   "PROF ZERO",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -182,6 +195,7 @@ void debug_console_init(void)
    debug_console.reset_cpld=0;
    debug_console.reset_fpga=0;
    debug_console.overlay_enabled=0;
+   debug_console.prof_buckets=0;   /* CYBERSTORM C1: nothing armed at power-on */
 }
 uint32_t hextoi(char *str)
 {
@@ -445,6 +459,74 @@ int debug_thread(struct pt *pt)
                   case PSTATZ:
                   case CORE0_LOOP_ZERO:
                      core0_stats_zero();         // zero core0 cumulative totals + worst-ever latch
+                     debug_console.subcmd=0;
+                     break;
+                  /* CYBERSTORM C1 profiler (core1). Every one of these is a WRITE to the
+                   * cross-core command word; core1 consumes it in do_specialties(), so it
+                   * costs nothing per emulated instruction and arrives within an
+                   * interrupt period.
+                   *
+                   * Core0 cannot tell which core1 image is running -- there is no
+                   * "profiler present" bit and adding one would mean another hand-mirrored
+                   * SHARED field for a question that already has an answer: the profiling
+                   * image announces itself at boot with a "[PROF] profiling build: ARM
+                   * clock ..." line. So these commands say what they asked for, not what
+                   * happened, and the absence of a [PROF] reply IS the answer. */
+                  case PROF:
+                  case PROF_ARM:
+                     {  // cycle the sampler rate: off -> 250 -> 1000 -> 4000 -> off
+                        uint32_t hz=shared->prof_hz;
+                        if(hz==0)         hz=250;
+                        else if(hz<1000)  hz=1000;
+                        else if(hz<4000)  hz=4000;
+                        else              hz=0;
+                        shared->prof_hz=hz;
+                        if(hz) {
+                           shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM,0);
+                           xil_printf("PROF ARM %lu Hz requested (zeroes the ring; PROFILING build only)\r\n",
+                                      (unsigned long)hz);
+                        } else {
+                           shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+                           xil_printf("PROF STOP requested (data kept -- PROFD/PROFR still read it)\r\n");
+                        }
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFB:
+                  case PROF_BUCKETS:
+                     {  // the interpreter stage buckets, which are NOT free -- see below
+                        debug_console.prof_buckets=!debug_console.prof_buckets;
+                        shared->prof_ctl=debug_console.prof_buckets
+                              ? Z3660_PROF_CFG_CTL_BUCKETS_ON : Z3660_PROF_CFG_CTL_BUCKETS_OFF;
+                        xil_printf("PROF BUCKETS %s requested -- these cost real time: "
+                                   "the per-stage SHARES are the answer, the instruction RATE is not\r\n",
+                                   debug_console.prof_buckets?"ON":"OFF");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFD:
+                  case PROF_DUMP:
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_DUMPSTATS;   // buckets + counters, ~35 lines
+                     xil_printf("PROF DUMP requested (stage buckets + counters)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFR:
+                     // The newest 4096 samples: ~90 KB, roughly 8 s of 115200 serial.
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_DUMPRING;    // arg 0 = the default slice
+                     xil_printf("PROF RING requested (newest 4096 samples, ~8 s of serial)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROF_RING:
+                     // The long name dumps the WHOLE ring: 65536 samples, ~1.4 MB, about
+                     // two minutes of serial. Deliberately the one that has to be typed out.
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_DUMPRING,65535);
+                     xil_printf("PROF RING (full) requested: up to 65535 samples, ~2 min of serial\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFZ:
+                  case PROF_ZERO:
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_ZERO;        // buckets, counters and ring
+                     xil_printf("PROF ZERO requested (buckets, counters and ring)\r\n");
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:
@@ -1179,5 +1261,12 @@ void debug_console_help(void)
    xil_printf("'PERFS'   or 'PERF STATS' toggles core1 per-instruction perf accounting (EMU)\r\n");
    xil_printf("'PROBES'  or 'EMU PROBES' toggles the core1 run-loop diagnostic probes (EMU)\r\n");
    xil_printf("'CSTAT'   or 'CORE0 LOOP STATS' toggles core0 C0STAT span STAMPING (not just printing)\r\n");
+   xil_printf("--- CYBERSTORM C1 interpreter profiler (PROFILING build only; that image says so at boot) ---\r\n");
+   xil_printf("'PROF'    cycles the guest-PC sampler: off -> 250 -> 1000 -> 4000 Hz -> off (arming zeroes the data)\r\n");
+   xil_printf("'PROFB'   toggles the interpreter STAGE BUCKETS -- costly: read the shares, not the rate\r\n");
+   xil_printf("'PROFD'   dumps stage buckets + counters (~35 lines)\r\n");
+   xil_printf("'PROFR'   dumps the newest 4096 PC samples (~8 s of serial); 'PROF RING' dumps all 65535 (~2 min)\r\n");
+   xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
+   xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
 }
 #endif

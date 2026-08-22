@@ -33,6 +33,7 @@ existing list. Upstream Z3660 behaviour is unchanged.
 | **AMIX warm-reboot fix** | A clean Zynq reboot on an AMIX `reboot`, instead of the register-flood / data-abort the naïve path produced. |
 | **Emulator perf + debug knobs** | `service_cadence` (CPU throughput vs. interrupt latency) and per-category debug gating (`DEMU` / `DSCSI`) to silence the emulator's debug floods. |
 | **Run-loop overhead switches** | `perf_stats` / `emu_probes` / `core0_stats` turn off the firmware's own per-instruction and per-loop-iteration instrumentation at runtime, so its cost can be measured rather than assumed. All default to on (unchanged behaviour). |
+| **Interpreter profiler** | A third firmware variant (`make profile` -> `BOOT-prof.BIN`) with a wall-clock guest-PC sampler and per-stage ARM cycle attribution, so the interpreter's remaining cost is measured rather than argued about. Off unless asked for; see [docs/profiler.md](profiler.md). |
 | **Sizable AMIX RAM window** | `amix_ram <MiB>` sizes the single contiguous window the AMIX memory contract presents (default 16, bounded at 128 by the combo board window). |
 
 ---
@@ -100,6 +101,12 @@ service_cadence 4             # AMIX-safe perf; see below
 #perf_stats NO
 #emu_probes NO
 #core0_stats NO
+
+# Optional: arm the interpreter profiler from power-on. Only the PROFILING firmware
+# (`make profile` -> BOOT-prof.BIN) acts on these; the other two images ignore them.
+# Both default to off. See docs/profiler.md.
+#prof_hz 1000                  # guest-PC sampler rate in Hz; 0 or absent = off
+#prof_buckets YES              # ...and the interpreter stage buckets; absent = NO
 
 # Map an A3000-variant Kickstart (you supply the .rom file):
 kickstart5 kicks/A3kKS31.rom
@@ -360,6 +367,32 @@ emulation, not just measurement.
   default image is byte-for-byte the firmware it has always been.
 - `Z3660_emu/src/uae/runloop_build.h` is the single copy of the rule, and the host harness asserts
   both shapes (`make run` and `make run-lean` under `Z3660_emu/test/host`).
+
+#### The profiling build — `make profile`
+
+Switching the instrumentation off, and then compiling it out, answered how much of the ARM's time
+the *firmware's own diagnostics* were taking. It said nothing about where the remaining time goes,
+which is the question that has to be answered before anything is optimised. `make profile` builds
+a **third** core1 — the lean flags plus `-DZ3660_EMU_PROF=1` — and emits **`sd_card/BOOT-prof.BIN`**
+beside the other two. It carries a wall-clock guest-PC sampler and per-stage ARM cycle attribution
+for the interpreter (opcode fetch, extension fetch, data read, data write, MMU translate, table
+walk, handler body, loop tail, fault), plus page-cache and ATC hit-rate counters.
+
+It is built **on top of lean**, not on top of the default: a profile of the diagnostic loop would
+describe a binary nobody runs, and the 9.1 % measured above is larger than several of the effects
+the profile exists to rank.
+
+It is a **measuring instrument, not a production image**. The sampler is cheap; the stage buckets
+are not, and with them on the reported instruction rate is far below the lean rate — their *shares*
+are the answer, their *rate* is not. The firmware measures its own probe cost at arm time and
+prints it next to the totals so the inflation is subtractable rather than merely acknowledged.
+
+Config keys `prof_hz` / `prof_buckets` arm it from power-on (both default to off), which is the
+only way to profile the boot itself; the serial console has `PROF` / `PROFB` / `PROFD` / `PROFR` /
+`PROFZ` for everything after that. The **[full reference, wire format and recommended metal
+session are in `docs/profiler.md`](profiler.md)** — including the bias statement, which is not
+optional reading: samples are taken at instruction boundaries and carry a `WEIGHT` field that a
+reader must honour, or the stalls this instrument exists to find are the exact thing it deletes.
 
 ### `isoN <file>` — CD-ROM images (upstream's key, with a trap)
 

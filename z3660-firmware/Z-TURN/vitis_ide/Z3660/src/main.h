@@ -127,6 +127,8 @@ typedef struct {
    volatile uint32_t amix_ram;            // 0xFFFF00CC  AMIX main-RAM window size in MiB (16 = the historical default; bounds in Z3660/src/amix_ram.h)
    volatile uint32_t perf_stats;          // 0xFFFF00D0  MMU run loops: 1=per-instruction perf accounting ON (the historical default), 0=off (perf_stats key, PERFS cmd)
    volatile uint32_t emu_probes;          // 0xFFFF00D4  MMU run loops: 1=run-loop diagnostic probes ON (the historical default), 0=off (emu_probes key, PROBES cmd)
+   volatile uint32_t prof_ctl;            // 0xFFFF00D8  CYBERSTORM C1 profiler command word: cmd in bits 15..0, arg in 31..16 (Z3660_PROF_CTL_*). Core1 consumes and clears it in do_specialties(). Inert unless core1 is the PROFILING build.
+   volatile uint32_t prof_hz;             // 0xFFFF00DC  CYBERSTORM C1 sampler rate in Hz, read when prof_ctl says ARM (PROF cmd; 1..20000, default 1000)
 } SHARED;
 extern SHARED *shared;
 #define REG_BASE_ADDRESS XPAR_Z3660_0_BASEADDR

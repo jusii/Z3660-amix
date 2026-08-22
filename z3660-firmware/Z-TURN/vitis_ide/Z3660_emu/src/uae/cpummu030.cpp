@@ -1231,6 +1231,11 @@ static void desc_get_quad(uaecptr addr, uae_u32 *descr)
  * for PTEST (levels 1 to 7). Using level 0 creates an ATC entry. */
 
 static uae_u32 mmu030_table_search(uaecptr addr, uae_u32 fc, bool write, int level) {
+    /* CYBERSTORM C1: this IS the 030 descriptor table walk -- the tier-2 miss. The bucket
+     * is not closed on the bus-error exits below because those THROW; the run loop's
+     * CATCH recovers the span into FAULT, which is where a walk that faulted belongs. */
+    Z3660_PROF_CNT(Z3660_PROF_C_ATC_MISS);
+    Z3660_PROF_ENTER(Z3660_PROF_B_WALK);
     /* During table walk up to 7 different descriptors are used:
      * root pointer, descriptors fetched from function code lookup table,
      * tables A, B, C and D and one indirect descriptor */
@@ -1608,7 +1613,7 @@ static uae_u32 mmu030_table_search(uaecptr addr, uae_u32 fc, bool write, int lev
         mmu030.status = (mmu030.status&~MMUSR_NUM_LEVELS_MASK) | descr_num;
 
         /* If root pointer is page descriptor (descr_num 0), return 0 */
-        return descr_num ? descr_addr[descr_num] : 0;
+        Z3660_PROF_RET(descr_num ? descr_addr[descr_num] : 0);
     }
     
     /* Find an ATC entry to replace */
@@ -1663,8 +1668,8 @@ static uae_u32 mmu030_table_search(uaecptr addr, uae_u32 fc, bool write, int lev
               mmu030.atc[i].physical.write_protect?1:0,
               mmu030.atc[i].physical.modified?1:0);
 #endif // MMU030_ATC_DBG_MSG
-    
-    return 0;
+
+    Z3660_PROF_RET(0);
 }
 
 /* This function is used for PTEST level 0. */
@@ -2082,9 +2087,15 @@ static uae_u32 mmu030_get_atc_generic(uaecptr addr, int l, uae_u32 fc, int flags
  * by comparing the logical address and function code to the values
  * stored in the ATC entries. If a matching entry is found it sets
  * the history bit and returns the cache index of the entry. */
+/* CYBERSTORM C1. On the 030 this is the tier-1 ATC search, and -- like mmu_translate on
+ * the 040 -- reaching it at all means the tier-0 page cache missed. So one probe here
+ * yields both numbers: XLATE counts page-cache misses, and the bucket span covers the ATC
+ * search proper. The table walk it does not cover is charged separately in
+ * mmu030_table_search. */
 static int mmu030_logical_is_in_atc(uaecptr addr, uae_u32 fc, bool write) {
     uaecptr logical_addr = 0;
     uae_u32 addr_mask = mmu030.translation.page.imask;
+    Z3660_PROF_CNT(Z3660_PROF_C_XLATE);
 	uae_u32 maddr = addr & addr_mask;
     int offset = (maddr >> mmu030.translation.page.size) & 0x1f;
 
@@ -2104,6 +2115,7 @@ static int mmu030_logical_is_in_atc(uaecptr addr, uae_u32 fc, bool write) {
                 /* Maintain history bit */
 					mmu030_atc_handle_history_bit(index);
 					atcindextable[offset] = index;
+					Z3660_PROF_CNT(Z3660_PROF_C_ATC_HIT);
 					return index;
 				} else {
 					mmu030.atc[index].logical.valid = false;

@@ -33,7 +33,22 @@
 #define MMU_IPAGECACHE 1
 #define MMU_DPAGECACHE 1
 
+/* CYBERSTORM C1. Upstream already carries the hit/miss branch scaffolding for the two
+ * page caches -- correctly placed on every hit and every miss arm below -- and only
+ * switches it off. The profiling build switches it on; the default and lean builds get
+ * the literal 0 they have always had, so their generated code is unchanged.
+ *
+ * It stays OUT of the default build on purpose. An increment looks free, but this is a
+ * read-modify-write on every guest memory access, and C3b's metal calibration priced the
+ * per-instruction 64-bit accumulator -- a strictly smaller amount of the same work -- at
+ * 2.0 % of guest throughput. Adding it back to the shipping loop would undo the thing
+ * C3b just finished proving. */
+#include "z3660_prof.h"
+#if Z3660_EMU_PROF
+#define CACHE_HIT_COUNT 1
+#else
 #define CACHE_HIT_COUNT 0
+#endif
 
 #include "mmu_common.h"
 
@@ -256,10 +271,23 @@ extern struct mmufastcache atc_data_cache_read[MMUFASTCACHE_ENTRIES];
 extern struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
 #endif
 
-#if CACHE_HIT_COUNT
+#if CACHE_HIT_COUNT && !Z3660_EMU_PROF
 extern int mmu_ins_hit, mmu_ins_miss;
 extern int mmu_data_read_hit, mmu_data_read_miss;
 extern int mmu_data_write_hit, mmu_data_write_miss;
+#endif
+#if Z3660_EMU_PROF
+/* Land upstream's six hit/miss increments in the profiler's 64-bit counters instead of
+ * upstream's ints. Not a stylistic preference: an int counter overflows after 2.1e9
+ * accesses, which a hot interpreter reaches in a few minutes -- shorter than the boot
+ * profile this instrument exists to take, and it would wrap silently. Done by macro so
+ * the twelve branch sites below stay verbatim upstream code. */
+#define mmu_ins_hit         z3660_prof_cnt[Z3660_PROF_C_IPAGE_HIT]
+#define mmu_ins_miss        z3660_prof_cnt[Z3660_PROF_C_IPAGE_MISS]
+#define mmu_data_read_hit   z3660_prof_cnt[Z3660_PROF_C_DPAGE_RHIT]
+#define mmu_data_read_miss  z3660_prof_cnt[Z3660_PROF_C_DPAGE_RMISS]
+#define mmu_data_write_hit  z3660_prof_cnt[Z3660_PROF_C_DPAGE_WHIT]
+#define mmu_data_write_miss z3660_prof_cnt[Z3660_PROF_C_DPAGE_WMISS]
 #endif
 
 static ALWAYS_INLINE uae_u32 mmu_get_ilong(uaecptr addr, int size)
@@ -684,25 +712,50 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
 }
 #endif
 
+/* ==========================================================================
+ * CYBERSTORM C1 -- where the interpreter's stage buckets are actually charged.
+ *
+ * This is the choke layer, and picking it was the whole design decision. The named
+ * accessors above it (get_long_mmu040 and friends) are STATIC_INLINE = always_inline and
+ * vanish into ~3000 call sites in cpuemu_31; the mmu_get_ / mmu_put_ family below it is
+ * the same. The uae_mmu040_ functions in between are ALWAYS_INLINE, which here is bare
+ * `__inline` (mmu_common.h:109) -- a hint, not a command -- and gcc emits ONE out-of-line
+ * copy per translation unit. Verified against the shipped objects: cpuemu_31.o carries
+ * exactly one uae_mmu040_get_iword with 920 call relocations into it.
+ *
+ * So a probe here is ~10 code sites in the whole firmware rather than 3000, which is what
+ * keeps BOOT.BIN under the ~12 MB SD/TFTP threshold that a naive instrumentation of the
+ * named accessors would have blown straight through.
+ *
+ * The Z3660_PROF_RET idiom exists so the NON-profiling expansion is textually the
+ * original `return expr;` -- default and lean must be byte-identical to the build before
+ * this file was touched, and the cheapest way to be certain is to hand gcc the same text.
+ * ========================================================================== */
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_iword(uaecptr addr)
 {
+	Z3660_PROF_ENTER_IFETCH();
+	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
 #if MMU_ICACHE
-	return uae_mmu040_getc_iword(addr);
+	Z3660_PROF_RET(uae_mmu040_getc_iword(addr));
 #else
-	return mmu_get_iword(addr, sz_word);
+	Z3660_PROF_RET(mmu_get_iword(addr, sz_word));
 #endif
 }
 static ALWAYS_INLINE uae_u32 uae_mmu040_get_ilong(uaecptr addr)
 {
+	Z3660_PROF_ENTER_IFETCH();
+	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
 #if MMU_ICACHE
 	uae_u32 result = uae_mmu040_getc_iword(addr);
 	result <<= 16;
 	result |= uae_mmu040_getc_iword(addr + 2);
-	return result;
+	Z3660_PROF_RET(result);
 #else
-	if (unlikely(is_unaligned_bus(addr, 4)))   /* ISSUE-52: see uae_mmu040_get_long */
-		return mmu_get_ilong_unaligned(addr);
-	return mmu_get_ilong(addr, sz_long);
+	if (unlikely(is_unaligned_bus(addr, 4))) {  /* ISSUE-52: see uae_mmu040_get_long */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu_get_ilong_unaligned(addr));
+	}
+	Z3660_PROF_RET(mmu_get_ilong(addr, sz_long));
 #endif
 }
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_ibyte(uaecptr addr)
@@ -722,38 +775,56 @@ static ALWAYS_INLINE uae_u32 uae_mmu040_get_long(uaecptr addr)
 	 * board's memory layer, which cannot do a misaligned transfer and drops bytes on metal
 	 * (0x80800000 -> 0x80000000, bit 23). The unaligned splitter issues only aligned word/
 	 * byte sub-accesses, which every backing does correctly. See is_unaligned_bus. */
-	if (unlikely(is_unaligned_bus(addr, 4)))
-		return mmu_get_long_unaligned(addr, true);
-	return mmu_get_long(addr, true, sz_long);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	if (unlikely(is_unaligned_bus(addr, 4))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu_get_long_unaligned(addr, true));
+	}
+	Z3660_PROF_RET(mmu_get_long(addr, true, sz_long));
 }
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_word(uaecptr addr)
 {
-	if (unlikely(is_unaligned_bus(addr, 2)))   /* ISSUE-52: see uae_mmu040_get_long */
-		return mmu_get_word_unaligned(addr, true);
-	return mmu_get_word(addr, true, sz_word);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	if (unlikely(is_unaligned_bus(addr, 2))) {  /* ISSUE-52: see uae_mmu040_get_long */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu_get_word_unaligned(addr, true));
+	}
+	Z3660_PROF_RET(mmu_get_word(addr, true, sz_word));
 }
 static ALWAYS_INLINE uae_u8 uae_mmu040_get_byte(uaecptr addr)
 {
-	return mmu_get_byte(addr, true, sz_byte);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	Z3660_PROF_RET(mmu_get_byte(addr, true, sz_byte));
 }
 
 static ALWAYS_INLINE void uae_mmu040_put_word(uaecptr addr, uae_u16 val)
 {
-	if (unlikely(is_unaligned_bus(addr, 2)))   /* ISSUE-52: see uae_mmu040_get_long */
-		mmu_put_word_unaligned(addr, val, true);
-	else
-		mmu_put_word(addr, val, true, sz_word);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	if (unlikely(is_unaligned_bus(addr, 2))) {  /* ISSUE-52: see uae_mmu040_get_long */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
+		Z3660_PROF_RETV(mmu_put_word_unaligned(addr, val, true));
+	}
+	Z3660_PROF_RETV(mmu_put_word(addr, val, true, sz_word));
 }
 static ALWAYS_INLINE void uae_mmu040_put_byte(uaecptr addr, uae_u8 val)
 {
-	mmu_put_byte(addr, val, true, sz_byte);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	Z3660_PROF_RETV(mmu_put_byte(addr, val, true, sz_byte));
 }
 static ALWAYS_INLINE void uae_mmu040_put_long(uaecptr addr, uae_u32 val)
 {
-	if (unlikely(is_unaligned_bus(addr, 4)))   /* ISSUE-52: see uae_mmu040_get_long */
-		mmu_put_long_unaligned(addr, val, true);
-	else
-		mmu_put_long(addr, val, true, sz_long);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	if (unlikely(is_unaligned_bus(addr, 4))) {  /* ISSUE-52: see uae_mmu040_get_long */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
+		Z3660_PROF_RETV(mmu_put_long_unaligned(addr, val, true));
+	}
+	Z3660_PROF_RETV(mmu_put_long(addr, val, true, sz_long));
 }
 
 

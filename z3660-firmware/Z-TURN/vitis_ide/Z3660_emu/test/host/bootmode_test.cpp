@@ -24,7 +24,15 @@
 extern "C" {
 #include "../../../Z3660/src/config_file.h"
 #include "../../../Z3660/src/overhead_switches.h"
+#include "../../../Z3660/src/prof_config.h"
 }
+/* CYBERSTORM C1. This is the ONLY place in the tree where core0's prof_config.h and
+ * core1's z3660_prof.h are compiled side by side. They MUST agree -- core0 writes the
+ * command word, core1 decodes it -- and they cannot share a header, because one is core0
+ * C and the other lives inside the UAE C++ include tree. Two hand-maintained copies that
+ * only ever meet at runtime, on metal, silently, are exactly the shape of the beta-21
+ * SHARED mis-merge (docs/piscsi-service-path.md 5). So they meet here instead. */
+#include "../../src/uae/z3660_prof.h"
 
 static int g_pass = 0, g_fail = 0;
 #define CHECK(cond, ...) do { \
@@ -96,8 +104,12 @@ int main(void)
    CHECK(CONFITEM_AMIX_RAM        + 1 == CONFITEM_PERF_STATS,      "amix_ram -> perf_stats\n");
    CHECK(CONFITEM_PERF_STATS      + 1 == CONFITEM_EMU_PROBES,      "perf_stats -> emu_probes\n");
    CHECK(CONFITEM_EMU_PROBES      + 1 == CONFITEM_CORE0_STATS,     "emu_probes -> core0_stats\n");
-   CHECK(CONFITEM_CORE0_STATS     + 1 == CONFITEM_NUM,
-         "core0_stats is the LAST item -- append new keys after it, never before\n");
+   CHECK(CONFITEM_CORE0_STATS     + 1 == CONFITEM_PROF_HZ,
+         "core0_stats is followed by prof_hz\n");
+   CHECK(CONFITEM_PROF_HZ         + 1 == CONFITEM_PROF_BUCKETS,
+         "prof_hz is followed by prof_buckets\n");
+   CHECK(CONFITEM_PROF_BUCKETS    + 1 == CONFITEM_NUM,
+         "prof_buckets is the LAST item -- append new keys after it, never before\n");
 
    /* 5. The overhead switches resolve the way the whole feature promises they do.
     *
@@ -122,6 +134,52 @@ int main(void)
     * "unset" value would resolve every absent key to OFF. */
    CHECK(Z3660_OVH_UNSET   == -1, "the unset sentinel is -1 (what both config paths write)\n");
    CHECK(Z3660_OVH_DEFAULT ==  1, "the default is ON\n");
+
+   /* 6. CYBERSTORM C1: the profiler config keys.
+    *
+    *    Same negative guarantee as the switches above, landing on the opposite value and
+    *    for the same reason. The C3 switches default ON because ON is what this firmware
+    *    has always done; these default OFF because a profiler has never existed. "An
+    *    absent key changes nothing" is one rule, not two. */
+   printf("[test] profiler config: an absent key leaves the board not profiling\n");
+   CHECK(z3660_prof_cfg_hz(Z3660_PROF_CFG_UNSET) == 0,
+         "unset prof_hz -> 0 = off: an absent key does not start a profiler\n");
+   CHECK(z3660_prof_cfg_buckets(Z3660_PROF_CFG_UNSET) == 0,
+         "unset prof_buckets -> off\n");
+   CHECK(z3660_prof_cfg_is_default(z3660_prof_cfg_hz(Z3660_PROF_CFG_UNSET),
+                                   z3660_prof_cfg_buckets(Z3660_PROF_CFG_UNSET)),
+         "and the resolved pair IS the default, so the config printer stays silent\n");
+   CHECK(Z3660_PROF_CFG_UNSET == -1, "the unset sentinel is -1, as both other headers use\n");
+   CHECK(z3660_prof_cfg_hz(0) == 0, "an explicit prof_hz 0 is off, not 'unset'\n");
+   CHECK(z3660_prof_cfg_hz(1000) == 1000, "a plain rate passes through\n");
+   /* Out-of-range CLAMPS rather than refusing -- deliberately unlike amix_ram, because
+    * the worst case here is profiling at a different rate (which the dump header records)
+    * rather than a board that does not work. */
+   CHECK(z3660_prof_cfg_hz(999999) == Z3660_PROF_CFG_HZ_MAX,
+         "an absurd rate clamps to the ceiling instead of refusing to profile\n");
+   CHECK(z3660_prof_cfg_hz(-5) == 0, "a negative rate is off, not a clamp to the floor\n");
+   CHECK(z3660_prof_cfg_buckets(1) == 1 && z3660_prof_cfg_buckets(7) == 1,
+         "a junk truthy prof_buckets is coerced to exactly 1 (it goes into the mailbox)\n");
+
+   printf("[test] profiler: core0's mirrored constants agree with core1's originals\n");
+   CHECK((int)Z3660_PROF_CFG_HZ_MIN == (int)Z3660_PROF_HZ_MIN, "HZ_MIN agrees\n");
+   CHECK((int)Z3660_PROF_CFG_HZ_MAX == (int)Z3660_PROF_HZ_MAX, "HZ_MAX agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_NONE        == Z3660_PROF_CTL_NONE,        "CTL_NONE agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_ARM         == Z3660_PROF_CTL_ARM,         "CTL_ARM agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_STOP        == Z3660_PROF_CTL_STOP,        "CTL_STOP agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_ZERO        == Z3660_PROF_CTL_ZERO,        "CTL_ZERO agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_DUMPSTATS   == Z3660_PROF_CTL_DUMPSTATS,   "CTL_DUMPSTATS agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_DUMPRING    == Z3660_PROF_CTL_DUMPRING,    "CTL_DUMPRING agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_BUCKETS_ON  == Z3660_PROF_CTL_BUCKETS_ON,  "CTL_BUCKETS_ON agrees\n");
+   CHECK(Z3660_PROF_CFG_CTL_BUCKETS_OFF == Z3660_PROF_CTL_BUCKETS_OFF, "CTL_BUCKETS_OFF agrees\n");
+   /* The packing is the part that would fail QUIETLY rather than loudly: a command whose
+    * argument landed in the wrong half would still decode as SOME valid command. */
+   CHECK(Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_DUMPRING, 4096)
+         == Z3660_PROF_CTL_MAKE(Z3660_PROF_CTL_DUMPRING, 4096), "the packing agrees\n");
+   CHECK(Z3660_PROF_CTL_CMD(Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM, 1))
+         == Z3660_PROF_CTL_ARM, "core1 decodes the command core0 packed\n");
+   CHECK(Z3660_PROF_CTL_ARG(Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM, 1)) == 1,
+         "...and its argument, which is how a config-armed boot profile gets its buckets\n");
 
    printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
    return g_fail ? 1 : 0;

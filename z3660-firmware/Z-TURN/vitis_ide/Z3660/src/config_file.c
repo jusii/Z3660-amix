@@ -13,6 +13,7 @@
 #include "config_file.h"
 #include "amix_ram.h"
 #include "overhead_switches.h"   /* the single copy of the perf_stats/emu_probes/core0_stats rule */
+#include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (CYBERSTORM C1) */
 #include "core0_stats.h"         /* core0_stats_set_enabled() -- the core0_stats key */
 #include "main.h"
 #include "ARM_ztop/checkbox.h"
@@ -158,6 +159,8 @@ const char *config_item_names[] = {
       "perf_stats",
       "emu_probes",
       "core0_stats",
+      "prof_hz",
+      "prof_buckets",
 };
 /* Tripwire: config_item_names[] is indexed by CONFITEM, so a new enum entry with
  * no matching string silently shifts every key after it -- the parser would then
@@ -272,6 +275,36 @@ static void resolve_overhead_switches(int verbose)
              yesno_names[config.core0_stats]);
 }
 
+/* CYBERSTORM C1: resolve the profiler keys and publish them to the cross-core mailbox.
+ *
+ * Published UNCONDITIONALLY, exactly like perf_stats/emu_probes above and for the same
+ * reason: the mailbox is DDR that survives a warm reset, so a boot that leaves prof_ctl
+ * alone would let core1 act on the previous boot's command. Writing it every time makes
+ * "no profile requested" an explicit instruction rather than the absence of one.
+ *
+ * The buckets ride the ARM command's argument field rather than a mailbox word of their
+ * own. That is not a byte count -- SHARED is hand-maintained in two headers that a beta
+ * resync has already mis-merged once (docs/piscsi-service-path.md 5), so every field NOT
+ * added is one fewer chance to alias something. The command word already has a 16-bit
+ * argument and this is what it is for.
+ *
+ * On a non-profiling core1 the whole thing is inert: the stub poll_cmd never reads it. */
+static void resolve_prof_config(int verbose)
+{
+   config.prof_hz      = z3660_prof_cfg_hz(config.prof_hz);            /* prof_config.h */
+   config.prof_buckets = z3660_prof_cfg_buckets(config.prof_buckets);
+
+   shared->prof_hz  = (uint32_t)config.prof_hz;
+   shared->prof_ctl = config.prof_hz
+       ? Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM, config.prof_buckets ? 1 : 0)
+       : Z3660_PROF_CFG_CTL_NONE;
+
+   if(verbose && !z3660_prof_cfg_is_default(config.prof_hz, config.prof_buckets))
+      printf("[CFG] profiler: prof_hz %d, prof_buckets %s "
+             "(PROFILING build only -- the default and lean images ignore this)\n",
+             config.prof_hz, yesno_names[config.prof_buckets]);
+}
+
 static void resolve_amix_ram(int verbose)
 {
    int requested = config.amix_ram;
@@ -345,6 +378,8 @@ void load_default_config(void)
    config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
    config.emu_probes=Z3660_OVH_UNSET;
    config.core0_stats=Z3660_OVH_UNSET;
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -785,6 +820,8 @@ retry:
    config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
    config.emu_probes=Z3660_OVH_UNSET;
    config.core0_stats=Z3660_OVH_UNSET;
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -1025,6 +1062,22 @@ retry:
          if(verbose) printf("[CFG] core0_stats %s.\n", yesno_names[config.core0_stats]);
          break;
 
+      /* CYBERSTORM C1 profiler arming. Both default to OFF -- see prof_config.h for why
+       * that is the SAME "an absent key changes nothing" rule as the C3 switches above
+       * and not its opposite. These exist for the one profile the serial console cannot
+       * take: the boot itself. Config file only, not per preset. */
+      case CONFITEM_PROF_HZ:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.prof_hz=get_int_type(cur_cmd);
+         if(verbose) printf("[CFG] prof_hz %d\n", config.prof_hz);
+         break;
+
+      case CONFITEM_PROF_BUCKETS:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.prof_buckets=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] prof_buckets %s.\n", yesno_names[config.prof_buckets]);
+         break;
+
       case CONFITEM_AMIX_RAM:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.amix_ram=get_int_type(cur_cmd);
@@ -1246,6 +1299,7 @@ load_successful:;
    if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
    shared->service_cadence=config.service_cadence;
    resolve_overhead_switches(verbose);      /* perf_stats / emu_probes / core0_stats */
+   resolve_prof_config(verbose);            /* CYBERSTORM C1: prof_hz / prof_buckets */
 
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
@@ -1686,6 +1740,7 @@ retry:
       if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
       shared->service_cadence=config.service_cadence;
       resolve_overhead_switches(verbose);   /* perf_stats / emu_probes / core0_stats */
+      resolve_prof_config(verbose);         /* CYBERSTORM C1: prof_hz / prof_buckets */
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 

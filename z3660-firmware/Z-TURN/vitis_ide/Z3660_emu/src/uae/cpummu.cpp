@@ -90,7 +90,11 @@ struct mmufastcache atc_data_cache_read[MMUFASTCACHE_ENTRIES];
 struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
 #endif
 
-#if CACHE_HIT_COUNT
+/* CYBERSTORM C1: in a profiling build these six names are macros for slots in
+ * z3660_prof_cnt[] (cpummu.h), so there is nothing to define here -- and defining them
+ * would expand to `int z3660_prof_cnt[5], ...`, which is why the guard is explicit
+ * rather than relying on CACHE_HIT_COUNT alone. */
+#if CACHE_HIT_COUNT && !Z3660_EMU_PROF
 int mmu_ins_hit, mmu_ins_miss;
 int mmu_data_read_hit, mmu_data_read_miss;
 int mmu_data_write_hit, mmu_data_write_miss;
@@ -851,12 +855,25 @@ static void mmu_add_cache(uaecptr addr, uaecptr phys, bool super, bool data, boo
 	}
 }
 
+/* CYBERSTORM C1 probe note. Reaching this function AT ALL is a miss in the tier-0 page
+ * caches (MMU_IPAGECACHE / MMU_DPAGECACHE, in cpummu.h's inlines), so XLATE counts
+ * tier-0 misses; ATC_MISS below counts the ones that also missed the 4-way ATC and had
+ * to walk the descriptor tables. Three tiers, three numbers, one out-of-line function
+ * each -- which is why the whole translate path costs two probe sites and not thirty.
+ *
+ * The bucket wrapper is a scope around the WHOLE body including the mmu_bus_error()
+ * exits; those THROW, so the exit() is skipped and the span is recovered by the run
+ * loop's CATCH into FAULT. That is the correct attribution: a translate that faults did
+ * not spend its cycles translating, it spent them starting a page fault. */
 uaecptr mmu_translate(uaecptr addr, uae_u32 val, bool super, bool data, bool write, int size)
 {
 	int way, i, index, way_invalid;
 	struct mmu_atc_line *l;
 	uae_u32 status060 = 0;
 	uae_u32 tag = ((super ? 0x80000000 : 0x00000000) | (addr >> 1)) & mmu_tagmask;
+
+	Z3660_PROF_ENTER(Z3660_PROF_B_XLATE);
+	Z3660_PROF_CNT(Z3660_PROF_C_XLATE);
 
 	if (mmu_pagesize_8k)
 		index=(addr & 0x0001E000)>>13;
@@ -884,7 +901,7 @@ atc_retry:
 							status060 |= MMU_FSLW_WP;
 
 						mmu_bus_error(addr, val, mmu_get_fc(super, data), write, size, status060, false);
-						return 0; // never reach, bus error longjumps out of the function
+						Z3660_PROF_RET(0); // never reach, bus error longjumps out of the function
 					}
 				}
 				// if first write to this page initiate table search to set M bit (but modify this slot)
@@ -908,7 +925,8 @@ atc_retry:
 				mmu_add_cache(addr, l->phys, super, data, write);
 
 				// return translated addr
-				return l->phys | (addr & mmu_pagemask);
+				Z3660_PROF_CNT(Z3660_PROF_C_ATC_HIT);
+				Z3660_PROF_RET(l->phys | (addr & mmu_pagemask));
 			} else {
 				way_invalid = way;
 			}
@@ -922,7 +940,10 @@ atc_retry:
 	
 	// then initiate table search and create a new entry
 	l = &mmu_atc_array[data][index][way];
+	Z3660_PROF_CNT(Z3660_PROF_C_ATC_MISS);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WALK);
 	mmu_fill_atc(addr, super, tag, write, l, &status060);
+	Z3660_PROF_EXIT();
 
 	if (status060 && currprefs.mmu_model == 68060) {
 		mmu_bus_error(addr, val, mmu_get_fc(super, data), write, size, status060, false);

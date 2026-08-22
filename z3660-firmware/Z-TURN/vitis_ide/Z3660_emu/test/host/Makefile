@@ -18,8 +18,18 @@ UAE      := $(SRC)/uae
 # firmware's contract is asserted, not merely compiled.
 # Z3660_LEAN_EXPECTED tells the harness which variant it is SUPPOSED to be, so a
 # stale/mixed build is a test failure rather than a quietly relabelled pass.
+#
+# Z3660_PROF=1 (CYBERSTORM C1) is the third variant and mirrors `make profile`: the
+# LEAN flags PLUS -DZ3660_EMU_PROF=1. The profiling firmware is built on top of lean
+# on purpose -- a profile of the default loop would describe a binary nobody runs --
+# so the harness variant does the same rather than inventing a fourth combination.
 Z3660_LEAN ?= 0
-ifeq ($(Z3660_LEAN),1)
+Z3660_PROF ?= 0
+ifeq ($(Z3660_PROF),1)
+BUILD        := build-prof
+VARIANT_DEFS := -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_EMU_PROF=1 \
+                -DZ3660_LEAN_EXPECTED=1 -DZ3660_PROF_EXPECTED=1
+else ifeq ($(Z3660_LEAN),1)
 BUILD        := build-lean
 VARIANT_DEFS := -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_LEAN_EXPECTED=1
 else
@@ -32,7 +42,12 @@ INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) 
 
 # -O0 -g for fast iteration + gdb. -fno-strict-aliasing matches WinUAE assumptions.
 # SDL_strcasecmp macro (sysconfig.h) -> libc strcasecmp. Exceptions ON (TRY/CATCH).
-CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions \
+# -MMD -MP: track HEADER dependencies. Not a nicety -- without them, editing a header
+# left every object stale and the link succeeded anyway, which during CYBERSTORM C1 made a
+# deliberately-broken probe macro pass its own mutation test. A build system that cannot
+# fail is not evidence. (-D flags are STILL untracked, which is why the variants keep
+# separate build directories; the two mechanisms cover different halves of the hazard.)
+CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions -MMD -MP \
             -DSDL_strcasecmp=strcasecmp -DHOST_TEST_HARNESS \
             -Wno-write-strings -Wno-narrowing $(VARIANT_DEFS) $(INCLUDES)
 
@@ -43,7 +58,7 @@ UAE_SRCS := newcpu.cpp newcpu_common.cpp readcpu.cpp cpudefs.cpp cpustbl.cpp \
             cpuemu_0.cpp cpuemu_4.cpp cpuemu_11.cpp cpuemu_13.cpp \
             cpuemu_40.cpp cpuemu_44.cpp cpuemu_32.cpp cpuemu_31.cpp \
             cpustbl_mmu030.cpp cpustbl_mmu040.cpp \
-            cpummu030.cpp cpummu.cpp newcpu_mmu_glue.cpp
+            cpummu030.cpp cpummu.cpp newcpu_mmu_glue.cpp z3660_prof.cpp
 
 HOST_SRCS := board_stubs.cpp harness_main.cpp
 
@@ -52,6 +67,10 @@ HOST_OBJS := $(addprefix $(BUILD)/host/,$(HOST_SRCS:.cpp=.o))
 OBJS      := $(UAE_OBJS) $(HOST_OBJS)
 
 BIN := $(BUILD)/mmu_harness
+
+# The generated header-dependency files (see -MMD above). Missing on a first build, which
+# is exactly when they are not needed, hence the leading '-'.
+-include $(OBJS:.o=.d)
 
 # Standalone SCSI CD-ROM CDB unit test. Self-contained: scsi_cd_test.cpp compiles
 # a3000_scsi.cpp in directly (to reach its static CDB decoders + geo[]) and stubs
@@ -63,7 +82,8 @@ SCSI_CD_BIN := $(BUILD)/scsi_cd_test
 # bug that killed the first AMIX-040 metal boot: a boot mode that core0 does not
 # recognise as emulated, so core1 is never started.
 BOOTMODE_BIN := $(BUILD)/bootmode_test
-CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhead_switches.h
+CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhead_switches.h \
+                  $(ROOT)/../Z3660/src/prof_config.h $(UAE)/z3660_prof.h
 
 # AMIX RAM-window sizing guard. Compiles ONLY Z3660/src/amix_ram.h (self-contained by
 # design, exactly like config_file.h above), because that header is the SINGLE copy of
@@ -71,7 +91,7 @@ CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhe
 AMIX_RAM_BIN := $(BUILD)/amix_ram_test
 CORE0_AMIX_RAM_H := $(ROOT)/../Z3660/src/amix_ram.h
 
-.PHONY: all clean objs run run-lean run-scsi run-bootmode run-amix-ram
+.PHONY: all clean clean-all objs run run-lean run-prof run-scsi run-bootmode run-amix-ram
 all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 
 $(BIN): $(OBJS)
@@ -96,6 +116,8 @@ $(BUILD)/host/%.o: %.cpp
 	@echo "  CXX   host/$*.cpp"
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
+-include $(BUILD)/bootmode_test.d $(BUILD)/amix_ram_test.d $(BUILD)/scsi_cd_test.d
+
 $(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
 	@mkdir -p $(BUILD)
 	@echo "  CXX+LINK  bootmode_test.cpp"
@@ -117,6 +139,13 @@ run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 run-lean:
 	@$(MAKE) Z3660_LEAN=1 run
 
+# The profiling firmware's core1 (CYBERSTORM C1). Runs the whole MMU suite through the
+# instrumented accessors -- which is the point: the probes sit inside the read/write/fetch
+# path, so "the emulator still computes the same answers with the profiler compiled in" is
+# a claim that has to be tested, not assumed. Adds the profiler's own suite on top.
+run-prof:
+	@$(MAKE) Z3660_PROF=1 run
+
 run-scsi: $(SCSI_CD_BIN)
 	@$(SCSI_CD_BIN)
 
@@ -128,3 +157,7 @@ run-amix-ram: $(AMIX_RAM_BIN)
 
 clean:
 	rm -rf $(BUILD)
+
+# All three variants at once -- same reasoning as Z3660_emu/Makefile's clean-all.
+clean-all:
+	rm -rf build build-lean build-prof

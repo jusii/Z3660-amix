@@ -6,6 +6,7 @@
 #include "uae/types.h"
 
 #include "mmu_common.h"
+#include "z3660_prof.h"   /* CYBERSTORM C1: stage buckets (expands to nothing off-profile) */
 
 #define MMU_DPAGECACHE030 1
 #define MMU_IPAGECACHE030 1
@@ -113,73 +114,115 @@ static ALWAYS_INLINE uae_u32 uae_mmu030_get_fc_data(void)
 	return (regs.s ? 4 : 0) | 1;
 }
 
+/* ==========================================================================
+ * CYBERSTORM C1 -- the 68030 half of the stage buckets, at the same layer and for the
+ * same reason as the 040's (see the long note above uae_mmu040_get_iword in cpummu.h):
+ * ALWAYS_INLINE is bare `__inline` in this tree, so gcc emits one out-of-line copy per
+ * translation unit and a probe here is a handful of code sites, not the ~2900 call sites
+ * cpuemu_32 makes into the mmu030_state wrappers above.
+ *
+ * The 030 gets the same bucket split as the 040. It does NOT get the per-tier page-cache
+ * hit counters: the 030 caches live inside the mmu030_get_ and mmu030_put_ family in
+ * cpummu030.cpp with no upstream scaffolding to switch on, so those twelve branch edits
+ * would be new code in a fork of someone else's emulator, on the path that is NOT the
+ * CYBERSTORM target. The ATC and table-walk tiers are still visible on the 030 (see
+ * mmu030_logical_is_in_atc and mmu030_table_search); the tier-0 hit rate is the one
+ * number a 030 profile does without, and this note is here so a reader finds that out
+ * from the source rather than from a suspiciously absent row in a dump.
+ * ========================================================================== */
 static ALWAYS_INLINE uae_u32 uae_mmu030_get_ilong(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_code();
 
-	if (unlikely(is_unaligned_bus(addr, 4)))
-		return mmu030_get_ilong_unaligned(addr, fc, 0);
-	return mmu030_get_ilong(addr, fc);
+	Z3660_PROF_ENTER_IFETCH();
+	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
+	if (unlikely(is_unaligned_bus(addr, 4))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu030_get_ilong_unaligned(addr, fc, 0));
+	}
+	Z3660_PROF_RET(mmu030_get_ilong(addr, fc));
 }
 static ALWAYS_INLINE uae_u16 uae_mmu030_get_iword(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_code();
 
-	return mmu030_get_iword(addr, fc);
+	Z3660_PROF_ENTER_IFETCH();
+	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
+	Z3660_PROF_RET(mmu030_get_iword(addr, fc));
 }
 static ALWAYS_INLINE uae_u16 uae_mmu030_get_ibyte(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_code();
 
-	return mmu030_get_byte(addr, fc);
+	Z3660_PROF_ENTER_IFETCH();
+	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
+	Z3660_PROF_RET(mmu030_get_byte(addr, fc));
 }
 
 static ALWAYS_INLINE uae_u32 uae_mmu030_get_long(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	if (unlikely(is_unaligned_bus(addr, 4)))
-		return mmu030_get_long_unaligned(addr, fc, 0);
-	return mmu030_get_long(addr, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	if (unlikely(is_unaligned_bus(addr, 4))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu030_get_long_unaligned(addr, fc, 0));
+	}
+	Z3660_PROF_RET(mmu030_get_long(addr, fc));
 }
 static ALWAYS_INLINE uae_u32 uae_mmu030_get_word(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	if (unlikely(is_unaligned_bus(addr, 2)))
-		return mmu030_get_word_unaligned(addr, fc, 0);
-	return mmu030_get_word(addr, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	if (unlikely(is_unaligned_bus(addr, 2))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		Z3660_PROF_RET(mmu030_get_word_unaligned(addr, fc, 0));
+	}
+	Z3660_PROF_RET(mmu030_get_word(addr, fc));
 }
 static ALWAYS_INLINE uae_u32 uae_mmu030_get_byte(uaecptr addr)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	return mmu030_get_byte(addr, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	Z3660_PROF_RET(mmu030_get_byte(addr, fc));
 }
 
 static ALWAYS_INLINE void uae_mmu030_put_long(uaecptr addr, uae_u32 val)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	if (unlikely(is_unaligned_bus(addr, 4)))
-		mmu030_put_long_unaligned(addr, val, fc, 0);
-	else
-		mmu030_put_long(addr, val, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	if (unlikely(is_unaligned_bus(addr, 4))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
+		Z3660_PROF_RETV(mmu030_put_long_unaligned(addr, val, fc, 0));
+	}
+	Z3660_PROF_RETV(mmu030_put_long(addr, val, fc));
 }
 static ALWAYS_INLINE void uae_mmu030_put_word(uaecptr addr, uae_u32 val)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	if (unlikely(is_unaligned_bus(addr, 2)))
-		mmu030_put_word_unaligned(addr, val, fc, 0);
-	else
-		mmu030_put_word(addr, val, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	if (unlikely(is_unaligned_bus(addr, 2))) {
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
+		Z3660_PROF_RETV(mmu030_put_word_unaligned(addr, val, fc, 0));
+	}
+	Z3660_PROF_RETV(mmu030_put_word(addr, val, fc));
 }
 static ALWAYS_INLINE void uae_mmu030_put_byte(uaecptr addr, uae_u32 val)
 {
 	uae_u32 fc = uae_mmu030_get_fc_data();
 
-	mmu030_put_byte(addr, val, fc);
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	Z3660_PROF_RETV(mmu030_put_byte(addr, val, fc));
 }
 
 static ALWAYS_INLINE uae_u32 uae_mmu030_get_ilong_fc(uaecptr addr)

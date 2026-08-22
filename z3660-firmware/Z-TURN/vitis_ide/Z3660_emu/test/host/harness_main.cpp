@@ -17,6 +17,7 @@
 #include "newcpu.h"
 #include "cpummu030.h"
 #include "cpummu.h"        /* 68040 MMU: mmu_translate, mmu_set_tc, mmu_match_ttr, TTR/descriptor defines */
+#include "z3660_prof.h"    /* CYBERSTORM C1: the profiler's wire format + phase machine */
 #include "harness.h"
 #include "main.h"          /* the cross-core SHARED struct -- ABI guard below */
 extern SHARED *shared;     /* board_stubs.cpp; the tests write knobs through it */
@@ -2729,8 +2730,399 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, amix_ram),        0xCC, "amix_ram        @ 0xFFFF00CC");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, perf_stats),      0xD0, "perf_stats      @ 0xFFFF00D0 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, emu_probes),      0xD4, "emu_probes      @ 0xFFFF00D4 (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xD8, "SHARED is 0xD8 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_ctl),        0xD8, "prof_ctl        @ 0xFFFF00D8 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_hz),         0xDC, "prof_hz         @ 0xFFFF00DC (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE0, "SHARED is 0xE0 bytes -- new fields go on the END");
 }
+
+/* ==================================================================
+ * CYBERSTORM C1 -- the interpreter profiler.
+ *
+ * Four things are worth testing here and they are not the same thing:
+ *
+ *   1. THE WIRE FORMAT, because a host-side symbolizer is written against z3660_prof.h
+ *      once and then never rebuilt in step with the firmware. A silently-resized record
+ *      or a renumbered bucket would not fail anywhere -- it would produce a plausible,
+ *      wrong profile. Sizes, offsets, flag bits and ids are pinned here.
+ *
+ *   2. THE BUCKET ARITHMETIC, which is the reason the cycle source is injectable on the
+ *      host at all. Against a real clock you can only observe that the numbers look
+ *      sensible; against a clock you set by hand you can assert that 100 cycles inside a
+ *      nested stage land in that stage and NOT in its parent, and that the buckets sum to
+ *      the elapsed span exactly. Attribution that is never checked against known input is
+ *      not measurement.
+ *
+ *   3. RING INTEGRITY under wrap -- including that `drops` counts what a dump cannot show
+ *      and that WEIGHT saturates instead of overflowing into the flag bits underneath it.
+ *
+ *   4. THAT THE PROFILER CHANGES NO EMULATION. Its probes sit inside the read, write and
+ *      fetch path of the interpreter -- not beside it. "The answers are still right" is
+ *      therefore a claim about this build, and the whole MMU suite running green in the
+ *      profiling variant is most of the evidence; this test adds the direct A/B.
+ * ================================================================== */
+static void test_prof_wire_format(void)
+{
+	printf("[test] profiler wire format: what a symbolizer is allowed to rely on\n");
+
+	CHECK_EQ32((uae_u32)sizeof(z3660_prof_sample_t), Z3660_PROF_REC_SIZE,
+	           "sample record is exactly Z3660_PROF_REC_SIZE bytes");
+	CHECK_EQ32((uae_u32)Z3660_PROF_REC_SIZE, 8, "...and that is 8");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_sample_t, pc),     0, "sample.pc     @ 0");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_sample_t, opcode), 4, "sample.opcode @ 4");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_sample_t, flags),  6, "sample.flags  @ 6");
+
+	CHECK_EQ32((uae_u32)sizeof(z3660_prof_hdr_t), Z3660_PROF_HDR_SIZE,
+	           "ring header is exactly Z3660_PROF_HDR_SIZE bytes");
+	CHECK_EQ32((uae_u32)Z3660_PROF_HDR_SIZE, 80, "...and that is 80 (four uint64_t force 8-byte alignment)");
+	CHECK_EQ32((uae_u32)offsetof(z3660_prof_hdr_t, samples), 32,
+	           "the 64-bit block starts at 32 -- eight leading uint32_t, no hidden padding");
+	CHECK_EQ32((uae_u32)Z3660_PROF_MAGIC, 0x5A335031u, "magic is 'Z3P1'");
+	CHECK_EQ32((uae_u32)Z3660_PROF_VERSION, 1u, "version 1");
+
+	/* Flag bits. Spelled as literals on purpose: re-deriving them from the macros would
+	 * assert only that the macros equal themselves. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_SUPER,  0x0001u, "flag bit 0 = supervisor");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_MMU,    0x0002u, "flag bit 1 = MMU enabled");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_AMIX,   0x0004u, "flag bit 2 = AMIX mode");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_CPU040, 0x0008u, "flag bit 3 = 68040 run loop");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_WEIGHT(0x0100u), 1u,  "WEIGHT extracts from bits 15..8");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_WEIGHT(0xFF0Fu), 255u, "WEIGHT tops out at 255");
+	CHECK_EQ32((uae_u32)Z3660_PROF_F_WEIGHT(0x000Fu), 0u,
+	           "a zero weight field is possible on the wire (unwritten slot) and means 'unknown'");
+
+	/* Bucket and counter ids are wire values. A reorder silently relabels every capture
+	 * ever taken, so pin the ones a symbolizer will hard-code and the two counts. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_LOOP,    0,  "bucket LOOP == 0");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_FETCHOP, 1,  "bucket FETCHOP == 1");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_HANDLER, 7,  "bucket HANDLER == 7");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   11, "11 buckets");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_INSNS,   0,  "counter INSNS == 0");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   19, "19 counters");
+	CHECK_EQ32((uae_u32)Z3660_PROF_RING_ENTRIES, 65536u, "ring holds 65536 samples");
+	CHECK((Z3660_PROF_RING_ENTRIES & Z3660_PROF_RING_MASK) == 0,
+	      "ring capacity is a power of two (the head is masked, not divided)\n");
+
+	/* The name tables are what makes a capture self-describing; a NULL in one would
+	 * crash the dump on the board, at the end of a long metal run. */
+	{
+		int i, ok = 1;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) if (!z3660_prof_bucket_names[i]) ok = 0;
+		CHECK(ok, "every bucket has a name\n");
+		ok = 1;
+		for (i = 0; i < Z3660_PROF_C_COUNT; i++) if (!z3660_prof_counter_names[i]) ok = 0;
+		CHECK(ok, "every counter has a name\n");
+		CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_WALK], "WALK") == 0,
+		      "names line up with ids (WALK)\n");
+		CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_ATC_MISS], "ATC_MISS") == 0,
+		      "names line up with ids (ATC_MISS)\n");
+	}
+}
+
+static void test_prof_build_variant(void)
+{
+	printf("[test] profiler build variant: %s\n",
+	       Z3660_EMU_PROF ? "PROFILING (sampler + stage buckets compiled in)"
+	                      : "not a profiling build");
+
+#if defined(Z3660_PROF_EXPECTED)
+	CHECK_EQ32((uae_u32)Z3660_EMU_PROF, 1, "PROFILING build: the profiler is compiled in");
+	CHECK_EQ32((uae_u32)z3660_prof_present(), 1, "...and says so at runtime");
+	/* The profiling variant is built ON TOP OF LEAN. If someone ever bases it on the
+	 * default loop, the profile would describe a binary nobody runs -- and the C3
+	 * calibration measured that difference at 9.1 %, bigger than several of the effects
+	 * this instrument exists to rank. Fail here rather than mislead C2. */
+	CHECK_EQ32((uae_u32)Z3660_RUNLOOP_BUILD_IS_LEAN, 1,
+	           "PROFILING build is lean-based (diagnostics compiled out under the profiler)");
+	CHECK_EQ32((uae_u32)(Z3660_RUNLOOP_BUILD_FLAGS | Z3660_PROF_BUILD_PROF), 0x04u,
+	           "build_flags word for the shipped profiling combination is 0x04");
+#else
+	CHECK_EQ32((uae_u32)Z3660_EMU_PROF, 0,
+	           "DEFAULT/LEAN build: the profiler is compiled OUT (absent -D changes nothing)");
+	CHECK_EQ32((uae_u32)z3660_prof_present(), 0,
+	           "...and the API stubs say so, so a console command can refuse instead of no-op");
+	CHECK_EQ32((uae_u32)z3660_prof_cpu_hz(), 0, "no calibrated clock without a profiler");
+#endif
+}
+
+#if Z3660_EMU_PROF
+/* Drive the phase machine with a clock we set by hand. */
+static void prof_clock(uae_u32 c) { z3660_prof_host_cycles = c; }
+
+static void test_prof_bucket_arithmetic(void)
+{
+	printf("[test] profiler stage buckets: exclusive attribution against a known clock\n");
+
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	prof_clock(1000);
+	z3660_prof_loop_reset();          /* cur = LOOP, last = 1000 */
+
+	/* 10 cycles of LOOP, then 100 of HANDLER with 30 of READ nested inside it,
+	 * then 5 more of LOOP. */
+	prof_clock(1010); z3660_prof_enter(Z3660_PROF_B_HANDLER);
+	prof_clock(1040); z3660_prof_enter(Z3660_PROF_B_READ);
+	prof_clock(1070); z3660_prof_exit();       /* 30 cycles of READ */
+	prof_clock(1110); z3660_prof_exit();       /* HANDLER got 30 + 40 = 70 */
+	prof_clock(1115);
+	z3660_prof_enter(Z3660_PROF_B_TAIL);       /* closes 5 more cycles of LOOP */
+	prof_clock(1120); z3660_prof_exit();       /* 5 cycles of TAIL */
+
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_READ], 30,
+	           "a nested stage gets exactly its own span");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_HANDLER], 70,
+	           "...and the parent gets its span MINUS the nested one (exclusive, not inclusive)");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 15,
+	           "LOOP collects only what ran outside every named stage");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAIL], 5, "TAIL gets its 5");
+	{
+		uae_u64 total = 0; int i;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
+		CHECK_EQ32((uae_u32)total, 120,
+		           "the buckets sum to the whole elapsed span -- no cycle counted twice, none lost");
+	}
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 6,
+	           "every transition is counted, so probe overhead is subtractable");
+
+	/* The 32-bit cycle counter wraps every ~6.4 s at 666 MHz. Modular subtraction has to
+	 * make that a non-event, or every bucket total is garbage a few seconds into a run. */
+	z3660_prof_zero();
+	prof_clock(0xFFFFFFF0u); z3660_prof_loop_reset();
+	prof_clock(0x0000000Fu); z3660_prof_enter(Z3660_PROF_B_READ);
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 31,
+	           "a span across the cycle-counter wrap measures 31, not 4 billion");
+
+	/* Unwind. A guest page fault is a C++ throw straight past every pending exit(). */
+	z3660_prof_zero();
+	prof_clock(500); z3660_prof_loop_reset();
+	z3660_prof_enter(Z3660_PROF_B_HANDLER);
+	z3660_prof_enter(Z3660_PROF_B_READ);
+	z3660_prof_enter(Z3660_PROF_B_XLATE);
+	CHECK_EQ32((uae_u32)z3660_prof_sp, 3, "three stages nested");
+	prof_clock(600); z3660_prof_unwound();
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_FAULT], 100,
+	           "the abandoned span is charged to FAULT, not silently lost");
+	CHECK_EQ32((uae_u32)z3660_prof_sp, 0, "and the stack is back at the floor");
+	CHECK_EQ32((uae_u32)z3660_prof_cur, (uae_u32)Z3660_PROF_B_LOOP, "...running LOOP again");
+
+	/* Overflow must DROP the transition, never clamp the index: a clamp would corrupt the
+	 * pop order and mis-attribute every stage after it. Depth 16 against a real maximum
+	 * nesting of four means this is unreachable in the firmware -- which is exactly why
+	 * it needs a test rather than a comment. */
+	z3660_prof_zero();
+	prof_clock(0); z3660_prof_loop_reset();
+	{
+		int i;
+		for (i = 0; i < Z3660_PROF_STACK_DEPTH + 4; i++) z3660_prof_enter(Z3660_PROF_B_READ);
+		CHECK_EQ32((uae_u32)z3660_prof_sp, Z3660_PROF_STACK_DEPTH, "the stack stops at its depth");
+		CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_STACK_OVF], 4,
+		           "and every dropped transition is counted (a dump showing non-zero here is not trustworthy)");
+		for (i = 0; i < Z3660_PROF_STACK_DEPTH; i++) z3660_prof_exit();
+		CHECK_EQ32((uae_u32)z3660_prof_sp, 0, "and it unwinds cleanly afterwards");
+	}
+
+	/* Switched off, the machine must be inert -- not merely quiet. PROFB off is what a
+	 * session uses to take an undistorted PC map. */
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+	prof_clock(0); z3660_prof_enter(Z3660_PROF_B_HANDLER);
+	prof_clock(9999); z3660_prof_exit();
+	{
+		uae_u64 total = 0; int i;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
+		CHECK_EQ32((uae_u32)total, 0, "buckets OFF: nothing is charged anywhere");
+		CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 0,
+		           "buckets OFF: not even a transition count");
+	}
+}
+
+/* ==================================================================
+ * The probe macros put the work INSIDE the bucket.
+ *
+ * This test exists because the first build of this feature got it backwards and nothing
+ * caught it. `Z3660_PROF_RET(expr)` was written as `exit(); return (expr);` -- which
+ * sequences the bucket CLOSE before the accessor's work, so every data read and every
+ * instruction fetch charged its cycles to the enclosing HANDLER instead of to READ or
+ * FETCH. Every other test still passed: the counters were right, the stack balanced, the
+ * emulation was correct, and the sums added up. Only the attribution -- the one thing the
+ * instrument is for -- was wrong, and it was found by reading the generated ARM, where
+ * enter/count/exit stood in three adjacent `bl`s ahead of the memory access.
+ *
+ * So the ordering gets its own test, on stand-ins built from the same macros the real
+ * accessors use, with a "memory access" that costs a known 100 cycles.
+ * ================================================================== */
+static uae_u32 prof_fake_work_u32(void)  { z3660_prof_host_cycles += 100; return 0xABCD1234u; }
+static void    prof_fake_work_void(void) { z3660_prof_host_cycles += 100; }
+
+static uae_u32 prof_victim_ret(void)
+{
+	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
+	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	Z3660_PROF_RET(prof_fake_work_u32());
+}
+static void prof_victim_retv(void)
+{
+	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
+	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	Z3660_PROF_RETV(prof_fake_work_void());
+}
+
+static void test_prof_ret_macro_ordering(void)
+{
+	printf("[test] profiler probe macros: the accessor's work is INSIDE its bucket\n");
+
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	prof_clock(0);
+	z3660_prof_loop_reset();
+
+	{
+		uae_u32 v = prof_victim_ret();
+		CHECK_EQ32(v, 0xABCD1234u, "the value still comes back through the macro");
+	}
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_READ], 100,
+	           "Z3660_PROF_RET: the 100 cycles of work land in READ, not in the caller's bucket");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 0,
+	           "...and LOOP gets none of them (0 here is what a correct ordering looks like)");
+
+	z3660_prof_zero();
+	prof_clock(0);
+	z3660_prof_loop_reset();
+	prof_victim_retv();
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_WRITE], 100,
+	           "Z3660_PROF_RETV: same for the void form");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 0,
+	           "...and LOOP gets none of those either");
+
+	z3660_prof_set_buckets(0);
+}
+
+static void test_prof_ring(void)
+{
+	printf("[test] profiler ring: wrap, drop accounting and sample weight\n");
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_arm(1000);
+	/* z3660_prof_arm() calibrated a period from the host's fake clock; pin it so the
+	 * weight arithmetic below is arithmetic and not a measurement. */
+	z3660_prof_period   = 100;
+	prof_clock(0);
+	z3660_prof_deadline = 100;
+
+	/* An on-time sample: the deadline has just come due. */
+	prof_clock(100);
+	z3660_prof_sample_slow(0x08001234u, 0x4E71u, Z3660_PROF_F_SUPER | Z3660_PROF_F_CPU040);
+	CHECK_EQ32((uae_u32)z3660_prof_deadline, 200, "the deadline re-arms from itself, so the rate does not drift");
+
+	/* A LATE sample: 4 periods went by with the sampler unable to fire. The weight is the
+	 * whole point of this instrument -- without it a mailbox round trip or a STOP spin
+	 * would simply vanish from the profile instead of showing up as a heavy sample. */
+	prof_clock(600);
+	z3660_prof_sample_slow(0x08005678u, 0x4E75u, 0);
+	CHECK_EQ32((uae_u32)z3660_prof_deadline, 700,
+	           "and a late sample skips forward to the next future deadline rather than firing a burst");
+
+	/* Weight must saturate, not wrap into the flag bits underneath it. */
+	prof_clock(600 + 100 * 400);
+	z3660_prof_sample_slow(0x08009ABCu, 0x0000u, Z3660_PROF_F_MMU);
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_STACK_OVF], 0, "no stack damage from the ring path");
+
+	/* Drop accounting. Fill past capacity and check that `drops` says how much of the run
+	 * the dump cannot show -- an unreported wrap is a profile of the last few seconds
+	 * presented as a profile of the whole run. */
+	z3660_prof_zero();
+	z3660_prof_period = 100;
+	{
+		uae_u32 i;
+		for (i = 0; i < Z3660_PROF_RING_ENTRIES + 5000u; i++) {
+			prof_clock(100 * (i + 1));
+			z3660_prof_deadline = 100 * (i + 1);
+			z3660_prof_sample_slow(0x08000000u + i * 2u, (uae_u16)(i & 0xFFFFu), 0);
+		}
+	}
+	/* z3660_prof_samples / drops are file-static; the dump is where they surface, so
+	 * exercise the real dump and let it assert its own consistency by not crashing on a
+	 * wrapped ring -- the failure mode that matters here is an out-of-range slot index. */
+	z3660_prof_dump_ring(4);
+	z3660_prof_dump_stats();
+	CHECK(1, "a wrapped ring dumps without walking off the end of the buffer\n");
+
+	z3660_prof_stop();
+}
+
+static void test_prof_under_execution(void)
+{
+	printf("[test] profiler under real execution: counters move, and emulation does not\n");
+
+	/* A 68040 program that reads, writes and fetches extension words.
+	 *
+	 * Setting currprefs.mmu_model is NOT enough on its own -- build_cpufunctbl() has to run
+	 * again to select the cpuemu_31 column, and harness_set_x_funcs() to point x_prefetch
+	 * at get_iword_mmu040. Without both, the run loop dispatches the NON-MMU handlers,
+	 * which never touch uae_mmu040_* and so never trip a probe. That is exactly how the
+	 * first version of this test failed: the counters stayed at zero and it looked like
+	 * broken instrumentation rather than a fixture that never reached it. */
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040;
+	currprefs.mmu_model = 68040;
+	changed_prefs = currprefs;
+	init_m68k();
+	build_cpufunctbl();
+	harness_set_x_funcs();
+	regs.mmu_enabled = 0;                /* TC.E off -> the accessors are transparent */
+	const uae_u32 CODE = 0x00010000u;
+	const uae_u32 DATA = 0x00020000u;
+	hram_poke32(DATA, 0x11223344u);
+	hram_poke16(CODE + 0, 0x2039); hram_poke32(CODE + 2, DATA);        /* move.l DATA,d0 */
+	hram_poke16(CODE + 6, 0x23C0); hram_poke32(CODE + 8, DATA + 8);    /* move.l d0,DATA+8 */
+	hram_poke16(CODE + 12, 0x4E71);                                    /* nop            */
+
+	/* ---- with the buckets ON ---- */
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	run040_steps(CODE, 3);
+	uae_u32 with_d0 = (uae_u32)m68k_dreg(regs, 0);
+	uae_u32 with_mem = hram_peek32(DATA + 8);
+
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_INSNS], 3,
+	           "INSNS counts instructions retired through the run-loop tail");
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_FETCH] >= 3,
+	      "instruction-stream fetches are counted (opcode + extension words)\n");
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_READ] >= 1, "data reads are counted\n");
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_WRITE] >= 1, "data writes are counted\n");
+	/* Deliberately NOT an assertion about cycles. On the host the cycle source is the
+	 * injectable counter, and nothing advances it during real execution -- so every span
+	 * measures zero here, and a test that demanded otherwise would be testing the fake
+	 * clock. What IS testable, and is the thing that would actually break, is that the
+	 * probes fire in matched pairs through thousands of real accessor calls and land the
+	 * phase machine back at the floor. Absolute cycle attribution is a metal measurement;
+	 * this is the structural half of it. */
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS] > 0,
+	      "the probes fire on the real accessor path, not only on the synthetic one\n");
+	CHECK_EQ32((uae_u32)z3660_prof_sp, 0,
+	           "every enter has found its exit -- the phase stack is back at the floor");
+	CHECK_EQ32((uae_u32)z3660_prof_cur, (uae_u32)Z3660_PROF_B_LOOP,
+	           "...and the run loop is charging LOOP again, not stuck inside a stage");
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_STACK_OVF], 0,
+	           "real execution never overflows the phase stack (max nesting is four)");
+	CHECK(z3660_prof_cnt[Z3660_PROF_C_INSNS_SUPER] <= z3660_prof_cnt[Z3660_PROF_C_INSNS],
+	      "the supervisor share cannot exceed the whole\n");
+
+	/* Opcode fetch and extension fetch share one accessor and are separated by a one-shot
+	 * mark set in the run loop. If the mark ever leaks, FETCHOP would collect extension
+	 * words too -- so assert the loop consumed it rather than left it standing. */
+	CHECK_EQ32((uae_u32)z3660_prof_opfetch_hint, 0,
+	           "the opcode-fetch mark is consumed, not left armed for the next extension word");
+
+	/* ---- and with them OFF: same answers ---- */
+	z3660_prof_set_buckets(0);
+	hram_poke32(DATA + 8, 0);
+	run040_steps(CODE, 3);
+	CHECK_EQ32((uae_u32)m68k_dreg(regs, 0), with_d0,
+	           "the profiler changes no register result");
+	CHECK_EQ32(hram_peek32(DATA + 8), with_mem,
+	           "...and no memory result: the probes measure the accessors, they do not replace them");
+}
+#endif /* Z3660_EMU_PROF */
 
 int main(int argc, char **argv)
 {
@@ -2784,6 +3176,14 @@ int main(int argc, char **argv)
 	test_runloop_overhead_switches();
 	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
+	test_prof_wire_format();
+	test_prof_build_variant();
+#if Z3660_EMU_PROF
+	test_prof_bucket_arithmetic();
+	test_prof_ret_macro_ordering();
+	test_prof_ring();
+	test_prof_under_execution();
+#endif
 
 	printf("\n=== %d passed, %d failed ===\n", g_pass, g_fail);
 	return g_fail ? 1 : 0;

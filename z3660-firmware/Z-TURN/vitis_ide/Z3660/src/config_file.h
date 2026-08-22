@@ -112,6 +112,10 @@ typedef struct {
    int perf_stats;      // core1 MMU run loops: per-instruction perf accounting
    int emu_probes;      // core1 MMU run loops: ISSUE-52-era diagnostic probes
    int core0_stats;     // core0 cooperative loop: C0STAT span stamping
+   /* CYBERSTORM C1 profiler arming, config file only (NOT per preset -- see prof_config.h).
+    * -1 = unset -> off, so an absent key produces a board that does not profile. */
+   int prof_hz;         // core1 PROFILING build: guest-PC sampler rate in Hz, 0 = off
+   int prof_buckets;    // core1 PROFILING build: interpreter stage buckets YES/NO
    int mount_sd_0x76;
    int mount_sd_root;
    float resistor;
@@ -319,6 +323,11 @@ enum CONFITEM {
    CONFITEM_PERF_STATS,
    CONFITEM_EMU_PROBES,
    CONFITEM_CORE0_STATS,
+   /* CYBERSTORM C1. APPEND-ONLY, like everything above: config_item_names[] is indexed by
+    * this enum, so a mid-enum insert silently reassigns every key after it and the parser
+    * writes the wrong field for the rest of the file with no diagnostic at all. */
+   CONFITEM_PROF_HZ,
+   CONFITEM_PROF_BUCKETS,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50

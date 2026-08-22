@@ -23,8 +23,19 @@ LDSCRIPT:= $(SRCDIR)/lscript.ld
 # variant switch leave half the objects from the other one in place, and the link
 # would happily succeed. Separate dirs make that impossible instead of merely
 # unlikely, and let both BOOT.BINs exist at once for an A/B re-flash pair.
+#
+# Z3660_PROF=1 (CYBERSTORM C1) is the THIRD variant: the lean flags PLUS
+# -DZ3660_EMU_PROF=1, into build-prof. It is built on top of LEAN and not on top of the
+# default on purpose -- a profile of the diagnostic loop would be a map of a binary nobody
+# runs, and the C3 calibration priced the difference between the two loops at 9.1 % of
+# guest throughput, larger than several of the effects C2 is meant to rank. See
+# src/uae/z3660_prof.h.
 Z3660_LEAN ?= 0
-ifeq ($(Z3660_LEAN),1)
+Z3660_PROF ?= 0
+ifeq ($(Z3660_PROF),1)
+BUILDDIR    := $(ROOT)/build-prof
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_EMU_PROF=1
+else ifeq ($(Z3660_LEAN),1)
 BUILDDIR    := $(ROOT)/build-lean
 VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0
 else
@@ -49,7 +60,12 @@ INCLUDES:= -I$(SRCDIR) \
            -I$(BSP_CORE1_INC) \
            -I$(BSP_CORE1_EXPORT_INC)
 
-CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 \
+# -MMD -MP: track HEADER dependencies. Until CYBERSTORM C1 nothing here did, so a header
+# edit left stale objects in every build dir and the link succeeded regardless -- the
+# reason `rm -rf build*` has been the standing advice. It generates .d files only and
+# cannot change a single byte of output. (-D flags remain untracked; that is what the
+# separate build directories are for.)
+CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 -MMD -MP \
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
            -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY \
@@ -88,7 +104,11 @@ OBJS += $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(S_SRCS))
 ELF := $(BUILDDIR)/Z3660_emu.elf
 BIN := $(BUILDDIR)/Z3660_emu.bin
 
-.PHONY: all clean size bin elf
+# The generated header-dependency files (see -MMD above). Absent on a first build, which
+# is the one build that does not need them.
+-include $(OBJS:.o=.d)
+
+.PHONY: all clean clean-all size bin elf
 
 all: $(ELF) $(BIN)
 	@echo "Generated: $(ELF) and $(BIN)"
@@ -138,4 +158,11 @@ $(BIN): $(ELF)
 
 clean:
 	rm -rf $(BUILDDIR)
+
+# All three variants at once. `clean` above removes only the dir this invocation selected,
+# which is right for a rebuild of one variant and wrong when the other two also need to go
+# -- a -D is not a tracked dependency (headers now are, via -MMD), so the variants are
+# kept apart by directory and cleaned together by this target.
+clean-all:
+	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof
 

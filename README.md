@@ -31,10 +31,13 @@
 > build needs you to download AMD/Xilinx Vitis 2023.2 yourself — it is staged outside the repo and
 > never committed.)
 >
-> Two firmware images come out of the one tree: `make bootbin` gives the usual **`BOOT.BIN`**, with
-> the emulator's run-loop diagnostics compiled in and switchable at runtime, and `make lean` gives
+> Three firmware images come out of the one tree. `make bootbin` gives the usual **`BOOT.BIN`**,
+> with the emulator's run-loop diagnostics compiled in and switchable at runtime; `make lean` gives
 > **`BOOT-lean.BIN`**, the production image with those diagnostics — and their per-instruction
-> predicates — compiled out. Details in **[docs/AMIX.md](docs/AMIX.md)**.
+> predicates — compiled out; and `make profile` gives **`BOOT-prof.BIN`**, the lean image plus an
+> interpreter profiler (a wall-clock guest-PC sampler and per-stage ARM cycle attribution). The
+> profiling image is a measuring instrument, not a production one — it costs measured time to run.
+> Details in **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
 >
 > ### Running AMIX
 > Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image** placed

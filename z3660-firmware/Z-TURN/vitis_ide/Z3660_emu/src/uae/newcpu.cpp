@@ -34,6 +34,7 @@
 #include "../main.h"
 #include "cpummu.h"
 #include "cpummu030.h"
+#include "z3660_prof.h"   // CYBERSTORM C1: profiling variant -- sampler + interpreter stage buckets
 #include "cputbl.h"
 #include "cpu_prefetch.h"
 #include "uae/uaestring.h"
@@ -3499,6 +3500,12 @@ static void z3660_knobs_poll(void);
 static int do_specialties (int cycles)
 {
    z3660_knobs_poll();   /* SERV / PERFS / PROBES reach the run loops from here */
+#if Z3660_EMU_PROF
+   /* CYBERSTORM C1: and so do the profiler commands, for exactly the same reason -- this
+    * function runs only when regs.spcflags != 0, so a serial PROFDUMP costs nothing per
+    * emulated instruction and still arrives within an interrupt period. */
+   z3660_prof_poll_cmd();
+#endif
 
    if (regs.spcflags & SPCFLAG_MODE_CHANGE)
       return 1;
@@ -4569,6 +4576,32 @@ static void amix_dump_wild(uae_u32 wildpc)
 // ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
 #include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
 #include "runloop_build.h"   // Z3660_EMU_PROBES / Z3660_EMU_PERF: which instruments this binary carries
+
+/* CYBERSTORM C1: the per-instruction sample tick, spelled once so the two run loops
+ * cannot drift in what they record.
+ *
+ * Placed at the TAIL and not before the fetch, deliberately. At the tail the instruction
+ * that just executed still owns regs.instruction_pc (040) / mmu030_insn_start_pc (030),
+ * so a deadline that expired *during* a long instruction is attributed to that
+ * instruction rather than to the next one. Before the fetch it would be off by one on
+ * exactly the instructions that matter most -- the slow ones.
+ *
+ * Expands to NOTHING outside the profiling build: no tick, and so no predicate either,
+ * which is the same rule runloop_build.h established for the other two instruments. */
+#if Z3660_EMU_PROF
+#define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)                      \
+   do {                                                                       \
+      uae_u16 z3660_f_ = (uae_u16)((regs.s ? Z3660_PROF_F_SUPER : 0)          \
+                                 | (regs.mmu_enabled ? Z3660_PROF_F_MMU : 0)  \
+                                 | (amix_mmu_on ? Z3660_PROF_F_AMIX : 0)      \
+                                 | ((is040) ? Z3660_PROF_F_CPU040 : 0));      \
+      z3660_prof_count(Z3660_PROF_C_INSNS);                                   \
+      if (regs.s) z3660_prof_count(Z3660_PROF_C_INSNS_SUPER);                 \
+      z3660_prof_tick((uae_u32)(pcexpr), (uae_u16)(opexpr), z3660_f_);        \
+   } while (0)
+#else
+#define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)  do { } while (0)
+#endif
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
 #if Z3660_EMU_PERF
 static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
@@ -4753,6 +4786,7 @@ void m68k_run_mmu040(void)
    struct flag_struct f;
    int halt = 0;
 
+   Z3660_PROF_LOOP_RESET();   // C1: do_specialties() can return out of this loop mid-stage
    while (!halt) {
       TRY(prb) {
          for (;;) {
@@ -4796,8 +4830,16 @@ void m68k_run_mmu040(void)
             do_cycles(cpu_cycles);
 
             mmu_opcode = -1;
+            Z3660_PROF_MARK_OPFETCH();   // C1: this fetch is the OPCODE, not an extension word
             mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
             count_instr(regs.opcode);
+#if Z3660_EMU_PROF
+            /* Snapshot the opcode for the sampler. regs.opcode is fair game for a handler
+             * to overwrite, and mmu_opcode is not reset on this loop's path -- neither is
+             * a promise, and a sample record that names the wrong instruction is worse
+             * than no sample at all. One store per instruction, profiling build only. */
+            const uae_u16 z3660_prof_op = (uae_u16)regs.opcode;
+#endif
 
 #if Z3660_EMU_PROBES
             /* CYBERSTORM C3: the three post-fetch ISSUE-52 probes collapsed behind ONE
@@ -4912,7 +4954,9 @@ void m68k_run_mmu040(void)
             }
             }   /* if (z3660_probes_on) -- post-fetch probe group */
 #endif /* Z3660_EMU_PROBES */
+            Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
             cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+            Z3660_PROF_EXIT();
             cpu_cycles = adjust_cycles(cpu_cycles);
 
             // Same IPL/cross-core poll throttle the 030 loop has, and for the same reason:
@@ -4922,13 +4966,20 @@ void m68k_run_mmu040(void)
             // per-instruction (STOP/trace/mode-change correctness). cadence 1 -- the
             // default and what the env sets today -- is byte-for-byte the old behaviour;
             // this only makes the existing SERV knob reach the 040 loop as well.
+            Z3660_PROF_RUNLOOP_SAMPLE(regs.instruction_pc, z3660_prof_op, 1);
+            Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
             Z3660_RUNLOOP_TAIL();
             if (regs.spcflags) {
-               if (do_specialties(cpu_cycles))
+               if (do_specialties(cpu_cycles)) {
+                  Z3660_PROF_EXIT();
                   return;
+               }
             }
+            Z3660_PROF_EXIT();
          }
       } CATCH(prb) {
+         Z3660_PROF_UNWOUND();
+         Z3660_PROF_CNT(Z3660_PROF_C_FAULTS);
          if (mmu_restart) {
             // instruction restart: undo partial effects by rewinding to its start
             regs.ccrflags = f;
@@ -4953,10 +5004,16 @@ static void m68k_run_mmu030(void)
 
    mmu030_opcode_stageb = -1;
    mmu030_fake_prefetch = -1;
+   Z3660_PROF_LOOP_RESET();   // C1: see m68k_run_mmu040
    while (!halt) {
       TRY(prb) {
          for (;;) {
             int cnt;
+#if Z3660_EMU_PROF
+            /* Declared ahead of `insretry:` on purpose: the sub-access replay path jumps
+             * back to that label, and a variable declared after it would be jumped over. */
+            uae_u16 z3660_prof_op = 0;
+#endif
 insretry:
             regs.instruction_pc = m68k_getpc();
             mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
@@ -4985,6 +5042,7 @@ insretry:
             mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
             mmu030_opcode = -1;
             if (mmu030_opcode_stageb < 0) {
+               Z3660_PROF_MARK_OPFETCH();   // C1: the OPCODE fetch, not an extension word
                regs.opcode = x_prefetch(0);
             } else {
                regs.opcode = mmu030_opcode_stageb;
@@ -4992,6 +5050,9 @@ insretry:
             }
             mmu030_opcode = regs.opcode;
             mmu030_idx_done = 0;
+#if Z3660_EMU_PROF
+            z3660_prof_op = (uae_u16)mmu030_opcode;   // C1: see m68k_run_mmu040
+#endif
 
             cnt = 50;
             for (;;) {
@@ -5001,7 +5062,9 @@ insretry:
 
                count_instr(regs.opcode);
                do_cycles(cpu_cycles);
+               Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
                cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+               Z3660_PROF_EXIT();
 
                cnt--; // don't loop forever if things go wrong
                if (!mmu030_retry)
@@ -5047,13 +5110,20 @@ insretry:
             // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
             // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
             // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
+            Z3660_PROF_RUNLOOP_SAMPLE(mmu030_insn_start_pc, z3660_prof_op, 0);
+            Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
             Z3660_RUNLOOP_TAIL();
             if (regs.spcflags) {
-               if (do_specialties(cpu_cycles))
+               if (do_specialties(cpu_cycles)) {
+                  Z3660_PROF_EXIT();
                   return;
+               }
             }
+            Z3660_PROF_EXIT();
          }
       } CATCH(prb) {
+         Z3660_PROF_UNWOUND();
+         Z3660_PROF_CNT(Z3660_PROF_C_FAULTS);
          bool lastwrite_norestart = false;
          if (mmu030_opcode == -1) {
             // fault during opcode prefetch

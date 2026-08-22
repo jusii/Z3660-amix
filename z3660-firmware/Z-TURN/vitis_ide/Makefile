@@ -8,17 +8,23 @@
 #   make z3660_emu  -> build emulator firmware (core1)
 #   make bootbin    -> generate BOOT.BIN
 #   make lean       -> LEAN (production) core1 + BOOT-lean.BIN, side by side with BOOT.BIN
+#   make profile    -> PROFILING core1 + BOOT-prof.BIN, side by side with the other two
 #   make version    -> run make_version_alfa.py packaging script
-#   make clean      -> clean app builds (FSBL/app dirs), both core1 build variants
+#   make clean      -> clean app builds (FSBL/app dirs), all THREE core1 build variants
 #
-# TWO FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3):
+# THREE FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3 + C1):
 #   BOOT.BIN       default -- the run-loop diagnostics are compiled in and switchable at
 #                  runtime (PROBES / PERFS / CSTAT). Flash this when something needs
 #                  looking at.
 #   BOOT-lean.BIN  production -- core1 built -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0, so
 #                  the instruments AND their per-instruction predicates are gone.
 #                  `Z3660_emu/src/uae/runloop_build.h` is the contract.
-# The two never share objects: the lean core1 builds into Z3660_emu/build-lean.
+#   BOOT-prof.BIN  profiling -- the LEAN core1 PLUS -DZ3660_EMU_PROF=1: a wall-clock
+#                  guest-PC sampler and per-stage ARM cycle attribution for the
+#                  interpreter. Built on lean so the map describes the loop that ships.
+#                  Not for production; it costs measured time. Contract:
+#                  `Z3660_emu/src/uae/z3660_prof.h`.
+# The three never share objects: build / build-lean / build-prof.
 #
 
 # Set the path to bootgen.exe on your host system (e.g., macOS or Linux).
@@ -45,13 +51,20 @@ BOOTBIN       := Z3660_system/Alfa/sd_card/BOOT.BIN
 LEAN_BIF      := Z3660_system/Alfa/system_cli_lean.bif
 LEAN_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-lean.BIN
 
+# PROFILING variant (CYBERSTORM C1). Same shape again: its own bif, its own output file,
+# so all three images exist side by side and a metal session can re-flash between them
+# without a rebuild.
+PROF_BIF      := Z3660_system/Alfa/system_cli_prof.bif
+PROF_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-prof.BIN
+
 # Component directories
 FSBL_DIR      := design_1_wrapper/zynq_fsbl
 Z3660_DIR     := Z3660
 Z3660_EMU_DIR := Z3660_emu
 
 # Default target
-.PHONY: all build z3660 z3660_emu z3660_emu_lean lean lean_prepare bootbin version bsp_cortexa9_0 bsp_cortexa9_1
+.PHONY: all build z3660 z3660_emu z3660_emu_lean z3660_emu_prof lean lean_prepare \
+        profile profile_prepare bootbin version bsp_cortexa9_0 bsp_cortexa9_1
 # Default: build firmware only to avoid rebuilding FSBL/BOOT every `make`
 all: bootbin version
 
@@ -87,6 +100,10 @@ z3660_emu: bsp_cortexa9_1
 # LEAN core1: -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0, into Z3660_emu/build-lean.
 z3660_emu_lean: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_LEAN=1 -j 4
+
+# PROFILING core1: the lean flags plus -DZ3660_EMU_PROF=1, into Z3660_emu/build-prof.
+z3660_emu_prof: bsp_cortexa9_1
+	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_PROF=1 -j 4
 
 # DDR_SPEED variable can be set to 533, 667, or 800
 DDR_SPEED ?= 533
@@ -129,6 +146,17 @@ lean: lean_prepare
 	$(BOOTGEN_EXE_HOST) $(LEAN_BIF) $(LEAN_BOOTBIN)
 	@echo "BOOT-lean.BIN -> $(LEAN_BOOTBIN)"
 
+# `make profile` -> sd_card/BOOT-prof.BIN. Core0 and the FSBL are the same binaries the
+# other two images use; only core1 differs. Does NOT touch BOOT.BIN or BOOT-lean.BIN.
+profile_prepare: bsp_cortexa9_0 z3660 z3660_emu_prof $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
+	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+
+profile: profile_prepare
+	@mkdir -p $(dir $(PROF_BOOTBIN))
+	@echo "Generating BOOT-prof.BIN (DDR $(DDR_SPEED)MHz, lean loop + interpreter profiler)"
+	$(BOOTGEN_EXE_HOST) $(PROF_BIF) $(PROF_BOOTBIN)
+	@echo "BOOT-prof.BIN -> $(PROF_BOOTBIN)"
+
 version:
 	python3 Z3660_system/make_version_alfa.py
 
@@ -139,8 +167,8 @@ clean:
 	-@cd $(FSBL_DIR)/zynq_fsbl_bsp/ps7_cortexa9_0/lib && rm -f *.o *.a *.d
 	# Clean Z3660
 	-@cd $(Z3660_DIR) && rm -rf build *.o *.d
-	# Clean Z3660_emu (both build variants)
-	-@cd $(Z3660_EMU_DIR) && rm -rf build build-lean *.o *.d
+	# Clean Z3660_emu (all three build variants)
+	-@cd $(Z3660_EMU_DIR) && rm -rf build build-lean build-prof *.o *.d
 	# Clean BSP libraries
 	-@cd design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp && rm -rf *.o *.a
 	-@cd design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp && rm -rf *.o *.a
