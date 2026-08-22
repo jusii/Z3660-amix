@@ -23,6 +23,7 @@
 //#include "custom.h"
 #include "events.h"
 #include "newcpu.h"
+#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: map_banks() invalidates the decoded-op cache */
 //#include "autoconf.h"
 //#include "savestate.h"
 //#include "ar.h"
@@ -3192,6 +3193,11 @@ static void map_banks2 (addrbank *bank, int start, int size, int realsize, int q
 		old = debug_bankchange (-1);
 #endif
 	flush_icache(3); /* Sure don't want to keep any old mappings around! */
+	/* CYBERSTORM C2 rung 1: and the decoded-op cache is exactly "an old mapping" in the
+	 * sense this line means -- its entries hold opcode words read through the bank map
+	 * that is being replaced on the next line. flush_icache() is a no-op macro without
+	 * the JIT, so upstream's own sentence has had nothing to act on until now. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_MAP);
 #ifdef NATMEM_OFFSET
 	//if (!quick)
 		//delete_shmmaps(start << 16, size << 16);

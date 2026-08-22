@@ -71,6 +71,13 @@ int m68k_move2c (int regno, uae_u32 *regp)
 					cacr_mask = 0x80008000;
 				regs.cacr = *regp & cacr_mask;
 				set_cpu_caches (false);
+				/* CYBERSTORM C2 rung 1. CACR is the register that enables and disables
+				 * the very caches the decoded-op cache is standing in for -- on the
+				 * 68040 it carries the instruction- and data-cache enables, and
+				 * uae_mmu040_getc_iword() consults bit 15 directly. A guest that turns
+				 * the instruction cache off has asked for its contents to stop being
+				 * authoritative, so honour that here as well. */
+				z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT);
 			}
 			break;
 		/* 68040 only */
@@ -136,8 +143,18 @@ int m68k_move2c (int regno, uae_u32 *regp)
 		// real the contract holds, and this site is correct as it stands. Re-examined and left
 		// unchanged on purpose -- do not "fix" it without evidence that AMIX omits a PFLUSH
 		// the 68040 UM requires.
-		case 0x806: regs.urp = *regp & 0xffffffff; break;
-		case 0x807: regs.srp = *regp & 0xffffffff; break;
+		/* CYBERSTORM C2 rung 1 rides along, and it is important that it does NOT change
+		 * the paragraph above. The ATC's silicon-faithful "no implicit flush" contract
+		 * stands untouched. The decoded-op cache is an emulator-internal structure with
+		 * no silicon counterpart and therefore no such contract to keep, and it is tagged
+		 * by guest VIRTUAL address -- so a root-pointer change is precisely the event
+		 * after which its tags may mean something different. The map asks for
+		 * invalidation "on any MMU root or TC change"; TC arrives through mmu_set_tc(),
+		 * and this is where the root arrives. Conservative by construction: the worst
+		 * case is a cold cache after a context switch, which the DOPC_INVAL counter will
+		 * price if it turns out to matter. */
+		case 0x806: regs.urp = *regp & 0xffffffff; z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT); break;
+		case 0x807: regs.srp = *regp & 0xffffffff; z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT); break;
 		default:
 			op_illg (0x4E7B);
 			return 0;

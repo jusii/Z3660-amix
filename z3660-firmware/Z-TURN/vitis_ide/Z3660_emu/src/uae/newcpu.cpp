@@ -1114,6 +1114,12 @@ void build_cpufunctbl (void)
    }
    write_log(_T("\n"));
 
+   /* CYBERSTORM C2 rung 1. Every decoded-op cache entry holds a RESOLVED cpufunctbl[]
+    * pointer, and the loop above has just rebuilt that table -- so a surviving entry
+    * would dispatch the previous mode's implementation of its opcode. That is a wrong
+    * instruction rather than a stale word, and it is reachable from any mode change. */
+   z3660_dopc_invalidate(Z3660_DOPC_INV_TABLE);
+
    set_cpu_caches (true);
 //   target_cpu_speed();
 }
@@ -4716,6 +4722,14 @@ static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical 
 #include "z3660_blk.h"
 static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
 
+/* CYBERSTORM C2 rung 1: the decoded-op cache. Same shape of switch as rung 0 and for the
+ * same reasons -- compiled into EVERY variant because it is an optimisation and not a
+ * diagnostic, and switchable at runtime so a metal session can A/B it on a live guest
+ * without reflashing, and so the host harness has an off state to compare against.
+ * z3660_dopc.h carries the geometry, the encoding and the invalidation contract. */
+#include "z3660_dopc.h"
+static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
+
 #if Z3660_EMU_PERF
 /* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
  * disagree about it -- a read-back that recomputes the answer proves nothing about the
@@ -4739,6 +4753,10 @@ extern "C" void z3660_knobs_sync(void)
    z3660_probes_on = shared->emu_probes ? 1 : 0;                                       // PROBES
 #endif
    z3660_blk_chunk = z3660_blk_resolve_chunk((unsigned)shared->blk_chunk);             // BLK
+   {                                                                                   // DOPC
+      unsigned d = z3660_dopc_resolve((unsigned)shared->dopc_on);
+      if (d != z3660_dopc_on) { z3660_dopc_on = d; z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB); }
+   }
 }
 
 /* Read-back + direct set for the host harness and the serial console. The setter takes a
@@ -4749,6 +4767,19 @@ extern "C" unsigned z3660_blk_set(unsigned requested)
 {
    z3660_blk_chunk = z3660_blk_resolve_chunk(requested);
    return z3660_blk_chunk;
+}
+
+/* Same pair for the decoded-op cache. Setting it ALWAYS invalidates, even when the
+ * resolved state does not change: the cheap thing to get wrong here is to turn the cache
+ * off, let the guest rewrite a page while nothing is watching, and turn it back on with
+ * the pre-rewrite decodes still stamped live. Invalidating on every set removes the
+ * question rather than answering it. */
+extern "C" unsigned z3660_dopc_get(void) { return z3660_dopc_on; }
+extern "C" unsigned z3660_dopc_set(unsigned requested)
+{
+   z3660_dopc_on = z3660_dopc_resolve(requested);
+   z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB);
+   return z3660_dopc_on;
 }
 
 /* Read-back for the harness (and any future serial dump).
@@ -5109,8 +5140,22 @@ static uae_u32 z3660_blk_room(uaecptr addr, uae_u32 gran)
 /* The recognizer. Returns 1 if it serviced a chunk (the caller must NOT dispatch, and
  * takes the emulated cycle count from *cycp); 0 to dispatch normally.
  *
- * `op` is the already-fetched opcode and the pc still stands on it. */
-static int z3660_blk_run(uae_u16 op, int *cycp)
+ * `op` is the already-fetched opcode and the pc still stands on it.
+ *
+ * *shapep IS THE DECODED-OP CACHE'S IDIOM VERDICT (C2 rung 1), and its contract is the
+ * reason this function has a third argument at all. The caller arrives with *shapep = 1
+ * and this function may only clear it when it has POSITIVELY ESTABLISHED, from the
+ * instruction words alone, that the code at this pc is not an idiom head. Every decline
+ * that depends on anything else -- the trace bits, the chunk cap, the destination's
+ * alignment, the device gate, the privilege state -- must leave it set.
+ *
+ * The asymmetry is deliberate and it is what makes caching the verdict safe. A cached
+ * TRUE costs one wasted recognizer test on a later hit; a cached FALSE would lose the
+ * fast path at that pc until the next invalidation, and rung 0 is worth 43.6 % of an
+ * AMIX boot. So the cheap error is the one this is biased towards, and the expensive one
+ * is unreachable: the words the verdict is computed from are the same words the entry
+ * caches, and anything that changes them invalidates the entry. */
+static int z3660_blk_run(uae_u16 op, int *cycp, int *shapep)
 {
    unsigned cap = z3660_blk_chunk;
    uaecptr pc;
@@ -5126,13 +5171,20 @@ static int z3660_blk_run(uae_u16 op, int *cycp)
    if (!cap) return 0;
 
    /* Head discrimination first: three masked compares reject the entire rest of the
-    * instruction set before anything more expensive happens. */
+    * instruction set before anything more expensive happens.
+    *
+    * This one test is a function of the opcode alone, so a failure here is the STATIC
+    * verdict the decoded-op cache wants and it is recorded as such. It is also the
+    * overwhelmingly common case -- almost every instruction in the stream reaches this
+    * line and leaves -- which is exactly why caching the answer is worth doing: metal
+    * measured rung 0 costing dhrystone ~1 % for precisely these three compares, paid on
+    * every dispatch and repaid only inside the idiom stream. */
    if (Z3660_BLK_IS_MOVE_AN_INC(op) || Z3660_BLK_IS_MOVE_INC_INC(op))
       idiom_len = 6;                                   /* MOVE + DBF + displacement */
    else if (Z3660_BLK_IS_CPUSHL(op))
       idiom_len = 10;                                  /* CPUSHL + ADDA.W #imm + DBF + disp */
    else
-      return 0;
+      { *shapep = 0; return 0; }
 
    /* Trace has to see every instruction, and STOP/mode-change handling is per-instruction
     * business the fast path is not entitled to skip. */
@@ -5148,25 +5200,32 @@ static int z3660_blk_run(uae_u16 op, int *cycp)
    if (regs.mmu_enabled && ((pc ^ (pc + (uae_u32)idiom_len - 1u)) & mmu_pagemaski) != 0)
       return 0;
 
+   /* Everything from here to the end of the shape test reads the instruction stream, so
+    * every failure in it is STATIC -- a property of the words at this pc, which is
+    * exactly what the decoded-op cache is allowed to remember. The one exception is the
+    * user-mode CPUSHL test at the bottom, which is a property of the machine and is
+    * marked as such. */
    if (idiom_len == 6) {
       opdb = (uae_u16)get_iword_mmu040(2);
-      if (!Z3660_BLK_IS_DBF(opdb)) return 0;
+      if (!Z3660_BLK_IS_DBF(opdb)) { *shapep = 0; return 0; }
       disp = (uae_s16)get_iword_mmu040(4);
       /* A DBcc's displacement is relative to its own extension word, so the target is
        * (pc+2) + 2 + disp. "This is a two-instruction loop" == that target is the head. */
-      if ((uae_u32)(pc + 4u + (uae_u32)(uae_s32)disp) != pc) return 0;
+      if ((uae_u32)(pc + 4u + (uae_u32)(uae_s32)disp) != pc) { *shapep = 0; return 0; }
    } else {
       uae_u16 opadd = (uae_u16)get_iword_mmu040(2);
-      if (!Z3660_BLK_IS_ADDA_W_IMM(opadd)) return 0;
+      if (!Z3660_BLK_IS_ADDA_W_IMM(opadd)) { *shapep = 0; return 0; }
       /* The ADDA must advance the register the CPUSHL is walking, or this is not the
        * cache-flush loop and the collapse would step the wrong pointer. */
-      if ((int)((opadd >> 9) & 7) != (int)(op & 7)) return 0;
+      if ((int)((opadd >> 9) & 7) != (int)(op & 7)) { *shapep = 0; return 0; }
       opdb = (uae_u16)get_iword_mmu040(6);
-      if (!Z3660_BLK_IS_DBF(opdb)) return 0;
+      if (!Z3660_BLK_IS_DBF(opdb)) { *shapep = 0; return 0; }
       disp = (uae_s16)get_iword_mmu040(8);
-      if ((uae_u32)(pc + 8u + (uae_u32)(uae_s32)disp) != pc) return 0;
+      if ((uae_u32)(pc + 8u + (uae_u32)(uae_s32)disp) != pc) { *shapep = 0; return 0; }
       /* CPUSHL is privileged: in user mode op_f428_31_ff raises Exception(8), which is a
-       * per-instruction event and not ours to collapse. */
+       * per-instruction event and not ours to collapse. NOT a static verdict: the same
+       * words are a perfectly good idiom head the next time this pc runs in supervisor
+       * mode, and a kernel that maps one page into both is not this core's business. */
       if (!regs.s) return 0;
    }
 
@@ -5327,6 +5386,299 @@ static int z3660_blk_run(uae_u16 op, int *cycp)
    }
 }
 
+/* ====================================================================================
+ * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
+ *
+ * WHAT IT REPLACES. Every pass of the run loop currently pays, before it has executed
+ * anything: an indirect call through `x_prefetch`, a TTR predicate, a one-entry
+ * instruction-page-cache compare, a physical read of guest DRAM through the board's bank
+ * dispatch, an indexed load out of a 65 536-entry (256 KB) handler table, and rung 0's
+ * recognizer test. The map prices the fetch half of that at 78.2 ARM cycles per opcode
+ * word and 85.2 per extension word -- 28.65 % of the interpreter, its largest rung.
+ *
+ * A hit replaces all of it with a generation compare, up to four tag compares out of one
+ * cache line, and three loads out of the same line.
+ *
+ * WHY THE HIT PATH IS THE DESIGN AND NOT AN AFTERTHOUGHT. The map pre-registers the
+ * failure mode by name: **"a high hit rate with a low speedup"**, which is what happens
+ * when the tag check and the validity check cost as much as the fetch they replace. At a
+ * 96.6-98.5 % tier-0 ipagecache hit rate, what this has to beat is an already-fast path.
+ * Hence: the whole set is contiguous with the four tags in its first 32-byte line, so a
+ * way scan is one line and not four; validity is ONE per-set generation compare rather
+ * than a per-entry stamp, because every invalidation here is whole-cache and four
+ * per-entry stamps could never disagree; and replacement is round-robin, decided at FILL
+ * time, so a hit performs no stores at all beyond arming the extension-word window.
+ *
+ * THE IDIOM VERDICT RIDES IN THE ENTRY. This is the integration that makes rung 1 pay for
+ * rung 0's overhead rather than adding to it. Metal 2026-08-22 measured rung 0 at boot
+ * -43.6 % and dhrystone -1 %: the recognizer's three masked compares are paid on every
+ * dispatch and repaid only inside the idiom stream, so a workload with no block idiom in
+ * its hot loop pays and never collects. The entry therefore carries the recognizer's
+ * STATIC shape verdict, and on a hit that says "not an idiom" the run loop does not call
+ * the recognizer at all. See z3660_blk_run()'s *shapep contract for why the bit is
+ * conservative-true and why that makes both error directions cheap.
+ *
+ * ONE EXTENSION WORD, AND WHY ONLY ONE. The map asks the entry to hold "the instruction's
+ * extension words". The generated handlers fetch their own -- cpuemu_31 calls
+ * get_iword_mmu040(N) about 920 times -- so the only place to answer them is inside
+ * uae_mmu040_get_iword(), through the address-keyed window in z3660_dopc.h. At 16 bytes
+ * per entry there is room for exactly one word, and the measurement says one is most of
+ * the prize: 1.5983 fetches per guest instruction is one opcode plus 0.5983 extension
+ * words, so a single slot covers the great majority of a bucket worth 11.31 %. The
+ * remainder -- second and later extension words, and the 32-bit displacements that go
+ * through get_ilong -- still fetch, and DOPC_EXT is what says how much was reached.
+ *
+ * THE SLOT IS FILLED BY A REAL FETCH ON THE MISS PATH, not by a guess, and the read is
+ * bounded by the same argument rung 0's recognizer uses for its own lookahead: the page
+ * holding `pc` was just fetched successfully, so every word inside it is reachable, and
+ * the granule test refuses anything that would leave it. With the MMU off the granule is
+ * the 64 KB bank window instead, which is the same guarantee one level down -- a
+ * speculative word from a bank the opcode did not come from could have a device side
+ * effect, and this never issues one.
+ *
+ * ------------------------------------------------------------------------------------
+ * COHERENCE -- the whole risk surface, and it is asymmetric
+ * ------------------------------------------------------------------------------------
+ *
+ * A cache that invalidates too eagerly is slower. One that invalidates too little
+ * executes instructions the guest has already overwritten, and that is a working system
+ * that goes wrong hours later with no symptom at the point of the bug. So this one
+ * follows the map's instruction literally: **invalidate everything on any event that
+ * could plausibly matter, measure the hit rate, and only then narrow it.** Whole-cache
+ * invalidation is affordable as the DEFAULT policy here because it is O(1) -- one
+ * generation increment -- rather than a walk.
+ *
+ * The events, and why each one is in the list:
+ *
+ *   mmu_flush_cache()   The single choke point for the 68040's own instruction-cache and
+ *                       ATC maintenance: flush_mmu040() (every CPUSHL/CPUSHP/CPUSHA and
+ *                       CINV), mmu_flush_atc_page()/_all() (every PFLUSH form), and
+ *                       mmu_set_tc() and mmu_reset() through the latter. It is also
+ *                       where upstream flushes its own (compiled-out) instruction cache,
+ *                       so this cache is invalidated by exactly the operations the
+ *                       architecture already requires a guest to perform before executing
+ *                       code it has written. That is what makes self-modifying code safe
+ *                       without a per-store check: on a 68040 the guest MUST maintain the
+ *                       caches itself, and AMIX does -- the CPUSHL loop alone is 7.79 %
+ *                       of a boot. Note the rung 0 interaction the map flags: stage C
+ *                       collapses that loop into one flush, and one flush is exactly what
+ *                       has to reach here, which it does because the fast path calls
+ *                       flush_mmu040() itself.
+ *
+ *   MOVEC to URP/SRP    A root-pointer change is a change of address space. The ATC
+ *                       deliberately does NOT flush on this (see newcpu_common.cpp: that
+ *                       matches silicon, where PFLUSH is the sole ATC coherence point).
+ *                       This cache is not silicon and has no such contract to keep, so it
+ *                       takes the conservative rule the map asks for. MOVEC to CACR joins
+ *                       it, because that write is what enables and disables the caches
+ *                       whose semantics this one is standing in for.
+ *
+ *   build_cpufunctbl()  The entries hold RESOLVED HANDLER POINTERS out of cpufunctbl[],
+ *                       and a mode change rebuilds that table. A cached pointer into the
+ *                       previous table is a wrong implementation, not a stale word.
+ *
+ *   DMA into guest RAM  THIS ONE IS SPECIFIC TO THIS BOARD and it is not hypothetical.
+ *                       core0 reads disk sectors straight into guest DRAM (scsi.c's
+ *                       f_read into the mapped address) and the interpreter never sees
+ *                       those bytes go past -- so an AMIX text pagein, or an AmigaOS
+ *                       loader reusing a buffer, replaces instruction bytes underneath
+ *                       this cache. core1's own side of that mailbox already knows: it
+ *                       spins until core0 is done and then invalidates its L1 over the
+ *                       exact range (Z3660_emu/src/main.cpp). That is the precise moment
+ *                       the write becomes observable to this core, it is core1-local, and
+ *                       it needs no cooperation from a core0 that may be older than this
+ *                       change -- which a SHARED epoch word would have needed, and would
+ *                       have failed DANGEROUSLY when it did not get it.
+ *
+ *   map_banks()         The emulator's own memory map moving under a cached opcode.
+ *
+ * WHAT IS DELIBERATELY *NOT* IN THE LIST: an ordinary guest store. Checking every write
+ * against the cache would cost more than the cache saves, and the 68040 architecture does
+ * not require it -- the guest is responsible for cache maintenance and the list above is
+ * what that maintenance looks like from in here. `test_dopc_coherence` in the host
+ * harness pins each arm, including the negative: a write with no flush is NOT required to
+ * be visible, and the test says so rather than leaving it to be discovered.
+ * ==================================================================================== */
+
+/* One set: four ways, 64 bytes, with the four tags, the generation stamp and the
+ * replacement cursor packed into the first 32-byte Cortex-A9 line so a way scan touches
+ * one line. Sizes are asserted in the harness -- a set that grows past 64 bytes silently
+ * doubles the hit path's line traffic and nothing else would notice. */
+struct z3660_dopc_set {
+   uae_u32     tag[Z3660_DOPC_WAYS];      /* Z3660_DOPC_KEY(pc, regs.s), or TAG_EMPTY   */
+   uae_u32     stamp;                     /* == z3660_dopc_gen while this set is live   */
+   uae_u32     victim;                    /* round-robin cursor, advanced only on fill  */
+   cpuop_func *handler[Z3660_DOPC_WAYS];  /* the resolved cpufunctbl[] entry            */
+   uae_u16     opcode[Z3660_DOPC_WAYS];
+   uae_u16     ext0[Z3660_DOPC_WAYS];     /* the instruction word at pc + 2             */
+   uae_u8      meta[Z3660_DOPC_WAYS];     /* Z3660_DOPC_M_*                             */
+   uae_u8      pad[4];
+};
+
+static struct z3660_dopc_set z3660_dopc_tab[Z3660_DOPC_SETS] __attribute__((aligned(32)));
+
+/* THE SIZE IS A COMPILE-TIME GUARANTEE ON THE TARGET, not a runtime hope. 64 bytes per
+ * set is two Cortex-A9 cache lines with all four tags, the stamp and the cursor inside
+ * the first, which is the property the hit path is designed around -- a set that grew
+ * would double its line traffic and nothing would fail. Guarded on 32-bit pointers only,
+ * because the host harness builds the same source on x86-64 where a handler pointer is
+ * eight bytes and the set is legitimately 80; the harness asserts the field arithmetic
+ * instead, and this line is what refuses the build that would actually ship. */
+typedef char z3660_dopc_set_is_one_pair_of_lines[
+   (sizeof(void *) != 4 || sizeof(struct z3660_dopc_set) == Z3660_DOPC_SET_BYTES) ? 1 : -1];
+typedef char z3660_dopc_table_is_64k[
+   (sizeof(void *) != 4 || sizeof(z3660_dopc_tab) == Z3660_DOPC_BYTES) ? 1 : -1];
+
+/* Generation 0 is RESERVED and never live, so a zeroed table (BSS at power-on, and the
+ * memset on wrap below) is entirely stale rather than entirely valid. */
+static uae_u32 z3660_dopc_gen = 1;
+
+/* The extension-word window (z3660_dopc.h). C linkage: cpummu.h's single out-of-line
+ * uae_mmu040_get_iword() reads it from other translation units. */
+extern "C" {
+unsigned int   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
+unsigned short z3660_dopc_ext_val = 0;
+}
+
+extern "C" void z3660_dopc_invalidate(int cause)
+{
+   (void)cause;
+   /* The window came out of an entry, so it dies with the entries. Doing this FIRST
+    * matters: a handler that invalidates and then reads its own extension word must get
+    * a real fetch, and the ordering here is the only thing that guarantees it. */
+   z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+   if (++z3660_dopc_gen == 0) {
+      /* 2^32 invalidations later. Every stamp must be made unequal to the generation we
+       * are about to resume at, and zeroing does that for generation 1 -- so this is a
+       * real clear and not a wrap that silently revalidates the whole table. */
+      memset(z3660_dopc_tab, 0, sizeof z3660_dopc_tab);
+      z3660_dopc_gen = 1;
+      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
+      return;
+   }
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
+}
+
+/* The DMA arm. Takes the range core0 wrote even though it currently invalidates
+ * everything: a narrowed invalidation needs that range, and a call site that never
+ * carried it could not grow one later without touching main.cpp again. */
+extern "C" void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len)
+{
+   (void)addr; (void)len;
+   z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
+}
+
+extern "C" unsigned int z3660_dopc_generation(void) { return z3660_dopc_gen; }
+/* Harness only: drive the counter to the wrap boundary without performing 2^32
+ * invalidations. Nothing on the board calls it. */
+extern "C" void z3660_dopc_force_generation(unsigned int gen) { z3660_dopc_gen = gen; }
+/* Harness only: the geometry as the COMPILER laid it out, not as the header meant it. */
+extern "C" unsigned z3660_dopc_set_bytes(void)   { return (unsigned)sizeof(struct z3660_dopc_set); }
+extern "C" unsigned z3660_dopc_table_bytes(void) { return (unsigned)sizeof(z3660_dopc_tab); }
+/* Harness only: is (pc, space) cached, and as what? Counts nothing and arms nothing, so a
+ * test can ask without perturbing the thing it is asking about. */
+extern "C" int z3660_dopc_peek(unsigned int pc, int super)
+{
+   const struct z3660_dopc_set *s;
+   uae_u32 key;
+   unsigned w;
+
+   if (!z3660_dopc_on || (pc & 1u)) return -1;
+   s = &z3660_dopc_tab[Z3660_DOPC_INDEX(pc)];
+   if (s->stamp != z3660_dopc_gen) return -1;
+   key = Z3660_DOPC_KEY(pc, super);
+   for (w = 0; w < Z3660_DOPC_WAYS; w++)
+      if (s->tag[w] == key) return (int)s->opcode[w];
+   return -1;
+}
+
+/* THE HIT PATH. Returns the set and the way, or NULL.
+ *
+ * always_inline is not decoration: the firmware builds at -Os, where gcc would happily
+ * leave this out of line and charge the hot loop a call to save the space -- which is the
+ * exact trade this rung exists to refuse. */
+static __inline__ __attribute__((always_inline))
+struct z3660_dopc_set *z3660_dopc_find(uaecptr pc, int *wayp)
+{
+   struct z3660_dopc_set *s;
+   uae_u32 key;
+
+   if (!z3660_dopc_on) return NULL;   /* OFF is a pure passthrough: nothing is read */
+   /* An odd pc cannot be encoded, because the tag reuses bit 0 for the address space and
+    * an odd pc would collide with the supervisor entry of the instruction before it.
+    * Nothing can execute at an odd pc on a 68040, so this is never taken on a running
+    * guest -- but "never taken" and "cannot happen" are different claims. */
+   if (pc & 1u) { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   s = &z3660_dopc_tab[Z3660_DOPC_INDEX(pc)];
+   if (s->stamp != z3660_dopc_gen) { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   key = Z3660_DOPC_KEY(pc, regs.s);
+   if      (s->tag[0] == key) *wayp = 0;
+   else if (s->tag[1] == key) *wayp = 1;
+   else if (s->tag[2] == key) *wayp = 2;
+   else if (s->tag[3] == key) *wayp = 3;
+   else { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_HIT);
+   return s;
+}
+
+/* Is the word at pc+2 reachable without issuing an access the opcode fetch did not
+ * already prove safe? With the MMU on the granule is the guest page whose translation the
+ * opcode fetch just used; with it off, the 64 KB bank window, because a bank boundary is
+ * where a speculative read could acquire a device side effect. A 4 KB or 8 KB page lies
+ * entirely inside one 64 KB bank, so the MMU-on test implies the MMU-off one. */
+static __inline__ int z3660_dopc_ext_reachable(uaecptr pc)
+{
+   uae_u32 gran = regs.mmu_enabled ? mmu_pagemaski : 0xFFFF0000u;
+   return ((((uae_u32)pc) ^ (((uae_u32)pc) + 3u)) & gran) == 0;
+}
+
+/* THE FILL. noinline on purpose: this runs on the miss path only, and inlining it would
+ * grow the run loop's instruction footprint for code that executes one pass in ten. */
+static __attribute__((noinline))
+void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 ext0)
+{
+   struct z3660_dopc_set *s;
+   uae_u32 key, empty;
+   unsigned idx, w;
+
+   if (!z3660_dopc_on || (pc & 1u)) return;
+
+   idx   = Z3660_DOPC_INDEX(pc);
+   s     = &z3660_dopc_tab[idx];
+   key   = Z3660_DOPC_KEY(pc, regs.s);
+   empty = Z3660_DOPC_TAG_EMPTY(idx);
+
+   /* A set from an older generation is reclaimed here rather than by a sweep. This is the
+    * whole reason invalidation can be O(1): the cost of clearing a set is paid by the
+    * first fill that wants it, and a set nothing touches again is never cleared at all. */
+   if (s->stamp != z3660_dopc_gen) {
+      s->stamp  = z3660_dopc_gen;
+      s->tag[0] = s->tag[1] = s->tag[2] = s->tag[3] = empty;
+      s->victim = 0;
+   }
+
+   for (w = 0; w < Z3660_DOPC_WAYS; w++)
+      if (s->tag[w] == empty || s->tag[w] == key) break;
+   if (w == Z3660_DOPC_WAYS) {
+      w = s->victim;
+      s->victim = (s->victim + 1u) & (Z3660_DOPC_WAYS - 1u);
+   }
+
+   s->opcode[w]  = op;
+   s->handler[w] = cpufunctbl[op];
+   s->ext0[w]    = ext0;
+   s->meta[w]    = (uae_u8)((shape     ? Z3660_DOPC_M_IDIOM : 0u)
+                          | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u));
+   /* The tag LAST. Everything above is dead until this line makes the way findable, so
+    * there is no window in which a lookup can see a half-built entry -- which matters
+    * because z3660_dopc_fill() can be reached from inside a chunk the fast path is
+    * servicing, and will matter more the first time anything here becomes reentrant. */
+   s->tag[w] = key;
+}
+
 // UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
 // (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
 // generated cpuemu_31 handlers (op_smalltbl_31_ff, cputbls[4][4]). Adapted from
@@ -5354,6 +5706,7 @@ void m68k_run_mmu040(void)
    int halt = 0;
 
    Z3660_PROF_LOOP_RESET();   // C1: do_specialties() can return out of this loop mid-stage
+   z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;   // C2: no window survives a loop re-entry
    while (!halt) {
       TRY(prb) {
          for (;;) {
@@ -5397,8 +5750,38 @@ void m68k_run_mmu040(void)
             do_cycles(cpu_cycles);
 
             mmu_opcode = -1;
-            Z3660_PROF_MARK_OPFETCH();   // C1: this fetch is the OPCODE, not an extension word
-            mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
+            /* CYBERSTORM C2 rung 1. The decoded-op cache is consulted HERE, before
+             * x_prefetch, because this is the last moment at which the loop still has a
+             * choice about paying for the fetch. A hit supplies the opcode word, the
+             * resolved handler, rung 0's idiom verdict and one extension word; a miss is
+             * byte-for-byte the fetch this loop has always done, plus one lookahead read
+             * to fill the extension slot. See the long comment above the table. */
+            const uaecptr z3660_dopc_pc = (uaecptr)regs.instruction_pc;
+            int z3660_dopc_way = 0;
+            struct z3660_dopc_set *z3660_dopc_e = z3660_dopc_find(z3660_dopc_pc, &z3660_dopc_way);
+            int     z3660_dopc_ext_ok = 0;
+            uae_u16 z3660_dopc_ext0   = 0;
+            if (z3660_dopc_e) {
+               mmu_opcode = regs.opcode = z3660_dopc_e->opcode[z3660_dopc_way];
+               if (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_EXT0) {
+                  z3660_dopc_ext_val = z3660_dopc_e->ext0[z3660_dopc_way];
+                  z3660_dopc_ext_pc  = (unsigned int)(z3660_dopc_pc + 2u);
+               } else {
+                  z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
+               }
+            } else {
+               /* Disarm BEFORE the fetch: the previous instruction's window must not be
+                * allowed to answer this one's opcode, and on the fill path below the
+                * lookahead read has to be a real fetch or the slot would cache itself. */
+               z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+               Z3660_PROF_MARK_OPFETCH();   // C1: this fetch is the OPCODE, not an extension word
+               mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
+               if (z3660_dopc_on && z3660_dopc_ext_reachable(z3660_dopc_pc)) {
+                  z3660_dopc_ext0   = (uae_u16)get_iword_mmu040(2);
+                  z3660_dopc_ext_ok = 1;
+               }
+            }
+            const uae_u16 z3660_dopc_op = (uae_u16)regs.opcode;
             count_instr(regs.opcode);
 #if Z3660_EMU_PROF
             /* Snapshot the opcode for the sampler. regs.opcode is fair game for a handler
@@ -5534,12 +5917,42 @@ void m68k_run_mmu040(void)
              * capture in which LOOP has grown is unambiguously this and nothing else. The
              * guest stores it performs still pass through the WRITE bracket normally. */
             {
-               int z3660_blk_cyc;
-               if (z3660_blk_run((uae_u16)regs.opcode, &z3660_blk_cyc)) {
+               int z3660_blk_cyc = 0, z3660_blk_shape = 1, z3660_blk_did;
+
+               /* THE IDIOM-FLAG INTEGRATION. On a hit whose cached verdict says "not an
+                * idiom", the recognizer is not called -- so rung 0's per-dispatch test,
+                * which metal priced at about 1 % of dhrystone, costs nothing on the 88 %+
+                * of dispatches this cache expects to serve. On a miss the recognizer runs
+                * as it always has and reports the verdict the fill will store. */
+               z3660_blk_did =
+                  (z3660_dopc_e == NULL
+                   || (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_IDIOM))
+                  && z3660_blk_run(z3660_dopc_op, &z3660_blk_cyc, &z3660_blk_shape);
+
+               /* Cache maintenance BEFORE the dispatch, so nothing here depends on state
+                * a handler may have changed -- regs.opcode is documented as fair game for
+                * a handler to overwrite, and z3660_blk_run() moves regs.instruction_pc. */
+               if (z3660_dopc_e != NULL) {
+                  /* Self-correcting downgrade. The verdict is stored conservative-true,
+                   * so an entry filled while the machine could not decide (tracing, say)
+                   * says "may be an idiom"; the first pass that CAN decide, and decides
+                   * no, writes the cheaper answer back. It only ever moves toward the
+                   * static truth, and only ever after the recognizer positively
+                   * established it. */
+                  if (!z3660_blk_shape)
+                     z3660_dopc_e->meta[z3660_dopc_way] &= (uae_u8)~Z3660_DOPC_M_IDIOM;
+               } else {
+                  z3660_dopc_fill(z3660_dopc_pc, z3660_dopc_op, z3660_blk_shape,
+                                  z3660_dopc_ext_ok, z3660_dopc_ext0);
+               }
+
+               if (z3660_blk_did) {
                   cpu_cycles = z3660_blk_cyc;
                } else {
                   Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
-                  cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+                  cpu_cycles = z3660_dopc_e
+                        ? (*z3660_dopc_e->handler[z3660_dopc_way])(regs.opcode)
+                        : (*cpufunctbl[regs.opcode])(regs.opcode);
                   Z3660_PROF_EXIT();
                }
             }
@@ -5564,6 +5977,10 @@ void m68k_run_mmu040(void)
             Z3660_PROF_EXIT();
          }
       } CATCH(prb) {
+         /* C2 rung 1: the fault unwound past the rest of the instruction that armed the
+          * extension-word window, so nothing is left to consume it and Exception() is
+          * about to run with the pc somewhere else entirely. Disarm. */
+         z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
          Z3660_PROF_UNWOUND();
          Z3660_PROF_CNT(Z3660_PROF_C_FAULTS);
          if (mmu_restart) {

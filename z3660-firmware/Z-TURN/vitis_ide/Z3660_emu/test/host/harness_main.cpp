@@ -2810,7 +2810,8 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, prof_hz),         0xDC, "prof_hz         @ 0xFFFF00DC (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, arm_wall_hz),     0xE0, "arm_wall_hz     @ 0xFFFF00E0 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, blk_chunk),       0xE4, "blk_chunk       @ 0xFFFF00E4 (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xE8, "SHARED is 0xE8 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, dopc_on),         0xE8, "dopc_on         @ 0xFFFF00E8 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xEC, "SHARED is 0xEC bytes -- new fields go on the END");
 }
 
 /* ==================================================================
@@ -2903,7 +2904,15 @@ static void test_prof_wire_format(void)
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_HIT,      21, "counter BLK_HIT == 21 (appended)");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_INSNS,    22, "counter BLK_INSNS == 22 (appended)");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_BLK_BYTES,    23, "counter BLK_BYTES == 23 (appended)");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   24, "24 counters");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_HIT,     24, "counter DOPC_HIT == 24 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_MISS,    25, "counter DOPC_MISS == 25 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_EXT,     26, "counter DOPC_EXT == 26 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_INVAL,   27, "counter DOPC_INVAL == 27 (appended)");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_HIT], "DOPC_HIT") == 0,
+	      "names line up with ids (DOPC_HIT, the C2 rung-1 append)\n");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_INVAL], "DOPC_INVAL") == 0,
+	      "names line up with ids (DOPC_INVAL)\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   28, "28 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -4299,6 +4308,546 @@ static void test_blk_state_equivalence(void)
 	cpu_bringup(68030);
 }
 
+
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
+ *
+ * Two claims have to be established and they are not the same claim, so they get two
+ * suites:
+ *
+ *   STATE EQUIVALENCE  the cache changes nothing a guest can observe. Same corpus
+ *                      discipline as rung 0's -- every case runs twice from an identical
+ *                      fixture, once with SHARED.dopc_on = OFF (a pure passthrough: the
+ *                      lookup returns before it has read the table) and once with the
+ *                      cache live -- and the two outcomes are compared as whole objects,
+ *                      registers and SR and USP/ISP and a ONE MEGABYTE memcmp of guest
+ *                      physical memory covering the tables, the code, the vectors, the
+ *                      stack and the data. Plus one extra assertion rung 0 could not
+ *                      make: the RUN-LOOP PASS COUNTS must be EXACTLY equal. This cache
+ *                      changes what a pass costs and never how many there are, so an
+ *                      inequality here is a bug even when the final state agrees.
+ *
+ *   COHERENCE          the cache is invalidated by everything that could make an entry
+ *                      wrong -- and, just as importantly, is NOT invalidated by anything
+ *                      else, which is what makes it worth having. The map names three
+ *                      cases as mandatory and none of them are ordinary: self-modifying
+ *                      code, CPUSHL/CINV/PFLUSH and MMU-root changes, and DMA into an
+ *                      instruction page.
+ *
+ * The coherence suite asks the cache DIRECTLY (z3660_dopc_peek) as well as through
+ * execution. A test that can only infer the mechanism from its consequences passes for
+ * the wrong reason as soon as the consequence has a second cause.
+ * ================================================================== */
+#include "z3660_dopc.h"
+
+/* Physical layout, inside the same one-megabyte window blk_equal() memcmps. */
+#define DOPC_PCODE   0x001C0000u
+#define DOPC_PCODE2  0x001C1000u
+#define DOPC_PVEC    0x001C2000u
+#define DOPC_PSTK    0x001C3000u
+#define DOPC_PDATA   0x001C4000u
+
+#define DOPC_VCODE   0x00800000u
+#define DOPC_VVEC    0x00820000u   /* not adjacent to the code page on purpose */
+#define DOPC_VSTK    0x40003000u
+#define DOPC_VDATA   0x00900000u
+#define DOPC_VNOMAP  0x00A00000u   /* deliberately never mapped */
+#define DOPC_FAULTPC (DOPC_VCODE + 0x100u)
+
+/* The mixed loop. Chosen so the corpus covers the shapes the cache treats differently:
+ * an instruction with ONE extension word (the slot the entry can hold), one with THREE
+ * (only the first of which the slot can hold), one with none, a guest read, a guest
+ * write, and a DBcc that brings the pc back to the head so the same PCs repeat and the
+ * cache is actually exercised rather than merely present.
+ *
+ *   +0x00  2028 0000        MOVE.L (0,A0),D0
+ *   +0x04  0680 1234 5678   ADDI.L #$12345678,D0
+ *   +0x0A  2140 0004        MOVE.L D0,(4,A0)
+ *   +0x0E  5289             ADDQ.L #1,A1
+ *   +0x10  51CA FFEE        DBF    D2,+0x00
+ *   +0x14  4E71             NOP                 <- DONE
+ */
+#define DOPC_MIXED_DONE 0x14u
+/* The rung-0 idiom, so the cached idiom verdict is exercised against the fast path it
+ * gates rather than only against the recognizer's decline. */
+#define DOPC_IDIOM_DONE 0x06u
+
+struct dopc_desc {
+	int      idiom;      /* plant the bzero idiom instead of the mixed loop     */
+	uae_u32  n;          /* loop trip count                                     */
+	uae_u32  code_off;   /* where in the code page the program starts           */
+	int      map_code2;  /* map the SECOND code page (for a straddling program) */
+	int      user;       /* run in user mode                                    */
+	int      fault;      /* point A0 at an UNMAPPED page: the loop must fault   */
+	unsigned blk;        /* rung 0's knob for this case (Z3660_BLK_OFF or a cap)*/
+};
+
+/* Set by dopc_run() just before it tears the fixture down: the cached opcode at the loop
+ * head, or -1. The ANTI-VACUITY evidence -- "the two runs agree" proves nothing if the
+ * cache never held anything, and this is how the corpus knows it did. */
+static int g_dopc_peek_head;
+
+static void dopc_build(const struct dopc_desc *c)
+{
+	mmu040_gen_init();                       /* resets RAM, brings up 68040 + MMU, S=1 */
+
+	mmu040_gen_map(DOPC_VCODE, DOPC_PCODE, 0);
+	if (c->map_code2) mmu040_gen_map(DOPC_VCODE + 0x1000u, DOPC_PCODE2, 0);
+	mmu040_gen_map(DOPC_VVEC,  DOPC_PVEC,  0);
+	mmu040_gen_map(DOPC_VSTK,  DOPC_PSTK,  0);
+	mmu040_gen_map(DOPC_VDATA, DOPC_PDATA, 0);
+
+	for (uae_u32 i = 0; i < 0x1000u; i += 4)
+		hram_poke32(DOPC_PDATA + i, 0xDA7A0000u | i);
+
+	{
+		/* Plant by VIRTUAL offset from the head, so a program that straddles the code
+		 * page lands in the second frame instead of wrapping inside the first. */
+		#define DOPC_POKE(off, w)                                                       \
+			do {                                                                        \
+				uae_u32 _a = c->code_off + (uae_u32)(off);                              \
+				if (_a < 0x1000u) hram_poke16(DOPC_PCODE  + _a, (uae_u16)(w));           \
+				else              hram_poke16(DOPC_PCODE2 + _a - 0x1000u, (uae_u16)(w)); \
+			} while (0)
+		if (c->idiom) {
+			DOPC_POKE(0x00, 0x20C9);                  /* MOVE.L A1,(A0)+ */
+			DOPC_POKE(0x02, 0x51C9);                  /* DBF D1,-4       */
+			DOPC_POKE(0x04, 0xFFFC);
+			DOPC_POKE(0x06, 0x4E71);                  /* DONE: nop       */
+		} else {
+			DOPC_POKE(0x00, 0x2028); DOPC_POKE(0x02, 0x0000);
+			DOPC_POKE(0x04, 0x0680); DOPC_POKE(0x06, 0x1234); DOPC_POKE(0x08, 0x5678);
+			DOPC_POKE(0x0A, 0x2140); DOPC_POKE(0x0C, 0x0004);
+			DOPC_POKE(0x0E, 0x5289);
+			DOPC_POKE(0x10, 0x51CA); DOPC_POKE(0x12, 0xFFEE);
+			DOPC_POKE(0x14, 0x4E71);                  /* DONE: nop       */
+		}
+		#undef DOPC_POKE
+	}
+	hram_poke16(DOPC_PCODE + 0x100, 0x60FE);              /* FAULT: bra.s .          */
+	hram_poke32(DOPC_PVEC | 0x08, DOPC_FAULTPC);          /* vector 2: access fault  */
+	hram_poke32(DOPC_PVEC | 0x20, DOPC_FAULTPC);          /* vector 8: privilege     */
+	hram_poke32(DOPC_PVEC | 0x24, DOPC_FAULTPC);          /* vector 9: trace         */
+
+	cpu_set_context(DOPC_VCODE + c->code_off);
+	regs.vbr = DOPC_VVEC;
+	regs.s = 1;
+	m68k_areg(regs, 7) = DOPC_VSTK | 0xF00;
+
+	/* Poison the register file and the CCR for the same reason rung 0's fixture does:
+	 * the two runs of a case are sequential on one machine, so whatever the reference
+	 * run leaves behind is exactly the state the second run is being checked for
+	 * producing, and an omission would agree with it perfectly. */
+	for (int i = 0; i < 8; i++) {
+		m68k_dreg(regs, i) = 0xD0D00000u | (uae_u32)i;
+		if (i != 7) m68k_areg(regs, i) = 0xA0A00000u | (uae_u32)i;
+	}
+	CLEAR_CZNV();
+	SET_CFLG(1); SET_VFLG(1); SET_ZFLG(1); SET_NFLG(1); SET_XFLG(1);
+	MakeSR();
+	MakeFromSR();
+
+	m68k_areg(regs, 0) = c->fault ? DOPC_VNOMAP : DOPC_VDATA;
+	m68k_areg(regs, 1) = c->idiom ? 0x00000000u : 0x0000A000u;
+	m68k_dreg(regs, 1) = 0xABCD0000u | c->n;   /* the idiom's counter        */
+	m68k_dreg(regs, 2) = 0x12340000u | c->n;   /* the mixed loop's counter   */
+	MakeSR();
+
+	if (c->user) {
+		regs.usp = DOPC_VSTK | 0xE00;
+		regs.s = 0;
+		MakeSR();
+		m68k_areg(regs, 7) = regs.usp;
+	}
+}
+
+/* Build, set BOTH knobs through the mailbox (do_specialties resyncs every 64th call, so
+ * a directly-poked variable would be clobbered mid-run), drive to completion or to the
+ * fault handler, snapshot. */
+static void dopc_run(struct blk_snap *s, const struct dopc_desc *c, unsigned knob, int budget)
+{
+	const uae_u32 done = DOPC_VCODE + c->code_off
+	                   + (c->idiom ? DOPC_IDIOM_DONE : DOPC_MIXED_DONE);
+	unsigned long polls0;
+	int steps = 0, reached = 0;
+	int super_at_head;
+
+	dopc_build(c);
+	shared->dopc_on   = knob;
+	shared->blk_chunk = c->blk;
+	z3660_knobs_sync();
+	super_at_head = c->user ? 0 : 1;
+
+	polls0 = harness_ipl_polls;
+	regs.spcflags |= Z_SPCFLAG_MODE_CHANGE;
+	while (steps < budget) {
+		uae_u32 pc = m68k_getpc();
+		if (pc == done)         { reached = 1; break; }
+		if (pc == DOPC_FAULTPC) { reached = 2; break; }
+		m68k_run_mmu040();
+		steps++;
+	}
+	regs.spcflags = 0;
+
+	g_dopc_peek_head = z3660_dopc_peek(DOPC_VCODE + c->code_off, super_at_head);
+	blk_take(s, polls0, steps, reached);
+
+	shared->dopc_on   = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	mmu040_off();
+}
+
+/* One corpus entry: run it with the cache OFF and with the cache ON, demand the two
+ * outcomes are identical, demand the pass counts are identical, and demand the cache
+ * actually held the loop head in the ON run. */
+static void dopc_case(const struct dopc_desc *c, const char *what)
+{
+	int budget = (int)(c->n + 2u) * 8 + 64;
+	int ref_peek, fast_peek;
+	uae_u16 head = c->idiom ? 0x20C9 : 0x2028;
+
+	dopc_run(&g_blk_ref, c, Z3660_DOPC_OFF, budget);
+	ref_peek = g_dopc_peek_head;
+	dopc_run(&g_blk_fast, c, Z3660_DOPC_DEFAULT, budget);
+	fast_peek = g_dopc_peek_head;
+
+	blk_equal(&g_blk_ref, &g_blk_fast, what);
+
+	CHECK_EQ32((uae_u32)g_blk_fast.steps, (uae_u32)g_blk_ref.steps, what);
+	CHECK_EQ32((uae_u32)ref_peek, 0xFFFFFFFFu,
+	           "OFF is a pure passthrough: nothing was cached at all");
+	if (c->fault) {
+		/* A run that faults on its first instruction may never complete one, so the
+		 * head need not be cached -- but the OFF arm must still have cached nothing. */
+		g_pass++;
+	} else {
+		CHECK_EQ32((uae_u32)fast_peek, (uae_u32)head,
+		           "the cache actually held the loop head -- the comparison is not "
+		           "two runs of the same uncached interpreter");
+	}
+}
+
+static void test_dopc_state_equivalence(void)
+{
+	printf("[test] C2 decoded-op cache: state equivalence against the uncached path\n");
+
+	struct dopc_desc c;
+
+	/* Geometry first, against the compiler's own sizeof and not against the constants
+	 * the struct was supposed to be built from. A set that grows past 64 bytes doubles
+	 * the hit path's line traffic and nothing else in this suite would notice. */
+	/* The set's size is a claim about the TARGET, where a handler pointer is four bytes.
+	 * This host builds the same struct with eight-byte pointers, so it is legitimately 80
+	 * bytes here and asserting 64 would be asserting the wrong machine. What transfers is
+	 * the field arithmetic -- assert that, and let newcpu.cpp's compile-time tripwire
+	 * refuse the 32-bit build if the struct ever grows a field or a hole. */
+	{
+		unsigned fields = 16u                              /* tag[4]     */
+		                + 4u + 4u                          /* stamp, victim */
+		                + 4u * (unsigned)sizeof(void *)    /* handler[4] */
+		                + 8u + 8u + 4u + 4u;               /* opcode[4], ext0[4], meta[4], pad */
+		CHECK_EQ32(z3660_dopc_set_bytes(), fields,
+		           "the set is exactly its fields: no padding, no hole");
+		CHECK_EQ32(16u + 4u + 4u + 4u * 4u + 8u + 8u + 4u + 4u, Z3660_DOPC_SET_BYTES,
+		           "...and with 32-bit handler pointers that is 64 bytes -- two Cortex-A9 "
+		           "lines, with all four tags and the stamp inside the first");
+		CHECK_EQ32(z3660_dopc_table_bytes(), Z3660_DOPC_SETS * fields,
+		           "the table is SETS x one set, contiguous");
+	}
+	CHECK_EQ32(Z3660_DOPC_ENTRIES, 4096u, "4096 entries, from the map's §9.1 measurement");
+	CHECK_EQ32(Z3660_DOPC_WAYS,    4u,    "4-way");
+	CHECK_EQ32(Z3660_DOPC_BYTES,   Z3660_DOPC_ENTRIES * 16u,
+	           "64 KB at 16 bytes per entry -- the map's sizing budget");
+
+	/* The switch rule. Every branch, including the ones no metal session will reach. */
+	CHECK_EQ32(z3660_dopc_resolve(Z3660_DOPC_UNSET), 1u,
+	           "UNSET resolves to the DEFAULT and not to off -- a core0 built before the "
+	           "field existed must still run the shipped behaviour");
+	CHECK_EQ32(z3660_dopc_resolve(Z3660_DOPC_OFF),   0u, "the off sentinel is off");
+	CHECK_EQ32(z3660_dopc_resolve(1u),               1u, "1 is on");
+	CHECK_EQ32(z3660_dopc_resolve(0xFFFFFFFEu),      1u,
+	           "...and so is anything else, including one below the off sentinel");
+	CHECK_EQ32(z3660_dopc_set(Z3660_DOPC_OFF), 0u, "OFF through the setter");
+	CHECK_EQ32(z3660_dopc_get(), 0u, "...and the read-back agrees");
+	CHECK_EQ32(z3660_dopc_set(Z3660_DOPC_UNSET), Z3660_DOPC_DEFAULT, "default through the setter");
+
+	/* THE SENTINEL SWEEP. The empty-way marker must not be a legal key of the set it
+	 * sits in, for ANY pc and either address space -- and this is not a hypothetical:
+	 * a fixed sentinel of 1 is exactly "pc 0 in supervisor mode", which a guest reaches
+	 * by taking an exception through an unplanted vector, and it dispatched a NULL
+	 * handler out of a way nothing had ever filled the first time this suite ran. */
+	{
+		int bad = 0;
+		for (unsigned i = 0; i < Z3660_DOPC_SETS; i++) {
+			unsigned e = Z3660_DOPC_TAG_EMPTY(i);
+			if (((e >> 1) & (Z3660_DOPC_SETS - 1u)) == i) bad++;
+		}
+		CHECK_EQ32((uae_u32)bad, 0u,
+		           "no set's empty marker is a legal key of that set (all 1024 swept)");
+	}
+	CHECK_EQ32(Z3660_DOPC_KEY(0u, 1), 1u,
+	           "pc 0 in supervisor mode is key 1 -- the value a fixed sentinel would have been");
+	CHECK(Z3660_DOPC_KEY(0u, 1) != Z3660_DOPC_TAG_EMPTY(Z3660_DOPC_INDEX(0u)),
+	      "...and it does not match set 0's empty marker\n");
+	CHECK_EQ32(Z3660_DOPC_INDEX(0x00800000u), Z3660_DOPC_INDEX(0x00800000u + (Z3660_DOPC_SETS * 2u)),
+	           "the index wraps every 2 KB of guest pc, as (pc >> 1) & 1023 says");
+	CHECK(Z3660_DOPC_KEY(0x00800000u, 0) != Z3660_DOPC_KEY(0x00800000u, 1),
+	      "supervisor and user tags for the same VA differ: a context switch cannot alias\n");
+
+	memset(&c, 0, sizeof c);
+	c.blk = Z3660_BLK_OFF;
+
+	c.n = 40; dopc_case(&c, "mixed loop, supervisor, 40 iterations");
+	c.n = 1;  dopc_case(&c, "mixed loop, one iteration (nothing is warm yet)");
+	c.n = 0;  dopc_case(&c, "mixed loop, DBcc boundary: n=0 still runs the body once");
+
+	c.n = 40; c.user = 1; dopc_case(&c, "mixed loop in USER mode (the tag's address-space bit)");
+	c.user = 0;
+
+	/* The straddle. The head sits two bytes from the end of the code page, so the
+	 * extension-word lookahead must REFUSE -- its granule test is the only thing keeping
+	 * it from issuing a fetch the opcode did not prove safe -- while the instructions
+	 * themselves still execute across the boundary. */
+	c.n = 8; c.code_off = 0x0FFEu; c.map_code2 = 1;
+	dopc_case(&c, "program straddling the code page (the lookahead must decline)");
+	c.code_off = 0; c.map_code2 = 0;
+
+	/* Faulting: the run loop's CATCH disarms the extension-word window, and the whole
+	 * exception frame is compared byte for byte by blk_equal's memcmp of the stack. */
+	c.n = 8; c.fault = 1;
+	dopc_case(&c, "the loop faults on an unmapped operand (frame compared as memory)");
+	c.fault = 0;
+
+	/* Rung 0 and rung 1 together, which is the combination that ships. The cached idiom
+	 * verdict gates the recognizer, so a wrong verdict shows up here as a different
+	 * final state or a different pass count -- and the pass-count check is the sharp one,
+	 * because a lost fast path costs passes without changing any register. */
+	c.idiom = 1; c.n = 300; c.blk = 256u;
+	dopc_case(&c, "the rung-0 idiom with BLK 256 and the cache live");
+	c.n = 300; c.blk = Z3660_BLK_OFF;
+	dopc_case(&c, "the same idiom with BLK OFF: the verdict is cached either way");
+	c.n = 0; c.blk = 256u;
+	dopc_case(&c, "idiom, n=0 (one iteration) with BLK 256");
+	c.idiom = 0; c.blk = Z3660_BLK_OFF;
+
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_UNSET;
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * COHERENCE
+ *
+ * The fixture is two instructions:
+ *
+ *   +0x00  5289   ADDQ.L #1,A1
+ *   +0x02  60FC   BRA.S  -4     -> +0x00
+ *
+ * Run it twice round and the head is cached. Then poke 0x5489 (ADDQ.L #2,A1) into the
+ * code page BEHIND the interpreter's back -- hram_poke16 writes the host buffer directly,
+ * which is exactly what core0's DMA does and what a guest store the cache does not watch
+ * looks like from in here -- and step the head once more. A1 advances by 1 if the stale
+ * decode was used and by 2 if it was not. One bit of evidence, unambiguous, and it does
+ * not depend on any counter being compiled in.
+ * ================================================================== */
+#define DOPC_C_ADD1  0x5289u
+#define DOPC_C_ADD2  0x5489u
+
+static void dopc_coh_build(void)
+{
+	mmu040_gen_init();
+	mmu040_gen_map(DOPC_VCODE, DOPC_PCODE, 0);
+	mmu040_gen_map(DOPC_VVEC,  DOPC_PVEC,  0);
+	mmu040_gen_map(DOPC_VSTK,  DOPC_PSTK,  0);
+	mmu040_gen_map(DOPC_VDATA, DOPC_PDATA, 0);
+
+	hram_poke16(DOPC_PCODE + 0x00, DOPC_C_ADD1);   /* ADDQ.L #1,A1 */
+	hram_poke16(DOPC_PCODE + 0x02, 0x60FC);        /* BRA.S -4     */
+	hram_poke16(DOPC_PCODE + 0x100, 0x60FE);
+	hram_poke32(DOPC_PVEC | 0x08, DOPC_FAULTPC);
+	hram_poke32(DOPC_PVEC | 0x20, DOPC_FAULTPC);
+
+	cpu_set_context(DOPC_VCODE);
+	regs.vbr = DOPC_VVEC;
+	regs.s = 1;
+	m68k_areg(regs, 7) = DOPC_VSTK | 0xF00;
+	m68k_areg(regs, 0) = DOPC_VDATA;
+	m68k_areg(regs, 1) = 0;
+	m68k_dreg(regs, 1) = DOPC_C_ADD2;
+	MakeSR();
+
+	shared->dopc_on   = Z3660_DOPC_DEFAULT;
+	shared->blk_chunk = Z3660_BLK_OFF;
+	z3660_knobs_sync();
+	regs.spcflags |= Z_SPCFLAG_MODE_CHANGE;
+}
+
+static void dopc_coh_step(int n)
+{
+	for (int i = 0; i < n; i++) {
+		regs.spcflags |= Z_SPCFLAG_MODE_CHANGE;
+		m68k_run_mmu040();
+	}
+}
+
+/* Warm the cache on the head, rewrite the head behind the interpreter's back, apply
+ * `maintain`, and report how far A1 moved on the next execution of the head:
+ * 1 == the stale decode ran, 2 == the fresh one did. */
+typedef void (*dopc_maint_fn)(void);
+static uae_u32 dopc_coh_probe(dopc_maint_fn maintain, int *cached_before, int *cached_after)
+{
+	uae_u32 a1_before, a1_after;
+
+	dopc_coh_build();
+	dopc_coh_step(4);                       /* two round trips: the head is cached now */
+	*cached_before = z3660_dopc_peek(DOPC_VCODE, 1);
+
+	hram_poke16(DOPC_PCODE + 0x00, DOPC_C_ADD2);   /* the interpreter never sees this */
+	if (maintain) maintain();
+	*cached_after = z3660_dopc_peek(DOPC_VCODE, 1);
+
+	a1_before = m68k_areg(regs, 1);
+	dopc_coh_step(1);                       /* execute the head once */
+	a1_after = m68k_areg(regs, 1);
+
+	regs.spcflags = 0;
+	shared->dopc_on   = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	return a1_after - a1_before;
+}
+
+static void dopc_m_cpushl(void)   { flush_mmu040(0, 0); }
+static void dopc_m_pflush_pg(void){ mmu_flush_atc(DOPC_VCODE, true, true); }
+static void dopc_m_pflush_all(void){ mmu_flush_atc_all(true); }
+static void dopc_m_settc(void)    { mmu_set_tc(0x8000); }
+static void dopc_m_urp(void)      { uae_u32 v = regs.urp; m68k_move2c(0x806, &v); }
+static void dopc_m_srp(void)      { uae_u32 v = regs.srp; m68k_move2c(0x807, &v); }
+static void dopc_m_cacr(void)     { uae_u32 v = 0; m68k_move2c(2, &v); }
+static void dopc_m_dma(void)      { z3660_dopc_invalidate_dma(DOPC_PCODE, 0x1000u); }
+static void dopc_m_tbl(void)      { build_cpufunctbl(); }
+static void dopc_m_knob(void)     { shared->dopc_on = Z3660_DOPC_OFF; z3660_knobs_sync();
+                                    shared->dopc_on = Z3660_DOPC_DEFAULT; z3660_knobs_sync(); }
+static void dopc_m_wrap(void)     { z3660_dopc_force_generation(0xFFFFFFFFu);
+                                    z3660_dopc_invalidate(Z3660_DOPC_INV_WRAP); }
+
+static void dopc_coh_one(dopc_maint_fn m, uae_u32 want_delta, const char *what)
+{
+	int before = -1, after = -1;
+	uae_u32 d = dopc_coh_probe(m, &before, &after);
+	CHECK_EQ32(d, want_delta, what);
+	CHECK_EQ32((uae_u32)before, DOPC_C_ADD1,
+	           "...the head really was cached before the rewrite (anti-vacuity)");
+	if (want_delta == 2)
+		CHECK_EQ32((uae_u32)after, 0xFFFFFFFFu, "...and the entry is gone afterwards");
+	else
+		CHECK_EQ32((uae_u32)after, DOPC_C_ADD1, "...and the entry is still there");
+}
+
+static void test_dopc_coherence(void)
+{
+	printf("[test] C2 decoded-op cache: coherence -- what invalidates it, and what does not\n");
+
+	/* THE NEGATIVE CASE FIRST, because it is what makes every positive one meaningful.
+	 * A guest store into a code page with no cache maintenance is NOT required to be
+	 * visible to the instruction stream on a 68040 -- the architecture puts that duty on
+	 * the guest, and this cache takes the architecture at its word rather than checking
+	 * every write, which is the only way it can be cheap enough to be worth having. So
+	 * the stale decode runs, and this test pins that as a documented contract rather
+	 * than leaving it to be discovered. Every case below it changes the answer. */
+	dopc_coh_one(NULL, 1u,
+	             "no maintenance: the stale decode runs (the 68040 contract, pinned)");
+
+	dopc_coh_one(dopc_m_cpushl,    2u, "CPUSHL / CINV (flush_mmu040) invalidates");
+	dopc_coh_one(dopc_m_pflush_pg, 2u, "PFLUSH of one page invalidates");
+	dopc_coh_one(dopc_m_pflush_all,2u, "PFLUSHA invalidates");
+	dopc_coh_one(dopc_m_settc,     2u, "a TC write (MOVEC to TC -> mmu_set_tc) invalidates");
+	dopc_coh_one(dopc_m_urp,       2u, "MOVEC to URP -- an MMU ROOT change -- invalidates");
+	dopc_coh_one(dopc_m_srp,       2u, "MOVEC to SRP invalidates");
+	dopc_coh_one(dopc_m_cacr,      2u, "MOVEC to CACR invalidates");
+	dopc_coh_one(dopc_m_dma,       2u,
+	             "DMA into an instruction page invalidates -- core1's own side of the "
+	             "piscsi mailbox calls exactly this, after core0 has written guest DRAM");
+	dopc_coh_one(dopc_m_tbl,       2u,
+	             "build_cpufunctbl() invalidates: the entries hold RESOLVED handler "
+	             "pointers, and a mode change makes every one of them wrong");
+	dopc_coh_one(dopc_m_knob,      2u, "toggling the switch off and on invalidates");
+
+	/* THE GENERATION-STAMP PATH. Validity is a stamp rather than a per-entry flag, which
+	 * is what makes invalidation O(1) -- and it has exactly one boundary, 2^32
+	 * invalidations away, where the counter wraps back onto stamps that are still
+	 * sitting in the table. Driven directly here rather than left as an argument. */
+	dopc_coh_one(dopc_m_wrap, 2u, "the generation wrap clears the table rather than "
+	                              "revalidating it");
+	CHECK_EQ32(z3660_dopc_generation(), 1u,
+	           "...and it resumes at 1, never at 0: generation 0 is reserved so that a "
+	           "zeroed table reads as entirely stale");
+
+	/* SELF-MODIFYING CODE, EXECUTED BY THE GUEST. Everything above pokes memory from the
+	 * host side. This one makes the guest do the whole sequence itself -- write the new
+	 * opcode, CPUSHL, branch back -- which is the shape the AMIX kernel actually
+	 * generates, and it exercises the store path, the flush handler and the cache in the
+	 * order a real guest puts them in.
+	 *
+	 *   +0x00  5289               ADDQ.L #1,A1
+	 *   +0x02  33C1 0080 0000     MOVE.W D1,$00800000     ; rewrite the head
+	 *   +0x08  F468               CPUSHL (A0)             ; the architectural maintenance
+	 *   +0x0A  60F4               BRA.S  -12  -> +0x00
+	 */
+	{
+		uae_u32 a1_before, a1_after;
+		int cached;
+
+		mmu040_gen_init();
+		mmu040_gen_map(DOPC_VCODE, DOPC_PCODE, 0);
+		mmu040_gen_map(DOPC_VVEC,  DOPC_PVEC,  0);
+		mmu040_gen_map(DOPC_VSTK,  DOPC_PSTK,  0);
+		hram_poke16(DOPC_PCODE + 0x00, DOPC_C_ADD1);
+		hram_poke16(DOPC_PCODE + 0x02, 0x33C1);
+		hram_poke32(DOPC_PCODE + 0x04, DOPC_VCODE);
+		hram_poke16(DOPC_PCODE + 0x08, 0xF468);
+		hram_poke16(DOPC_PCODE + 0x0A, 0x60F4);
+		hram_poke16(DOPC_PCODE + 0x100, 0x60FE);
+		hram_poke32(DOPC_PVEC | 0x08, DOPC_FAULTPC);
+
+		cpu_set_context(DOPC_VCODE);
+		regs.vbr = DOPC_VVEC;
+		regs.s = 1;
+		m68k_areg(regs, 7) = DOPC_VSTK | 0xF00;
+		m68k_areg(regs, 0) = DOPC_VCODE;
+		m68k_areg(regs, 1) = 0;
+		m68k_dreg(regs, 1) = DOPC_C_ADD2;
+		MakeSR();
+
+		shared->dopc_on   = Z3660_DOPC_DEFAULT;
+		shared->blk_chunk = Z3660_BLK_OFF;
+		z3660_knobs_sync();
+
+		dopc_coh_step(4);        /* ADDQ, MOVE.W, CPUSHL, BRA -- one whole round trip */
+		cached = z3660_dopc_peek(DOPC_VCODE, 1);
+		CHECK_EQ32(hram_peek16(DOPC_PCODE + 0x00), DOPC_C_ADD2,
+		           "the guest's own store landed in the code page");
+		CHECK_EQ32((uae_u32)cached, 0xFFFFFFFFu,
+		           "the guest's own CPUSHL invalidated the head it had just rewritten");
+
+		a1_before = m68k_areg(regs, 1);
+		dopc_coh_step(1);
+		a1_after = m68k_areg(regs, 1);
+		CHECK_EQ32(a1_after - a1_before, 2u,
+		           "self-modifying code: the guest executes the NEW instruction");
+
+		regs.spcflags = 0;
+	}
+
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+
 /* ==================================================================
  * The BLK_ counters: the utilisation verdict a metal capture will be read through.
  *
@@ -4359,6 +4908,152 @@ static void test_blk_counters(void)
 	z3660_knobs_sync();
 	cpu_bringup(68030);
 }
+
+/* ==================================================================
+ * THE DOPC_ COUNTERS -- and, through them, THE HIT PATH'S COST
+ *
+ * The map pre-registers this rung's failure mode by name: **"a high hit rate with a low
+ * speedup"**, which is what happens when the entry's tag check costs as much as the fetch
+ * it replaces. The counters are what turn that from a worry into a measurement, so their
+ * arithmetic is pinned here rather than sanity-checked on metal, against a workload of
+ * known shape.
+ *
+ * It is also the only place the hit path's cost can be attacked from the host at all. An
+ * ARM instruction count comes out of objdump, not out of x86-64; what IS measurable here
+ * is the WORK REMOVED -- how many instruction-stream fetches the same guest workload
+ * still performs with the cache live. That is the numerator of the whole rung, and a
+ * capture where the fetches did not fall is a cache that is hitting and not saving.
+ * ================================================================== */
+struct dopc_cnt { uae_u64 c[Z3660_PROF_C_COUNT]; int steps; };
+
+static void dopc_count_run(struct dopc_cnt *out, unsigned knob, uae_u32 n)
+{
+	struct dopc_desc c;
+	const uae_u32 done = DOPC_VCODE + DOPC_MIXED_DONE;
+	int steps = 0, budget = (int)(n + 2u) * 8 + 64;
+
+	memset(&c, 0, sizeof c);
+	c.n = n; c.blk = Z3660_BLK_OFF;
+
+	dopc_build(&c);
+	shared->dopc_on   = knob;
+	shared->blk_chunk = Z3660_BLK_OFF;
+	z3660_knobs_sync();
+
+	/* Zeroed AFTER the fixture is built: the page-table pokes and the bring-up are not
+	 * the workload, and counting them would put the same constant in both arms and
+	 * flatten the ratio this test exists to measure. */
+	z3660_prof_zero();
+	regs.spcflags |= Z_SPCFLAG_MODE_CHANGE;
+	while (steps < budget) {
+		if (m68k_getpc() == done) break;
+		m68k_run_mmu040();
+		steps++;
+	}
+	regs.spcflags = 0;
+
+	memcpy(out->c, (const void *)z3660_prof_cnt, sizeof out->c);
+	out->steps = steps;
+
+	shared->dopc_on   = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	mmu040_off();
+}
+
+static void test_dopc_counters(void)
+{
+	printf("[test] C2 decoded-op cache counters: hit rate, and the fetches that stopped happening\n");
+
+	struct dopc_cnt off, on;
+	const uae_u32 N = 40;            /* 41 iterations of a five-instruction loop */
+
+	z3660_prof_set_buckets(0);
+	dopc_count_run(&off, Z3660_DOPC_OFF,     N);
+	dopc_count_run(&on,  Z3660_DOPC_DEFAULT, N);
+
+	/* Printed, not just asserted. The assertions below are floors chosen against the
+	 * metal pre-registration; the actual figures are what a reader wants when the metal
+	 * capture disagrees with them, and a test that only says PASS cannot supply one. */
+	printf("       insns %llu | DOPC hit %llu miss %llu ext %llu | FETCH %llu -> %llu\n",
+	       (unsigned long long)on.c[Z3660_PROF_C_INSNS],
+	       (unsigned long long)on.c[Z3660_PROF_C_DOPC_HIT],
+	       (unsigned long long)on.c[Z3660_PROF_C_DOPC_MISS],
+	       (unsigned long long)on.c[Z3660_PROF_C_DOPC_EXT],
+	       (unsigned long long)off.c[Z3660_PROF_C_FETCH],
+	       (unsigned long long)on.c[Z3660_PROF_C_FETCH]);
+
+	/* OFF is a pure passthrough all the way down to the instrument: the lookup returns
+	 * before it has read the table, so it cannot even count a miss. A counter that moved
+	 * here would mean the off state is a second implementation rather than the reference
+	 * one, which is the property the whole equivalence corpus rests on. */
+	CHECK_EQ32((uae_u32)off.c[Z3660_PROF_C_DOPC_HIT],  0, "OFF: no hits");
+	CHECK_EQ32((uae_u32)off.c[Z3660_PROF_C_DOPC_MISS], 0, "OFF: not even a miss is counted");
+	CHECK_EQ32((uae_u32)off.c[Z3660_PROF_C_DOPC_EXT],  0, "OFF: no extension words served");
+
+	/* THE INVARIANT THAT MAKES THE HIT RATE A HIT RATE. Every run-loop pass consults the
+	 * cache exactly once, so HIT + MISS is the number of dispatches -- which is what
+	 * DOPC_HIT / (DOPC_HIT + DOPC_MISS) has to be a fraction of for the pre-registered
+	 * 88 % to mean anything on metal. */
+	CHECK_EQ32((uae_u32)(on.c[Z3660_PROF_C_DOPC_HIT] + on.c[Z3660_PROF_C_DOPC_MISS]),
+	           (uae_u32)on.c[Z3660_PROF_C_INSNS],
+	           "HIT + MISS == INSNS: every dispatch consults the cache exactly once");
+
+	/* The cache changes what a dispatch COSTS, never how many there are. */
+	CHECK_EQ32((uae_u32)on.c[Z3660_PROF_C_INSNS], (uae_u32)off.c[Z3660_PROF_C_INSNS],
+	           "the same guest instructions retire either way");
+	CHECK_EQ32((uae_u32)on.steps, (uae_u32)off.steps, "...in the same number of run-loop passes");
+
+	/* Hit rate. A five-instruction loop run 41 times misses only on its first pass, so
+	 * this workload is friendlier than dhrystone by construction -- the assertion is
+	 * against the pre-registered metal bar (>= 88 %) precisely so that it is a floor and
+	 * not a fit to this fixture. */
+	{
+		uae_u64 tot = on.c[Z3660_PROF_C_DOPC_HIT] + on.c[Z3660_PROF_C_DOPC_MISS];
+		unsigned pct = tot ? (unsigned)((on.c[Z3660_PROF_C_DOPC_HIT] * 100u) / tot) : 0u;
+		CHECK(pct >= 88u,
+		      "hit rate %u%% clears the pre-registered >= 88 %% bar on a repeating loop\n", pct);
+		CHECK(on.c[Z3660_PROF_C_DOPC_MISS] >= 5,
+		      "...and the loop's five distinct PCs each missed once on the way in\n");
+	}
+
+	/* THE WORK REMOVED. Uncached, one iteration of this loop performs nine
+	 * instruction-stream fetches: five opcodes plus a displacement, a 32-bit immediate,
+	 * another displacement and the DBcc's. Cached, the five opcodes come out of the
+	 * entries and three of the four extension words come out of the entries' single
+	 * slots -- the ADDI's 32-bit immediate goes through get_ilong, which the one-word
+	 * slot cannot answer, and it is the honest remainder this design does not reach. */
+	CHECK(on.c[Z3660_PROF_C_FETCH] * 3u < off.c[Z3660_PROF_C_FETCH],
+	      "instruction-stream fetches fall by more than two thirds (%llu -> %llu)\n",
+	      (unsigned long long)off.c[Z3660_PROF_C_FETCH],
+	      (unsigned long long)on.c[Z3660_PROF_C_FETCH]);
+	CHECK(on.c[Z3660_PROF_C_IFETCH_CALLS] < off.c[Z3660_PROF_C_IFETCH_CALLS],
+	      "...and so do the entries into the shared FETCHOP/FETCHEX bracket, which is "
+	      "what the stage profile will report as those two buckets shrinking\n");
+	CHECK(on.c[Z3660_PROF_C_DOPC_EXT] >= 3u * (uae_u64)N,
+	      "three extension words per iteration are served from the entries (%llu)\n",
+	      (unsigned long long)on.c[Z3660_PROF_C_DOPC_EXT]);
+	CHECK(on.c[Z3660_PROF_C_FETCH] + on.c[Z3660_PROF_C_DOPC_EXT]
+	      + on.c[Z3660_PROF_C_DOPC_HIT] >= off.c[Z3660_PROF_C_FETCH],
+	      "every fetch the uncached run made is accounted for: still fetched, served "
+	      "from a slot, or supplied by a hit\n");
+
+	/* Invalidation is counted, and the count is what decides whether the conservative
+	 * whole-cache policy is worth narrowing. */
+	{
+		uae_u64 n0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - n0), 2u,
+		           "DOPC_INVAL counts invalidations, whatever the cause");
+	}
+
+	z3660_prof_zero();
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_UNSET;
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
 #endif /* Z3660_EMU_PROF */
 
 int main(int argc, char **argv)
@@ -4415,6 +5110,8 @@ int main(int argc, char **argv)
 	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
 	test_blk_state_equivalence();
+	test_dopc_state_equivalence();
+	test_dopc_coherence();
 	test_prof_wire_format();
 	test_prof_build_variant();
 #if Z3660_EMU_PROF
@@ -4426,6 +5123,7 @@ int main(int argc, char **argv)
 	test_prof_translation_counters();
 	test_prof_ifetch_calls();
 	test_blk_counters();
+	test_dopc_counters();
 	test_prof_ring();
 	test_prof_under_execution();
 #endif

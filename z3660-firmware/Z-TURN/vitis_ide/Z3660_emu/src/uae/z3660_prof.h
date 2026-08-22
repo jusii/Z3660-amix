@@ -494,7 +494,11 @@ enum {
    Z3660_PROF_C_BLK_HIT     = 21, /* block-idiom fast-path CHUNKS serviced             */
    Z3660_PROF_C_BLK_INSNS   = 22, /* ... guest instructions those chunks retired       */
    Z3660_PROF_C_BLK_BYTES   = 23, /* ... bytes zeroed / copied / flushed by them       */
-   Z3660_PROF_C_COUNT       = 24
+   Z3660_PROF_C_DOPC_HIT    = 24, /* decoded-op cache: opcode+decode served from a hit */
+   Z3660_PROF_C_DOPC_MISS   = 25, /* ... consulted and not found (the fetch still ran) */
+   Z3660_PROF_C_DOPC_EXT    = 26, /* ... extension words served from the entry's slot  */
+   Z3660_PROF_C_DOPC_INVAL  = 27, /* ... whole-cache invalidations, all causes         */
+   Z3660_PROF_C_COUNT       = 28
 };
 
 /* THE THREE `BLK_` COUNTERS ARE THE UTILISATION VERDICT, and they are three rather than
@@ -523,6 +527,35 @@ enum {
  * per-instruction machinery; measuring it with the machinery it removes would be the
  * §10.1 distortion applied to the one place it would be worst. Appended ids, no version
  * bump -- see IFETCH_CALLS above for that reasoning, which is the same here. */
+
+/* THE FOUR `DOPC_` COUNTERS ARE THE DECODED-OP CACHE'S VERDICT, and the map is explicit
+ * about why they are mandatory rather than nice: **"a high hit rate with a low speedup is
+ * the expected failure mode"** (§11.2). It is what happens when the entry's tag check and
+ * validity check cost as much as the fetch they replace -- and at a 96.6-98.5 % tier-0
+ * ipagecache hit rate, what this cache must beat is an already-fast path. Instrumenting
+ * the hit rate is what turns that worry into a measurement instead of an argument.
+ *
+ * `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` is the hit rate, pre-registered at >= 88 % on a
+ * dhrystone run and >= 85 % on the raw disk read -- per-workload because the IO workload
+ * is the one that stresses this cache and the tier-0 page caches for L2 at the same time,
+ * and it is also the workload whose measured PC distribution chose 4096 entries over
+ * 2048. A hit rate that clears those bars while `dhry` does NOT clear 5000 is the failure
+ * mode arriving, and the next thing to read is the hit path's ARM instruction count.
+ *
+ * `DOPC_EXT` counts extension words served out of the entry rather than fetched, and it
+ * exists because the two halves of rung 1 are separable and are worth separating: the
+ * cache removes `FETCHOP` (17.34 %) by construction on every hit, but `FETCHEX` (11.31 %)
+ * only for the instructions whose first extension word fits the entry's single slot.
+ * `DOPC_EXT / FETCH` says how much of the second half was actually reached, and the
+ * pre-registered gate -- FETCHOP + FETCHEX below 18 % in the next stage profile -- is not
+ * reachable on the first half alone.
+ *
+ * `DOPC_INVAL` is the price of the conservative policy, and it is the counter that
+ * decides whether narrowing is worth doing. Invalidation here is whole-cache and O(1),
+ * but AMIX flushes a great deal -- the CPUSHL loop alone is 7.79 % of a boot -- so a
+ * capture where `DOPC_INVAL` is large relative to `DOPC_MISS` says the misses are
+ * self-inflicted rather than capacity, and the fix is a narrower invalidation (per-page,
+ * or a separate generation per address space) and not a bigger cache. */
 
 /* WHY `IFETCH_CALLS` EXISTS, AND WHY IT IS THE ONE COUNTER WORTH ADDING.
  *

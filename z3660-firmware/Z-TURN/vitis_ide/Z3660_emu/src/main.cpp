@@ -32,6 +32,7 @@
 #include "newcpu.h"
 #include "custom.h"
 #include "defines.h"
+#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: the DMA arm of the decoded-op cache's invalidation */
 
 SHARED *shared;
 extern LOCAL local;
@@ -345,6 +346,22 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
       && piscsi_addr_stash!=0 && piscsi_len_stash!=0)
    {
       Xil_L1DCacheInvalidateRange(piscsi_addr_stash,piscsi_len_stash);
+      /* CYBERSTORM C2 rung 1. The two lines are the same problem one level apart, and
+       * the second one is new. The ARM's L1 above holds stale COPIES of guest DRAM; the
+       * decoded-op cache holds stale DECODES of it. core0 has just written instruction
+       * bytes into guest memory that the interpreter never saw go past -- an AMIX text
+       * pagein, or an AmigaOS loader filling a buffer it is about to jump into -- so
+       * every decode this core holds may now describe bytes that are gone.
+       *
+       * This is the right place for it, and the alternative is worth naming because it
+       * looked right first: a SHARED epoch word that core0 bumps after every DMA would
+       * put the knowledge on the producer, and a core1 running against a core0 built
+       * before that field existed would read a permanent zero and never invalidate --
+       * fail-DANGEROUS, silently, in the one direction that corrupts a filesystem. Here
+       * the consumer decides, using knowledge it already has: the spin above ended when
+       * core0 finished, so this line is the exact moment the write became observable to
+       * this core, and it needs nothing from the image on the other side. */
+      z3660_dopc_invalidate_dma(piscsi_addr_stash,piscsi_len_stash);
    }
 }
 
@@ -460,6 +477,14 @@ extern "C" void write_floppy_register(uint16_t zaddr,uint32_t zdata,int type)
 
 
    while(shared->write_floppy==1){NOP;}
+
+   /* CYBERSTORM C2 rung 1 -- the same DMA argument as write_scsi_register()'s, and this
+    * arm is the one that matters for an AmigaOS boot: a floppy READ lands sectors in
+    * guest DRAM that the bootblock is about to execute. The address/length descriptor is
+    * not stashed on this path (core0 holds it), so the range is passed as unknown --
+    * which today invalidates everything anyway, and is honest about what is known here. */
+   if(zaddr==PIFLP_CMD_READ || zaddr==PIFLP_CMD_READ64)
+      z3660_dopc_invalidate_dma(0u,0u);
 }
 
 extern "C" uint32_t read_floppy_register(uint16_t zaddr,int type)

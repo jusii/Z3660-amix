@@ -219,6 +219,29 @@ add up.
 | 8 | `DPAGE_RMISS` | | 18 | `STACK_OVF` |
 | 9 | `DPAGE_WHIT` | | 19 | `ATC_HIT` ← **v2, new** |
 
+Appended after v2, **without a version bump** — no id below them changed meaning, the binary
+header layout is untouched, and a v2 symbolizer reports an unknown id uninterpreted rather
+than mis-labelled. Bumping would make every existing tool refuse a capture it can read
+correctly.
+
+| id | name | what it counts |
+|---|---|---|
+| 20 | `IFETCH_CALLS` | entries into the shared `FETCHOP`/`FETCHEX` bracket — **calls, not words** |
+| 21 | `BLK_HIT` | block-idiom fast-path **chunks** serviced (C2 rung 0) |
+| 22 | `BLK_INSNS` | guest instructions those chunks retired |
+| 23 | `BLK_BYTES` | bytes zeroed / copied / flushed by them |
+| 24 | `DOPC_HIT` | decoded-op cache: opcode + decode served from a hit (C2 rung 1) |
+| 25 | `DOPC_MISS` | ... consulted and not found; the fetch still ran |
+| 26 | `DOPC_EXT` | ... extension words served from the entry's single slot |
+| 27 | `DOPC_INVAL` | ... whole-cache invalidations, all causes |
+
+Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
+identically (all five bracket sites increment `FETCH` exactly once), and
+`DOPC_HIT + DOPC_MISS == INSNS` when the decoded-op cache is on — every dispatch consults it
+exactly once, which is what makes `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate. With the
+cache off all four `DOPC_` counters are **exactly zero**: the lookup returns before it can
+count a miss.
+
 All 64-bit — a 32-bit counter overflows in about seven minutes of hot interpretation,
 which is shorter than the boot profile this exists to take.
 

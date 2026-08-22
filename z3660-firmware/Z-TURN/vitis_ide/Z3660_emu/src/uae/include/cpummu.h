@@ -44,6 +44,10 @@
  * 2.0 % of guest throughput. Adding it back to the shipping loop would undo the thing
  * C3b just finished proving. */
 #include "z3660_prof.h"
+/* CYBERSTORM C2 rung 1: the decoded-op cache publishes its one extension-word window
+ * here, so the single out-of-line copy of uae_mmu040_get_iword() below can answer from
+ * it. Nothing else in this header depends on it. */
+#include "z3660_dopc.h"
 #if Z3660_EMU_PROF
 #define CACHE_HIT_COUNT 1
 #else
@@ -735,6 +739,29 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
  * ========================================================================== */
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_iword(uaecptr addr)
 {
+	/* CYBERSTORM C2 rung 1 -- the decoded-op cache's extension-word window.
+	 *
+	 * This is the ONLY place a handler's extension-word fetch can be intercepted. The
+	 * generated handlers call get_iword_mmu040(N) directly (cpuemu_31 does so about 920
+	 * times) and nothing in the run loop can hand them a value, so a cache that means to
+	 * attack FETCHEX -- 11.31 % of the interpreter, against FETCHOP's 17.34 % -- has to
+	 * answer here or not at all.
+	 *
+	 * It is safe because it is keyed on the ADDRESS and not on the pc: the window holds
+	 * the word at one specific guest address, armed only by a validated cache hit whose
+	 * generation stamp is current, and a fetch of any other address falls straight
+	 * through. A handler that has already moved the pc therefore computes a different
+	 * address and gets a real fetch; so does the next instruction's opcode, and so does
+	 * every fetch after any invalidation, because invalidating disarms the window. The
+	 * disarmed sentinel is odd and every instruction-word address is even.
+	 *
+	 * It sits ABOVE the bracket on purpose: a served word costs no fetch, so it must not
+	 * be charged to FETCHEX, or the profile would report the cache working as the fetch
+	 * still being expensive. DOPC_EXT counts what was served instead. */
+	if (addr == (uaecptr)z3660_dopc_ext_pc) {
+		Z3660_PROF_CNT(Z3660_PROF_C_DOPC_EXT);
+		return (uae_u16)z3660_dopc_ext_val;
+	}
 	Z3660_PROF_ENTER_IFETCH();
 	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
 #if MMU_ICACHE

@@ -37,6 +37,7 @@ int  piscsi_stats_reporting(void);
  * `unsigned` and nothing else. A mirrored copy would only be a second place for the OFF
  * sentinel to drift away from the one core1 tests against. */
 #include "../../Z3660_emu/src/uae/z3660_blk.h"
+#include "../../Z3660_emu/src/uae/z3660_dopc.h"
 typedef enum {
    A,
 
@@ -97,6 +98,8 @@ typedef enum {
    PROFO,   PROF_OFF,      /* C2-prep: the lossless stop. See the case below. */
    /* CYBERSTORM C2 rung 0: the block-idiom fast path. APPEND-ONLY, like everything above. */
    BLK,     BLOCK_IDIOM,
+   /* CYBERSTORM C2 rung 1: the decoded-op cache. APPEND-ONLY, like everything above. */
+   DOPC,    DECODED_OP_CACHE,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -159,6 +162,7 @@ const char *command_names[] = {
       "PROFZ",   "PROF ZERO",
       "PROFO",   "PROF OFF",
       "BLK",     "BLOCK IDIOM",
+      "DOPC",    "DECODED OP CACHE",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -644,6 +648,26 @@ int debug_thread(struct pt *pt)
                         else
                            xil_printf("BLOCK IDIOM %lu iterations/chunk (the interrupt poll runs once per chunk)\r\n",
                                       (unsigned long)c);
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case DOPC:
+                  case DECODED_OP_CACHE:
+                     {  /* CYBERSTORM C2 rung 1. Toggle the decoded-op cache ON <-> OFF.
+                        * A toggle and not a size, unlike BLK: the geometry is fixed by
+                        * the map's measured PC distribution (4096 entries, 4-way) and a
+                        * runtime way-count knob would put a variable bound on the hit
+                        * path, which is the one place this rung cannot afford one. The
+                        * rule that turns this word into a state is z3660_dopc.h's
+                        * z3660_dopc_resolve(); core1 picks it up at its next knob resync
+                        * and invalidates the whole cache when it does. */
+                        uint32_t c=shared->dopc_on;
+                        c = (z3660_dopc_resolve(c)!=0u) ? Z3660_DOPC_OFF : Z3660_DOPC_DEFAULT;
+                        shared->dopc_on=c;
+                        if(c==Z3660_DOPC_OFF)
+                           xil_printf("DECODED OP CACHE OFF (every instruction is fetched and decoded again)\r\n");
+                        else
+                           xil_printf("DECODED OP CACHE ON (4096 entries, 4-way, 64 KB; carries the block-idiom verdict)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1390,6 +1414,7 @@ void debug_console_help(void)
    xil_printf("'PROFR'   dumps the newest 4096 PC samples (~8 s of serial); 'PROF RING' dumps all 65535 (~2 min)\r\n");
    xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
+   xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

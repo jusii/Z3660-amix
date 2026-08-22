@@ -1659,6 +1659,24 @@ void REGPARAM2 mmu_flush_cache(void)
 	int len = sizeof(mmu_icache_data);
 	memset(&mmu_icache_data, 0xff, sizeof(mmu_icache_data));
 #endif
+	/* CYBERSTORM C2 rung 1. THIS is the 68040 core's instruction-cache flush point, and
+	 * it always was -- upstream clears its own (compiled-out) icache right here. So the
+	 * decoded-op cache joins it, and by doing so it inherits the architecture's own
+	 * coherence contract instead of inventing one:
+	 *
+	 *   flush_mmu040()        every CPUSHL / CPUSHP / CPUSHA / CINV form
+	 *   mmu_flush_atc_page()  PFLUSH of one page
+	 *   mmu_flush_atc_all()   PFLUSHA -- and, through it, mmu_set_tc() and mmu_reset()
+	 *
+	 * which is exactly the set of operations a 68040 guest is REQUIRED to perform before
+	 * executing code it has written or remapped. That requirement is what makes it safe
+	 * for the decoded-op cache not to check every guest store: on this architecture the
+	 * guest maintains the caches, and AMIX does -- its CPUSHL loop is 7.79 % of a boot.
+	 *
+	 * Note the rung 0 interaction the map calls out: the block-idiom fast path collapses
+	 * that whole CPUSHL loop into ONE flush_mmu040(), and one is all that has to arrive
+	 * here, because the flush is idempotent and the cache invalidation is whole-cache. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
 }
 
 void m68k_do_rte_mmu040 (uaecptr a7)
