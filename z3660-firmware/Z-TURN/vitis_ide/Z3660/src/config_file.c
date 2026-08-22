@@ -11,6 +11,7 @@
 #include <string.h>
 #include "xil_exception.h"
 #include "config_file.h"
+#include "amix_ram.h"
 #include "main.h"
 #include "ARM_ztop/checkbox.h"
 CONFIG config,default_config,temp_config;
@@ -147,6 +148,7 @@ const char *config_item_names[CONFITEM_NUM] = {
       "arm_frequency",
       "amix_mode",
       "service_cadence",
+      "amix_ram",
 };
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
@@ -200,6 +202,72 @@ void print_line(FIL *fil, char* line_in, ...)
    sprintf(line,line_in, args);
    f_write(fil, line, strlen(line),&NumBytesWritten);
 }
+/* Resolve, validate and publish the AMIX main-RAM window size.
+ *
+ * Called from BOTH config paths (no-preset and preset) once the whole file is
+ * parsed, so config.amix_ram is always a usable MiB value by the time core1 is
+ * dispatched. The bounds and the fallback live in amix_ram.h -- core1 re-runs
+ * exactly the same classification on the mailbox value before it builds the map,
+ * so a corrupted or stale shared->amix_ram cannot produce a bad bank range.
+ *
+ * A refused value is NOT truncated to the bound. It falls back to the default and
+ * shouts, because the operator must not end up on a 128 MiB machine believing it
+ * is a 512 MiB one -- especially when the failure mode at the top of the range is
+ * the guest producing no console output whatsoever.
+ *
+ * The resolved value is always published to the mailbox (so core1 can never read a
+ * stale one), but it only MEANS anything under amix_mode -- core1 consults it solely
+ * inside its amix_mode arm, so every non-AMIX config is bit-for-bit unaffected. */
+static void resolve_amix_ram(int verbose)
+{
+   int requested = config.amix_ram;
+   int status    = amix_ram_classify(requested);
+
+   config.amix_ram = amix_ram_resolve(requested);
+   shared->amix_ram = config.amix_ram;   /* always published, so core1 never reads a stale mailbox */
+
+   if(!config.amix_mode)
+   {
+      /* Not an AMIX boot: the key is inert. Say so rather than silently ignoring
+       * a line someone deliberately wrote. */
+      if(verbose && requested != -1)
+         printf("[CFG] amix_ram %d ignored: amix_mode is NO (no AMIX memory contract)\n", requested);
+      return;
+   }
+
+   if(amix_ram_is_refused(status))
+   {
+      printf("\n");
+      printf("[CFG] **************** amix_ram %d %s\n", requested, amix_ram_status_text(status));
+      printf("[CFG] **************** valid range is %d..%d MiB; falling back to %d MiB\n",
+             AMIX_RAM_MB_MIN, AMIX_RAM_MB_MAX, AMIX_RAM_MB_DEFAULT);
+      printf("[CFG] **************** the AMIX window starts at guest $%08lX and must stop below\n",
+             (unsigned long)AMIX_RAM_GUEST_BASE);
+      printf("[CFG] **************** guest $%08lX, where the RTG/ethernet combo board lives\n",
+             (unsigned long)(AMIX_RAM_BOARD_BANK << AMIX_RAM_BANK_SHIFT));
+      printf("\n");
+   }
+   else if(status == AMIX_RAM_EXPERIMENTAL)
+   {
+      printf("[CFG] amix_ram %d MiB -- %s\n", config.amix_ram, amix_ram_status_text(status));
+      printf("[CFG] amix_ram: %d MiB is the recommended cap for a shipping config\n",
+             AMIX_RAM_MB_SHIP_MAX);
+      if(config.boot_mode==UAE_030_MMU)
+         printf("[CFG] amix_ram: the 2KB-page 68030 kernel has the LOWER ceiling of the two -- "
+                "this size is 68040-line territory\n");
+   }
+   else if(verbose)
+   {
+      printf("[CFG] amix_ram %d MiB (guest $%08lX..$%08lX)\n",
+             config.amix_ram,
+             (unsigned long)AMIX_RAM_GUEST_BASE,
+             (unsigned long)(AMIX_RAM_GUEST_BASE + amix_ram_bytes(config.amix_ram) - 1));
+   }
+
+   if(amix_ram_hides_a3000mem(config.amix_ram))
+      printf("[CFG] amix_ram %d MiB > %d: a3000mem (guest $07000000) is dropped -- its host backing "
+             "is inside the window\n", config.amix_ram, AMIX_RAM_A3000MEM_MB);
+}
 void load_default_config(void)
 {
    config.boot_mode=UAEJIT_040;
@@ -218,6 +286,7 @@ void load_default_config(void)
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
    config.amix_mode=-1;
+   config.amix_ram=-1;
    config.service_cadence=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
@@ -340,6 +409,11 @@ void write_config_file(char *filename)
    print_line(&fil,"amix_mode NO\n");
    print_line(&fil,"#amix_mode YES\n");
    print_line(&fil,"#service_cadence 8\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# AMIX main-RAM window size in MiB (only meaningful with amix_mode YES)\n");
+   print_line(&fil,"# Default 16. Valid 1..128; a larger value would collide with the combo board\n");
+   print_line(&fil,"# window at guest $10000000 and is REFUSED (falls back to 16), never truncated.\n");
+   print_line(&fil,"#amix_ram 16\n");
    print_line(&fil,"\n");
    print_line(&fil,"# MOUNT SD 0x76 partition\n");
    print_line(&fil,"# (YES or NO, in capitals)\n");
@@ -642,6 +716,7 @@ retry:
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
    config.amix_mode=-1;
+   config.amix_ram=-1;
    config.service_cadence=-1;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
@@ -861,6 +936,14 @@ retry:
          if(verbose) printf("[CFG] service_cadence %d\n", config.service_cadence);
          break;
 
+      case CONFITEM_AMIX_RAM:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.amix_ram=get_int_type(cur_cmd);
+         /* Validation is deferred to resolve_amix_ram(), which runs once the whole
+          * file is parsed -- the advisory text depends on amix_mode and boot_mode,
+          * and those lines may come after this one. */
+         break;
+
       case CONFITEM_MOUNT_SD_0x76:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.mount_sd_0x76=get_yesno_type(cur_cmd);
@@ -1068,8 +1151,9 @@ load_successful:;
    // config file is parsed, so config.amix_mode is always 0/1 by the time anything
    // (here, the shared field below, or downstream) reads it. Default: AMIX iff UAE_030_MMU.
    if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
-   if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
+   if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single contiguous window (no $08 CPU RAM board)
    shared->amix_mode=config.amix_mode;
+   resolve_amix_ram(verbose);               /* AMIX RAM window size: default, bounds, loud refusal */
    if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
    shared->service_cadence=config.service_cadence;
 
@@ -1084,6 +1168,7 @@ load_successful:;
       COPY_DEFAULT(autoconfig_rtg);
       COPY_DEFAULT(cpu_ram);
       COPY_DEFAULT(amix_mode);
+      COPY_DEFAULT(amix_ram);
       COPY_DEFAULT(service_cadence);
       COPY_DEFAULT(mount_sd_0x76);
       COPY_DEFAULT(mount_sd_root);
@@ -1339,6 +1424,13 @@ retry:
                   if(preset==preset_selected)
                      if(verbose) printf("\e[30m\e[103m[ENV] AMIX mode %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].amix_mode]);
                   break;
+               case CONFITEM_AMIX_RAM:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].amix_ram=get_int_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] amix_ram %d MiB\e[0m\n", env_file_vars_temp[preset].amix_ram);
+                  /* Bounds/refusal happen in resolve_amix_ram() once the preset is applied. */
+                  break;
                case CONFITEM_SERVICE_CADENCE:
                   get_next_string(parse_line, cur_cmd, &str_pos, ' ');
                   env_file_vars_temp[preset].service_cadence=get_int_type(cur_cmd);
@@ -1445,6 +1537,7 @@ retry:
       config.autoconfig_rtg=env_file_vars_temp[preset_selected].autoconfig_rtg;
       config.cpu_ram=env_file_vars_temp[preset_selected].cpu_ram;
       config.amix_mode=env_file_vars_temp[preset_selected].amix_mode;
+      config.amix_ram=env_file_vars_temp[preset_selected].amix_ram;
       config.service_cadence=env_file_vars_temp[preset_selected].service_cadence;
       config.mount_sd_0x76=env_file_vars_temp[preset_selected].mount_sd_0x76;
       config.mount_sd_root=env_file_vars_temp[preset_selected].mount_sd_root;
@@ -1462,15 +1555,18 @@ retry:
       // at the RDB - "[PISCSI] DRIVER ... not mapped in FPGA RAM"). AMIX instead autoboots via the
       // a3k204 ROM scsi.device from the A3000 SCSI @ $00DD0000 (a3000_scsi, gated only on enable_mmu).
       // scsiboot itself stays as the preset set it, so piscsi_init() still maps devs[6]/Amix.hdf for
-      // the a3000_scsi cross-core backend. The emulator presents NO RAM at $08000000 (dmmy_bank), so
-      // the ROM's motherboard-RAM probe (emulated CPU) only finds the 16MB a3000mem @ $07000000 => a
-      // single contiguous SCN1 window, no vatosde() coalesce.
+      // the a3000_scsi cross-core backend. (This comment used to say the emulator presents NO RAM at
+      // $08000000 and that AMIX runs from a3000mem @ $07000000 -- that describes an OLD map. It is
+      // the other way round now: the AMIX window IS $08000000 (drct_bank, amix_ram MiB wide) and
+      // a3000mem is vestigial. What is unchanged is WHY: exactly one contiguous region in the
+      // memlist, nothing probeable adjacent to it, so no vatosde() coalesce. See amix_ram.h.)
       // amix_mode decouples the AMIX memory contract from UAE_030_MMU (the PMMU boot mode). Default
       // (amix_mode==-1, i.e. no amix_mode line in the preset): AMIX iff UAE_030_MMU, so every existing
       // preset stays byte-identical in behaviour. Only when amix_mode is ON do we force cpu_ram OFF.
       if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
-      if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single <=16MB window (no $08 CPU RAM board)
+      if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single contiguous window (no $08 CPU RAM board)
       shared->amix_mode=config.amix_mode;
+      resolve_amix_ram(verbose);            /* AMIX RAM window size: default, bounds, loud refusal */
       if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
       shared->service_cadence=config.service_cadence;
       memcpy(&temp_config,&config,sizeof(CONFIG));
@@ -1543,6 +1639,8 @@ retry:
          f_printf(&fil,"cpu_ram %s\n",yesno_names[env_file->cpu_ram]);
          if(env_file->amix_mode!=-1)
             f_printf(&fil,"amix_mode %s\n",yesno_names[env_file->amix_mode]);
+         if(env_file->amix_ram!=-1)
+            f_printf(&fil,"amix_ram %d\n",env_file->amix_ram);
          if(env_file->service_cadence!=-1)
             f_printf(&fil,"service_cadence %d\n",env_file->service_cadence);
          f_printf(&fil,"mount_sd_0x76 %s\n",yesno_names[env_file->mount_sd_0x76]);
@@ -1633,6 +1731,7 @@ int write_env_files_scsi(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
    env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
@@ -1693,6 +1792,7 @@ int write_env_files_bootscres(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
    env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
@@ -1725,6 +1825,7 @@ int write_env_files_misc(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
    env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
@@ -1756,6 +1857,7 @@ int write_env_files_preset(ENV_FILE_VARS *env_file)
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
    env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
    env_file->service_cadence=config.service_cadence;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
@@ -1821,6 +1923,7 @@ retry:
    DELETE_FILE("env/autoconfig_rtg");
    DELETE_FILE("env/cpu_ram");
    DELETE_FILE("env/amix_mode");
+   DELETE_FILE("env/amix_ram");
    DELETE_FILE("env/service_cadence");
    DELETE_FILE("env/cpufreq");
    DELETE_FILE("env/kickstart");

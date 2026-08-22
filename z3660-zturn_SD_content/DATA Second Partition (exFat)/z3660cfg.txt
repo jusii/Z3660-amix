@@ -17,6 +17,15 @@ bootmode CPU
 # board) and the emulated A3000 SCSI bootstrap that AMIX boots through.
 # Default: YES when bootmode is UAE_030_MMU, else NO (so non-AMIX configs are unaffected).
 #amix_mode NO
+# AMIX main-RAM window size in MiB (only meaningful with amix_mode YES).
+# Default 16 -- the historical size, unchanged when this key is absent.
+# Valid 1..128. The window starts at guest $08000000 and must stop below $10000000,
+# where the RTG/ethernet combo board lives; a larger value is REFUSED at boot (loudly,
+# on the serial console) and falls back to 16 -- it is never silently truncated.
+# 64 is the recommended cap for a shipping config: past the AMIX kernel's describable-RAM
+# ceiling the boot dies SILENTLY, with no banner and no console output at all. The 4KB-page
+# 68040 kernel reaches further than the 2KB-page 68030 one. See docs/AMIX.md.
+#amix_ram 16
 # Emulator service cadence: emulated instructions between interrupt-service polls.
 # Default 1. Higher = faster CPU but more interrupt latency. AMIX boot-safe up to 4;
 # cadence 8 hangs the A3000-SCSI bootstrap. Use 4 for AMIX (raise via SERV menu after boot).

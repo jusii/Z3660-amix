@@ -799,11 +799,21 @@ uae_u8 *memory_get_real_address(uaecptr);
 int memory_valid_address(uaecptr, uae_u32);
 
 extern "C" volatile int a3000_amix_mode;
+extern "C" volatile int a3000mem_alias;
 STATIC_INLINE uae_u8 *get_real_address (uaecptr addr)
 {
 	// AMIX a3000mem: guest $07000000-$07FFFFFF is host-DDR-backed at $09000000+.
 	// The rest of the map is guest==host 1:1, so only translate that one window.
-	if (a3000_amix_mode && (addr & 0xFF000000u) == 0x07000000u)
+	//
+	// Gated on a3000mem_alias, NOT on a3000_amix_mode. The two are equivalent at the
+	// historical 16 MiB window (uae_emulator() arms the alias at exactly the program
+	// point that sets a3000_amix_mode), but an amix_ram larger than 16 MiB makes host
+	// $09000000 the guest's OWN RAM -- and then this redirect would silently send
+	// guest $07xxxxxx reads and writes into live guest memory. Disarming it is the
+	// other half of dropping the a3000mem bank; doing one without the other is the
+	// worst failure mode in this file (silent, wild, and it corrupts the disk via the
+	// direct-DMA path).
+	if (a3000mem_alias && (addr & 0xFF000000u) == 0x07000000u)
 		return((uae_u8 *)(addr + 0x02000000u));   // +($09000000-$07000000)
 	return((uae_u8 *)addr);
 //	return memory_get_real_address(addr);

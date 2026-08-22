@@ -105,6 +105,7 @@ typedef struct {
    int autoconfig_rtg;
    int cpu_ram;
    int amix_mode;
+   int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
    int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
@@ -152,6 +153,7 @@ typedef struct {
    int autoconfig_rtg;
    int cpu_ram;
    int amix_mode;
+   int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
    int service_cadence;
    int mount_sd_0x76;
    int mount_sd_root;
@@ -303,6 +305,7 @@ enum CONFITEM {
    CONFITEM_ARM_FREQUENCY,
    CONFITEM_AMIX_MODE,
    CONFITEM_SERVICE_CADENCE,
+   CONFITEM_AMIX_RAM,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50

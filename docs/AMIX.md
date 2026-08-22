@@ -32,6 +32,7 @@ existing list. Upstream Z3660 behaviour is unchanged.
 | **Native AMIX drivers** | [`amix-z3660scsi` / `amix-z3660net`](https://github.com/jusii/amix-kerntools) run inside AMIX against the Z3660 PISCSI + ethernet register protocol this repo owns — they live in the companion **amix-kerntools** repo. |
 | **AMIX warm-reboot fix** | A clean Zynq reboot on an AMIX `reboot`, instead of the register-flood / data-abort the naïve path produced. |
 | **Emulator perf + debug knobs** | `service_cadence` (CPU throughput vs. interrupt latency) and per-category debug gating (`DEMU` / `DSCSI`) to silence the emulator's debug floods. |
+| **Sizable AMIX RAM window** | `amix_ram <MiB>` sizes the single contiguous window the AMIX memory contract presents (default 16, bounded at 128 by the combo board window). |
 
 ---
 
@@ -117,13 +118,14 @@ it is shown for clarity. The same options work in a `presets/presetN.txt` quick-
 
 ## New configuration options
 
-These two options are specific to this fork (defined in
+These options are specific to this fork (defined in
 [`config_file.c`](../z3660-firmware/Z-TURN/vitis_ide/Z3660/src/config_file.c)).
 
 ### `amix_mode YES|NO`
 
-Applies the **AMIX memory contract** (a single ≤16 MB window — no separate `$08000000` CPU-RAM
-board) and enables the **A3000-SCSI bootstrap**.
+Applies the **AMIX memory contract** (a single contiguous RAM window — no separate `$08000000`
+CPU-RAM board) and enables the **A3000-SCSI bootstrap**. The window is 16 MB unless
+[`amix_ram`](#amix_ram-n--integer-mib) says otherwise.
 
 - **Default:** `YES` when `bootmode` is `UAE_030_MMU`, otherwise `NO`. Existing non-AMIX configs
   are therefore unaffected.
@@ -131,6 +133,43 @@ board) and enables the **A3000-SCSI bootstrap**.
   with the AMIX address map).
 - It is a *separate* switch from `bootmode` on purpose: you can run plain 030+PMMU AmigaOS
   (`bootmode UAE_030_MMU`, `amix_mode NO`) without the AMIX memory layout.
+
+### `amix_ram N`  (integer, MiB)
+
+How much main RAM the AMIX memory contract presents. The firmware maps `N` MiB of Zynq DDR
+1:1 at guest `$08000000` and dummies out everything above it, so the AmigaOS memory list —
+which the AMIX kernel's `config()` copies verbatim into `bootinfo.memory[]` — holds exactly
+**one** region. Only meaningful with `amix_mode YES`; ignored (with a note on the serial
+console) otherwise.
+
+- **Default:** `16`. With the key absent the map is bit-for-bit what it has always been, on
+  both the 030 and the 040 line.
+- **Valid range:** `1`–`128`.
+- **⚠️ Values outside that range are REFUSED, not clamped.** The window starts at guest
+  `$08000000` and must stop below `$10000000`, where the RTG/ethernet combo board is mapped
+  (and where the `z3660eth` driver binds). A larger value would have the board silently punch
+  a hole through memory AMIX believes is RAM, so the firmware prints a refusal block on the
+  serial console and falls back to 16 MB. It never truncates to 128 — booting a machine at a
+  size the operator did not ask for is worse than not booting at their size at all.
+- **⚠️ 64 MB is the recommended cap for a shipping config.** Past the AMIX kernel's
+  *describable-RAM* ceiling, `rmalloc()` returns `NULL` unchecked and the boot dies **silently**
+  — no SVR4 banner, no memory line, no console output whatsoever. That ceiling is *computed*,
+  has never been bisected, and **moves down as the kernel grows** (a kernel carrying
+  `z3660scsi` + `z3660eth` + `cdfs` has less kernel-virtual space to spend on the frame array).
+  Above 64 the firmware warns but still obeys — the knob exists so the ladder can find the
+  real line.
+- **68030 vs 68040.** The 4 KB-page (Model-B, 68040) kernel needs half as many `page[]`
+  entries per MiB as the 2 KB-page (68030) kernel, so its ceiling sits roughly twice as far
+  out. The knob is shared by both boot modes, but large values are 68040-line territory;
+  under `UAE_030_MMU` the firmware says so.
+- **Side effect above 16 MB:** the vestigial `a3000mem` window at guest `$07000000` is
+  dropped, because its host backing store (`$09000000`) is inside the widened window. Guest
+  `$07000000`–`$07FFFFFF` then reads as nothing — deliberately, so the motherboard SIMMs at
+  that address stay invisible to the Kickstart's RAM sizer and cannot coalesce with our
+  window into a second region (which panics the kernel in `vatosde()`).
+- **Verify it took:** the serial console prints
+  `[Core1] AMIX RAM window N MiB: guest $08000000-$...`, and AMIX's own
+  `Total Unix memory = ...` line should scale with it.
 
 ### `service_cadence N`  (integer, `N ≥ 1`)
 

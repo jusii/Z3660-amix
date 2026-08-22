@@ -124,6 +124,7 @@ typedef struct {
    volatile uint32_t amix_mode;           // 0xFFFF00C0  AMIX memory contract on/off (control core sets from config.amix_mode)
    volatile uint32_t service_cadence;     // 0xFFFF00C4  030-MMU run loop: instructions between IPL/cross-core polls (1=every; perf knob, SERV cmd)
    volatile uint32_t perf_report;         // 0xFFFF00C8  030-MMU run loop: 1=print instr/sec to serial ~1Hz (PERF cmd)
+   volatile uint32_t amix_ram;            // 0xFFFF00CC  AMIX main-RAM window size in MiB (16 = the historical default; bounds in Z3660/src/amix_ram.h)
 } SHARED;
 extern SHARED *shared;
 #define REG_BASE_ADDRESS XPAR_Z3660_0_BASEADDR

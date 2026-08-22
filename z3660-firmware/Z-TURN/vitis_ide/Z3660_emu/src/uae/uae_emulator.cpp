@@ -11,6 +11,7 @@
 #include "maccess.h"
 #include "memory.h"
 #include "../memorymap.h"
+#include "../../../Z3660/src/amix_ram.h"   // AMIX RAM window contract: bounds + bank arithmetic (shared with core0 and the host harness)
 
 LOCAL local;
 #ifdef __cplusplus
@@ -901,6 +902,14 @@ addrbank a3000_scsi_bank = {
 // + a3000mem_xlate do the same for the normal access paths.
 // Big-endian-swapped like z3ram so byte-wise DMA stores + longword reads agree.
 #define A3000MEM_HOST 0x09000000u
+// Is the a3000mem window LIVE this run? Gates the get_real_address() guest-$07xxxxxx ->
+// host-$09xxxxxx redirect (memory.h). It used to be gated on a3000_amix_mode, which was
+// correct only while the AMIX window was fixed at 16 MiB: a window larger than that
+// swallows host $09000000, so the alias would silently redirect guest $07xxxxxx accesses
+// into LIVE guest RAM. Set once, in uae_emulator(), at the same program point where
+// a3000_scsi_init() sets a3000_amix_mode -- so at the 16 MiB default the two are
+// indistinguishable and behaviour is byte-identical.
+extern "C" { volatile int a3000mem_alias = 0; }
 // AMIX a3000mem ($07000000 guest -> host DDR $09000000) byte-swapped like z3ram/drct so byte-wise
 // DMA stores + longword reads agree. (Vestigial under the $08000000-DDR boot path; see the RANGE_MAP
 // comment in uae_emulator() -- AMIX runs from $08000000, this window is mapped but not in the memlist.)
@@ -1131,30 +1140,81 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
    // forces MAINSTORE=$07000000, VSIZOFMEM=16MB (window [$07000000,$08000000)) for a high-
    // loaded kernel. EVERY RAM region AmigaOS lists must lie INSIDE that one window, else the
    // kernel adds the stray pages to its pool, touches one outside SCN1, and panics
-   // vatosde() ("address not in SCN1"). Two adjacent banks ($07+$08) COALESCE into a >16MB
-   // window (also fatal); a split leaves a region outside SCN1 (fatal). So AMIX must see exactly
-   // ONE <=16MB Fast-RAM window in its memlist -- we give it 16MB of DDR CPU RAM @ $08000000 (the
-   // per-bank map below). Result: AMIX runs on fast Zynq DDR, ~3.4x faster than the mobo SIMMs.
-#define AMIX_A3000MEM_MB 16
+   // vatosde() ("address not in SCN1"). Two adjacent banks ($07+$08) COALESCE into one larger
+   // window; a split leaves a region outside SCN1 (fatal). So AMIX must see exactly ONE
+   // CONTIGUOUS Fast-RAM window in its memlist -- we give it amix_ram MiB of DDR CPU RAM @
+   // $08000000 (the per-bank map below). AMIX runs on fast Zynq DDR, ~3.4x faster than the SIMMs.
+   //
+   // NOTE ON THE 16MB HALF OF THAT CONCLUSION. The CONTIGUITY requirement above stands and is
+   // what the map below preserves at every size. The SIZE half -- "and it must be <=16MB" -- does
+   // NOT: it came from the QUICK_KLUDGE path, which applies to a HIGH-LOADED kernel, and this
+   // kernel does not relocate, it runs in place at $08000000. 16MB was our own compile-time
+   // choice, not a kernel limit. Against it: the emulated piscsi rig boots to multiuser on 32MB
+   // at $08000000 (amix-kerntools/docs/piscsi-rig.md), and a community-reported A3000 runs 48MB.
+   // The kernel limit that IS real is a different one -- roughly 128MB of total DESCRIBABLE RAM,
+   // past which rmalloc() returns NULL unchecked and the boot dies with no console output at all
+   // (grimoire-amix/docs/how-it-works/ram-ceiling.md). Hence amix_ram's advisory band rather than
+   // a hard stop: see Z3660/src/amix_ram.h and docs/amix-ram-presentation.md.
+#define AMIX_A3000MEM_MB AMIX_RAM_A3000MEM_MB
+   // Function-scope so the a3000mem startup block further down (memset + alias arm) agrees
+   // with the map built here. Values are meaningful only under amix_mode.
+   int amix_ram_mb = AMIX_RAM_MB_DEFAULT;
+   int amix_ram_a3000mem_live = 0;
    if(amix_mode)
    {
-      (void)((AMIX_A3000MEM_MB * 1024 * 1024) >> 16);            // (a3000mem page count)
       // AMIX on Zynq-local DDR (NOT the slow motherboard SIMMs) -- per-bank map:
       //  $0100-$0700 slow_bank : real bus; no RAM lives below $07000000 on the A4000 (unchanged from PATH B).
       //  $0700-$0800 a3000mem  : 16MB DDR (host $09000000). VESTIGIAL -- NOT in the AmigaOS memlist (the
       //                          Kickstart's mobo-RAM detection never CPU-probes it; proven via the now-removed
-      //                          [A3KMEM] diag = 0 hits even function-path). AMIX never uses it; left mapped for safety.
-      //  $0800-$0900 drct_bank : 16MB DDR CPU RAM (host 1:1 $08000000) = AMIX's ACTUAL main RAM. The ext-kickstart/
-      //                          autoconfig adds $08000000 to the AmigaOS memlist, the AMIX loader AllocMem(MEMF_FAST)s
-      //                          the kernel there, and THIS kernel brings up its 2KB-page MMU IN PLACE at $08000000
-      //                          (serial "MMU enabled ... PC=08000fe6") and RUNS there -- it does NOT relocate to $07000000.
-      //  $0900-$1000 dmmy_bank : nothing above, so the memlist holds exactly one 16MB window (no >16MB SCN1 coalesce).
+      //                          [A3KMEM] diag = 0 hits even function-path). AMIX never uses it; left mapped for
+      //                          safety -- but ONLY while the window below is small enough not to overlap it.
+      //  $0800-...   drct_bank : DDR CPU RAM (host 1:1 $08000000) = AMIX's ACTUAL main RAM, amix_ram MiB wide.
+      //                          The ext-kickstart/autoconfig adds $08000000 to the AmigaOS memlist, the AMIX
+      //                          loader AllocMem(MEMF_FAST)s the kernel there, and the kernel brings up its MMU
+      //                          IN PLACE at $08000000 (serial "MMU enabled ... PC=08000fe6") and RUNS there --
+      //                          it does NOT relocate to $07000000.
+      //  ...  -$1000 dmmy_bank : nothing above the window, so the memlist holds exactly ONE region and nothing
+      //                          can coalesce past it into a >SCN1 span (the vatosde() panic).
       // NOTE: AMIX_HIDE08 (mmu_common.h) is DISABLED -- it was built for an older kernel that relocated to $07000000;
       //       hiding $08000000 under THIS in-place kernel would yank its own running code -> reboot loop.
+      //
+      // WINDOW SIZE. amix_ram (config key / shared mailbox) sizes the drct span. Core0 already
+      // validated it; we re-run the SAME classification here so a stale or corrupted mailbox
+      // value can never build a bank range that runs into the combo board window at $10000000.
+      // amix_ram_resolve() falls back to the 16 MiB default on a refused value -- it never
+      // truncates to the bound.
+      amix_ram_mb = (int)shared->amix_ram;
+      if(amix_ram_is_refused(amix_ram_classify(amix_ram_mb)))
+         z3660_printf("[Core1] amix_ram %d %s -- using %d MiB\n",
+                      amix_ram_mb, amix_ram_status_text(amix_ram_classify(amix_ram_mb)),
+                      AMIX_RAM_MB_DEFAULT);
+      amix_ram_mb = amix_ram_resolve(amix_ram_mb);
+      const unsigned int amix_ram_end = amix_ram_end_bank(amix_ram_mb);
+
       RANGE_MAP(0x0100, 0x0700, slow_bank);                       // real bus, $01000000-$06FFFFFF (no RAM here)
-      RANGE_MAP(0x0700, 0x0800, a3000mem_bank);                   // 16MB DDR AMIX main RAM @ guest $07000000 -> host $09000000
-      RANGE_MAP(0x0800, 0x0900, drct_bank);                       // 16MB DDR CPU RAM @ $08000000 (loader memlist scratch; hidden post-MMU)
-      RANGE_MAP(0x0900, 0x1000, dmmy_bank);                       // nothing above $09000000
+      if(!amix_ram_hides_a3000mem(amix_ram_mb))
+      {
+         RANGE_MAP(0x0700, 0x0800, a3000mem_bank);                // 16MB DDR @ guest $07000000 -> host $09000000
+      }
+      else
+      {
+         // The window has claimed a3000mem's host backing ($09000000). Drop the bank, and map
+         // guest $07000000-$07FFFFFF to dmmy_bank rather than slow_bank: on THIS A4000 the
+         // motherboard SIMMs live at $07000000 (commit 22ce6f2 -- they are the slow RAM AMIX
+         // used to run on), and a3000mem has been hiding them all along. Exposing them on the
+         // real bus would hand the Kickstart sizer a SECOND, probeable RAM region directly
+         // adjacent-below ours -- exactly the coalesce that panics vatosde(). dmmy_bank fails a
+         // write/read-back probe, so the memlist keeps exactly one region at every window size.
+         RANGE_MAP(0x0700, 0x0800, dmmy_bank);                    // mobo SIMMs stay hidden: one region only
+      }
+      RANGE_MAP(AMIX_RAM_BASE_BANK, amix_ram_end, drct_bank);     // amix_ram MiB of DDR CPU RAM @ $08000000
+      RANGE_MAP(amix_ram_end, 0x1000, dmmy_bank);                 // nothing above the window
+      z3660_printf("[Core1] AMIX RAM window %d MiB: guest $%08lX-$%08lX (banks $%04lX-$%04lX)\n",
+                   amix_ram_mb,
+                   (unsigned long)AMIX_RAM_GUEST_BASE,
+                   (unsigned long)(AMIX_RAM_GUEST_BASE + amix_ram_bytes(amix_ram_mb) - 1),
+                   (unsigned long)AMIX_RAM_BASE_BANK, (unsigned long)(amix_ram_end - 1));
+      amix_ram_a3000mem_live = !amix_ram_hides_a3000mem(amix_ram_mb);
    }
    else
    {
@@ -1204,8 +1264,16 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
    reset_autoconfig();
    if(amix_mode)
    {
-      memset((void*)A3000MEM_HOST, 0, AMIX_A3000MEM_MB * 1024 * 1024); // clear a3000mem host backing ($09000000)
+      if(amix_ram_a3000mem_live)
+         memset((void*)A3000MEM_HOST, 0, AMIX_A3000MEM_MB * 1024 * 1024); // clear a3000mem host backing ($09000000)
+      // else: host $09000000 IS the second 16 MiB of the guest's own RAM window now. Zeroing it
+      // here would be a stray wipe of guest memory, so the memset goes with the bank.
+      a3000mem_alias = amix_ram_a3000mem_live;   // arm/disarm the get_real_address() $07->$09 redirect
       a3000_scsi_init(); // AMIX: reset emulated A3000 WD33C93+SuperDMAC state
+   }
+   else
+   {
+      a3000mem_alias = 0;
    }
 
    init_m68k();

@@ -48,8 +48,14 @@ SCSI_CD_BIN := $(BUILD)/scsi_cd_test
 BOOTMODE_BIN := $(BUILD)/bootmode_test
 CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h
 
-.PHONY: all clean objs run run-scsi run-bootmode
-all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN)
+# AMIX RAM-window sizing guard. Compiles ONLY Z3660/src/amix_ram.h (self-contained by
+# design, exactly like config_file.h above), because that header is the SINGLE copy of
+# the bounds/arithmetic that core0's config parser and core1's bank map both run.
+AMIX_RAM_BIN := $(BUILD)/amix_ram_test
+CORE0_AMIX_RAM_H := $(ROOT)/../Z3660/src/amix_ram.h
+
+.PHONY: all clean objs run run-scsi run-bootmode run-amix-ram
+all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
@@ -78,16 +84,25 @@ $(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
 	@echo "  CXX+LINK  bootmode_test.cpp"
 	@$(CXX) $(CXXFLAGS) bootmode_test.cpp -o $@
 
-run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN)
+$(AMIX_RAM_BIN): amix_ram_test.cpp $(CORE0_AMIX_RAM_H)
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  amix_ram_test.cpp"
+	@$(CXX) $(CXXFLAGS) amix_ram_test.cpp -o $@
+
+run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
 	@$(BIN)
 	@$(SCSI_CD_BIN)
 	@$(BOOTMODE_BIN)
+	@$(AMIX_RAM_BIN)
 
 run-scsi: $(SCSI_CD_BIN)
 	@$(SCSI_CD_BIN)
 
 run-bootmode: $(BOOTMODE_BIN)
 	@$(BOOTMODE_BIN)
+
+run-amix-ram: $(AMIX_RAM_BIN)
+	@$(AMIX_RAM_BIN)
 
 clean:
 	rm -rf $(BUILD)

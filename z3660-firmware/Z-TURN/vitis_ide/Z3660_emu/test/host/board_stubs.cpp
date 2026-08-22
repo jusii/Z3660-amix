@@ -150,6 +150,11 @@ addrbank dmmy_bank = {
  * ===================================================================== */
 extern "C" {
 volatile int a3000_amix_mode = 0;          /* AMIX (A3000 SCSI) mode — off for MMU tests */
+/* Arms the get_real_address() guest-$07xxxxxx -> host-$09xxxxxx redirect (memory.h).
+ * Defined in uae_emulator.cpp on the board; that file is not in the harness build, so
+ * it is stubbed here. Off, so the harness's flat buffer stays 1:1 as every MMU test
+ * assumes. amix_ram_test covers the size logic that decides this flag on the board. */
+volatile int a3000mem_alias = 0;
 volatile int amix_mmu_on = 0;
 /* "the guest is the 68030 AMIX kernel image" — set only by a3000_scsi_init() (not linked
  * here). Stubbed so test_amix_mmu040_latch can assert the 040 latch never touches it. */
