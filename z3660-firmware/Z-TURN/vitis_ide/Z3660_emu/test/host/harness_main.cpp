@@ -4769,6 +4769,101 @@ static void test_dfast_state_equivalence(void)
 		CHECK_EQ32((uae_u32)z3660_dfast_armed(), 1, "re-arming restores it");
 	}
 
+	/* ---- stage J: the whole machine, not just the accessor -------------------------
+	 *
+	 * Everything above drives get_long_mmu040() and friends DIRECTLY, which is the right
+	 * unit for an equivalence corpus but leaves one thing uncovered: the accessors are
+	 * now considerably larger and inline a resolver that allocates registers, and they
+	 * are called from ~3000 generated handler sites. A clobber that the direct calls
+	 * survive -- because the harness holds nothing live across them -- could still eat a
+	 * handler's operand.
+	 *
+	 * So: run real guest code through the run loop's own dispatch, with its DATA in the
+	 * identity window so the fast path actually serves, once disarmed and once armed,
+	 * and compare the whole visible machine. */
+	{
+		const uae_u32 VCODE = 0x00340000u, PCODE = HDIRECT_BASE + 0x14000u;
+		const uae_u32 VDATA = 0x00341000u, PDATA = HDIRECT_BASE + 0x15000u;
+		struct { uae_u32 d[8], a[8], pc, sr, mem[4]; int faulted; unsigned long serves; } arm[2];
+		int pass, rep;
+
+		for (pass = 0; pass < 2; pass++) {
+			int i;
+			mmu040_gen_init();
+			harness_direct_reset();
+			harness_direct_map(1);
+			mmu040_gen_map(VCODE, PCODE, 0);
+			mmu040_gen_map(VDATA, PDATA, 0);
+			regs.s = 1;
+			z3660_dfast_arm(pass);          /* 0 = reference, 1 = armed */
+
+			/* moveq #$42,d0 / moveq #7,d1 / add.l d0,d1 / move.l d1,(a0) /
+			 * move.l (a0),d2 / add.l d1,d2 / move.l d2,4(a0)
+			 * -- a write, a read-back of what was written, and a second write at a
+			 * different offset, all through a page the fast path serves. */
+			hdirect_poke32(PCODE + 0,  0x70427207u);   /* moveq #$42,d0 ; moveq #7,d1    */
+			hdirect_poke32(PCODE + 4,  0xd2802081u);   /* add.l d0,d1   ; move.l d1,(a0) */
+			hdirect_poke32(PCODE + 8,  0x2410d481u);   /* move.l (a0),d2; add.l d1,d2    */
+			hdirect_poke32(PCODE + 12, 0x21420004u);   /* move.l d2,4(a0)                */
+
+			/* TWICE, and the SECOND pass is the one measured. The first is a cold
+			 * cache: a write to a page whose write-cache entry does not exist yet is a
+			 * miss, the fast path declines, and the original path fills it -- correct,
+			 * and exactly one serve out of three accesses. A running guest is warm, so
+			 * measuring the cold pass would understate engagement and hide a regression
+			 * in the warm path behind it. Both passes run on both arms, so the
+			 * state comparison is still like-for-like. */
+			arm[pass].faulted = 0;
+			for (rep = 0; rep < 2; rep++) {
+				cpu_set_context(VCODE);
+				for (i = 0; i < 8; i++) { m68k_dreg(regs, i) = 0; m68k_areg(regs, i) = 0; }
+				m68k_areg(regs, 0) = VDATA;
+				z3660_dfast_serves = 0;     /* so the count is the WARM pass's */
+
+				SAVE_EXCEPTION;
+				TRY(p) {
+					for (i = 0; i < 7; i++) {
+						regs.instruction_pc = m68k_getpc();
+						regs.opcode = x_prefetch(0);
+						(*cpufunctbl[regs.opcode])(regs.opcode);
+					}
+				} CATCH(p) { arm[pass].faulted = 1; (void)p; } ENDTRY
+				RESTORE_EXCEPTION;
+			}
+
+			for (i = 0; i < 8; i++) { arm[pass].d[i] = m68k_dreg(regs, i);
+			                          arm[pass].a[i] = m68k_areg(regs, i); }
+			arm[pass].pc = m68k_getpc();
+			arm[pass].sr = regs.sr;
+			for (i = 0; i < 4; i++) arm[pass].mem[i] = hdirect_peek32(PDATA + (uae_u32)i * 4);
+			arm[pass].serves = z3660_dfast_serves;
+		}
+
+		CHECK_EQ32((uae_u32)arm[0].serves, 0, "interpreted run, disarmed: nothing served");
+		CHECK_EQ32((uae_u32)arm[1].serves, 3u,
+		           "interpreted run, armed and warm: all THREE data accesses served");
+		CHECK_EQ32((uae_u32)arm[1].faulted, (uae_u32)arm[0].faulted,
+		           "interpreted run: same fault outcome");
+		CHECK_EQ32(arm[1].pc, arm[0].pc, "interpreted run: same PC");
+		CHECK_EQ32(arm[1].sr, arm[0].sr, "interpreted run: same SR");
+		{
+			int i;
+			for (i = 0; i < 8; i++) {
+				CHECK_EQ32(arm[1].d[i], arm[0].d[i], "interpreted run: same D register");
+				CHECK_EQ32(arm[1].a[i], arm[0].a[i], "interpreted run: same A register");
+			}
+			for (i = 0; i < 4; i++)
+				CHECK_EQ32(arm[1].mem[i], arm[0].mem[i], "interpreted run: same memory");
+		}
+		/* ...and the run actually computed something, so "identical" is not two
+		 * identically-failed runs agreeing. */
+		CHECK_EQ32(arm[1].d[1], 0x49u, "interpreted run: d1 = 0x42 + 7");
+		CHECK_EQ32(arm[1].mem[0], 0x49u, "interpreted run: the store landed");
+		CHECK_EQ32(arm[1].d[2], 0x92u,
+		           "interpreted run: d2 = the READ-BACK of that store, plus d1");
+		CHECK_EQ32(arm[1].mem[1], 0x92u, "interpreted run: and the second store landed");
+	}
+
 	mmu040_off();
 	harness_direct_map(1);
 	z3660_dfast_arm(1);

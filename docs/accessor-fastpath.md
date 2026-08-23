@@ -252,7 +252,15 @@ address registers, and the four page-cache counters** are identical. Cases:
 | transparent | DTT0 read/write/byte; misaligned inside a TTR window; write-protected TTR; supervisor-only TTR from both privilege levels |
 | invalidation | a remap + flush, and a single-page `PFLUSH`, must both be honoured — the fast path must not answer from a retired entry |
 | MMU off | declines, both directions |
+| **the whole machine** | seven real 68k instructions through the run loop's own dispatch, with their data in the identity window — a write, a read-back of that write, and a second write — run armed and disarmed and compared on all sixteen registers, PC, SR, fault outcome and memory. This is what the direct calls above cannot cover: the accessors are now much larger and inline a register-allocating resolver, and they are reached from ~3000 generated handler sites, so a clobber the harness survives could still eat a handler's operand |
 | the reference itself | disarmed ⇒ every verdict in both tables is `SLOW`, and a rebuild while disarmed stays `SLOW` |
+
+> The interpreted case runs its sequence **twice and measures the second pass**. The first is a
+> cold cache — a write to a page whose *write*-cache entry does not exist yet is a miss, the fast
+> path declines, and the original path fills it, which is exactly **one** serve out of three
+> accesses. A running guest is warm; measuring the cold pass would understate engagement and hide
+> a warm-path regression behind it. Warm, all three accesses are served, and that is the
+> assertion.
 
 **Engagement is pinned on every case**, because *"the two paths agree"* is trivially true when
 the fast path silently never fired — the failure a state-equivalence corpus is blindest to. Every
@@ -286,9 +294,12 @@ assumption in the tree.
 
 | variant | before | after |
 |---|---|---|
-| default | 1796 | **3147** |
-| lean | 1792 | **3143** |
-| profiling | 1943 | **3345** |
+| default | 1796 | **3181** |
+| lean | 1792 | **3177** |
+| profiling | 1943 | **3379** |
+
+(The other three harness binaries — SCSI CDB, boot-mode and AMIX-RAM — are unaffected at
+34 / 75 / 81.)
 
 ---
 
