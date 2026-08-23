@@ -567,3 +567,227 @@ the counter keeps its meaning and stays comparable with every capture taken befo
 experiment. `Z3660_PROF_CNT` compiles out below the profiling build, so the shipping image
 pays nothing. **`FETCH` / `IFETCH_CALLS` is the counter that genuinely falls**, as declared
 above.
+
+---
+
+# THE METAL VERDICT — 2026-08-23: **OFF-SCALE MISS**
+
+> Everything above this line is the pre-registration and the *As built* correction to it,
+> both written before the row existed. This section is the row. **Nothing above it has been
+> edited**, which is the only reason the table below is worth reading.
+
+Session 2026-08-23 14:29–15:34 EEST, A4000 + Z3660 metal, preset 7 (`amix_ram 128`,
+`service_cadence 4`), root = piscsi card 1, installed 040 AMIX. Lean cadence-4 dhrystone,
+median of five runs per arm, the estimator declared before the reference row was taken.
+
+> ## The rung fires exactly as designed and makes the machine **7.55 % slower**.
+>
+> Coverage is **21.12 %** of guest instructions — dead centre of the pre-registered 18–27 %
+> band — so this is not a build failure and not a non-event. The specialised body runs on
+> one guest instruction in five, and every one of those dispatches gets **~33 % slower**.
+>
+> The pre-registration has three cells — NULL (±0.68 %), PAY (≥ +0.90 %), UNRESOLVED
+> (+0.68 .. +0.90 %) — and all three assume the armed arm is **at worst flat**. A large
+> negative is off the bottom of the scale, **6.87 pp below the NULL floor**. No cell applies.
+>
+> **The rung is not funded.** That is the conservative default and it is unambiguous.
+> **But the classification was not bought.** The discriminator was built to read the *sign
+> of a removal*. What it measured is that this particular inline body is a **worse
+> implementation** than the generated handler it replaced. `HANDLER` is still unclassified.
+
+## The rows
+
+| arm | runs | **median** | mean | spread |
+|---|---|---|---|---|
+| boot 0 — as-found `86C0BC18` (rung-3 lean, superseded) | 8219 / 8162 / 8185 | 8185 | 8188.7 | 0.70 % |
+| **boot 1 — REF `DEC21748`** | 8197 / 8141 / 8197 / 8197 / 8174 | **8197** | 8181.2 | 0.68 % |
+| **boot 2 — `6ADABE4A`, SPEC ON — THE ROW** | 7578 / 7578 / 7578 / 7562 / 7552 | **7578** | 7569.6 | 0.34 % |
+| boot 2 — `6ADABE4A`, SPEC OFF (same boot) | 8085 / 8119 / 8098 / 8109 / 8119 | 8109 | 8106.0 | 0.42 % |
+| boot 2 — `6ADABE4A`, SPEC ON, **return leg** | 7547 / 7583 / 7573 | 7573 | 7567.7 | 0.48 % |
+
+```
+cross-build   SPEC ON  vs DEC21748 : 7578/8197 = 0.92448  ->  -7.55 %   <- THE VERDICT NUMBER
+disarm        SPEC OFF vs DEC21748 : 8109/8197 = 0.98926  ->  -1.07 %
+same-boot     SPEC ON  vs SPEC OFF : 7578/8109 = 0.93452  ->  -6.55 %
+identity      0.98926 x 0.93452    = 0.92448  ==  0.92448 measured   CLOSES TO FIVE DIGITS
+```
+
+The as-found row reproduces the previous session's measurement of the **same image** to the
+digit (mean 8188.7 against 8188.7) and the reference row reproduces its `DEC21748` median of
+8197 exactly, so the bands are judged against a live rig. The return leg reproduces the first
+armed arm to −0.07 % median / −0.03 % mean: the effect is the switch's, and it is reversible.
+
+## The scored pre-registrations
+
+| # | pre-registered | measured | verdict |
+|---|---|---|---|
+| **1** | **THE VERDICT BAND.** NULL within ±0.68 % (8141–8253); PAY ≥ +0.90 % (≥ 8271); UNRESOLVED 8253–8271 | **−7.55 %** — median 8197 → **7578** (mean 8181.2 → 7569.6, −7.48 %) | **OFF-SCALE MISS** — 6.87 pp below the NULL floor; no cell applies |
+| 1b | this document's own prediction, written down to be scored: **dependency-chained ⇒ PAY** | the armed arm is a large **regression** | **REFUTED**, and not in the way a null would have refuted it |
+| 1c | the count model, context not band: +1.25 .. +2.27 % (8287–8371) | −7.55 % | model wrong in **sign** |
+| **2** | added-work band: the SPEC-OFF arm sits **0.25 – 0.90 %** below `DEC21748` | **−1.07 %** median (mean −0.92 %) | **MISS** — 0.17 pp below the floor |
+| 2b | the *As built* corrected expectation beside it, **−0.6 .. −2.8 %** | −1.07 % | **INSIDE** |
+| **3** | **`SPEC_HIT / INSNS` 18 – 27 %** — read FIRST | **21.12 %** (20 700 631 / 98 025 213); 0.00 % disarmed; 20.90 % with `DFAST` off | **HIT** — mid-band, engagement pinned both ways |
+| **4a** | `DOPC_HIT` must not move > ±0.5 pp across the switch | 84.56 % vs 85.04 % = **−0.47 pp** | **HIT**, at the very edge of the band |
+| **4b** | `DFAST_HIT` and the dpagecache rates must not move; the two switches independent both ways | DFAST 99.38 / 99.40 (−0.01 pp); dpagecache read 99.44 / 99.45, write 99.53 / 99.53; `DFAST_HIT = 0` with DFAST off; `SPEC_HIT` 21.12 → 20.90 % across the DFAST switch | **HIT** — independent in both directions |
+| **4c** | `FETCH` / `IFETCH_CALLS` **WILL FALL** (declared, not a defect) | per guest instruction **0.5233 vs 0.5109 = +2.44 %** — it **ROSE** | **MISS**, and in the opposite direction to the declaration |
+| **4d** | `IPAGE_HIT` / `IPAGE_MISS` must not move (±0.1 pp) | 88.51 % vs 88.66 % = **−0.150 pp** | **MISS** — 0.05 pp outside; same sign as 4c and the same cause |
+| **5** | identity `cross-build × disarm = same-boot switch`, to **three** digits | 0.98926 × 0.93452 = **0.92448**; measured cross-build **0.92448** (mean basis 0.92524 = 0.92524) | **HIT — to five digits, on both bases** |
+| **6** | *if the armed arm reads null*, suspect (a) coverage, (b) I-cache — in that order | the arm did not read null; **(a) is cleared** (21.12 %, mid-band) and the loss localises to `HANDLER`, not to a global slowdown | the pinned order was **followed and it worked** |
+| **7** | the pre-registered failure mode: *the body serves 20 %, the handler bodies get measurably **shorter**, and dhrystone does not move* | the body serves 21.12 % and the **`HANDLER` bucket got 14–16 % LONGER**; dhrystone moved, downward | **the failure mode did NOT fire** — a third outcome the pre-registration did not enumerate |
+| — | *As built* Site-D note: the accessors did not inline ⇒ read `R` at the **LOW** end of 7–11 % | confirmed statically — all six accessors still `bl` from the loop | **HIT** (and `R` never got the chance to matter) |
+
+## Where the 6.55 % went — all of it inside `HANDLER`
+
+Same-boot SPEC switch, prof image `8B5DC5C3`, stage buckets armed, corrected cycles **per
+guest instruction** (the two ~11 s windows are not the same length, so nothing raw is
+compared). The price is swept over this capture's own usable band: the firmware refuses the
+boot line's 66 as arithmetically impossible here and prints a ceiling of 60, bound by
+`TAILADV`.
+
+| bucket | SPEC ON | SPEC OFF | delta @54 | delta @60 |
+|---|---|---|---|---|
+| **HANDLER** | **105.07** | **91.97** | **+14.25 %** | **+16.25 %** |
+| DOPCFILL | 19.79 | 17.84 | +10.90 % | +11.69 % |
+| TAILSPEC | 2.07 | 1.89 | +9.16 % | +9.33 % |
+| FETCHEX | 57.97 | 56.54 | +2.52 % | +2.62 % |
+| FETCHOP | 21.41 | 21.08 | +1.59 % | +1.63 % |
+| WRITE | 34.35 | 33.71 | +1.90 % | +2.00 % |
+| DOPCFIND | 77.83 | 76.75 | +1.40 % | +1.52 % |
+| READ | 43.77 | 43.75 | +0.04 % | +0.03 % |
+| LOOPRES | 56.64 | 56.86 | −0.38 % | −0.78 % |
+| **corrected TOTAL** (instrument excluded) | **496.52** | **477.05** | **+4.08 %** | **+4.83 %** |
+
+**Nothing got cheaper.** Not one bucket moved down by more than the 0.4–0.8 % `LOOPRES`
+residue, and the bucket the rung exists to shrink is the one that grew most. The counters
+say the *work* is identical: READ/INSN 0.4215 vs 0.4219, WRITE/INSN 0.3007 vs 0.3010,
+XLATE/INSN 0.01700 vs 0.01683, FAULTS 3630 vs 3629. **Same work, more cycles, all of it in
+one bucket.**
+
+Per served instruction, two independent derivations:
+
+```
+A. from the lean wall clock (the shipping instrument)
+   time ratio ON/OFF 1.07007 over 21.12 % coverage  ->  served dispatches +33.2 % SLOWER
+   at ~71.8 ARM cyc per guest instruction (lean, disarmed) -> ~ +24 cyc per served instruction
+
+B. from the bucket capture (the localising instrument)
+   HANDLER +13.10 cyc/INSN over 20.15 % coverage    ->  +65 cyc per served instruction,
+                                                        inside the HANDLER bracket alone
+```
+
+The two instruments disagree in size — the bucket capture's probes inflate everything and
+the +65 sits inside a bracket that also carries the probe pair's own scaffolding — and agree
+completely in **sign and location**. Against the model: this document predicted the served
+dispatch would get **7–11 % cheaper**. It got **33 % more expensive**: sign wrong, magnitude
+3–4× the predicted size in the other direction.
+
+## The mechanism — the body is 2–3× the handler it replaced
+
+Counted from the shipped lean ELF that produced `6ADABE4A`
+(`arm-none-eabi-objdump -d`, every instruction issued, predicated-not-taken ones included).
+The **served path** is traced through the inlined body for the four shapes the *Pre-registered
+arithmetic* table priced; the **replaced path** is the run loop's dispatch triple plus the
+generated handler plus the result move:
+
+| shape | served SPEC body | generated-handler path replaced | ratio |
+|---|---|---|---|
+| `MOVE.L Dn,Dn` (`op_2000`) | **65** | 4 dispatch + 15 handler + 2 join = **21** | **3.1×** |
+| `MOVE.L d16(An),Dn` (`op_2028`) | **85** | 4 + 24 + **9 window** + 2 = **39** | **2.2×** |
+| `MOVEA.L d16(An),An` (`op_2068`) | **77** | 4 + 19 + **9 window** + 2 = **34** | **2.3×** |
+| `MOVE.L (An)+,(An)+` (`op_20d8`) | **118** | 4 + 37 + 2 = **43** | **2.7×** |
+
+*dispatch* = `add r3,fp,#6` / `ldrh r0,[r4,#84]` / `ldr r3,[r5,r3,lsl #2]` / `blx r3`;
+*join* = the `mov r7,r0` / `b` that lands the handler's return on the tail; *window* = the
+nine instructions `uae_mmu040_get_iword()` spends on a window hit, which is what site C
+removes and which both `d16(An)` shapes pay in the reference arm. The four accessor calls
+the body itself makes (`get_long_mmu040` and friends) are common to both arms and are
+excluded from both columns.
+
+On a dispatch of ~180 ARM instructions that is **+24 % to +40 % of the whole served
+dispatch**, which is where the measured **+33 %** comes from. The model's `R` was
+**7–11 % removed**; the binary's `R` is **40–100 % added**.
+
+**Why, in one line: `gencpu`'s per-opcode handlers ARE the specialisation, and an inline
+body that takes the opcode word at *runtime* is a DE-specialisation.** `op_2000_31_ff` is
+15 instructions of straight-line code with **no call frame at all** — gcc made it a leaf
+ending in `bx lr`, so §30.3 site A's "handler's `push`/`pop`" is worth **zero** on the
+commonest shape. The specialised body spends **27 instructions on its prologue alone** —
+five field extractions, the size ladder, the `srcmem`/`dstmem` tests, the length
+computation — before it touches a register or a byte of guest state. It then walks a
+six-way source ladder and a six-way destination ladder that gencpu resolved at compile
+time. The four sites §30.3 priced as removals are real, and they are dwarfed by a mode
+ladder the pre-registration never counted because it assumed the switches would be folded.
+
+**And the design's Site C did not materialise as specified.** `z3660_spec_iword()` takes its
+offset as a *runtime* value (`srcmode == 5 ? 4 : 2`), so the `have_ext0` test cannot fold and
+both arms survive: **two `bl uae_mmu040_get_iword` call sites remain inside the specialised
+body**, taken whenever the entry does not describe the word (`M_EXT0` clear, or the
+destination displacement at `pc + 4` when both EAs are `d16(An)` — a word the entry cannot
+hold). A static census of the whole run loop counts **nine** `get_iword` sites; seven of them
+pre-date this experiment (the decoded-op fill's own ext0 fetch and rung 0's block-idiom
+recognizer) and **two are the body's**.
+
+## Finding 4c was arithmetically impossible as declared — and that is this document's error
+
+The pre-registration declared, twice and emphatically, that `FETCH` / `IFETCH_CALLS` would
+**fall** by the number of served `d16(An)` instructions. **It could not.** Site C removes a
+*window hit*, and `uae_mmu040_get_iword()` answers a window hit **above** the bracket:
+
+```c
+if (addr == (uaecptr)z3660_dopc_ext_pc) {
+        Z3660_PROF_CNT(Z3660_PROF_C_DOPC_EXT);      /* counted here ... */
+        return (uae_u16)z3660_dopc_ext_val;
+}
+Z3660_PROF_ENTER_IFETCH();                          /* ... never reaching FETCH */
+Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
+```
+
+A served window hit never incremented `FETCH` in either arm, so removing the call could
+only move `DOPC_EXT` — and `DOPC_EXT` was deliberately re-counted inside the body to keep
+it comparable, which is why it reads **0.3385 vs 0.3391, unchanged, exactly as designed.**
+The declaration confused "the accessor is not called" with "the fetch is not paid"; the
+cache had already stopped paying it.
+
+What actually moved `FETCH` is the miss rate. The armed arm takes **3.2 % more decoded-op
+misses per dispatch** (0.15439 vs 0.14963, the −0.47 pp of check 4a), and a miss costs two
+real instruction fetches a hit does not: the run loop's own `x_prefetch(0)` and the
+extension lookahead. `+0.00476 misses × 2 = +0.0095` fetches per guest instruction against a
+measured `+0.0124` — the right size and the right sign, and it carries `IPAGE` (4d) with it
+for the same reason. **4c and 4d are one finding, and it is a bookkeeping error in this
+document, not a defect in the build.**
+
+## The owed side-measurement — THE FILL-PATH PRICE
+
+Taken while the rig was up, because it replaces the stale **62–64 cyc/miss** input the
+physical-index decoded-op study (map §33.4) is sized against.
+
+```
+DOPCFILL corrected cyc/miss = (acc[15] - spans[15] x price) / DOPC_MISS
+
+  reference posture (SPEC OFF, prof 8B5DC5C3)   75.9 .. 81.9 cyc/miss
+                                                at calibration band [54, 60] cyc/transition
+  armed arm     (SPEC ON)                       84.0 .. 90.0 cyc/miss, same band
+```
+
+**The stale input is refuted UPWARD.** Even 75.9 — the cheapest end, taken at the ceiling
+price, the most aggressive correction this capture permits — sits above the expensive end of
+62–64. The fill path is **19–32 % dearer** than the design has been sized against. Fills run
+0.218 per guest instruction and are **4.13 %** of the corrected profile. The band is part of
+the number: this capture's printed ceiling is **60, bound by `TAILADV`**, and the firmware
+rejects the boot line's in-bucket end of 66 as arithmetically impossible here. Provenance,
+so it is not carried further than it was earned: measured on the **SPEC prof build**
+`8B5DC5C3` with the switch **disarmed**, not on `DEC21748` itself.
+
+## What this closes, and what it does not
+
+**Closed.** The rung is not funded. Bands 1, 1b, 1c and 2 are refuted **as built**, and
+4c/4d are refuted as *declarations* — the fault there is this document's.
+
+**Not closed, and this is the honest half.** The experiment's premise was that the body
+*removes* work. It adds work — 2–3× the path it replaces, on every shape measured. Every
+band downstream of that premise is therefore measuring **the implementation**, not the
+bucket. You cannot conclude "`HANDLER` is dependency-chained" from a regression, and you
+cannot conclude "`HANDLER` is latency-hidden" either: a **null** was the reading that would
+have said that, and this is not a null. **`HANDLER` remains unclassified.** The ladder's #1
+rung is neither struck nor funded — it is unbought, and it now costs a rebuild to buy rather
+than a measurement.
