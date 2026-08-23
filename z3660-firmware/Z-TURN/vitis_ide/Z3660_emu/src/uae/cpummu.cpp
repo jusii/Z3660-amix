@@ -107,13 +107,13 @@ struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
  * against the live function over the whole (super x msb x register) space rather than
  * over a sample.
  * ========================================================================== */
-uae_u16 z3660_dfv_r[2][256];
-uae_u16 z3660_dfv_w[2][256];
+unsigned short z3660_dfv_r[2][256];
+unsigned short z3660_dfv_w[2][256];
 static int z3660_dfast_on = 1;
 
 /* One window's verdict for one (msb, super), or TTR_NO_MATCH. `cs` is written only on a
  * match, exactly as mmu_do_match_ttr() writes mmu_cache_state only on a match. */
-static int z3660_dfast_win(uae_u32 ttr, uae_u32 msb, int super, uae_u8 *cs)
+static int z3660_dfast_win(uae_u32 ttr, uae_u32 msb, int super, unsigned char *cs)
 {
 	uae_u8 hi, mask;
 
@@ -146,9 +146,9 @@ void z3660_dfast_rebuild(void)
 
 	for (super = 0; super < 2; super++) {
 		for (i = 0; i < 256; i++) {
-			uae_u8 cs = 0;
+			unsigned char cs = 0;
 			int res;
-			uae_u16 vr, vw;
+			unsigned short vr, vw;
 
 			if (!z3660_dfast_on) {
 				z3660_dfv_r[super][i] = Z3660_DFAST_SLOW;
@@ -163,12 +163,12 @@ void z3660_dfast_rebuild(void)
 
 			if (res == TTR_OK_MATCH) {
 				/* Transparent both ways. Nothing else in the original path runs. */
-				vr = (uae_u16)(Z3660_DFAST_XPAR | ((uae_u16)cs << 8));
+				vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
 				vw = vr;
 			} else if (res == TTR_NO_WRITE) {
 				/* Reads are transparent; a WRITE takes the bus-error path in
 				 * mmu_match_ttr_write(), which is not reimplemented here. */
-				vr = (uae_u16)(Z3660_DFAST_XPAR | ((uae_u16)cs << 8));
+				vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
 				vw = Z3660_DFAST_SLOW;
 			} else if (regs.mmu_enabled) {
 				vr = Z3660_DFAST_PAGE;
@@ -199,10 +199,10 @@ int z3660_dfast_arm(int on)
 }
 int z3660_dfast_armed(void) { return z3660_dfast_on; }
 
-uae_u64 z3660_dfast_served(void)
+unsigned long long z3660_dfast_served(void)
 {
 #if Z3660_EMU_PROF
-	return (uae_u64)z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
+	return (unsigned long long)z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
 #else
 	return 0;
 #endif

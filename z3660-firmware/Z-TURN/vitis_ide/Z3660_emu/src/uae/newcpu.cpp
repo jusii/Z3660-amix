@@ -4757,6 +4757,14 @@ extern "C" void z3660_knobs_sync(void)
       unsigned d = z3660_dopc_resolve((unsigned)shared->dopc_on);
       if (d != z3660_dopc_on) { z3660_dopc_on = d; z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB); }
    }
+   {                                                                                   // DFAST
+      /* CYBERSTORM C2 rung 2. Only on a CHANGE, because arming rebuilds two 1 KB tables
+       * and this runs at every resync point. Unlike DOPC there is nothing to invalidate:
+       * the fast path holds no state of its own -- disarming just makes every verdict
+       * SLOW, and the original accessor is what runs. */
+      unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
+      if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
+   }
 }
 
 /* Read-back + direct set for the host harness and the serial console. The setter takes a

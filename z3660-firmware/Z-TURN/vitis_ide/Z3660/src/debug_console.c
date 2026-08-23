@@ -38,6 +38,10 @@ int  piscsi_stats_reporting(void);
  * sentinel to drift away from the one core1 tests against. */
 #include "../../Z3660_emu/src/uae/z3660_blk.h"
 #include "../../Z3660_emu/src/uae/z3660_dopc.h"
+/* CYBERSTORM C2 rung 2: same reasoning again -- z3660_dfast.h is deliberately
+ * self-contained (plain types, no emulator headers) so the ONE rule that turns a mailbox
+ * word into a state lives in one file that both cores compile. */
+#include "../../Z3660_emu/src/uae/z3660_dfast.h"
 typedef enum {
    A,
 
@@ -100,6 +104,8 @@ typedef enum {
    BLK,     BLOCK_IDIOM,
    /* CYBERSTORM C2 rung 1: the decoded-op cache. APPEND-ONLY, like everything above. */
    DOPC,    DECODED_OP_CACHE,
+   /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
+   DFAST,   ACCESSOR_FAST_PATH,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -163,6 +169,7 @@ const char *command_names[] = {
       "PROFO",   "PROF OFF",
       "BLK",     "BLOCK IDIOM",
       "DOPC",    "DECODED OP CACHE",
+      "DFAST",   "ACCESSOR FAST PATH",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -668,6 +675,28 @@ int debug_thread(struct pt *pt)
                            xil_printf("DECODED OP CACHE OFF (every instruction is fetched and decoded again)\r\n");
                         else
                            xil_printf("DECODED OP CACHE ON (4096 entries, 4-way, 64 KB; carries the block-idiom verdict)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case DFAST:
+                  case ACCESSOR_FAST_PATH:
+                     {  /* CYBERSTORM C2 rung 2. Toggle the data accessors' fast path.
+                        * OFF is the REFERENCE MACHINE -- every access takes the original
+                        * out-of-line accessor -- so this is what makes a PROFZ-fenced
+                        * same-boot A/B of the rung possible without a second flash, which
+                        * is the experiment map SS23.1 says a build difference otherwise
+                        * needs two flashes for. There is nothing to invalidate on the way
+                        * through: the fast path holds no state of its own, only a derived
+                        * verdict table that is rebuilt either way. The rule that turns
+                        * this word into a state is z3660_dfast.h's z3660_dfast_resolve()
+                        * and nothing else re-implements it. */
+                        uint32_t c=shared->dfast_on;
+                        c = (z3660_dfast_resolve(c)!=0u) ? Z3660_DFAST_OFF : Z3660_DFAST_DEFAULT;
+                        shared->dfast_on=c;
+                        if(c==Z3660_DFAST_OFF)
+                           xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
+                        else
+                           xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1415,6 +1444,7 @@ void debug_console_help(void)
    xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
+   xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

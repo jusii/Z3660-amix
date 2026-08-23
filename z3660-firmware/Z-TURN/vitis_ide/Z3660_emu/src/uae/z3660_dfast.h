@@ -128,7 +128,14 @@
 #ifndef Z3660_DFAST_H
 #define Z3660_DFAST_H
 
-#include "uae/types.h"
+/* SELF-CONTAINED ON PURPOSE, and spelled in plain types rather than uae_u*.
+ *
+ * core0's serial console includes this header DIRECTLY -- exactly as it includes
+ * z3660_blk.h and z3660_dopc.h -- so that z3660_dfast_resolve() below is the single place
+ * a mailbox word becomes a state. core0 cannot compile the emulator's headers, so this one
+ * must not need them. A mirrored core0 copy would only be a second place for the OFF
+ * sentinel to drift away from the one core1 tests against.
+ */
 
 /* THE INLINE IS NOT DECORATION -- it is the rung.
  *
@@ -152,7 +159,7 @@
 #define Z3660_DFAST_PAGE  2u   /* no TTR matched and the MMU is on: consult the page cache */
 
 #define Z3660_DFAST_VERDICT(v) ((v) & 0xFFu)
-#define Z3660_DFAST_CSTATE(v)  ((uae_u8)((v) >> 8))
+#define Z3660_DFAST_CSTATE(v)  ((unsigned char)((v) >> 8))
 
 /* THE ENGAGEMENT SIGNAL, and why it is not the profiler's counter.
  *
@@ -186,8 +193,8 @@ extern "C" {
  * `mmu_cache_state` a match installs in the high byte. Two directions because the W bit
  * and the write-fault rules differ, and because the read and write page caches are
  * separate arrays anyway. 2 KB in total. */
-extern uae_u16 z3660_dfv_r[2][256];
-extern uae_u16 z3660_dfv_w[2][256];
+extern unsigned short z3660_dfv_r[2][256];
+extern unsigned short z3660_dfv_w[2][256];
 
 /* Rebuild both tables from regs.dtt0/dtt1, regs.mmu_enabled and the arm switch. Called
  * from mmu_tt_modified() and mmu_set_tc(); safe to call at any time. */
@@ -198,9 +205,23 @@ void z3660_dfast_rebuild(void);
 int  z3660_dfast_arm(int on);
 int  z3660_dfast_armed(void);
 
+/* THE CROSS-CORE KNOB, and the one rule that turns a mailbox word into a state.
+ *
+ * Same shape as z3660_dopc_resolve() and for the same reason: core0's serial console and
+ * core1's knob resync must not be able to disagree about what a word means, so the
+ * mapping lives here and nowhere else. UNSET (0) MEANS ON -- a core0 built before the
+ * field existed publishes a zeroed struct, and that must run the shipped behaviour rather
+ * than silently disarming the rung. */
+#define Z3660_DFAST_OFF     0xFFFFFFFFu
+#define Z3660_DFAST_DEFAULT 1u
+static __inline__ unsigned z3660_dfast_resolve(unsigned requested)
+{
+   return (requested == Z3660_DFAST_OFF) ? 0u : 1u;
+}
+
 /* Harness/console: how many accesses the fast path has served. Prof build only; 0
  * elsewhere. Reads the profiler's own counters, so it cannot disagree with a dump. */
-uae_u64 z3660_dfast_served(void);
+unsigned long long z3660_dfast_served(void);
 
 #ifdef __cplusplus
 }

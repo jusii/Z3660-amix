@@ -138,7 +138,18 @@ Two properties worth stating outright:
 `z3660_dfast_arm(0)` rebuilds the tables all-`SLOW`, so every access falls through to the original
 path. **That costs nothing on the hot path** — the disarm lives in the table the hot path was
 going to read anyway — and it gives the host harness a genuine reference to run the equivalence
-corpus against, and metal a `PROFZ`-fenced same-boot A/B without a second flash.
+corpus against.
+
+On metal it is the serial console's **`DFAST`** (or `ACCESSOR FAST PATH`), carried across the
+cores in `SHARED.dfast_on` at `0xFFFF00EC`, resolved by `z3660_dfast_resolve()` — the single rule
+both cores compile, exactly like `BLK` and `DOPC`. **Unset means ON**, so a core0 built before the
+field existed still runs the shipped behaviour rather than silently disarming the rung. Nothing is
+invalidated on the way through: the fast path holds no state of its own.
+
+> **That makes a `PROFZ`-fenced same-boot A/B of this rung possible without a second flash** —
+> which matters because map §23.1 established that a *build* difference cannot be defended by a
+> console switch and needs a two-flash A/B. This rung is not a build difference; it is a switch,
+> deliberately, so its own scoring does not inherit that problem.
 
 ---
 
@@ -191,6 +202,18 @@ already overlapping with guest-DRAM latency"* — is the one to watch.
 **The run loop did not grow at all**, which is the specific I-cache regression the map warned
 about. The growth is confined to the ~10 out-of-line accessor copies (one set per translation
 unit), because the resolver is inlined *there* and not at the ~3000 handler call sites.
+
+Whole-image, lean, measured by building the previous commit and this one:
+
+| | before (`55ee6c2`) | after |
+|---|---|---|
+| core1 `Z3660_emu.elf` `.text` | 6 450 836 B | **6 455 628 B** (+4 792 B = **+1 198 ARM instructions**) |
+| `BOOT-lean.BIN` | 12 778 804 B | 12 795 204 B |
+
+`+1 198` instructions over a ~1.6 M-instruction image is **+0.07 %**. (The boot image's +16 400 B
+is almost entirely core0's `DFAST` console command and the `mkbootimage` alignment around it, not
+core1.) The retired "keep BOOT.BIN under ~12 MB" rule is not in play; the number that mattered was
+the run loop's, and it is unmoved.
 
 > **The `always_inline` is the rung, not decoration.** `ALWAYS_INLINE` in this tree is bare
 > `__inline` — a hint — and at the `-Os` the firmware builds with, **gcc declined it**: the first

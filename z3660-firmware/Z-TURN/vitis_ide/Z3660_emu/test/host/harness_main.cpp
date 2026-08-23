@@ -2811,7 +2811,19 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, arm_wall_hz),     0xE0, "arm_wall_hz     @ 0xFFFF00E0 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, blk_chunk),       0xE4, "blk_chunk       @ 0xFFFF00E4 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, dopc_on),         0xE8, "dopc_on         @ 0xFFFF00E8 (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xEC, "SHARED is 0xEC bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, dfast_on),        0xEC, "dfast_on        @ 0xFFFF00EC (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xF0, "SHARED is 0xF0 bytes -- new fields go on the END");
+
+	/* C2 rung 2: the knob's RULE, not just its offset. UNSET must mean ON -- a core0
+	 * built before this field existed publishes a zeroed struct, and reading that as
+	 * "disarmed" would silently take the rung out of the shipped firmware while every
+	 * offset assertion above still passed. Same trap z3660_dopc_resolve() documents. */
+	CHECK_EQ32((uae_u32)z3660_dfast_resolve(0u),                    1u,
+	           "an UNSET dfast_on means ON, not off");
+	CHECK_EQ32((uae_u32)z3660_dfast_resolve(Z3660_DFAST_DEFAULT),   1u, "DEFAULT means ON");
+	CHECK_EQ32((uae_u32)z3660_dfast_resolve(Z3660_DFAST_OFF),       0u, "the OFF sentinel means off");
+	CHECK_EQ32((uae_u32)z3660_dfast_resolve(12345u),                1u,
+	           "and anything else means ON -- only the sentinel disarms");
 }
 
 /* ==================================================================

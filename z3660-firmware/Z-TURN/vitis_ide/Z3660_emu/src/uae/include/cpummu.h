@@ -743,7 +743,7 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
  * ========================================================================== */
 Z3660_DFAST_INLINE int z3660_dfast_read(uaecptr addr, uaecptr *pa, uae_u8 *cs)
 {
-	uae_u16 v = z3660_dfv_r[regs.s ? 1 : 0][addr >> 24];
+	unsigned short v = z3660_dfv_r[regs.s ? 1 : 0][addr >> 24];
 	unsigned verdict = Z3660_DFAST_VERDICT(v);
 	uaecptr phys;
 
@@ -801,7 +801,7 @@ Z3660_DFAST_INLINE int z3660_dfast_read(uaecptr addr, uaecptr *pa, uae_u8 *cs)
 
 Z3660_DFAST_INLINE int z3660_dfast_write(uaecptr addr, uaecptr *pa, uae_u8 *cs)
 {
-	uae_u16 v = z3660_dfv_w[regs.s ? 1 : 0][addr >> 24];
+	unsigned short v = z3660_dfv_w[regs.s ? 1 : 0][addr >> 24];
 	unsigned verdict = Z3660_DFAST_VERDICT(v);
 	uaecptr phys;
 
