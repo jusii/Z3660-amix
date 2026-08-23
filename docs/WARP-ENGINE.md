@@ -1189,6 +1189,171 @@ counter exists is the one thing §30's law strikes outright.
    WARP row compares wall clock across two profiling builds until that mechanism is named.
 8. **That any of these session counts are right.**
 
+## 0.6 M1 round 1 — the plumbing slice, pre-registered (2026-08-23)
+
+**This section is written before the first line of engine code and is scored as written.**
+§3.4's two rules govern it exactly as they govern §0.5: the pre-registration commit precedes
+the implementation commits, provably, by commit timestamp in this repository; and a
+prediction that turns out wrong is marked `MISSED` beside the measurement with the
+prediction left byte-untouched.
+
+### 0.6.1 What round 1 is, and what it deliberately is not
+
+**Round 1 builds the engine's skeleton end to end and generates no code.** Blocks are
+discovered, keyed, cached, invalidated, evicted, entered and exited — and every block is a
+**null block**: a generated stub that syncs nothing, retires nothing, and returns to the
+interpreter at the PC it was entered at. There is no per-opcode compiler, no `MOVE` codegen,
+no `Bcc`/`DBcc` inheritance, no `jnf_MEM_*` replacement. **No performance claim of any kind
+is made or is admissible from this round**, and §0.5.2's own table says why in advance:
+coverage is **0 by construction**, and *"coverage < 60 % … is not a verdict in either
+direction"*. The kill line cannot fire on round 1 and must not be quoted against it.
+
+What it exists to prove is the machinery §0.5 will be scored with: the switch, the counters,
+the block cache, the invalidation wiring, the cadence contract, the bail accounting and the
+lockstep oracle — **all of it before there is a compiler whose numbers could distract from
+it.** The one number round 1 does produce is a **cost**: what it costs to look a PC up, enter
+a block and come straight back out. §30's law says work prepended to the path arrives in
+full, and this round measures the arrival before anything is built on top of it.
+
+### 0.6.2 The no-empty-pass invariant, and the counter binding it forces
+
+A null block creates a case §0.5.6 did not have to model, and the resolution is written here
+rather than discovered in a capture.
+
+> **THE NO-EMPTY-PASS INVARIANT.** A block entry either **retires ≥ 1 guest instruction and
+> consumes the run-loop pass**, or **retires 0 and falls through to the interpreter inside the
+> same pass**. There is no third outcome, and in particular no pass that retires nothing.
+
+It is not a tidiness rule. Without it a null block at every dispatched PC would burn one
+whole run-loop pass per guest instruction: `INSNS` would double, the engine would need a
+re-entry guard to avoid an infinite loop at a bailed PC, and the wall clock would halve. With
+it, progress is guaranteed by construction — a pass always retires at least one instruction,
+whoever retires it — and no guard is needed at all.
+
+**The counter binding that follows, and §0.5.6's own topology law is the authority for it.**
+§0.5.6 defines `WARP_ENTER` (id 47) as *"the loop hook — the site that costs exactly one
+`INSNS`"*, and warns that incrementing it anywhere that does **not** cost an `INSNS`
+*"over-subtracts and reports coverage high"*. A fall-through entry costs no `INSNS` of its
+own: the interpreted instruction in the same pass costs it. Therefore:
+
+- **`WARP_ENTER` (id 47) counts pass-consuming entries only.** In round 1 it is **0**, always,
+  because no block consumes a pass. The §2e claim-3 identity
+  `DOPC_HIT + DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS` therefore reduces to the standing
+  identity in **both** arms, and holds exactly rather than approximately.
+- **`WARP_BLK` (id 48) counts every block execution**, null ones included, and is therefore
+  the quantity the **arm attestation** rides on. §0.5.1 requires the always-compiled
+  `warp_entered` confession to be *"one increment site, not two"* and to be the same quantity
+  as a counter in the profiled block; that requirement is met exactly, with id 48 in id 47's
+  place. **The binding moves; the property §0.5.1 asked for does not.** Binding it to id 47
+  instead would have made a lean arm-attestation read zero on an armed boot, which is the one
+  thing an attestation may not do.
+
+### 0.6.3 The six things round 1 builds
+
+1. **The switch.** `WARP` console command; `SHARED.warp_on` at **`0xFFFF00F0`** (the slot
+   `IFAST`, `SPEC` and the withdrawn `IVSUP` each briefly held and gave back), `SHARED` grows
+   to `0xF4`. **`unset = OFF`** (§0.1 Q9) — the deliberate house-rule inversion, with the
+   reason recorded at the switch itself and not only here. **Arming takes an exact 32-bit
+   magic**, `0x57415250`, on the `IVSUP` precedent: `SHARED` is hand-maintained in two headers
+   that a beta resync has already mis-merged once, so a neighbouring field's value bleeding
+   into this one must **disarm**, which a magic-word test guarantees and a truthiness test does
+   not. Core0 **republishes the OFF sentinel unconditionally on every boot** from both
+   config-resolve paths, because the mailbox is DDR that survives a warm reset — and the
+   harness carries the **anti-vacuity check** that a reader who deletes the republish as
+   redundant fails. Banner on arm and on disarm, printed by **core1**, because the console can
+   only write a mailbox word. `warp_entered` is compiled into **every** variant.
+2. **Counters 47 – 59** exactly as §0.5.6 pre-registered them, with **id 46 permanently
+   retired** behind a name-table placeholder so the indices align, and `Z3660_PROF_C_COUNT`
+   46 → **60**. No id below 46 changes meaning, no field changes shape, **the dump version
+   stays 2**.
+3. **The block manager.** Discovery at interpreter dispatch, armed only. **Keyed on guest
+   virtual PC with the supervisor bit in bit 0**, in the dopc's encoding, with the dopc's
+   **set-relative empty marker** — the M0-refuted `regs.pc_p` host-pointer keying (§0.3(c),
+   §2b) is replaced, not adapted. Generation invalidation hung off the existing
+   `z3660_dopc_invalidate()` choke point for **all** causes, so the code cache is opted *out*
+   of a new upstream cause rather than into it; `WARP_DISC` / `WARP_DISC_ROOT` (Q5's counters)
+   live from day one. Eviction is §2b's decision unchanged: bump-allocate, then throw
+   everything away and bump the generation (`WARP_FLUSH`).
+4. **The bail contract, skeleton form.** Block entry records the block-head guest PC; the null
+   block syncs nothing because nothing is dirty; the cadence feed exists **now**, feeds the
+   service-cadence counter with **retired guest instructions** (Q10, frozen), and carries its
+   M-7 mutation arm. Stubs are emitted through the code cache's own arena and published with
+   the **Q3-augmented** sequence — the shipped `arm_flush_cache` + `arm_icache_invalidate`
+   plus **BPIALL + DSB + ISB**, which is byte-for-byte the sequence stub B of the Q2 probe ran
+   under on metal (§0.4.1).
+5. **The lockstep oracle, host-harness mode.** Armed against disarmed over a corpus, compared
+   per instruction across §3.1's set plus the JIT's four. `WARP_LS_INSNS` / `WARP_DIVERGE`
+   live in a **gated build** that is compiled out of every shipping image.
+6. **The harness corpus and the mutation arms** that apply to this slice.
+
+**What round 1 does NOT build, and it is listed so that its absence is a decision rather than
+an omission:** the pass-consuming arm of the run-loop hook (it arrives with the first block
+that retires something, in round 2, and its price is what round 1 measures); the rung-0 PC
+decline (Q8 is honoured in round 1 by a stronger property — a null block retires nothing, so
+rung 0 runs in the same pass exactly as it does today, and `BLK_HIT`/`BLK_INSNS`/`BLK_BYTES`
+must read **identical** in both arms); and the supervisor gate's own counter — supervisor PCs
+are declined **before** discovery and are deliberately not counted in `WARP_DECLINE`, because
+one decline per supervisor instruction would make that counter a second copy of `INSNS_SUPER`
+and say nothing. The supervisor rate is read from `INSNS_SUPER`, which already exists.
+
+### 0.6.4 The round-1 gates, with their predictions
+
+Every one of these is a prediction made before the measurement exists.
+
+| gate | prediction |
+|---|---|
+| **G-R1.1 harness** | green (`0 failed`) in all three variants. New `CHECK`s: **+150 … +320** in the default variant, the **same** number in lean, and lean+prof gaining a further **+10 … +40** counter-only checks. Baseline is 3 186 / 3 182 / 3 390 |
+| **G-R1.2 disarmed object equivalence** | per-function normalised-disassembly diff of the **lean** `Z3660_emu.elf` against `3f33a6f`, addresses and branch-target immediates normalised away: **≤ 12 functions changed**, and every changed function on the WARP path, `m68k_run_mmu040`, `z3660_knobs_sync` or `z3660_dopc_invalidate`. `m68k_run_mmu040` grows **+8 … +40 bytes** from its standing 2 288 |
+| **G-R1.3 lockstep identity** | `WARP_DIVERGE == 0` over `WARP_LS_INSNS ≥ 10⁷`, and the two arms' final register file **and** guest memory byte-identical. A single divergence is a stop, not a statistic |
+| **G-R1.4 counter identities** | `DOPC_HIT + DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS` **exact** in both arms with `WARP_ENTER == 0` armed; `FAULTS(on) == FAULTS(off)` **exact** on the deterministic host corpus (the ±1 of §0.5.5 is a metal allowance); `sum(IV_*) − IV_WRAP == DOPC_INVAL` unchanged; `WARP_DISC` reconciles against the same invalidation stream; `BLK_*` identical between arms |
+| **G-R1.5 mutation arms** | each **caught**, and each shown to be caught in the log rather than merely asserted: **M-5** the block key drops the supervisor bit; **M-7** the cadence counter fed 1 per block instead of retired instructions; **M-ICACHE** a null block entered without the publish sequence; **M-ARM** a truthy word arms the switch; **M-REPUB** the per-boot republish deleted |
+| **G-R1.6 images** | the three shipping images rebuilt with the switch present, CRCs recorded, the archive firing for each. `BOOT-q2probe.BIN` is **not** rebuilt |
+| **G-R1.7 entry cost** | from the **lean** `objdump`, before any metal time: the **disarmed** gate costs **3 … 6** ARM instructions per guest instruction; the **armed** null-block path costs **24 … 40** ARM instructions per *user-mode* guest instruction |
+
+### 0.6.5 The metal expectation, derived and stated before the session
+
+The naive expectation is that a block which bails immediately costs nothing, so an armed
+null-block row should land inside the disarmed row's own spread. **The arithmetic disagrees,
+and it is written down here rather than after the row arrives.**
+
+```
+   lean dhry 8 151 x 643 guest instructions per dhrystone iteration (M0 capture, S0.4.2)
+        = 5.24 M guest instructions/s at 1.1 GHz  ->  ~210 ARM cycles per guest instruction
+   an added instruction costs ~1 cycle at IPC ~ 1, less where the A9 dual-issues it
+```
+
+| row | derived band | notes |
+|---|---|---|
+| disarm penalty — the WARP image **disarmed** against the `F294E75A` cross-build row (8 151) | **−0.5 % … −2.9 %**, dhry **7 915 … 8 110** | the shipped cost of *having* the switch, on 3 – 6 gate instructions. §3.5's table says this shape is normal: the three shipped rungs measured disarm penalties of −3.74 %, −1.58 % and −1.07 % |
+| same-boot switch — **armed** against **disarmed** on the same image | **−5 % … −16 %**, armed dhry ≈ **6 700 … 7 700** | 24 – 40 instructions on dhrystone's **83.91 %** user-mode share (§0.4.2's 16.09 % supervisor), i.e. 20 – 34 cycles on ~210 |
+
+**This is a cost, not a verdict**, and the reading rule is stated before the row exists:
+
+- The M1 kill line **does not fire** on it. Coverage is 0 by construction, and §0.5.2's table
+  is explicit that a sub-band coverage row is not a verdict in either direction.
+- A row **inside** the band confirms the pricing law's first bite and sizes the entry
+  sequence that round 2 must amortise over a block's length. It is the input to the obvious
+  round-2 lever — restricting discovery to control-transfer targets instead of every
+  dispatched PC — which is thereby **priced by measurement rather than adopted by taste**.
+- A row **above** the band (cheaper than predicted) is scored `MISSED` in the cheap direction
+  and the `objdump` count is re-read before anything is concluded from it.
+- The identity `cross-build × disarm-penalty = same-boot switch` must close, as it has three
+  times (§3.5). A round-1 row where it does not close is a measurement error, not a result.
+
+### 0.6.6 What round 1 explicitly does not establish
+
+1. **Anything about speed.** There is no compiler. Every number this round produces is a cost.
+2. **That the emitted sequence is correct on ARM.** The host harness proves the *decisions*
+   and asserts the emitted words **byte-exactly**, but it executes not one of them (§3.2's
+   honest limit). The stub's execution is proven on target and only on target.
+3. **That the cache-maintenance sequence is correct at volume.** Q3's `UAEJIT` A/B is still a
+   separate metal session and the platform caveat stands: adding barriers is not evidence of a
+   fix; only a soak on metal is.
+4. **That the cadence contract is unmoved on metal.** Round 1 asserts it by construction and
+   in the harness (M-7); the behavioural proof remains M3's PSTAT gap fingerprint.
+5. **Anything about faults or demand paging.** No block can fault, because no block does
+   anything.
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
