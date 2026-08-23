@@ -30,9 +30,22 @@ LDSCRIPT:= $(SRCDIR)/lscript.ld
 # runs, and the C3 calibration priced the difference between the two loops at 9.1 % of
 # guest throughput, larger than several of the effects C2 is meant to rank. See
 # src/uae/z3660_prof.h.
+#
+# Z3660_Q2PROBE=1 is the FOURTH variant, and it is not a measuring instrument like the
+# other two -- it is a one-question experiment (Plan WARP ENGINE, M0, Q2: can a C++ throw
+# cross a frame of generated code?). It is the DEFAULT variant plus src/warp_q2probe.cpp,
+# which emits ARM instructions into the heap, executes them, and provokes an unwind
+# failure across them. It must never reach a card that is running anything. It builds
+# into build-q2probe and produces BOOT-q2probe.BIN, and the probe source is filtered out
+# of the source list for every other variant below -- so the other three images are
+# byte-identical whether this file exists or not.
 Z3660_LEAN ?= 0
 Z3660_PROF ?= 0
-ifeq ($(Z3660_PROF),1)
+Z3660_Q2PROBE ?= 0
+ifeq ($(Z3660_Q2PROBE),1)
+BUILDDIR    := $(ROOT)/build-q2probe
+VARIANT_DEFS:= -DZ3660_WARP_Q2_PROBE=1
+else ifeq ($(Z3660_PROF),1)
 BUILDDIR    := $(ROOT)/build-prof
 VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_EMU_PROF=1
 else ifeq ($(Z3660_LEAN),1)
@@ -93,6 +106,12 @@ CXX_SRCS := $(filter-out \
 	$(SRCDIR)/uae/jit/codegen_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm2.cpp,$(CXX_SRCS))
+# The WARP Q2 unwind probe exists in exactly one variant. This filter is the first of the
+# two gates that keep it there; the second is the #if around the whole file (and around
+# its call site in main.cpp), so losing either one still ships nothing.
+ifneq ($(Z3660_Q2PROBE),1)
+CXX_SRCS := $(filter-out $(SRCDIR)/warp_q2probe.cpp,$(CXX_SRCS))
+endif
 S_SRCS := $(shell find $(SRCDIR) -type f -name "*.S")
 SRCS   := $(C_SRCS) $(CXX_SRCS) $(S_SRCS)
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(C_SRCS))
@@ -182,5 +201,5 @@ clean:
 # -- a -D is not a tracked dependency (headers now are, via -MMD), so the variants are
 # kept apart by directory and cleaned together by this target.
 clean-all:
-	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof
+	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof $(ROOT)/build-q2probe
 

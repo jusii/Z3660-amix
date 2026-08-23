@@ -41,6 +41,12 @@
 > rebuild never destroys the image you are comparing against. Details in
 > **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
 >
+> A fourth target, `make q2probe`, builds **`BOOT-q2probe.BIN`** — a throwaway experiment image
+> that answers one open design question about generated code and prints its verdict on serial
+> before emulation starts. It is compiled out of all three images above (their CRCs are
+> unchanged whether it exists in the tree or not), and it is meant to be booted once, not left
+> on a card. See **[docs/WARP-ENGINE.md](docs/WARP-ENGINE.md)**.
+>
 > ### Running AMIX
 > Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image** placed
 > on the **SCSI id it was installed on** (id 6 for the usual A3000 install — see the note in

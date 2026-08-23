@@ -1,7 +1,7 @@
 /Alfa/*
 !/Alfa/
 # The boot-image descriptors, one per build variant. Everything else under Alfa/ is a
-# generated artefact (BOOT*.BIN, sd_card contents), but these three are SOURCE: without
+# generated artefact (BOOT*.BIN, sd_card contents), but these four are SOURCE: without
 # them the matching make target cannot assemble an image at all.
 #
 # Name each one explicitly rather than writing `!/Alfa/*.bif`. The lean bif survived only
@@ -13,6 +13,7 @@
 !/Alfa/system_cli.bif
 !/Alfa/system_cli_lean.bif
 !/Alfa/system_cli_prof.bif
+!/Alfa/system_cli_q2probe.bif
 /Debug/
 /ReleaseAlfa/
 /Beta/

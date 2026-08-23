@@ -984,6 +984,19 @@ int main()
    //    for(int i=0x400,j=0;i<0x500;i++,j++)
    //        Xil_SetTlbAttributes(i*0x100000UL,(0x10000000+j*0x100000UL)|1); // mapped to 0x10000000
 
+#if defined(Z3660_WARP_Q2_PROBE)
+   // Plan WARP ENGINE, M0 / Q2 -- see src/warp_q2probe.cpp. Present in exactly one build
+   // variant (`make q2probe`); the preprocessor removes this call from the other three, so
+   // their images are byte-identical whether the probe exists in the tree or not.
+   //
+   // HERE and not earlier: the undefined-instruction, prefetch-abort and data-abort
+   // handlers are registered on the two lines above, so a probe that fails by executing
+   // garbage reports itself instead of rebooting silently. And not later: it must finish
+   // before the emulator starts, so one boot capture holds the whole answer.
+   extern void warp_q2_probe(void);
+   warp_q2_probe();
+#endif
+
    load_rom();
    load_romext();
    local.z3_enabled=shared->z3_enabled;

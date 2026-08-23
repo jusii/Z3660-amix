@@ -9,10 +9,11 @@
 #   make bootbin    -> generate BOOT.BIN
 #   make lean       -> LEAN (production) core1 + BOOT-lean.BIN, side by side with BOOT.BIN
 #   make profile    -> PROFILING core1 + BOOT-prof.BIN, side by side with the other two
+#   make q2probe    -> WARP M0 Q2 unwind-probe core1 + BOOT-q2probe.BIN (experiment only)
 #   make version    -> run make_version_alfa.py packaging script
-#   make clean      -> clean app builds (FSBL/app dirs), all THREE core1 build variants
+#   make clean      -> clean app builds (FSBL/app dirs), all FOUR core1 build variants
 #
-# THREE FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3 + C1):
+# FOUR FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3 + C1, WARP M0):
 #   BOOT.BIN       default -- the run-loop diagnostics are compiled in and switchable at
 #                  runtime (PROBES / PERFS / CSTAT). Flash this when something needs
 #                  looking at.
@@ -24,7 +25,13 @@
 #                  interpreter. Built on lean so the map describes the loop that ships.
 #                  Not for production; it costs measured time. Contract:
 #                  `Z3660_emu/src/uae/z3660_prof.h`.
-# The three never share objects: build / build-lean / build-prof.
+#   BOOT-q2probe.BIN
+#                  experiment -- the DEFAULT core1 plus `src/warp_q2probe.cpp`, which
+#                  answers Plan WARP ENGINE's Q2 (can a C++ throw cross a frame of
+#                  generated code?) early in boot and prints the verdict on serial. It
+#                  emits code into the heap and deliberately provokes an unwind failure,
+#                  so it exists to be booted once and never to be left on a card.
+# The four never share objects: build / build-lean / build-prof / build-q2probe.
 #
 
 # Set the path to bootgen.exe on your host system (e.g., macOS or Linux).
@@ -57,6 +64,14 @@ LEAN_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-lean.BIN
 PROF_BIF      := Z3660_system/Alfa/system_cli_prof.bif
 PROF_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-prof.BIN
 
+# Q2 PROBE variant (Plan WARP ENGINE, M0). Not an instrument and not a production image:
+# a one-question experiment that emits ARM code into the heap and provokes a C++ unwind
+# across it. Own bif, own output file, own build dir -- and src/warp_q2probe.cpp is
+# filtered out of every other variant's source list, so BOOT.BIN / BOOT-lean.BIN /
+# BOOT-prof.BIN are byte-identical with the probe in the tree and with it removed.
+Q2PROBE_BIF     := Z3660_system/Alfa/system_cli_q2probe.bif
+Q2PROBE_BOOTBIN := Z3660_system/Alfa/sd_card/BOOT-q2probe.BIN
+
 # THE ARCHIVE. Every image this Makefile produces is also copied here, CRC-stamped, e.g.
 # archive/BOOT-lean-86C0BC18.BIN. Gitignored (Z3660_system/.gitignore ignores /Alfa/*).
 #
@@ -84,8 +99,9 @@ Z3660_DIR     := Z3660
 Z3660_EMU_DIR := Z3660_emu
 
 # Default target
-.PHONY: all build z3660 z3660_emu z3660_emu_lean z3660_emu_prof lean lean_prepare \
-        profile profile_prepare bootbin version bsp_cortexa9_0 bsp_cortexa9_1
+.PHONY: all build z3660 z3660_emu z3660_emu_lean z3660_emu_prof z3660_emu_q2probe \
+        lean lean_prepare profile profile_prepare q2probe q2probe_prepare \
+        bootbin version bsp_cortexa9_0 bsp_cortexa9_1
 # Default: build firmware only to avoid rebuilding FSBL/BOOT every `make`
 all: bootbin version
 
@@ -125,6 +141,11 @@ z3660_emu_lean: bsp_cortexa9_1
 # PROFILING core1: the lean flags plus -DZ3660_EMU_PROF=1, into Z3660_emu/build-prof.
 z3660_emu_prof: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_PROF=1 -j 4
+
+# Q2-PROBE core1: the DEFAULT flags plus -DZ3660_WARP_Q2_PROBE=1 and the one extra source
+# file, into Z3660_emu/build-q2probe.
+z3660_emu_q2probe: bsp_cortexa9_1
+	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_Q2PROBE=1 -j 4
 
 # DDR_SPEED variable can be set to 533, 667, or 800
 DDR_SPEED ?= 533
@@ -181,6 +202,18 @@ profile: profile_prepare
 	@echo "BOOT-prof.BIN -> $(PROF_BOOTBIN)"
 	$(call archive_image,$(PROF_BOOTBIN))
 
+# `make q2probe` -> sd_card/BOOT-q2probe.BIN. Core0 and the FSBL are the same binaries the
+# other three images use. Does NOT touch BOOT.BIN, BOOT-lean.BIN or BOOT-prof.BIN.
+q2probe_prepare: bsp_cortexa9_0 z3660 z3660_emu_q2probe $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
+	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+
+q2probe: q2probe_prepare
+	@mkdir -p $(dir $(Q2PROBE_BOOTBIN))
+	@echo "Generating BOOT-q2probe.BIN (DDR $(DDR_SPEED)MHz, WARP M0 Q2 unwind probe)"
+	$(BOOTGEN_EXE_HOST) $(Q2PROBE_BIF) $(Q2PROBE_BOOTBIN)
+	@echo "BOOT-q2probe.BIN -> $(Q2PROBE_BOOTBIN)"
+	$(call archive_image,$(Q2PROBE_BOOTBIN))
+
 version:
 	python3 Z3660_system/make_version_alfa.py
 
@@ -191,8 +224,8 @@ clean:
 	-@cd $(FSBL_DIR)/zynq_fsbl_bsp/ps7_cortexa9_0/lib && rm -f *.o *.a *.d
 	# Clean Z3660
 	-@cd $(Z3660_DIR) && rm -rf build *.o *.d
-	# Clean Z3660_emu (all three build variants)
-	-@cd $(Z3660_EMU_DIR) && rm -rf build build-lean build-prof *.o *.d
+	# Clean Z3660_emu (all four build variants)
+	-@cd $(Z3660_EMU_DIR) && rm -rf build build-lean build-prof build-q2probe *.o *.d
 	# Clean BSP libraries
 	-@cd design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp && rm -rf *.o *.a
 	-@cd design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp && rm -rf *.o *.a
