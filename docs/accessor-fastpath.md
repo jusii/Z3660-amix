@@ -133,12 +133,31 @@ Two properties worth stating outright:
   invisible until it ate an ELF header.)
 * **It never fast-paths a device.** See above.
 
-### The switch is free, and it is the reference arm
+### The switch is the reference arm — and it is *not* free
 
 `z3660_dfast_arm(0)` rebuilds the tables all-`SLOW`, so every access falls through to the original
-path. **That costs nothing on the hot path** — the disarm lives in the table the hot path was
-going to read anyway — and it gives the host harness a genuine reference to run the equivalence
-corpus against.
+path, and it gives the host harness a genuine reference to run the equivalence corpus against.
+
+> **CORRECTION (2026-08-23 metal, finding F2).** This paragraph used to say the disarm *"costs
+> nothing on the hot path — the disarm lives in the table the hot path was going to read
+> anyway"*. **That is true of the ARMED table and false of the disarmed one**, and metal
+> measured the difference: with every verdict `SLOW`, an access still pays the table load and
+> the branch and *then* runs the unmodified accessor.
+>
+> ```
+> lean c4, DFAST OFF (this build)        6290 / 6299   mean 6294.5
+> lean c4, pre-rung-2 build (562c721)    6539 / 6539   mean 6539.0   ->  -3.74 %
+> ```
+>
+> Three earlier sessions bracket the reference at 6415–6539, so 6294.5 is below all six rows
+> and the sign is not in doubt. **The disarmed arm is about 3.7 % slower than the machine
+> before this rung existed** — which is what makes the same-boot A/B overstate the shipping
+> gain, below.
+>
+> What this does *not* weaken is the switch's purpose. Map §23.1's point was that a *build*
+> difference cannot be defended by a console switch; the switch here defends **engagement and
+> reversibility** (return leg 4022 against arm A's 4012 mean, 0.25 %), which it does exactly.
+> It is the *magnitude* that needs a cross-build reference — and the session took one.
 
 On metal it is the serial console's **`DFAST`** (or `ACCESSOR FAST PATH`), carried across the
 cores in `SHARED.dfast_on` at `0xFFFF00EC`, resolved by `z3660_dfast_resolve()` — the single rule
@@ -165,12 +184,30 @@ through `XPAR` and user accesses through `PAGE`.
 | **read, `XPAR` arm** (TTR match, direct bank) | **76** | **33** | **2.30×** |
 | **write, `PAGE` arm** | **138** | **51** | **2.71×** |
 | **write, `XPAR` arm** | **97** | **33** | **2.94×** |
-| read, weighted 30 % `XPAR` / 70 % `PAGE` | **99.8** | **43.5** | **2.29×** |
-| write, same weighting | **125.7** | **45.6** | **2.76×** |
+| read, weighted 24 % `XPAR` / 76 % `PAGE` | **101.8** | **44.4** | **2.29×** |
+| write, same weighting | **128.1** | **46.7** | **2.74×** |
 
-The 30/70 weighting is the capture's own: `DPAGE_R*` reaches 69.9 % of `READ`, so ~30 % of data
-reads never get there. `DFAST_XPAR` / `DFAST_HIT` measures that split directly on the next
-capture instead of inferring it.
+> **CORRECTION (2026-08-23 metal, finding F5).** The two weighted rows were originally computed
+> at **30 % `XPAR` / 70 % `PAGE`** (read 99.8 → 43.5, write 125.7 → 45.6), inferred from how far
+> short of `READ` the page-cache counters fell in the s19 capture. `DFAST_XPAR` now measures the
+> split directly, and on the 2026-08-23 capture it is **22.63 % (c1) / 24.07 % (c4)** — so the
+> rows above are re-derived at that session's **24/76**.
+>
+> Both numbers go **up**, and the ratio barely moves, because the shift is *away* from the
+> cheaper arm: `PAGE` costs more than `XPAR` both before and after, so a smaller `XPAR` share
+> means more of the expensive arm on both sides of the comparison.
+>
+> **The weighting is not a constant and must not be re-pinned to 24/76 either.** It is a
+> property of the window's supervisor/user mix: supervisor data goes through DTT0/DTT1 (`XPAR`)
+> and user data falls to the page cache (`PAGE`), and the supervisor *instruction* share moved
+> from 61.63 % (s19) to 52.02 / 53.24 % between captures — which is the whole of the change.
+> The counter makes reading it per capture free; the honest statement is *"read `DFAST_XPAR`
+> off the capture you are interpreting"*.
+>
+> The instrument validated on its own data, which is what makes the counter trustworthy: the
+> original *inference* method, re-run on the 2026-08-23 capture, gives 21.82 % (c1) / 23.27 %
+> (c4) against the directly measured 22.43 / 23.86 % — **the two methods agree to 0.6 pp within
+> a capture** and disagree only between captures.
 
 **Calls removed from the hit path: all of them.** Before, a read paid an out-of-line
 `mmu_match_ttr` (itself calling `mmu_do_match_ttr` once or twice), an indirect call through
@@ -320,12 +357,14 @@ Priced, so the next round does not have to re-derive them:
   costs a pc-literal load plus a load; one base pointer would serve all three. Worth ~4
   instructions on the `PAGE` arm. Not taken: it duplicates state that the fallback path also
   reads, for less than 10 %.
-* **The instruction side.** `mmu_get_iword()` / `mmu_get_ilong()` have the *same* out-of-line TTR
-  call, and ITT0 covers 0–1 GB, so **87 % of instruction fetches (53.3 M of 61.3 M) are
-  TTR-matched and pay it**. That is rung #2 on the map's ladder (`FETCHOP` + `FETCHEX`,
-  14.96–15.51 %), and this finding is the largest single input to it. **Deliberately not taken
-  here**: moving the fetch buckets in the same build would destroy the like-for-like check the
-  accessor pre-registration depends on.
+* **The instruction side. TAKEN — see `docs/ifetch-fastpath.md` (rung 3).**
+  `mmu_get_iword()` / `mmu_get_ilong()` have the *same* out-of-line TTR call, and ITT0 covers
+  0–1 GB, so **87 % of instruction fetches (53.3 M of 61.3 M) are TTR-matched and pay it**. That
+  was the next rung on the map's ladder and this finding was the largest single input to it.
+  **Deliberately not taken *here***: moving the fetch buckets in the same build would have
+  destroyed the like-for-like check this rung's pre-registration depends on. That constraint is
+  discharged — the accessor comparison above is banked — and rung 3 took it in the next commit,
+  behind its own switch so the two can still be scored apart.
 
 ---
 
@@ -342,6 +381,89 @@ Priced, so the next round does not have to re-derive them:
 because the removed scaffolding was already overlapping with guest-DRAM latency.* If that
 happens, the next thing to read is `DFAST_HIT` — the fast path's coverage of `READ` + `WRITE`. A
 wall-clock win with low coverage moved something else.
+
+---
+
+## Measured — 2026-08-23, A4000 + Z3660 metal
+
+Every row pre-registered before power-on. Full scorecard and findings in the session's
+`MATRIX.md` / `NOTES.txt`; what belongs here is the judgment on this document's own claims.
+
+| pre-registered | measured | |
+|---|---|---|
+| dhry c4 lean **≥ 6900** | **8185** (8185 / 8184 / 8185, within-arm spread 0.01 %) | **HIT** |
+| `READ`+`WRITE` **< 17 %** at c4 | **14.58 – 15.87 %** (from 23.12 – 24.13 %) | **HIT** |
+| dpagecache hit rates **unmoved** | read 99.19 % (was 99.20), write 99.33 / 99.34 (was 99.35 / 99.30) | **HIT** — ≤ 0.04 pp |
+| `DFAST` coverage 98.0 – 99.5 % | **99.11 %** (c1), **99.14 %** (c4) | **HIT** |
+| `DFAST_XPAR` share 30 – 33 % | **22.63 / 24.07 %** | **MISS** — see the F5 correction above |
+| `DOPCFIND` **absolute** cost unmoved (±3 %) | **+15.5 %** per dispatch | **MISS** — open item below |
+| the named failure mode | did not occur, and could not have hidden: dhry +25 %, `READ`+`WRITE` −8.4 pp and coverage 99.1 % all moved together | **clear** |
+
+> ### **The shipping number is +25.17 %. It is not +30.03 %.**
+>
+> ```
+> cross-build   lean c4   8184.7 vs the pre-rung-2 build's 6539.0   = +25.17 %   <- SHIPPING
+> same-boot     lean c4   8184.7 vs DFAST OFF's        6294.5       = +30.03 %
+> cross-build   lean c1                                            = +19.43 %
+> same-boot     prof c1                                            = +15.77 %
+> ```
+>
+> Both are honest and they answer different questions — *"what does the switch do on this
+> boot"* versus *"what did shipping this rung buy"* — and the gap is **exactly** the disarm
+> penalty from finding F2:
+>
+> ```
+> 1.2517 (shipping)  x  1.0388 (disarm penalty)  =  1.3003  =  the same-boot ratio, to 4 digits
+> ```
+>
+> **Quote +25.17 %.** The same-boot switch overstates the shipping gain by ~4.9 pp, and any
+> future rung with a console switch inherits the same arithmetic — rung 3 pre-registers its own
+> version of it from the disassembly rather than discovering it afterwards.
+
+The pre-registered band was **+8.5 – 8.9 %**; every arm overshot it. Even this document's own
+instruction counts predicted more than the band did (~13 pp of the profile removed, ≈ +15 % at
+constant IPC) — **and the measured 25 % is above even that.** The rung did better than an
+instruction count predicts, which means the removed scaffolding was *not* overlapping with DRAM
+latency: it was on the critical path, and removing an indirect call, two dependent loads out of
+a 256 KB table and a call chain that fences the ARM's own speculation also removed stalls the
+instruction count never saw. The map measured IPC 0.78 on this bucket and called that "the
+headroom the rung is claiming"; the outcome says the headroom was larger than IPC 0.78 implied,
+because the *surviving* code got faster too.
+
+**That is the mirror image of the pre-registered failure mode, and it is the lesson to carry
+forward:** the failure mode assumed overlap; the metal says the opposite. Rung 3 is projected
+with that stated explicitly rather than folded into its number.
+
+### Open item — `DOPCFIND` got ~15.5 % more expensive per dispatch (finding F6)
+
+At the same price (57 cyc/span), cadence 4:
+
+```
+s19   4 325 817 638 / 71 116 727 spans = 60.83 cyc/dispatch
+now   5 494 477 787 / 78 203 698 spans = 70.26 cyc/dispatch      -> +15.5 %
+```
+
+Pre-registered at ±3 % precisely so a move could not be waved through. It moved. Two candidates,
+and the 2026-08-23 session cannot separate them:
+
+* **(a) workload mix.** The dopc hit rate moved 82.91 → 79.05 % at c1 but 78.17 → 79.88 % at c4
+  — *opposite signs*, which is what a mix change looks like. A miss walks all four ways before
+  giving up, so a lower hit rate raises mean cyc/dispatch. The supervisor share also moved 9 pp.
+* **(b) D-cache pressure from this rung.** It adds 2 KB of `.bss` (`z3660_dfv_r` + `z3660_dfv_w`)
+  that is touched on **every** data access, i.e. maximally hot, competing with a 64 KB
+  decoded-op cache for L1D. The footprint table above reports `.text` growth and the run loop's
+  unchanged size; **it prices no second-order cost at all**, and this is one.
+
+The machine got 25 % faster while this bucket got 15 % slower per dispatch, so if it is (b) it
+is a **paid-for trade, not a regression to reverse** — but it is exactly the sort of cost the
+ladder's later rungs need to know about, and rung 3 adds 1 KB more of the same kind of table.
+
+**How to settle it cheaply — it is a same-boot question.** `PROFB` on; `PROFZ`, dhry with
+`DFAST` ON, `PROFD`; `PROFZ`, dhry with `DFAST` OFF, `PROFD`; compare `DOPCFIND` cyc/dispatch
+across the switch inside one boot with the mix held as close as the window allows. Four console
+commands and two dhrystone runs. With rung 3 landed, the same sequence over the `DFAST` × `IFAST`
+2×2 answers it for both rungs at once — which is one of the three reasons `IFAST` is a separate
+knob.
 
 ## New counters
 
@@ -386,11 +508,35 @@ genuine misaligned DATA reads  ==  MISALIGN_R − MISALIGN_I
 
 `MISALIGN_R` itself is untouched, so every existing capture still reads exactly as it did.
 
+### Measured — and map §25.1 is closed
+
+```
+                             c1          c4
+  MISALIGN_R            4 653 832   5 143 469
+  MISALIGN_I            4 590 681   5 080 454      (98.64 % / 98.77 % of it)
+  genuine misaligned DATA reads
+      = R − I              63 151      63 015
+      / READ              0.1886 %    0.1828 %
+  control MISALIGN_W / WRITE
+                         0.1317 %    0.1275 %
+  read : write asymmetry   1.43x       1.43x       (was 106x / 117x in-capture)
+```
+
+**It was a denominator defect, exactly as argued.** Subtract the instruction half and the two
+sides land within 1.43× of each other. Pre-registered band for `(R − I)/READ` was 0.05 – 0.40 %;
+measured 0.1886 / 0.1828 %.
+
+The construction argument cross-checks too, with the same caveat as everything else derived from
+one window: `2 × MISALIGN_I` is **17.77 % (c1) / 19.29 % (c4)** of `IFETCH_CALLS` against the
+26.9 % predicted from the s19 capture — the same mix-specificity as the `XPAR` split (F5), not a
+defect in the reasoning. Ordinary for SVR4 m68k code either way.
+
 **Does a cheap fix fall out?** No, and that is the useful half of the answer. The
 misaligned-longword *instruction* fetch is not a slow route taken needlessly — a 68040 instruction
 stream genuinely is half-misaligned at 4-byte granularity, and the splitter it goes through
-(`mmu_get_ilong_unaligned` → two `mmu_get_word`) is what ISSUE-52 requires on metal: the board's
-memory layer cannot do a misaligned physical transfer and drops bytes. **The split is load-bearing
-and must not be optimised away.** What is available, and is *not* built here, is serving these
-fetches from a wider decoded-op entry so the second word never needs a fetch at all — which is
-inside rung #2 (the fetch second pass), not this one.
+(`mmu_get_ilong_unaligned` → two `mmu_get_iword`, *not* `mmu_get_word`: it is an instruction
+fetch on both halves) is what ISSUE-52 requires on metal: the board's memory layer cannot do a
+misaligned physical transfer and drops bytes. **The split is load-bearing and must not be
+optimised away.** Rung 3 leaves it alone for exactly that reason and prices it as a not-taken
+item. What is available is serving these fetches from a wider decoded-op entry so the second
+word never needs a fetch at all — which is a decoded-op-cache change, not an accessor one.
