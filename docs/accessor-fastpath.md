@@ -357,7 +357,7 @@ Priced, so the next round does not have to re-derive them:
   costs a pc-literal load plus a load; one base pointer would serve all three. Worth ~4
   instructions on the `PAGE` arm. Not taken: it duplicates state that the fallback path also
   reads, for less than 10 %.
-* **The instruction side. TAKEN — see `docs/ifetch-fastpath.md` (rung 3).**
+* **The instruction side. TAKEN — and REVERTED at −0.05 %; see `docs/ifetch-fastpath.md` (rung 3).**
   `mmu_get_iword()` / `mmu_get_ilong()` have the *same* out-of-line TTR call, and ITT0 covers
   0–1 GB, so **87 % of instruction fetches (53.3 M of 61.3 M) are TTR-matched and pay it**. That
   was the next rung on the map's ladder and this finding was the largest single input to it.

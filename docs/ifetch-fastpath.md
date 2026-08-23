@@ -376,8 +376,9 @@ band this document quoted, `[54, 59]`, it reads 17.82 – 19.78 % and matches. T
 property of the boot, not of the workload — see `profiler.md`, bias note 2c.
 
 And the bucket really did shrink. Same-boot `IFAST` switch, prof image, cadence 4, corrected
-cycles **per guest instruction** (the two ~12 s windows are not the same length, so nothing
-raw is compared):
+cycles **per guest instruction** — the two ~12 s windows are not the same length, so nothing
+raw is compared — priced at this capture's own marginal 39 (at the in-bucket 50 the fetch
+pair's delta is the same to 0.03 cyc/INSN):
 
 | bucket | `IFAST` on | `IFAST` off | |
 |---|---|---|---|
@@ -491,6 +492,22 @@ The `z3660_ifv` table and its resolver, the `IFAST` console command and its mail
 the rung's harness corpus. Rung 2's fast path, the F1 formatter-ring fix and its guard are
 untouched. Nothing here needs re-deriving if a later rung finds a fetch-side cost the dopc is
 *not* hiding: the design is intact at `3087af9`.
+
+The rebuilt images, from a wiped `build*/` at the reverted HEAD:
+
+| image | bytes | `zlib crc32` |
+|---|---|---|
+| `BOOT.BIN` | 12 795 220 | `E687C5CF` |
+| `BOOT-lean.BIN` | 12 795 204 | **`DEC21748`** |
+| `BOOT-prof.BIN` | 12 811 676 | `4183F88C` |
+
+**`BOOT-lean.BIN` came back byte-identical to `DEC21748`** — the pre-rung-3 reference the
+verdict session measured against and could not re-flash because the rebuild had overwritten it.
+The revert restores that image exactly, which is also the cleanest reproducibility evidence
+this lane has: the same sources built in a different session give the same CRC. (`BOOT-prof.BIN`
+does *not* return to the r2 session's `15DC7660`, and should not: the F1 formatter fix lands in
+the profiling image and is kept.) Card as of the verdict session: `86C0BC18` — behaviourally
+−0.05 % from `DEC21748`, i.e. the rung-2 posture, safe to leave until the next flash.
 
 ---
 
