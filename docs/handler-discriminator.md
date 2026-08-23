@@ -447,3 +447,123 @@ Priced, so the next round does not re-derive them:
   instruction count in this document sees, and it is charged at zero in both bands. It is
   named the way rung 3 named its own stall-recovery possibility: **a mechanism by which the
   measurement may exceed the model, stated in advance, and not folded into the number.**
+
+---
+
+## As built — 2026-08-23, counted from the lean binary
+
+Everything above this line was written and committed (`d7f5470`) before the code existed
+(`87d3f49`). This section is what the build turned out to be. **It corrects two of the
+pre-registration's own numbers and leaves the bands alone** — a band that moves after the
+binary exists is not a band.
+
+### The two things gcc decided, and only one of them went the pre-registered way
+
+| pre-registered | as built | |
+|---|---|---|
+| the specialised body is inlined into `m68k_run_mmu040` | **inlined** — no `z3660_spec_move` symbol exists, and the accessor calls it makes appear directly inside the run loop | **as designed** |
+| site **D**: the accessor's call frame is removed *if gcc inlines it here* | **NOT inlined.** `uae_mmu040_get_long` / `_put_long` / `_get_word` / `_put_word` / `_get_byte` / `_put_byte` / `_get_iword` are all still `bl` from inside the run loop | **site D is not taken**, so `R` lands at the **low** end of its 7–11 % band |
+| the disarmed hot path grows by **exactly 2** ARM instructions | **+5** | **MISS — understated 2.5×**, see below |
+
+### The disarm penalty is +5 instructions, not +2, and the mechanism is register pressure
+
+Counted along the same taken path in both binaries — dopc hit on way 0, not an idiom, the
+switch disarmed, a cadence-4 pass that does not poll:
+
+| | pre-discriminator (`DEC21748`) | as built |
+|---|---|---|
+| run-loop hot path, disarmed | **96** | **101** |
+
+The five, named:
+
+```
++1   the way-0 hit now reaches the fill-in block through `mov fp, lr` instead of
+     falling into it -- the way index no longer survives in the register it used to
++1   `str r1, [sp, #12]`  -- the entry's meta byte is SPILLED
++3   the M_SPEC test is `ldr r3,[sp,#12]` / `tst r3,#4` / `bne`, because the byte has
+     to come back from that spill slot
+```
+
+**The pre-registration's 2 assumed the meta byte would still be in a register at the
+dispatch.** It is not, and the first build was worse: gcc rematerialized the address and
+re-loaded the byte, costing 4. Hoisting the three reads into one local
+(`z3660_dopc_meta`) removed the reload and left the spill — because the inlined MOVE body
+raised the run loop's register pressure to the point where an 8-byte-larger frame and a
+spilled byte are the allocator's answer. **That is a second-order cost of inlining into
+the loop, it is exactly the class the footprint tables price at zero (§34.5), and here it
+is the larger half of the charge.**
+
+**The added-work band, re-derived at 5 and offered beside the pre-registered one rather
+than in place of it:**
+
+```
+5 instr per dopc hit x 0.7834 = 3.9 ARM instructions per guest instruction
+   on a dispatch of ~180-215                    ->  2.3 .. 2.8 % of instructions
+count model, constant IPC                       ->  -2.3 .. -2.8 %
+at rung 3's MEASURED added-work rate (~0.26x)   ->  -0.6 .. -0.7 %
+                    pre-registered band was     ->  -0.25 .. -0.90 %
+```
+
+> **The verdict rows do not move.** The cross-build row against `DEC21748` is the shipping
+> number and the bands above are scored against it; the disarm penalty only sets how far
+> the same-boot switch overstates it. **Score the pre-registered −0.25 .. −0.90 % as
+> written** — it is a miss if the arm comes in below −0.90 % — and use −0.6 .. −2.8 % as
+> the expectation, not as the band.
+
+### Footprint
+
+| symbol (lean) | before (`DEC21748`) | after |
+|---|---|---|
+| **`m68k_run_mmu040`** | **2 288 B** | **3 516 B — +1 228 B, +307 ARM instructions** |
+| run-loop stack frame | `sub sp,#68` | `sub sp,#76` |
+| core1 `Z3660_emu.elf` text | 6 455 628 B | **6 457 132 B** (+1 504 B = +376 ARM instructions, +0.023 %) |
+| new always-hot data | — | **4 bytes** (`z3660_spec_on`, `.data`). **No new table.** |
+| `BOOT-lean.BIN` | 12 795 204 B, `DEC21748` | 12 795 196 B, **`6ADABE4A`** |
+
+> **The run loop grew, and rungs 2 and 3 were both able to say it did not.** +1 228 B is
+> the specific I-cache regression the map warns about, and it is unavoidable here: the
+> whole point is to remove the *call*, which means the body has to be in the loop. Against
+> a 32 KB L1I on the Cortex-A9 the loop is still ~3.4 KB, so the headroom is real — but it
+> is headroom, not an argument, and if the armed arm reads null this is the second thing
+> to suspect after coverage.
+
+**No new always-hot table**, which matters because F6 is still open and rung 3 demoted its
+D-cache candidate on exactly this axis. The verdict is a bit in a byte the hit path already
+loads; the only new state is one 4-byte flag.
+
+### Images
+
+| image | bytes | `zlib crc32` |
+|---|---|---|
+| `BOOT.BIN` | 12 795 204 | `56EDCFD5` |
+| `BOOT-lean.BIN` | 12 795 196 | **`6ADABE4A`** |
+| `BOOT-prof.BIN` | 12 811 660 | `8B5DC5C3` |
+
+The archive (`76fa64b`) preserved every outgoing image, **including `BOOT-lean-DEC21748.BIN`
+— the reference arm this experiment is scored against.** It is on the host and on the card;
+step 1 of the metal protocol does not need a rebuild.
+
+### The guard
+
+| variant | before | after |
+|---|---|---|
+| default | 3 186 | **3 288** |
+| lean | 3 182 | **3 284** |
+| profiling | 3 384 | **3 486** |
+
+(The other three harness binaries — SCSI CDB, boot-mode and AMIX-RAM — are unaffected at
+34 / 75 / 81.)
+
+**The sweep is 6 052 encodings × 3 arms**, and it found nothing to report only after it
+found two things during development. The mutation arm passes: with a long `MOVE` leaving V
+set, 30 of the 36 swept shapes diverge and the six `MOVEA` shapes correctly do not, because
+`MOVEA` sets no flags at all — a test that demanded all 36 would have been asserting the
+wrong thing.
+
+**One instrument change was needed and is not cosmetic.** `DOPC_EXT` counts extension words
+the cache supplied, and its counter lives in the accessor's window arm — which the
+specialised path no longer enters. It is therefore counted in the specialised path too, so
+the counter keeps its meaning and stays comparable with every capture taken before this
+experiment. `Z3660_PROF_CNT` compiles out below the profiling build, so the shipping image
+pays nothing. **`FETCH` / `IFETCH_CALLS` is the counter that genuinely falls**, as declared
+above.
