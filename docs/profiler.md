@@ -204,6 +204,50 @@ Two things about the split are worth knowing before reading a number out of it:
 v2 capture can be laid beside a v1 one without the reader having to know which four ids to
 add up.
 
+### Per-bucket transition spans — the `[PROF] s` lines (C2 rung 1b)
+
+The successor to `IFETCH_CALLS`, and the answer to the "subtract per bucket by its share of
+transitions" instruction the dump has always given without supplying the shares.
+
+```
+[PROF] === per-bucket spans and the corrected shares (price 32 cyc/span; sweep to the boot line's in-bucket figure) ===
+[PROF] s 0  LOOP     spans=203419144    corrected_cyc=15194182811     23.73%
+...
+[PROF] s -- corrected_total=64034387415  spans=851345830  (must equal TRANSITIONS 851345830 -- ...)
+```
+
+**What a "span" is, precisely** — a counter wired to the wrong quantity is worse than none.
+Every transition ends one span and begins the next. The span that ends is charged to
+`z3660_prof_cur`, and so is one probe's worth of the probe machinery: the *tail* of the probe
+that opened the span plus the *head* of the probe that closed it. So the right divisor for a
+bucket is the number of **spans charged to it**, and `spans` is incremented at exactly the two
+sites that do the charging. Note that this is *not* "calls into the bucket": entering a nested
+stage closes a span just as exiting does, so a `FETCHOP` with a translate inside it is charged
+twice.
+
+Two identities follow, both asserted in the host harness against a hand-driven clock:
+
+```
+sum(spans)                ==  TRANSITIONS
+corrected cyc for b       ==  acc[b] − spans[b] × probe_cyc
+```
+
+The second is the point: it makes the global correction (`total − TRANSITIONS × probe_cyc`)
+**decompose exactly**, so no bucket's corrected share can disagree with the total's. The
+firmware prices the `s` lines at the same `probe_cyc` the aggregate line uses, for that reason.
+The boot line's `[marginal, in-bucket]` bracket still applies and still has to be swept by hand
+— it is a range, and printing one end of it as if it were the answer is the error this
+instrument exists to stop.
+
+**`FAULT` is reported uncorrected**, and deliberately. An unwind (`z3660_prof_unwound()`) charges
+FAULT cycles but counts no span, because an unwind is not a probe transition and has never been
+in `TRANSITIONS` — counting it per bucket would make the two corrections disagree. At the
+0.06 % FAULT measures on this interpreter that is a rounding error, and it errs by
+over-reporting the bucket rather than under-reporting it.
+
+Adding this changed no id and no wire structure, so **the version stays 2**; the `s` block is
+additive text that an older symbolizer ignores.
+
 ### Counters
 
 | id | name | | id | name |
@@ -233,14 +277,27 @@ correctly.
 | 24 | `DOPC_HIT` | decoded-op cache: opcode + decode served from a hit (C2 rung 1) |
 | 25 | `DOPC_MISS` | ... consulted and not found; the fetch still ran |
 | 26 | `DOPC_EXT` | ... extension words served from the entry's single slot |
-| 27 | `DOPC_INVAL` | ... whole-cache invalidations, all causes |
+| 27 | `DOPC_INVAL` | ... whole-cache invalidations **actually performed** |
+| 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) |
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
 `DOPC_HIT + DOPC_MISS == INSNS` when the decoded-op cache is on — every dispatch consults it
-exactly once, which is what makes `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate. With the
-cache off all four `DOPC_` counters are **exactly zero**: the lookup returns before it can
-count a miss.
+exactly once, which is what makes `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate.
+
+A third arrives with the `IV_` block: **`sum(IV_*) − DOPC_INVAL` is exactly the number of
+invalidations rung 1b's narrowing skipped**, because the causes count every request and
+`DOPC_INVAL` counts only the ones that moved the generation. `sum(IV_*) < DOPC_INVAL` is
+impossible and the firmware warns if it sees it.
+
+**With the decoded-op cache off**, the four `DOPC_` counters are exactly zero — `HIT`/`MISS`/
+`EXT` because the lookup returns before it can count, and `DOPC_INVAL` because nothing is ever
+filled so every request hits the empty-cache short-circuit. **The `IV_*` counters still move**,
+by design: they count what the *guest* asked for, and the guest issues `CPUSHL` and `PFLUSH`
+whatever the switch says. That makes a cache-off arm a free, uncontaminated measurement of the
+guest's own invalidation rate. (Before rung 1b, `DOPC_INVAL` also counted with the cache off —
+`z3660_dopc_invalidate()` had no switch test at all — and the 2026-08-23 metal session found it
+reading 164 311 and 2 951 874 in the two off arms while the docs claimed zero.)
 
 All 64-bit — a 32-bit counter overflows in about seven minutes of hot interpretation,
 which is shorter than the boot profile this exists to take.
@@ -312,6 +369,14 @@ the hit counter beside it that was not.
    firmware **measures** this at arm time and reports it as `probe_cyc` alongside the
    `TRANSITIONS` count, so the inflation is computable and, if you care, subtractable per
    bucket by its share of transitions.
+
+   **And from C2 rung 1b it reports that share directly** (the `s` lines — see below).
+   "Subtractable per bucket by its share of transitions" was an instruction the dump did not
+   supply the numbers for: only the ifetch bracket had a per-bucket transition count, from
+   `IFETCH_CALLS`. The 2026-08-23 stage capture paid for that in the most visible way
+   available — `LOOP` came out the **largest single bucket at 23.78 % raw** and its corrected
+   share had to be published as an interval (≤ 33.90 % at 32 cyc, ≤ 39.71 % at 43) because the
+   number was not computable from the dump.
 
    **`probe_cyc` is per TRANSITION.** `TRANSITIONS` increments in `enter()` *and* in
    `exit()`, so the cost that multiplies it must be the cost of one of them. v1 calibrated
@@ -757,9 +822,10 @@ the console echo of the command that requested it.
 3. **Stage attribution.** `PROFB` on, `PROFZ`, re-run the same dhrystone, `PROF OFF`,
    `PROFD`. Expect the reported instruction rate to be far below the lean figure — that is
    the instrument, not the interpreter. Read the per-bucket **shares**, the whole-tail
-   rollup and the `probe overhead inside the totals` line, and take the counters
-   (`IPAGE_*`, `DPAGE_*`, `ATC_*`, `MISALIGN_*`) from this run: they are exact regardless
-   of the timing distortion.
+   rollup and the `probe overhead inside the totals` line, the **`s` per-bucket span block**
+   (which is what makes each bucket's corrected share a number rather than an interval), and
+   take the counters (`IPAGE_*`, `DPAGE_*`, `ATC_*`, `MISALIGN_*`, `IV_*`) from this run:
+   they are exact regardless of the timing distortion.
 4. **Install-workload profile** (optional, and the one most likely to surprise): repeat 2
    during a `pkgadd` or a large file copy, at a rate sized for how long that actually takes
    — an I/O workload runs for minutes, so 250 Hz is already marginal and the `WEIGHT`
