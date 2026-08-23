@@ -41,6 +41,16 @@ address, `flush_cpu_caches_040()` acts only at scope 3 which this line-scope fam
 is, `flush_icache()` is a no-op macro without the JIT — so all of it is idempotent and
 doing it once for the whole run is the same operation, not an approximation of it.
 
+> **Stage C also collapses the decoded-op cache's invalidation storm, and that turned out to
+> matter to a different rung.** One `flush_mmu040()` per chunk is one `z3660_dopc_invalidate()`
+> per chunk, not one per iteration — with the recognizer **off**, C2 rung 1 measured 18× more
+> invalidations on the same workload (2.94 M against 160 k). C2 rung 1b then built an
+> empty-cache short-circuit aimed squarely at that storm, and metal reverted it: **with stage C
+> live — the shipping posture — the storm it was built for does not exist.** The general form
+> is worth carrying: a cost measured with this recognizer switched off is not a cost the
+> shipping firmware pays, and a change justified on one is justified on nothing. See
+> `decoded-op-cache.md`.
+
 ## What it deliberately does not do
 
 **It does not replace the guest store.** No `memset`, no host block move, no direct pointer

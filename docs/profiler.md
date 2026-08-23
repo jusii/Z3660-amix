@@ -239,6 +239,43 @@ The boot line's `[marginal, in-bucket]` bracket still applies and still has to b
 — it is a range, and printing one end of it as if it were the answer is the error this
 instrument exists to stop.
 
+#### ★ Use the spans. The `2 × IFETCH_CALLS` method they replace is REFUTED, not merely bettered
+
+Before the `s` block existed there was no per-bucket transition count except for the ifetch
+bracket, so rung 1's stage analysis assumed the two ifetch buckets carried `2 × IFETCH_CALLS`
+transitions — one enter and one exit per call. **Metal 2026-08-23 measured both quantities on
+the same capture and they are not close:**
+
+| | transitions charged to the ifetch buckets | share of all transitions |
+|---|---|---|
+| assumed, `2 × IFETCH_CALLS` | 99 049 270 | 12.37 % |
+| **measured spans** | **50 194 621** | **6.27 %** |
+
+**The assumption over-charges the fetch buckets by 1.97×**, so every corrected share derived
+from it was biased **low** — rung 1's corrected `FETCHOP + FETCHEX` of 11.27 % @32 / 10.48 % @43
+included.
+
+**The mechanism is the decoded-op cache itself: with the cache ON, a hit never enters
+`FETCHOP` at all.** `FETCHOP spans = 15 547 429` against `DOPC_MISS = 15 436 987` — the bucket
+is entered once per **miss**, not once per fetch. `IFETCH_CALLS == FETCH` is still exactly true
+(all five bracket sites increment `FETCH` once); what is false is that `FETCH` predicts bucket
+*entries* once something upstream of the bucket answers fetches without entering it. Rung 1's
+own instrument could not have seen this, which is why the spans exist.
+
+So: **take per-bucket transition counts from the `s` block, never from a counter that merely
+correlates with them.** With them, `LOOP` — the bucket the whole probe-pricing argument turns
+on — becomes a number:
+
+| | corrected `LOOP` share |
+|---|---|
+| rung 1 (`2 × IFETCH_CALLS` era) | 33.90 % – 39.71 %, and those were **upper bounds** — "LOOP's own probe load not derivable" |
+| **metal 2026-08-23, measured spans** | **24.80 % @39 .. 25.11 % @50** |
+
+A **0.31 pp bracket in place of a 5.8 pp interval of upper bounds**, and the whole `s` block
+self-checks (`sum(spans) == TRANSITIONS`, 800 774 653 on that capture; boot-line price bracket
+39 (marginal) .. 50 (in-bucket) from `armed 105342, unarmed 23707, empty 2090, 1024 pairs`).
+This is the `LOOP`-interval closure the C2 map was owed; it can be consumed directly.
+
 **`FAULT` is reported uncorrected**, and deliberately. An unwind (`z3660_prof_unwound()`) charges
 FAULT cycles but counts no span, because an unwind is not a probe transition and has never been
 in `TRANSITIONS` — counting it per bucket would make the two corrections disagree. At the
@@ -279,25 +316,50 @@ correctly.
 | 26 | `DOPC_EXT` | ... extension words served from the entry's single slot |
 | 27 | `DOPC_INVAL` | ... whole-cache invalidations **actually performed** |
 | 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) |
+| 38 | `IV_CACR_SKIP` | ... a `MOVEC` to CACR proved **inert at its call site** (C2 rung 1c) — **not a cause**, and not a member of the block above |
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
 `DOPC_HIT + DOPC_MISS == INSNS` when the decoded-op cache is on — every dispatch consults it
 exactly once, which is what makes `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate.
 
-A third arrives with the `IV_` block: **`sum(IV_*) − DOPC_INVAL` is exactly the number of
-invalidations rung 1b's narrowing skipped**, because the causes count every request and
-`DOPC_INVAL` counts only the ones that moved the generation. `sum(IV_*) < DOPC_INVAL` is
-impossible and the firmware warns if it sees it.
+> `IFETCH_CALLS == FETCH` says nothing about how often the ifetch **buckets** are entered — see
+> the `s`-block section above, where the measured spans refute that inference by 1.97×.
+
+A third arrives with the `IV_` block: on a capture taken entirely with the cache on,
+**`sum(IV_*) == DOPC_INVAL`** — every request that reaches `z3660_dopc_invalidate()` performs
+one. `sum(IV_*) < DOPC_INVAL` is impossible and the firmware warns if it sees it. The gap in
+the other direction is the requests made while the cache was **off**, which is a fact about the
+window rather than a defect.
+
+> **`IV_CACR_SKIP` is separate because the row that would otherwise score it cannot see it.**
+> C2 rung 1b briefly defined "the narrowing's yield" as `sum(IV_*) − DOPC_INVAL`. That is
+> **false for any narrowing implemented at a call site**: the CACR compare lives in
+> `newcpu_common.cpp`, ahead of the invalidator, so an inert write increments nothing at all —
+> it is not a skipped request, it is an uncounted one. The 2026-08-23 session measured a 54.8 %
+> fall in invalidations that the row could account for only 7.3 % of, and reconstructed the
+> rest by hand across two sessions' captures.
+>
+> **A narrowing that decides before `z3660_dopc_invalidate()` must bring its own request
+> counter, or it is invisible to its own verdict.** The guest's true request rate is
+> `sum(IV_*) + IV_CACR_SKIP`, and the firmware prints that row with the narrowed share out of
+> it.
 
 **With the decoded-op cache off**, the four `DOPC_` counters are exactly zero — `HIT`/`MISS`/
-`EXT` because the lookup returns before it can count, and `DOPC_INVAL` because nothing is ever
-filled so every request hits the empty-cache short-circuit. **The `IV_*` counters still move**,
+`EXT` because the lookup returns before it can count, and `DOPC_INVAL` because
+`z3660_dopc_invalidate()` consults the switch too. **The `IV_*` counters still move**,
 by design: they count what the *guest* asked for, and the guest issues `CPUSHL` and `PFLUSH`
 whatever the switch says. That makes a cache-off arm a free, uncontaminated measurement of the
 guest's own invalidation rate. (Before rung 1b, `DOPC_INVAL` also counted with the cache off —
 `z3660_dopc_invalidate()` had no switch test at all — and the 2026-08-23 metal session found it
 reading 164 311 and 2 951 874 in the two off arms while the docs claimed zero.)
+
+> **Read that arm in a `PROFZ`-zeroed window or it will look broken.** The counters accumulate
+> from power-on and the console cannot fire before core1 starts, so an OFF arm armed during
+> boot necessarily carries a warm-up: the 2026-08-23 session read `DOPC_HIT` 2 480 711 with the
+> cache off and had to chase it before continuing. It was 2.49 M dispatches — 1.5 % of the boot
+> — taken before the arm landed. `PROFZ`, then the workload, then read: all four go to exactly
+> zero.
 
 All 64-bit — a 32-bit counter overflows in about seven minutes of hot interpretation,
 which is shorter than the boot profile this exists to take.
@@ -370,13 +432,19 @@ the hit counter beside it that was not.
    `TRANSITIONS` count, so the inflation is computable and, if you care, subtractable per
    bucket by its share of transitions.
 
-   **And from C2 rung 1b it reports that share directly** (the `s` lines — see below).
+   **And from C2 rung 1b it reports that share directly** (the `s` lines — see above).
    "Subtractable per bucket by its share of transitions" was an instruction the dump did not
    supply the numbers for: only the ifetch bracket had a per-bucket transition count, from
-   `IFETCH_CALLS`. The 2026-08-23 stage capture paid for that in the most visible way
+   `IFETCH_CALLS`. The 2026-08-22 stage capture paid for that in the most visible way
    available — `LOOP` came out the **largest single bucket at 23.78 % raw** and its corrected
    share had to be published as an interval (≤ 33.90 % at 32 cyc, ≤ 39.71 % at 43) because the
    number was not computable from the dump.
+
+   **That interval is now closed and both of its ends were wrong.** With per-bucket spans,
+   metal 2026-08-23 puts `LOOP` at **24.80 % @39 .. 25.11 % @50** — and the `2 × IFETCH_CALLS`
+   substitute the interval rested on over-charges the ifetch buckets by 1.97×, so it was not a
+   conservative approximation but a biased one. **Never derive a bucket's transition count from
+   a counter that merely correlates with it; take it from the `s` block.**
 
    **`probe_cyc` is per TRANSITION.** `TRANSITIONS` increments in `enter()` *and* in
    `exit()`, so the cost that multiplies it must be the cost of one of them. v1 calibrated
@@ -487,16 +555,21 @@ the hit counter beside it that was not.
    increment, which exist in this calibration and nowhere in the interpreter — and turns
    `unarmed` from a single conflated number into two separable ones:
 
-   | quantity | arithmetic | what it names | metal 2026-08-22 |
-   |---|---|---|---|
-   | **marginal** | `(armed − unarmed) / 2N` | the probe **bodies**: the `PMCCNTR` read, the 64-bit accumulate, `TRANSITIONS++`, the stack push/pop, the timestamp store. What `PROFB` gates off. | **32.8** |
-   | call scaffolding | `(unarmed − empty) / 2N` | the `bl`, prologue, predicate, epilogue and `bx lr` — inside the buckets, and still there when the bodies are gone | ~9.8 (est.) |
-   | **in-bucket** | `(armed − empty) / 2N` | bodies **plus** scaffolding: the price if the instrumentation calls go away entirely | ~**42.6** (est.) |
-   | whole armed call | `armed / 2N` | everything the armed loop pays, loop scaffolding included | 43.9 |
+   | quantity | arithmetic | what it names | metal 2026-08-22 | **metal 2026-08-23** |
+   |---|---|---|---|---|
+   | **marginal** | `(armed − unarmed) / 2N` | the probe **bodies**: the `PMCCNTR` read, the 64-bit accumulate, `TRANSITIONS++`, the stack push/pop, the timestamp store. What `PROFB` gates off. | **32.8** | **39.86** |
+   | call scaffolding | `(unarmed − empty) / 2N` | the `bl`, prologue, predicate, epilogue and `bx lr` — inside the buckets, and still there when the bodies are gone | ~9.8 (est.) | **10.56** |
+   | **in-bucket** | `(armed − empty) / 2N` | bodies **plus** scaffolding: the price if the instrumentation calls go away entirely | ~**42.6** (est.) | **50.42** |
+   | whole armed call | `armed / 2N` | everything the armed loop pays, loop scaffolding included | 43.9 | 51.44 |
 
-   (The three metal figures marked *est.* are reconstructed from `armed`/`unarmed` and a
-   1–1.5 cyc/transition allowance for the loop scaffolding; the next capture measures `empty`
-   directly and replaces them.)
+   **The `empty` pass is no longer an estimate.** Metal 2026-08-23 measured it directly —
+   `armed 105342, unarmed 23707, empty 2090, 1024 pairs` — and the 2026-08-22 estimates for the
+   scaffolding term were good (~9.8 predicted, 10.56 measured). **The two sessions' brackets do
+   not agree, and that is the point of printing the calibration per boot rather than tabulating
+   it here**: `[32.8, 42.6]` against `[39.9, 50.4]` is a ~20 % shift between captures on the
+   same board. **Price a capture from its OWN boot line, never from this table** — the columns
+   are here to show what the three passes mean and roughly where they land, not to supply a
+   constant.
 
    **What to price a capture at: sweep `[marginal, in-bucket]`, exactly as the C2 map swept
    50 → 59, and report the range.** Do not pick an end, and do not treat one as a correction of
@@ -509,6 +582,10 @@ the hit counter beside it that was not.
    exhausts `LOOP` and the 54.11 at which it exhausts `TAILADV`. So §8.3's conclusion that
    "`LOOP` is empty" is reached at a price this instrument does not support at either end.
    `LOOP`'s share is small but it is not established to be zero, and the C2 map should say so.
+
+   **Measured, 2026-08-23: `LOOP` is 24.80 % @39 .. 25.11 % @50 — not empty, and not small.**
+   The per-bucket spans settle it, and the map can consume that bracket directly instead of
+   the interval of upper bounds it was given.
 3. **A guest page fault is a C++ throw** and unwinds past every pending probe exit. The
    `CATCH` charges the abandoned span to `FAULT` and resets the phase stack. `FAULT` is
    therefore "the fault path plus a fragment of whatever stage it interrupted" —
@@ -824,8 +901,14 @@ the console echo of the command that requested it.
    the instrument, not the interpreter. Read the per-bucket **shares**, the whole-tail
    rollup and the `probe overhead inside the totals` line, the **`s` per-bucket span block**
    (which is what makes each bucket's corrected share a number rather than an interval), and
-   take the counters (`IPAGE_*`, `DPAGE_*`, `ATC_*`, `MISALIGN_*`, `IV_*`) from this run:
-   they are exact regardless of the timing distortion.
+   take the counters (`IPAGE_*`, `DPAGE_*`, `ATC_*`, `MISALIGN_*`, `IV_*`, `IV_CACR_SKIP`)
+   from this run: they are exact regardless of the timing distortion.
+
+   **Sweep the corrected shares across THIS boot's `[marginal, in-bucket]` bracket** — the boot
+   line prints both ends and they move ~20 % between sessions. Report the range; picking an end
+   is the error the third calibration pass exists to prevent. And take each bucket's transition
+   count from the `s` block: deriving it from a correlated counter is what the `2 ×
+   IFETCH_CALLS` method did, and it was wrong by 1.97×.
 4. **Install-workload profile** (optional, and the one most likely to surprise): repeat 2
    during a `pkgadd` or a large file copy, at a rate sized for how long that actually takes
    — an I/O workload runs for minutes, so 250 Hz is already marginal and the `WEIGHT`
