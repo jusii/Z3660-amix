@@ -248,16 +248,45 @@ The four parts, in the order the loop runs them:
 | 0 | `LOOPRES` | the residue: the flag snapshot, `mmu_restart`, `m68k_getpc()`, `do_cycles()`, `count_instr()`, the extension-lookahead reachability test, the cached idiom verdict's own test and its write-back, the handler selection and the `for(;;)` back edge. |
 
 **Four identities a capture can check**, and they are what makes these brackets worth their
-cost. Neither the lookup nor the fill touches guest memory, so neither can throw and neither
-span can be abandoned by an unwind — which is why the first two are *exact* rather than
-approximate, and why the firmware **warns** rather than notes when they fail:
+cost. Neither the lookup nor the fill touches guest memory, so neither *function* can throw
+— which is why the first two are *exact*, and why the firmware **warns** rather than notes
+when they fail:
 
 ```
 tcnt[DOPCFIND] == DOPC_HIT + DOPC_MISS      cache ON: one lookup per dispatch
 tcnt[DOPCFIND] == INSNS + FAULTS            cache ON, via the dispatch identity below
-tcnt[DOPCFILL] == DOPC_MISS                 cache ON: one fill per miss
-tcnt[BLKREC]   <= tcnt[DOPCFIND]            at most one recognizer call per dispatch
+tcnt[DOPCFILL] == DOPC_MISS - (misses whose opcode fetch or extension lookahead faulted)
+tcnt[BLKREC]   <= tcnt[DOPCFIND] + (BLKREC's own nested spans)
 ```
+
+> **The third identity needed a fault term, and the reason is that a bracketed function
+> not throwing is the wrong property.** What matters is whether the **interval the identity
+> spans** can throw, and this one can. `z3660_dopc_find()` counts `DOPC_MISS` and the
+> `DOPCFIND` bracket **exits before the fetch** (`newcpu.cpp`, the exit at the end of the
+> lookup); the miss arm then runs `x_prefetch(0)` — an MMU-translated opcode fetch — and an
+> extension lookahead, either of which can fault; and only after both does the miss reach
+> `z3660_dopc_fill()` and the `DOPCFILL` bracket. **A miss whose opcode fetch faults is
+> counted as a miss and never reaches the fill**, so the fill bracket runs *short* of
+> `DOPC_MISS` by exactly that number. It is bounded by `FAULTS` and, on the 2026-08-23
+> captures, sat at 1349 against `FAULTS` 3632 (cadence 1) and 1348 against 3627 (cadence 4)
+> — a stable 37.1 % / 37.2 %, reproducing to within one count on two cadences. **The
+> firmware's warning is therefore correct in form and expected in substance on any capture
+> with faults in it**: read the shortfall against `FAULTS`, and treat a shortfall *larger*
+> than `FAULTS` as the defect. Same class and same shape of fix as `== INSNS + FAULTS`.
+
+> **The fourth identity was stated about calls and compared over spans, and a cache-off
+> capture surfaced it.** `tcnt[BLKREC] <= tcnt[DOPCFIND]` reads as "at most one recognizer
+> call per dispatch", which is true — but `tcnt[]` counts **spans**, and `BLKREC` is the one
+> bracket this document already calls impure: on a fire it holds the whole serviced chunk,
+> whose guest stores nest through `WRITE`, and **every nested entry closes a span and opens
+> another**. So `BLKREC`'s span count exceeds its call count by its nesting, and the
+> comparison is not the one the sentence makes. On `51-CACHEOFF-profd.txt` it **failed**
+> correctly — 75 914 707 against 67 689 758, an excess of 8 224 949 over 41 025 chunks =
+> **200 nested spans per chunk against 308 guest instructions per chunk**, which is the
+> right order. It passes on cache-**on** dumps only by accident of the dispatch count being
+> ~4× larger there. **The call-level claim still holds and is still worth checking; it just
+> cannot be checked by comparing these two span counts.** `BLK_HIT` is the call-level
+> quantity for the fire arm.
 
 **With the cache OFF all three change shape, and none of it is a defect.** The lookup returns
 before it counts, so `DOPC_HIT + DOPC_MISS` is 0 while `DOPCFIND` goes on being entered every
@@ -327,10 +356,15 @@ transitions" instruction the dump has always given without supplying the shares.
 
 ```
 [PROF] === per-bucket spans and the corrected shares (price 32 cyc/span; sweep to the boot line's in-bucket figure) ===
+[PROF] s ceiling: min_b(acc/spans) = 59 cyc/span, bound by TAILADV -- the price above which a bucket's subtraction goes negative
+[PROF] s WARNING: the boot line's in-bucket end 68 is ABOVE this capture's ceiling 59 and is arithmetically impossible. Sweep [57, 59]; do NOT sweep to 68.
 [PROF] s 0  LOOP     spans=203419144    corrected_cyc=15194182811     23.73%
 ...
 [PROF] s -- corrected_total=64034387415  spans=851345830  (must equal TRANSITIONS 851345830 -- ...)
 ```
+
+The `ceiling` line is 2c's; read it before the shares, not after. It is the only line in the
+dump that can tell you the printed bracket's upper end is unusable.
 
 **What a "span" is, precisely** — a counter wired to the wrong quantity is worse than none.
 Every transition ends one span and begins the next. The span that ends is charged to
@@ -709,6 +743,40 @@ the hit counter beside it that was not.
    the other — the marginal figure is right for "the prof build with the probe bodies gated
    off", the in-bucket figure is right for "the prof build without the instrumentation calls",
    and the map's readers usually want the second while the firmware subtracts the first.
+
+   **…but not past the CEILING, and the boot line cannot know where that is.** A bucket's
+   corrected cycles are `acc[b] − spans[b] × price`, so the largest price the capture can be
+   swept to at all is
+
+   ```
+   ceiling = min over b with spans[b] > 0 of  acc[b] / spans[b]
+   ```
+
+   That is a property of the **capture**; the bracket is a property of the **calibration**;
+   and until 2026-08-23 nothing forced the two to be consistent. **Twice they have not
+   been.** The C2 map's v2 *picked* 59 when the arithmetic allowed at most ~50 — the error
+   that produced the "`LOOP` is empty" claim. Then the 2026-08-23 boot line *advertised* an
+   in-bucket end of **68** while that boot's own ceiling was **59.17** (bound by `TAILADV`),
+   so the printed end of the printed bracket was arithmetically impossible and the shares
+   at it were unusable. Both times it was caught by hand, after the shares had been
+   computed.
+
+   So `PROFD` now prints the ceiling beside the per-bucket price, names the bucket that
+   binds it, and **warns** when the boot line's in-bucket end is above it:
+
+   ```
+   [PROF] s ceiling: min_b(acc/spans) = <n> cyc/span, bound by <bucket> -- the price above which a bucket's subtraction goes negative
+   [PROF] s WARNING: the boot line's in-bucket end <n> is ABOVE this capture's ceiling <n> and is arithmetically impossible. Sweep [<marginal>, <ceiling>]; do NOT sweep to <n>.
+   [PROF] s usable sweep: [<marginal>, <in-bucket>] -- the boot line's in-bucket end fits under the ceiling
+   ```
+
+   **It warns rather than clamping**, and that is deliberate: `z3660_prof_probe_cyc_in_bucket()`
+   is what tools read to reproduce a capture's own bracket, and quietly returning a smaller
+   number would relabel every capture already read at the advertised one. The rule for a
+   reader is one line: **sweep `[marginal, min(in-bucket, ceiling)]`, and if the two ends
+   disagree say which one you used.** A ceiling *below* the marginal figure means the price
+   is wrong for this capture outright and no sweep is defensible — the existing
+   "modelled probe cost exceeds its measured cycles" warning fires on the same condition.
 
    **And one consequence that matters to the C2 map.** Even the *upper* end of the bracket,
    and even the whole armed call at 43.9, sit **below** the 50.59 at which the map's span

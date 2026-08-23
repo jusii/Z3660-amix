@@ -3350,6 +3350,95 @@ static void test_prof_probe_calibration(void)
 }
 
 /* ==================================================================
+ * CYBERSTORM C2 v3.1 riding item -- THE PRICE BRACKET'S CEILING.
+ *
+ * The map's §26.3 item 3, and the second time the same arithmetic has bitten: a capture's
+ * corrected cycles are acc[b] - spans[b] x price, so a price above min_b(acc[b]/spans[b])
+ * drives some bucket negative, the dump clamps it to zero, and the clamped zero reads like
+ * a measurement. v2 PICKED 59 when the capture allowed ~50; the 2026-08-23 boot line
+ * ADVERTISED 68 when that capture's ceiling was 59.17.
+ *
+ * What is testable here is the arithmetic and WHICH bucket binds it -- the min, not the
+ * first, and skipping the buckets with no spans (FAULT is charged cycles and no span on an
+ * unwind, and a zero-span bucket dividing into its cycles is not a price at all).
+ * ================================================================== */
+static void test_prof_price_ceiling(void)
+{
+	printf("[test] profiler price bracket: the ceiling above which a sweep is impossible\n");
+
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	prof_clock(0);
+	z3660_prof_loop_reset();
+
+	/* Hand-built so the ceiling is unambiguous and is NOT the first bucket with spans.
+	 *   LOOP    100 cyc over 2 spans -> 50
+	 *   HANDLER 600 cyc over 2 spans -> 300
+	 *   READ     30 cyc over 1 span  -> 30    <-- the minimum, and it binds
+	 * Every other bucket has zero spans and must be skipped rather than divided. */
+	prof_clock(50);  z3660_prof_enter(Z3660_PROF_B_HANDLER);  /* LOOP  += 50, span 1 */
+	prof_clock(350); z3660_prof_enter(Z3660_PROF_B_READ);     /* HAND  += 300, span 1 */
+	prof_clock(380); z3660_prof_exit();                       /* READ  += 30, span 1 */
+	prof_clock(680); z3660_prof_exit();                       /* HAND  += 300, span 2 */
+	prof_clock(730); z3660_prof_enter(Z3660_PROF_B_TAIL);     /* LOOP  += 50, span 2 */
+	prof_clock(730); z3660_prof_exit();                       /* TAIL  += 0,  span 1 */
+
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP],    100, "LOOP has its 100");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_HANDLER], 600, "HANDLER has its 600");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_READ],     30, "READ has its 30");
+
+	/* TAIL took 0 cycles over 1 span, so its own ratio is 0 and IT is the true minimum.
+	 * That is not a defect of the ceiling -- a bucket that measured zero cycles across a
+	 * real span genuinely cannot survive any positive price -- and the ceiling has to say
+	 * so rather than quietly skipping it, or it would advertise a price at which a bucket
+	 * clamps. This is exactly the shape of the TAILADV row that bound the metal capture. */
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling(), 0,
+	           "a bucket with a real span and zero cycles binds the ceiling at 0");
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling_bucket(), (uae_u32)Z3660_PROF_B_TAIL,
+	           "...and the dump names THAT bucket, not the first one with spans");
+
+	/* Now give TAIL enough cycles that READ is the binding row, which is the case the
+	 * metal dumps are actually in. */
+	prof_clock(1000); z3660_prof_enter(Z3660_PROF_B_TAIL);
+	prof_clock(1200); z3660_prof_exit();     /* TAIL += 200 over a 2nd span -> 200/2 = 100 */
+
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling(), 30,
+	           "with TAIL at 100 the minimum is READ's 30");
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling_bucket(), (uae_u32)Z3660_PROF_B_READ,
+	           "...and READ is named as the bucket that binds it");
+
+	/* The property the whole item exists for: at the ceiling nothing clamps, one cycle
+	 * above it something does. Asserted directly on the same subtraction the dump does. */
+	{
+		int price = z3660_prof_price_ceiling();
+		int i, clamped_at_ceiling = 0, clamped_above = 0;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) {
+			if (!z3660_prof_tcnt[i]) continue;
+			if (z3660_prof_acc[i] < z3660_prof_tcnt[i] * (uae_u64)price)
+				clamped_at_ceiling = 1;
+			if (z3660_prof_acc[i] < z3660_prof_tcnt[i] * (uae_u64)(price + 1))
+				clamped_above = 1;
+		}
+		CHECK(!clamped_at_ceiling,
+		      "at the ceiling no bucket's subtraction goes negative\n");
+		CHECK(clamped_above,
+		      "one cycle above it, one does -- which is what makes it a ceiling\n");
+	}
+
+	/* A capture with nothing bucketed yet has no ceiling to report, and must say 0/-1
+	 * rather than dividing by zero. The boot line is exactly in this state, which is why
+	 * the ceiling is printed on PROFD and not there. */
+	z3660_prof_zero();
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling(), 0,
+	           "an empty capture reports no ceiling rather than dividing by zero");
+	CHECK_EQ32((uae_u32)z3660_prof_price_ceiling_bucket(), (uae_u32)-1,
+	           "...and names no bucket");
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+}
+
+/* ==================================================================
  * CYBERSTORM C2-prep -- the tail split.
  *
  * The map's single highest-value instrument ask: TAIL was 20 % of guest time with no
@@ -5606,6 +5695,7 @@ int main(int argc, char **argv)
 	test_prof_ret_macro_ordering();
 	test_prof_tail_split();
 	test_prof_probe_calibration();
+	test_prof_price_ceiling();
 	test_prof_clock_source();
 	test_prof_translation_counters();
 	test_prof_ifetch_calls();

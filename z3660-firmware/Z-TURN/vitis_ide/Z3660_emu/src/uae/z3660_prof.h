@@ -1168,6 +1168,34 @@ void     z3660_prof_probe_cal_spans(uint32_t *armed, uint32_t *unarmed, uint32_t
  * measured with the probes INLINED and timed the whole loop, so it is a whole-cost,
  * inlined quantity that neither of these is a bound on. -1 in a non-profiling build. */
 int      z3660_prof_probe_cyc_in_bucket(void);
+
+/* THE CEILING THE BRACKET NEVER CARRIED, and the trap it closes.
+ *
+ * A bucket's corrected cycles are `acc[b] - spans[b] x price`. That subtraction goes
+ * NEGATIVE the moment `price` exceeds `acc[b] / spans[b]` for any bucket, so the largest
+ * price the whole capture can be swept to is
+ *
+ *     ceiling = min over b with spans[b] > 0 of  acc[b] / spans[b]
+ *
+ * which is a property of the CAPTURE, not of the calibration -- and the two are computed
+ * from different measurements, so nothing has ever forced them to be consistent. Twice
+ * now they have not been: the C2 map's v2 PICKED 59 when the arithmetic allowed at most
+ * ~50, and the 2026-08-23 boot line ADVERTISED an in-bucket end of 68 when the capture's
+ * own ceiling was 59.17. Both times the impossible end was discovered by hand, after the
+ * shares had been computed at it.
+ *
+ * The boot line cannot compute this -- it prints before any work has been bucketed -- so
+ * it is printed on the PROFD dump instead, beside the per-bucket price, together with the
+ * bucket that binds it. If the boot line's in-bucket end is above the ceiling the dump
+ * WARNS and names the usable range. It is a warning rather than a clamp on purpose:
+ * `z3660_prof_probe_cyc_in_bucket()` is what tools read to reproduce a capture's own
+ * bracket, and silently returning a different number would relabel every capture that has
+ * already been read at the advertised one. Returns 0 if nothing has been bucketed yet,
+ * and -1 in a non-profiling build. */
+int      z3660_prof_price_ceiling(void);
+/* Which bucket binds the ceiling above; -1 if there is none. */
+int      z3660_prof_price_ceiling_bucket(void);
+
 int      z3660_prof_present(void);              /* 1 in a profiling build, else 0        */
 
 #ifdef __cplusplus

@@ -662,6 +662,33 @@ extern "C" int      z3660_prof_probe_cyc_in_bucket(void)
 }
 extern "C" int      z3660_prof_present(void) { return 1; }
 
+/* The capture's own price ceiling -- see z3660_prof.h for why the bracket needs one.
+ *
+ * Integer division truncates DOWNWARD, which is the safe direction: a truncated ceiling
+ * can only under-state the largest usable price, never advertise an impossible one. The
+ * FAULT bucket is skipped by the spans>0 test on its own -- an unwind charges it cycles
+ * and no span -- so it never binds a ceiling of zero. */
+static int z3660_prof_ceiling_bucket_idx(void)
+{
+   int i, best = -1;
+   uint64_t bestv = 0;
+   for (i = 0; i < Z3660_PROF_B_COUNT; i++) {
+      uint64_t s = z3660_prof_tcnt[i];
+      uint64_t v;
+      if (!s) continue;
+      v = z3660_prof_acc[i] / s;
+      if (best < 0 || v < bestv) { bestv = v; best = i; }
+   }
+   return best;
+}
+extern "C" int z3660_prof_price_ceiling(void)
+{
+   int b = z3660_prof_ceiling_bucket_idx();
+   if (b < 0) return 0;
+   return (int)(z3660_prof_acc[b] / z3660_prof_tcnt[b]);
+}
+extern "C" int z3660_prof_price_ceiling_bucket(void) { return z3660_prof_ceiling_bucket_idx(); }
+
 /* ------------------------------------------------------------------ dumps */
 
 static uint32_t z3660_prof_build_flags(void)
@@ -833,6 +860,29 @@ extern "C" void z3660_prof_dump_stats(void)
       z3660_printf("[PROF] === per-bucket spans and the corrected shares "
                    "(price %d cyc/span; sweep to the boot line's in-bucket figure) ===\r\n",
                    z3660_prof_probecyc);
+      /* THE CEILING, printed beside the price it bounds. Without it the documented
+       * method -- "sweep to the boot line's in-bucket figure" -- walks into a price at
+       * which some bucket's subtraction is negative, and the clamp below turns that into
+       * a share of 0.00 % that reads like a measurement. It has happened twice; see
+       * z3660_prof_price_ceiling() in z3660_prof.h. */
+      {
+         int cb = z3660_prof_price_ceiling_bucket();
+         int ceil = z3660_prof_price_ceiling();
+         int inb  = z3660_prof_probe_cyc_in_bucket();
+         if (cb >= 0) {
+            z3660_printf("[PROF] s ceiling: min_b(acc/spans) = %d cyc/span, bound by %s "
+                         "-- the price above which a bucket's subtraction goes negative\r\n",
+                         ceil, z3660_prof_bucket_names[cb]);
+            if (inb > ceil)
+               z3660_printf("[PROF] s WARNING: the boot line's in-bucket end %d is ABOVE "
+                            "this capture's ceiling %d and is arithmetically impossible. "
+                            "Sweep [%d, %d]; do NOT sweep to %d.\r\n",
+                            inb, ceil, z3660_prof_probecyc, ceil, inb);
+            else
+               z3660_printf("[PROF] s usable sweep: [%d, %d] -- the boot line's in-bucket "
+                            "end fits under the ceiling\r\n", z3660_prof_probecyc, inb);
+         }
+      }
       for (i = 0; i < Z3660_PROF_B_COUNT; i++) {
          uint64_t p = z3660_prof_tcnt[i] * (uint64_t)(z3660_prof_probecyc > 0
                                                       ? z3660_prof_probecyc : 0);
@@ -1097,6 +1147,8 @@ extern "C" unsigned z3660_prof_cpu_hz(void)          { return 0; }
 extern "C" unsigned z3660_prof_wall_hz(void)         { return 0; }
 extern "C" int      z3660_prof_probe_cyc_per_transition(void) { return -1; }
 extern "C" int      z3660_prof_probe_cyc_in_bucket(void)       { return -1; }
+extern "C" int      z3660_prof_price_ceiling(void)             { return -1; }
+extern "C" int      z3660_prof_price_ceiling_bucket(void)      { return -1; }
 extern "C" void     z3660_prof_probe_cal_spans(uint32_t *a, uint32_t *u, uint32_t *e)
                                                      { if (a) *a = 0; if (u) *u = 0; if (e) *e = 0; }
 extern "C" int      z3660_prof_present(void)         { return 0; }
