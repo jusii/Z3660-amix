@@ -298,59 +298,6 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
                                    * of it was never separately visible.                 */
 #define Z3660_DOPC_INV_COUNT  10
 
-/* ---- THE `f` MEASUREMENT SWITCH -- DELIBERATELY UNSOUND, NEVER SHIPPED --------------
- *
- * docs/f-measurement.md is the pre-registration and it was committed before this code
- * existed. Read it before touching anything here.
- *
- * WHAT IT DOES. Armed, an invalidation request whose cause is INV_FLUSH (CPUSHL / CINV)
- * is counted and then NOT PERFORMED. That is a correctness violation -- the 68040 makes
- * the guest maintain the caches and this build stops honouring one of the two operations
- * it maintains them with. It exists for exactly one measurement:
- *
- *   a perfect physical index invalidates only the entries whose PHYSICAL address matches;
- *   a no-op invalidates none; the matching set is a subset -- so no-op >= physical index
- *   in hit rate BY CONSTRUCTION, and the hit-rate response to arming this is a STRICT
- *   UPPER BOUND on `f`, the fraction of misses a physical index could remove.
- *
- * C2 map v3.3 SS38.6 returned ADJUST on that study: everything else about it is measured
- * and favourable, and `f` is the one input that decides it. SS38.4 showed `f` had been
- * carried at 1.0 while its own calibration said 0.70. So the map says buy the prize's
- * size before funding the design, and this is the purchase.
- *
- * THE POLARITY IS THE OPPOSITE OF EVERY OTHER C2 SWITCH, ON PURPOSE. blk_chunk, dopc_on
- * and dfast_on all read "unset -> the built-in default -> ON", because for them the
- * shipped behaviour is the optimisation and a core0 built before the field existed must
- * still run it. The REASONING here is identical and the VALUE is inverted: unset means
- * the shipped behaviour, and the shipped behaviour of an unsound mode is OFF. There is no
- * "unset = ON" in this feature and there must never be one.
- *
- * ARMING TAKES AN EXACT MAGIC, not `1` and not "anything non-zero". SHARED is
- * hand-maintained in two headers that a beta resync has already mis-merged once
- * (docs/piscsi-service-path.md), so a neighbouring field bleeding into this one must
- * DISARM. A magic-word test guarantees that; a truthiness test does not. The value is
- * chosen to collide with nothing the other switches use (0, 1, 0xFFFFFFFF, 64/256/1024).
- *
- * AND IT MUST NOT SURVIVE A REBOOT. The mailbox is DDR that survives a warm reset --
- * config_file.c says so about prof_ctl -- so "the field defaults to disarmed" is not
- * enough on its own: a word the console wrote in one boot is still there in the next.
- * core0 therefore PUBLISHES THE OFF SENTINEL UNCONDITIONALLY from both config-resolve
- * paths on every boot, which is resolve_prof_config()'s pattern verbatim and for the same
- * stated reason. There is deliberately NO config-file key: the arm is reachable only by
- * typing the console command. */
-#define Z3660_DOPC_IVSUP_OFF  0u            /* unset AND the shipped state: DISARMED     */
-#define Z3660_DOPC_IVSUP_ARM  0xC2F1A5EDu   /* the one value that arms. Nothing else does */
-
-/* requested -> 1 (armed: INV_FLUSH is suppressed) or 0 (disarmed: standard behaviour).
- *
- * A resolved 0 must be the REFERENCE MACHINE: z3660_dopc_invalidate() performs exactly
- * the invalidations it performed before this switch existed, for every cause including
- * INV_FLUSH. That is what makes the harness's disarmed corpus meaningful. */
-static inline unsigned z3660_dopc_ivsup_resolve(unsigned requested)
-{
-   return (requested == Z3660_DOPC_IVSUP_ARM) ? 1u : 0u;
-}
-
 /* ---- The extension-word window -----------------------------------------------------
  *
  * The map asks the entry to hold "the instruction's extension words", but the generated
@@ -422,29 +369,6 @@ void z3660_dopc_invalidate(int cause);
  * because a counter that aggregates two causes cannot attribute either. */
 void z3660_dopc_cacr_skipped(void);
 
-/* ---- The `f` measurement switch's runtime half -------------------------------------
- *
- * Read-back + direct set, the same pair every C2 switch has, for the same reason: the
- * setter takes a RAW mailbox value and runs it through z3660_dopc_ivsup_resolve(), so a
- * console command and a mailbox word cannot mean two different things.
- *
- * BOTH TRANSITIONS INVALIDATE, unconditionally, exactly as z3660_dopc_set() does -- and
- * the DISARM direction is the one that needs it. After an armed window the table holds
- * entries whose invalidation was skipped, so returning to the sound machine without
- * invalidating would carry stale decodes into the reference arm and quietly corrupt the
- * A/B this whole build exists to take. The invalidation is raised with cause INV_KNOB,
- * which is not the suppressed cause, so it performs even while armed.
- *
- * z3660_dopc_ivsup_suppressed() is the confession, and it is compiled into EVERY variant
- * rather than living only in the profiler's counter block. The wall-clock arm of the
- * experiment is a LEAN boot, which has no profiler at all; without this counter that arm
- * could not say how many invalidations it skipped. The profiler's IV_SUPPRESSED (id 46)
- * carries the same event per CAPTURE, since it is zeroed with the capture. */
-int      z3660_dopc_ivsup_armed(void);
-unsigned z3660_dopc_ivsup_get(void);
-unsigned z3660_dopc_ivsup_set(unsigned requested);
-unsigned long long z3660_dopc_ivsup_suppressed(void);
-
 /* The DMA arm, called from core1's side of the cross-core mailbox once core0 has written
  * guest DRAM. Takes the range core0 wrote even though it invalidates everything: the
  * range is a PHYSICAL address and the tags are logical, so it cannot be compared against
@@ -474,13 +398,6 @@ void         z3660_dopc_force_generation(unsigned int gen);
 unsigned     z3660_dopc_set_bytes(void);
 unsigned     z3660_dopc_table_bytes(void);
 int          z3660_dopc_peek(unsigned int pc, int super);
-
-#ifdef HOST_TEST_HARNESS
-/* Harness only, and in no firmware binary: widen the `f` switch's suppression by one
- * NON-TARGET cause, so the per-cause enumeration that pins "INV_FLUSH and nothing else"
- * can be shown to fail when the claim stops being true. See newcpu.cpp. */
-void         z3660_dopc_ivsup_set_mutant(int on);
-#endif
 
 #ifdef __cplusplus
 }

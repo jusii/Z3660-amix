@@ -506,3 +506,11 @@ inherits); §38.2's inherited assumption that a decoded-op hit pays no opcode fe
 this small the wall clock had no signal to carry either way); §38.5's miss-rate confound (`f`
 is immune, the ceiling in *percent* derived from it is not, and is not quoted here); and any
 licence whatsoever for the IVSUP mode.
+
+---
+
+**2026-08-23, after the verdict above: the `IVSUP` machinery was removed from the tree.** The
+console command, the `dopc_ivsup` mailbox word, the suppression, the banners and the
+`IV_SUPPRESSED` counter (id 46) are all gone — everything this file describes as *present* is
+now history, and the profiler's live identity is `sum(IV_*) − IV_WRAP == DOPC_INVAL`. The
+measurement is not to be retaken: the reading rules above forbid it.

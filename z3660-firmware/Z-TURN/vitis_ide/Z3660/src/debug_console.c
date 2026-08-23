@@ -106,8 +106,6 @@ typedef enum {
    DOPC,    DECODED_OP_CACHE,
    /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
    DFAST,   ACCESSOR_FAST_PATH,
-   /* CYBERSTORM C2 SS38.6: the `f` measurement. DELIBERATELY UNSOUND. APPEND-ONLY. */
-   IVSUP,   UNSOUND_IV_SUPPRESS,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -172,7 +170,6 @@ const char *command_names[] = {
       "BLK",     "BLOCK IDIOM",
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
-      "IVSUP",   "UNSOUND IV SUPPRESS",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -700,46 +697,6 @@ int debug_thread(struct pt *pt)
                            xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
                         else
                            xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
-                     }
-                     debug_console.subcmd=0;
-                     break;
-                  case IVSUP:
-                  case UNSOUND_IV_SUPPRESS:
-                     {  /* CYBERSTORM C2 SS38.6, the `f` measurement. THIS ARMS A
-                        * DELIBERATELY UNSOUND MACHINE -- read docs/f-measurement.md
-                        * before using it, and never leave this image on the card.
-                        *
-                        * Armed, CPUSHL/CINV no longer invalidate the decoded-op cache, so
-                        * the guest executes decodes of instructions it has already
-                        * overwritten. It exists because "a no-op invalidates none" is a
-                        * STRICT UPPER BOUND on what a physical index could remove, which
-                        * makes one boot's hit-rate response the measurement of `f` that
-                        * SS38.6 says must be bought before the design round is funded.
-                        *
-                        * DISARMED IS THE SHIPPED STATE and unset resolves to it -- the
-                        * opposite of DOPC/DFAST/BLK above, and the one place in this file
-                        * where "unset" does not mean "the optimisation is on". The rule
-                        * is z3660_dopc.h's z3660_dopc_ivsup_resolve() and nothing else
-                        * re-implements it. core1 picks the change up at its next knob
-                        * resync, invalidates the whole cache on the way through, and
-                        * prints the banner that is the authoritative record -- this line
-                        * only says what was REQUESTED. */
-                        uint32_t c=shared->dopc_ivsup;
-                        c = (z3660_dopc_ivsup_resolve(c)!=0u) ? Z3660_DOPC_IVSUP_OFF
-                                                             : Z3660_DOPC_IVSUP_ARM;
-                        shared->dopc_ivsup=c;
-                        if(c==Z3660_DOPC_IVSUP_ARM)
-                        {
-                           xil_printf("\r\n**********************************************************************\r\n");
-                           xil_printf("*** MEASUREMENT MODE REQUESTED -- DOPC INVALIDATION SUPPRESSED     ***\r\n");
-                           xil_printf("*** THIS IS UNSOUND. CPUSHL/CINV WILL NOT INVALIDATE THE DECODED-  ***\r\n");
-                           xil_printf("*** OP CACHE. STALE DECODES CAN WILD-WRITE: USE A WORK COPY DISK.  ***\r\n");
-                           xil_printf("*** THIS BUILD MUST NEVER SHIP. docs/f-measurement.md              ***\r\n");
-                           xil_printf("**********************************************************************\r\n");
-                           xil_printf("(core1 confirms with its own [IVSUP] banner -- wait for it)\r\n\r\n");
-                        }
-                        else
-                           xil_printf("UNSOUND IV SUPPRESS OFF requested (CPUSHL/CINV invalidate again -- this is the reference arm)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1488,9 +1445,6 @@ void debug_console_help(void)
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
    xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
-   xil_printf("'IVSUP'   or 'UNSOUND IV SUPPRESS' arms the C2 f measurement (EMU): CPUSHL/CINV stop invalidating the\r\n");
-   xil_printf("          decoded-op cache. DELIBERATELY UNSOUND -- measurement only, work-copy disk, never ship it.\r\n");
-   xil_printf("          Default OFF, never armed by any config key, and never survives a reboot. docs/f-measurement.md\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

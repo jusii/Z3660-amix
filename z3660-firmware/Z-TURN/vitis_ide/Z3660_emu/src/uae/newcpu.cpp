@@ -4730,54 +4730,6 @@ static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
 #include "z3660_dopc.h"
 static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
 
-/* CYBERSTORM C2 SS38.6: the `f` measurement switch. DELIBERATELY UNSOUND WHEN ARMED --
- * docs/f-measurement.md, and z3660_dopc.h carries the contract.
- *
- * Initialised DISARMED, which is the second of the two mechanisms that keep the arm state
- * from surviving a reboot: core0 publishes the OFF sentinel unconditionally on every boot
- * (config_file.c), and this static means a core1 running before core0 has published
- * anything is disarmed rather than reading whatever the DDR happened to hold.
- *
- * The suppressed count is 64-bit and compiled into EVERY variant, unlike the profiler's
- * IV_SUPPRESSED: the wall-clock arm of this experiment is a LEAN boot with no profiler in
- * it, and an unsound arm that cannot say how many invalidations it skipped is an arm with
- * no confession. */
-static unsigned  z3660_dopc_ivsup_on    = 0u;
-static uae_u64   z3660_dopc_ivsup_count = 0;
-
-#ifdef HOST_TEST_HARNESS
-/* THE MUTATION ARM, and it is in no firmware binary. -1 = the shipped behaviour.
- *
- * The corpus's central claim is "armed, this suppresses INV_FLUSH and NOTHING ELSE", and
- * a claim like that is worth exactly as much as the test that would fail if it stopped
- * being true. So the harness can widen the suppression by one NON-TARGET cause and then
- * re-run the per-cause enumeration: if the enumeration still passes, the enumeration was
- * asserting nothing. Same device as rung 1b's DMA-arm mutation, which is what found the
- * attribution test that never exercised a call site. */
-static int z3660_dopc_ivsup_extra = -1;
-extern "C" void z3660_dopc_ivsup_set_mutant(int on)
-{
-   z3660_dopc_ivsup_extra = on ? Z3660_DOPC_INV_PFLUSH : -1;
-}
-#endif
-
-/* WHICH CAUSES THE SWITCH CATCHES. One function, so "what does armed suppress?" is
- * answered by reading four lines rather than by tracing a condition through a call.
- *
- * INV_FLUSH is mmu_flush_cache() (cpummu.cpp) and therefore every CPUSHL / CPUSHP /
- * CPUSHA / CINV form that reaches flush_mmu040()/flush_mmu060(). It is the ONLY cause
- * here. The other nine -- ROOT, DMA, TABLE, KNOB, WRAP, MAP, PFLUSH, PFLUSHA, CACR --
- * fall through to the invalidation they always performed, and the CACR call-site
- * narrowing (z3660_dopc_cacr_skipped()) is a different function this never reaches. */
-static __inline__ int z3660_dopc_ivsup_hits(int cause)
-{
-   if (cause == Z3660_DOPC_INV_FLUSH) return 1;
-#ifdef HOST_TEST_HARNESS
-   if (cause == z3660_dopc_ivsup_extra) return 1;   /* the mutation arm; never shipped */
-#endif
-   return 0;
-}
-
 #if Z3660_EMU_PERF
 /* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
  * disagree about it -- a read-back that recomputes the answer proves nothing about the
@@ -4812,36 +4764,6 @@ extern "C" void z3660_knobs_sync(void)
        * SLOW, and the original accessor is what runs. */
       unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
       if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
-   }
-   {                                                                                   // IVSUP
-      /* CYBERSTORM C2 SS38.6: the `f` measurement switch. ON A CHANGE ONLY -- the setter
-       * invalidates the whole cache unconditionally and this runs at every resync point,
-       * so calling it every time would flush the cache 60 times a second and destroy the
-       * very measurement it exists to take.
-       *
-       * CORE1 PRINTS THE BANNER, not core0. The console can only write a mailbox word;
-       * this is the line that says the EMULATOR armed, and it is the one a capture's
-       * serial log has to contain before the capture may be believed. Loud, on both
-       * transitions, and the disarm line carries the running count so the confession
-       * survives even if the profiler is not in this image. */
-      unsigned v = z3660_dopc_ivsup_resolve((unsigned)shared->dopc_ivsup);
-      if (v != z3660_dopc_ivsup_on) {
-         z3660_dopc_ivsup_set((unsigned)shared->dopc_ivsup);
-         if (v)
-            z3660_printf("\r\n[IVSUP] ***** MEASUREMENT MODE -- DOPC INVALIDATION "
-                         "SUPPRESSED -- UNSOUND *****\r\n"
-                         "[IVSUP] ***** CPUSHL/CINV NO LONGER INVALIDATE THE DECODED-OP "
-                         "CACHE. THIS BUILD MUST NOT SHIP. *****\r\n"
-                         "[IVSUP] ***** Stale decodes can produce wrong results, wild "
-                         "branches and wild WRITES: use a WORK COPY of the disk. *****\r\n"
-                         "[IVSUP] ***** docs/f-measurement.md -- the run is valid only if "
-                         "dhrystone's printed values are correct. *****\r\n\r\n");
-         else
-            z3660_printf("\r\n[IVSUP] measurement mode DISARMED -- sound behaviour "
-                         "restored, whole cache invalidated on the way out.\r\n"
-                         "[IVSUP] this boot suppressed %lu invalidation(s) in total.\r\n\r\n",
-                         (unsigned long)z3660_dopc_ivsup_suppressed());
-      }
    }
 }
 
@@ -5737,70 +5659,8 @@ static void z3660_dopc_do_invalidate(void)
 
 extern "C" void z3660_dopc_invalidate(int cause)
 {
-   /* THE CAUSE IS COUNTED FIRST, ABOVE THE SUPPRESSION, AND THAT IS THE WHOLE POINT.
-    *
-    * SS37.1's lesson is that a counter reached only AFTER the branch you are removing
-    * cannot move when you remove it -- scored twice against the firmware last round as a
-    * bookkeeping error in a design document. Here it is used deliberately in the other
-    * direction: IV_FLUSH sits above the skip, so the guest's own flush rate reads
-    * IDENTICALLY in both arms and the armed capture keeps its own denominator. The
-    * pre-registered direction table declares IV_FLUSH unchanged for exactly this reason.
-    *
-    * THE SUPPRESSION, and it is one cause and one cause only. cause == INV_FLUSH is the
-    * CPUSHL / CINV arm (mmu_flush_cache(), cpummu.cpp) and nothing else reaches it: every
-    * other cause -- ROOT, DMA, TABLE, KNOB, WRAP, MAP, PFLUSH, PFLUSHA, CACR -- falls
-    * through to the invalidation it always performed, and z3660_dopc_cacr_skipped() is a
-    * different function this never touches. The test is on the cause id and nothing else,
-    * so "which sources are suppressed" is answerable by reading one comparison.
-    *
-    * The whole call is skipped, including the extension-window disarm at the top of
-    * z3660_dopc_do_invalidate(). That is the faithful reading of "pretend this flush did
-    * not happen": the window is armed by a validated hit and is exactly as coherent as
-    * the entry it came from, and under suppression that entry is (deliberately) still
-    * believed. It keeps the arm a strict upper bound, which is what it is for.
-    *
-    * THE DISARMED COST, READ OFF THE OBJECT CODE RATHER THAN ASSUMED. The armed flag is
-    * tested first so a short-circuit would cost one load and one not-taken branch -- but
-    * gcc -Os materialises the `&&` branchlessly, and the lean build's disarmed prologue
-    * is EIGHT instructions (load the flag, normalise to 0/1, compare `cause` against 0,
-    * AND, branch) ahead of the original body, which follows verbatim. Against that,
-    * HEAD's z3660_dopc_invalidate() was a single tail-call branch, so the net is about
-    * +7 instructions per invalidation REQUEST.
-    *
-    * Nothing here is on the hit path, the fill path or the dispatch loop -- 25 126
-    * functions in the lean core1 and four of them changed, all four on this path. At
-    * dhrystone's 36 k - 81 k invalidation requests that is under 0.6 M cycles against a
-    * run of order 10^10, i.e. the < 0.01 % docs/f-measurement.md pre-registers, and the
-    * session measures it against DEC21748 rather than trusting this paragraph. */
    z3660_dopc_count_cause(cause);
-   if (z3660_dopc_ivsup_on && z3660_dopc_ivsup_hits(cause)) {
-      z3660_dopc_ivsup_count++;
-      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_SUPPRESSED);
-      return;
-   }
    z3660_dopc_do_invalidate();
-}
-
-/* The `f` measurement switch's runtime half. See z3660_dopc.h for the contract and
- * docs/f-measurement.md for the pre-registration. */
-extern "C" int      z3660_dopc_ivsup_armed(void) { return (int)z3660_dopc_ivsup_on; }
-extern "C" unsigned z3660_dopc_ivsup_get(void)   { return z3660_dopc_ivsup_on; }
-extern "C" unsigned long long z3660_dopc_ivsup_suppressed(void)
-{
-   return (unsigned long long)z3660_dopc_ivsup_count;
-}
-
-/* BOTH TRANSITIONS INVALIDATE, unconditionally -- and the DISARM direction is the one
- * that needs it. After an armed window the table holds entries whose invalidation was
- * skipped; returning to the sound machine without invalidating would carry stale decodes
- * straight into the reference arm and corrupt the A/B this build exists to take. Cause
- * INV_KNOB is not the suppressed cause, so it performs even while armed -- which is also
- * why the metal protocol's return leg is a real check and not a formality. */
-extern "C" unsigned z3660_dopc_ivsup_set(unsigned requested)
-{
-   z3660_dopc_ivsup_on = z3660_dopc_ivsup_resolve(requested);
-   z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB);
-   return z3660_dopc_ivsup_on;
 }
 
 /* Rung 1c: the CACR call site proved its request inert, so nothing is invalidated and

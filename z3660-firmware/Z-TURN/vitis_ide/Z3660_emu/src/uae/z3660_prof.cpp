@@ -58,10 +58,7 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
    "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3",
    /* rung 2: the misaligned-read denominator split, and the fast path's coverage. */
-   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR",
-   /* SS38.6: NOT a cause -- an INV_FLUSH request the measurement switch refused to
-    * perform. Non-zero means the capture came off an unsound machine. */
-   "IV_SUPPRESSED"
+   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -763,41 +760,6 @@ static void z3660_prof_pct(uint64_t part, uint64_t whole, unsigned *ip, unsigned
    }
 }
 
-/* CYBERSTORM C2 SS38.6 -- THE CONFESSION, PRINTED ON EVERY DUMP.
- *
- * The `f` measurement switch makes CPUSHL/CINV stop invalidating the decoded-op cache,
- * which is deliberately unsound (docs/f-measurement.md). A capture taken on that machine
- * describes an emulator that is executing decodes of instructions the guest has already
- * overwritten, and every hit-rate row in it means something different from the same row
- * in a sound capture.
- *
- * THE TEST IS "armed NOW **or** anything was suppressed IN THIS CAPTURE", not "armed
- * now". A session that arms, runs, disarms and then dumps would otherwise print a clean-
- * looking capture full of contaminated counters -- and that is the likeliest way to
- * mislead a reader, because it is the sequence a careful operator would perform. The
- * counter is zeroed with the capture (PROFZ / the ARM), so it scopes to exactly the
- * window the rest of the dump describes.
- *
- * Printed at the HEAD and again at the FOOT: this console interleaves two cores and a
- * long dump can be truncated at either end. */
-static void z3660_prof_ivsup_banner(void)
-{
-   uint64_t sup = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED];
-
-   if (!z3660_dopc_ivsup_armed() && !sup) return;
-
-   z3660_printf("[PROF] **********************************************************\r\n");
-   z3660_printf("[PROF] *** MEASUREMENT MODE -- DOPC INVALIDATION SUPPRESSED    ***\r\n");
-   z3660_printf("[PROF] *** UNSOUND. THIS CAPTURE IS NOT OF A CORRECT MACHINE.  ***\r\n");
-   z3660_printf("[PROF] *** %s CPUSHL/CINV invalidation(s) were SKIPPED in this capture\r\n",
-                z3660_prof_u64(sup));
-   z3660_printf("[PROF] *** switch is %s right now. docs/f-measurement.md       ***\r\n",
-                z3660_dopc_ivsup_armed() ? "ARMED " : "disarmed");
-   z3660_printf("[PROF] *** sum(IV_*) - IV_SUPPRESSED - IV_WRAP == DOPC_INVAL   ***\r\n");
-   z3660_printf("[PROF] *** is the identity here; the standing one does not.    ***\r\n");
-   z3660_printf("[PROF] **********************************************************\r\n");
-}
-
 extern "C" void z3660_prof_dump_stats(void)
 {
    uint64_t total = 0;
@@ -806,8 +768,6 @@ extern "C" void z3660_prof_dump_stats(void)
 
    z3660_prof_enter(Z3660_PROF_B_PROF);
    z3660_prof_cyc_advance();
-
-   z3660_prof_ivsup_banner();
 
    for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
    XTime_GetTime(&wall);
@@ -1093,7 +1053,6 @@ extern "C" void z3660_prof_dump_stats(void)
       uint64_t mi = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
       uint64_t iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
       uint64_t sk = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_CACR_SKIP];
-      uint64_t su = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED];
       uint64_t wr = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP];
       uint64_t req = 0;
       unsigned ip, fp;
@@ -1191,16 +1150,6 @@ extern "C" void z3660_prof_dump_stats(void)
                       "at the call site (%u.%02u%%)\r\n",
                       z3660_prof_u64(req + sk), z3660_prof_u64(iv), z3660_prof_u64(sk),
                       ip, fp);
-         /* SS38.6: the measurement switch's own row, printed only when it fired. It is a
-          * SECOND narrowing that decides before the invalidation -- unlike the CACR one
-          * it decides INSIDE z3660_dopc_invalidate() and after the attribution, which is
-          * why it subtracts from the identity below rather than being absent from it. */
-         if (su) {
-            z3660_prof_pct(su, req, &ip, &fp);
-            z3660_printf("[PROF] r dopc %s of those SUPPRESSED by the f measurement switch "
-                         "(%u.%02u%% of requests) -- UNSOUND, see the banner\r\n",
-                         z3660_prof_u64(su), ip, fp);
-         }
          /* The generation wrap, printed only when it happened -- so no capture's output
           * shape changes until one does. It is worth a line of its own because a wrap
           * MEMSETS the whole table rather than bumping a stamp: the misses that follow it
@@ -1215,21 +1164,14 @@ extern "C" void z3660_prof_dump_stats(void)
           * `req == iv` additionally holds for a capture taken entirely with the cache ON,
           * and the gap when it does not is the requests made while the cache was OFF --
           * which is a fact about the window, not a defect, so it is not warned about.
-          * The other direction is impossible and is.
-          *
-          * SS38.6 widens the bound by exactly the suppressed count: a suppressed request
-          * is counted in `req` and performs nothing, so the identity a capture off the
-          * measurement build satisfies is `req - su == iv`. Written as `req < iv + su` so
-          * the unsigned subtraction cannot underflow when su exceeds req -- which is
-          * itself impossible, and impossible is what this line is for. */
-         if (req < iv + su)
+          * The other direction is impossible and is. */
+         if (req < iv)
             z3660_printf("[PROF] r WARNING: sum(IV_*)-IV_WRAP=%s is less than DOPC_INVAL=%s "
-                         "plus IV_SUPPRESSED=%s -- a cause id is out of range or a call site "
-                         "bypasses the attribution\r\n",
-                         z3660_prof_u64(req), z3660_prof_u64(iv), z3660_prof_u64(su));
+                         "-- a cause id is out of range or a call site bypasses the "
+                         "attribution\r\n",
+                         z3660_prof_u64(req), z3660_prof_u64(iv));
       }
    }
-   z3660_prof_ivsup_banner();
    z3660_printf("[PROF] === end ===\r\n");
 
    z3660_prof_exit();
@@ -1274,10 +1216,6 @@ extern "C" void z3660_prof_dump_ring(unsigned n)
    if (n == 0 || (uint64_t)n > have) n = (unsigned)have;
    XTime_GetTime(&wall);
 
-   /* SS38.6: a ring is a share-of-runtime histogram of a machine, so it inherits the same
-    * confession the counter dump carries. Before the header, because a symbolizer reads
-    * from `ring hdr` onwards and a human reads from the top. */
-   z3660_prof_ivsup_banner();
    z3660_printf("[PROF] ring hdr magic=%s version=%u rec_size=%u rec_count=%u ring_entries=%lu "
                 "hz=%lu period_cyc=%lu cpu_hz=%lu\r\n",
                 Z3660_PROF_MAGIC_STR,

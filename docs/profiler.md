@@ -563,7 +563,14 @@ correctly.
 | 43 | `MISALIGN_I` | of `MISALIGN_R`, the **instruction-stream** half (C2 rung 2). `MISALIGN_R` is incremented at `get_ilong` as well as at the two data sites, so `MISALIGN_R − MISALIGN_I` is the genuine misaligned **data** reads. See `docs/accessor-fastpath.md` |
 | 44 | `DFAST_HIT` | data accesses served by the **accessor fast path** (C2 rung 2) — its coverage of `READ + WRITE` |
 | 45 | `DFAST_XPAR` | ... of those, via a **TTR match** rather than the page cache. The supervisor/user access split, measured |
-| 46 | `IV_SUPPRESSED` | `IV_FLUSH` requests the **`f` measurement switch counted and did not perform** (`docs/f-measurement.md`). **Not a cause**, and not a member of the block above — every entry there means *reached the invalidator*, which this one means the negation of. **Zero in every sound build.** A capture with a non-zero value here came off a deliberately UNSOUND machine, and the dump says so in a banner at both ends |
+
+> **Id 46 was `IV_SUPPRESSED`, on one build that no longer exists.** The `f` measurement
+> switch (`docs/f-measurement.md`) counted the `IV_FLUSH` requests it deliberately did not
+> perform, and the switch was removed from the tree on 2026-08-23 once the metal verdict came
+> back (`f = 0.0787` against a gate of 0.35). **No current build defines id 46**, and the
+> counter block ends at 45. A capture that carries a non-zero 46 came off that withdrawn,
+> deliberately unsound build — see the symbolizer rule 4e below before reading any other row
+> of it.
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
@@ -622,19 +629,14 @@ which is a fact about the window rather than a defect.
 > `sum(IV_*) + IV_CACR_SKIP`, and the firmware prints that row with the narrowed share out of
 > it.
 
-> **`IV_SUPPRESSED` widens the identity, and only on the measurement build.** The `f`
-> measurement switch (`docs/f-measurement.md`) decides *inside* `z3660_dopc_invalidate()` and
-> *after* the attribution, so — unlike the CACR narrowing above — a suppressed request **is**
-> in `sum(IV_*)` while performing nothing. The identity a capture off that build satisfies is
->
-> ```
-> sum(IV_*) − IV_SUPPRESSED − IV_WRAP  ==  DOPC_INVAL      cache ON
-> ```
->
-> with the standing identity being its `IV_SUPPRESSED == 0` special case, which is what every
-> sound build produces. Over a window armed throughout, `IV_SUPPRESSED == IV_FLUSH` exactly.
-> **Read the banner before reading any other row of such a capture**: it is not a profile of a
-> correct machine.
+> **Historical: `IV_SUPPRESSED` widened the identity on the withdrawn measurement build.**
+> The `f` measurement switch (`docs/f-measurement.md`) decided *inside*
+> `z3660_dopc_invalidate()` and *after* the attribution, so — unlike the CACR narrowing above —
+> a suppressed request **was** in `sum(IV_*)` while performing nothing, and a capture off that
+> build satisfies `sum(IV_*) − IV_SUPPRESSED − IV_WRAP == DOPC_INVAL` instead. The switch and
+> its counter were removed from the tree on 2026-08-23 after the metal verdict; **the identity
+> above is the only one any current build produces.** Read the banner before reading any other
+> row of an old armed capture: it is not a profile of a correct machine.
 
 **With the decoded-op cache off**, the four `DOPC_` counters are exactly zero — `HIT`/`MISS`/
 `EXT` because the lookup returns before it can count, and `DOPC_INVAL` because
@@ -1241,10 +1243,11 @@ minimum correct implementation:
    beside them so a share can be re-priced without rung 1d's own transitions.
 4d. **Use `ATC_HIT` (id 19) for the ATC hit rate, never id 12.** Id 12 is `XLATE_OK` and
    counts successful translates. `ATC_HIT + ATC_MISS == XLATE` when nothing faulted.
-4e. **Refuse to interpret a capture with `IV_SUPPRESSED` (id 46) non-zero as a profile of a
-   correct machine.** It is zero in every sound build; non-zero means the `f` measurement
-   switch was armed inside the window and the emulator was executing decodes the guest had
-   told it to drop. The counter is **not** part of the `IV_` cause block, so a tool that
+4e. **Refuse to interpret a capture carrying a non-zero id 46 as a profile of a correct
+   machine.** No current build defines id 46 — the counter block ends at 45. On the
+   withdrawn `f` measurement build (removed 2026-08-23) it was `IV_SUPPRESSED`, and non-zero
+   means the switch was armed inside the window and the emulator was executing decodes the
+   guest had told it to drop. It was **not** part of the `IV_` cause block, so a tool that
    sums the block by arithmetic index must stop at `IV_CACR` — and on such a capture the
    identity is `sum(IV_*) − IV_SUPPRESSED − IV_WRAP == DOPC_INVAL`. **Surface it prominently or
    refuse the file**; the id was appended without a wire bump, so a symbolizer that does

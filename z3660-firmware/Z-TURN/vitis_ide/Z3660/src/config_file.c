@@ -14,11 +14,6 @@
 #include "amix_ram.h"
 #include "overhead_switches.h"   /* the single copy of the perf_stats/emu_probes/core0_stats rule */
 #include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (CYBERSTORM C1) */
-/* CYBERSTORM C2 SS38.6: the OFF sentinel for the `f` measurement switch, which this file
- * publishes unconditionally on every boot. Included directly rather than mirrored, for
- * the reason debug_console.c gives: a mirrored copy is only a second place for the
- * sentinel to drift away from the one core1 tests against. */
-#include "../../Z3660_emu/src/uae/z3660_dopc.h"
 #include "core0_stats.h"         /* core0_stats_set_enabled() -- the core0_stats key */
 #include "main.h"
 #include "ARM_ztop/checkbox.h"
@@ -308,31 +303,6 @@ static void resolve_prof_config(int verbose)
       printf("[CFG] profiler: prof_hz %d, prof_buckets %s "
              "(PROFILING build only -- the default and lean images ignore this)\n",
              config.prof_hz, yesno_names[config.prof_buckets]);
-}
-
-/* CYBERSTORM C2 SS38.6: DISARM THE `f` MEASUREMENT SWITCH, ON EVERY BOOT, UNCONDITIONALLY.
- *
- * The switch makes CPUSHL/CINV stop invalidating the decoded-op cache. That is
- * deliberately unsound (docs/f-measurement.md, z3660_dopc.h) and it is armed by typing
- * IVSUP on the serial console, which writes a mailbox word.
- *
- * THE MAILBOX IS DDR THAT SURVIVES A WARM RESET -- resolve_prof_config() below says so
- * about prof_ctl, and the consequence is the same one: a boot that leaves this field
- * alone would let core1 act on the PREVIOUS boot's arm. For a switch between two sound
- * machines (blk_chunk / dopc_on / dfast_on, which are NOT published here) that is
- * harmless. For this one it would mean an unsound emulator coming up after a reset nobody
- * connected to a console. Writing it every time makes "not armed" an explicit instruction
- * rather than the absence of one.
- *
- * DELIBERATELY NOT A CONFIG KEY, and this function takes no argument for that reason:
- * there is nothing to parse, nothing to resolve and no way to ask for the armed state
- * from a file. The console command is the only way in, and it lasts one boot.
- *
- * Called from BOTH config paths, exactly like resolve_amix_ram() and
- * resolve_overhead_switches(), so the value is settled before core1 is dispatched. */
-static void disarm_measurement_switches(void)
-{
-   shared->dopc_ivsup = Z3660_DOPC_IVSUP_OFF;
 }
 
 static void resolve_amix_ram(int verbose)
@@ -1330,7 +1300,6 @@ load_successful:;
    shared->service_cadence=config.service_cadence;
    resolve_overhead_switches(verbose);      /* perf_stats / emu_probes / core0_stats */
    resolve_prof_config(verbose);            /* CYBERSTORM C1: prof_hz / prof_buckets */
-   disarm_measurement_switches();           /* CYBERSTORM C2 SS38.6: the f switch, never armed at boot */
 
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
@@ -1772,7 +1741,6 @@ retry:
       shared->service_cadence=config.service_cadence;
       resolve_overhead_switches(verbose);   /* perf_stats / emu_probes / core0_stats */
       resolve_prof_config(verbose);         /* CYBERSTORM C1: prof_hz / prof_buckets */
-      disarm_measurement_switches();        /* CYBERSTORM C2 SS38.6: the f switch, never armed at boot */
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 
