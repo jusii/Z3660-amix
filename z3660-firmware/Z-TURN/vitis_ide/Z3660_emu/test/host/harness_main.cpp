@@ -31,6 +31,10 @@ extern SHARED *shared;     /* board_stubs.cpp; the tests write knobs through it 
 #include <cstdio>
 #include <cstring>
 #include <cstddef>      /* offsetof -- the SHARED mailbox ABI guard */
+#include <cstdlib>      /* atoi   -- the formatter-ring source scan */
+#include <cctype>       /* isalnum/isdigit/isspace, same                */
+#include <string>       /* the scan holds the profiler source in memory */
+#include <algorithm>    /* std::count, to turn an offset into a line number */
 
 extern "C" void harness_set_x_funcs(void);   /* HOST_TEST_HARNESS hook in newcpu.cpp */
 extern void build_cpufunctbl(void);          /* defined in newcpu.cpp (no header decl) */
@@ -2851,6 +2855,190 @@ static void test_shared_mailbox_offsets(void)
  *      therefore a claim about this build, and the whole MMU suite running green in the
  *      profiling variant is most of the evidence; this test adds the direct A/B.
  * ================================================================== */
+/* ==================================================================
+ * THE DUMP'S OWN FORMATTER RING -- A CAP THAT COULD ONLY BE BROKEN SILENTLY.
+ *
+ * z3660_prof_u64() formats into a 4-slot rotating static ring, so the fifth call in one
+ * printf argument list overwrites the slot the first is still pointing at. Every argument
+ * is evaluated before printf runs, so the failure is not a crash or a garbled field: the
+ * line prints a DIFFERENT, plausible number where the first one belonged.
+ *
+ * It happened. The rung-1b way-histogram line made five calls; `wsum` landed on `w[0]`,
+ * and the line reported way0 as 100 % of hits -- past the pre-registered 85 % threshold
+ * that STRIKES the DOPCFIND rung from the C2 ladder, two lines above the firmware's own
+ * (correct, integer-computed) verdict that it stays. One aliased buffer, one inverted
+ * engineering decision. Found on its first metal appearance.
+ *
+ * WHY THIS TEST READS THE SOURCE FILE. The hazard is not in any value this harness can
+ * call: it is a property of how a CALL SITE is written, and it is invisible to the
+ * compiler (the types are right, the count is legal, the result is wrong). A comment at
+ * the function asking future writers to count their arguments is exactly the guarantee
+ * that already failed. So the cap is enforced against the text, mechanically, on every
+ * harness run -- and the cap itself is read out of the same file, so widening the ring
+ * widens the check and deleting the constant fails the test.
+ *
+ * The scan is comment- and string-aware: `z3660_printf` inside a comment (there are
+ * several, including in the header note this test is named in) must not be walked as if
+ * it were code, or an unbalanced paren in prose would take the parser off the end.
+ *
+ * ENGAGEMENT IS PINNED, for the reason rung 2's corpus made the house rule: a scanner
+ * that silently found nothing would pass this test forever. It must find the file, find
+ * dozens of printf sites, and find at least one sitting exactly ON the cap -- which is a
+ * real line in the file today (the ring-header dump, four values) and the closest thing
+ * to a positive control available without adding a defect on purpose.
+ * ================================================================== */
+#ifndef Z3660_PROF_SRC_PATH
+#error "Z3660_PROF_SRC_PATH must be defined by the Makefile -- see test_prof_u64_ring_depth"
+#endif
+
+/* Replace every comment body and string/char literal with spaces, so the paren walk below
+ * sees code and only code. Returns 0 if the file could not be read.
+ *
+ * NEWLINES SURVIVE THE BLANKING. They carry no syntax, so blanking them costs nothing to
+ * the parse -- but the offsets are turned back into a LINE NUMBER for the report, and a
+ * blanked newline inside one of this file's very long block comments moved that number by
+ * hundreds of lines. A guard against a print that reported a wrong number is not allowed
+ * to report a wrong number itself; caught by disbelieving its own first output. */
+#define PROF_SRC_BLANK(dst, src, k) ((dst)[k] = ((src)[k] == '\n') ? '\n' : ' ')
+
+static int prof_src_read_code_only(const char *path, std::string &out)
+{
+	FILE *f = fopen(path, "rb");
+	std::string raw;
+	char chunk[4096];
+	size_t got;
+	size_t i, n;
+
+	if (!f)
+		return 0;
+	while ((got = fread(chunk, 1, sizeof chunk, f)) > 0)
+		raw.append(chunk, got);
+	fclose(f);
+
+	out = raw;
+	n = raw.size();
+	for (i = 0; i < n; i++) {
+		char c = raw[i];
+		if (c == '/' && i + 1 < n && raw[i + 1] == '/') {
+			while (i < n && raw[i] != '\n') { out[i] = ' '; i++; }
+			i--;
+		} else if (c == '/' && i + 1 < n && raw[i + 1] == '*') {
+			out[i] = ' '; out[i + 1] = ' '; i += 2;
+			while (i + 1 < n && !(raw[i] == '*' && raw[i + 1] == '/')) {
+				PROF_SRC_BLANK(out, raw, i); i++;
+			}
+			if (i + 1 < n) { out[i] = ' '; out[i + 1] = ' '; i++; }
+		} else if (c == '"' || c == '\'') {
+			char q = c;
+			i++;
+			while (i < n && raw[i] != q) {
+				if (raw[i] == '\\' && i + 1 < n) { PROF_SRC_BLANK(out, raw, i); i++; }
+				PROF_SRC_BLANK(out, raw, i);
+				i++;
+			}
+		}
+	}
+	return 1;
+}
+
+static int prof_src_ident_at(const std::string &s, size_t pos, const char *id)
+{
+	size_t len = strlen(id);
+	if (pos + len > s.size() || s.compare(pos, len, id) != 0)
+		return 0;
+	if (pos > 0 && (isalnum((unsigned char)s[pos - 1]) || s[pos - 1] == '_'))
+		return 0;
+	return 1;
+}
+
+/* The identifier is followed (past whitespace) by '(' -- which is what distinguishes the
+ * RING form z3660_prof_u64( from the caller-owned z3660_prof_u64_into(. */
+static int prof_src_call_at(const std::string &s, size_t pos, const char *id)
+{
+	size_t j;
+	if (!prof_src_ident_at(s, pos, id))
+		return 0;
+	j = pos + strlen(id);
+	while (j < s.size() && isspace((unsigned char)s[j]))
+		j++;
+	return j < s.size() && s[j] == '(';
+}
+
+static void test_prof_u64_ring_depth(void)
+{
+	std::string code;
+	int slots = -1;
+	int sites = 0, worst = 0, at_cap = 0;
+	long worst_line = 0;
+	size_t i;
+
+	printf("[test] the dump's 64-bit formatter ring: no printf may outrun its slots\n");
+
+	CHECK(prof_src_read_code_only(Z3660_PROF_SRC_PATH, code),
+	      "the profiler source is readable at " Z3660_PROF_SRC_PATH "\n");
+	if (code.empty())
+		return;
+
+	/* The cap comes out of the file, not out of this test: widening the ring must widen
+	 * the check by itself, and deleting the constant must fail here rather than quietly
+	 * disarm the guard. Read from the RAW text is unnecessary -- a #define survives the
+	 * comment/string blanking above. */
+	for (i = 0; i < code.size(); i++) {
+		if (prof_src_ident_at(code, i, "Z3660_PROF_U64_SLOTS")) {
+			size_t j = i + strlen("Z3660_PROF_U64_SLOTS");
+			while (j < code.size() && (code[j] == ' ' || code[j] == '\t')) j++;
+			if (j < code.size() && isdigit((unsigned char)code[j])) {
+				slots = atoi(code.c_str() + j);
+				break;
+			}
+		}
+	}
+	CHECK(slots > 0, "the ring depth is declared as Z3660_PROF_U64_SLOTS\n");
+	if (slots <= 0)
+		return;
+
+	for (i = 0; i < code.size(); i++) {
+		size_t j, start;
+		int depth, calls;
+
+		if (!prof_src_call_at(code, i, "z3660_printf"))
+			continue;
+		start = i;
+		j = i + strlen("z3660_printf");
+		while (j < code.size() && code[j] != '(') j++;
+		depth = 0;
+		calls = 0;
+		for (; j < code.size(); j++) {
+			if (code[j] == '(') {
+				depth++;
+			} else if (code[j] == ')') {
+				if (--depth == 0) break;
+			} else if (prof_src_call_at(code, j, "z3660_prof_u64")) {
+				calls++;
+			}
+		}
+		sites++;
+		if (calls == slots)
+			at_cap++;
+		if (calls > worst) {
+			worst = calls;
+			worst_line = 1 + (long)std::count(code.begin(), code.begin() + (long)start, '\n');
+		}
+		i = j;
+	}
+
+	printf("       %d z3660_printf() sites, ring depth %d, worst line uses %d"
+	       " (line %ld), %d at the cap\n", sites, slots, worst, worst_line, at_cap);
+
+	/* Engagement, then the property. In that order: the second assertion is worthless
+	 * unless the first two say the scanner actually looked at something. */
+	CHECK(sites >= 40, "the scanner found the file's printf sites (engagement check)\n");
+	CHECK(at_cap >= 1,
+	      "...and at least one of them sits exactly ON the cap, so the counter counts\n");
+	CHECK(worst <= slots,
+	      "no z3660_printf() argument list outruns the formatter ring\n");
+}
+
 static void test_prof_wire_format(void)
 {
 	printf("[test] profiler wire format: what a symbolizer is allowed to rely on\n");
@@ -6406,6 +6594,7 @@ int main(int argc, char **argv)
 	test_dopc_state_equivalence();
 	test_dopc_coherence();
 	test_prof_wire_format();
+	test_prof_u64_ring_depth();
 	test_prof_build_variant();
 #if Z3660_EMU_PROF
 	test_prof_bucket_arithmetic();

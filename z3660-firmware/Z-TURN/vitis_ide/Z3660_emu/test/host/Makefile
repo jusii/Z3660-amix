@@ -47,9 +47,19 @@ INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) 
 # deliberately-broken probe macro pass its own mutation test. A build system that cannot
 # fail is not evidence. (-D flags are STILL untracked, which is why the variants keep
 # separate build directories; the two mechanisms cover different halves of the hazard.)
+# test_prof_u64_ring_depth() RE-READS the profiler source and enforces the formatter
+# ring's per-printf cap against the text -- a hazard no compiler can see, because the
+# broken form is legal C that prints a plausible wrong number (2026-08-23 finding F1).
+# ABSOLUTE, via $(abspath): the test must not depend on the harness binary's cwd. If the
+# tree moves without a rebuild the open FAILS and the test FAILS, which is the honest
+# outcome -- a guard that silently skips itself is the thing being guarded against.
+# Defined ABOVE CXXFLAGS because CXXFLAGS is `:=` and expands it on the spot.
+PROF_SRC := $(abspath $(UAE)/z3660_prof.cpp)
+
 CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions -MMD -MP \
             -DSDL_strcasecmp=strcasecmp -DHOST_TEST_HARNESS \
-            -Wno-write-strings -Wno-narrowing $(VARIANT_DEFS) $(INCLUDES)
+            -Wno-write-strings -Wno-narrowing $(VARIANT_DEFS) $(INCLUDES) \
+            -DZ3660_PROF_SRC_PATH='"$(PROF_SRC)"'
 
 # Portable core subset (relative to $(UAE)). All six cpuemu_* are required because
 # cpustbl.cpp's op_smalltbl_N[] arrays reference handlers across all of them.

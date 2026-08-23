@@ -169,19 +169,56 @@ int z3660_prof_opfetch_hint = 0;
  * perfectly plausible number and nothing anywhere would say so. Every 64-bit quantity in
  * a dump goes through here.
  *
- * Four rotating buffers so one printf can carry four of them, which is the most any line
- * below needs. Single-threaded on core1 by construction. */
+ * ==========================================================================
+ * THE RING IS A CAP ON HOW MANY OF THESE MAY APPEAR IN ONE printf, AND IT IS SILENT.
+ * ==========================================================================
+ *
+ * The buffers rotate, so the Nth call in one argument list overwrites the slot the
+ * (N-4)th call is still holding a pointer to. Every argument is evaluated before printf
+ * runs, so a fifth call does not truncate or garble -- IT PRINTS A DIFFERENT NUMBER,
+ * plausibly formatted, in the first slot's place.
+ *
+ * That is not hypothetical. The way-histogram line below (rung 1b) made five calls, and
+ * the fifth (`wsum`) landed on top of the first (`w[0]`) -- so the line printed
+ * "way0 = DOPC_HIT", from which a reader computes way0 = 100 %, crosses the pre-registered
+ * 85 % threshold, and STRIKES A LIVE RUNG from the C2 ladder. The opposite of the verdict
+ * the firmware itself printed two lines later, off one aliased buffer. Found on its first
+ * metal appearance (2026-08-23 verdict, finding F1).
+ *
+ * Two things exist because of it:
+ *   - `z3660_prof_u64_into()`, below: a caller-owned buffer, which is how a line that
+ *     genuinely needs more than Z3660_PROF_U64_SLOTS of these is written;
+ *   - a harness guard (`test_prof_u64_ring_depth`) that RE-READS THIS SOURCE FILE and
+ *     fails if any z3660_printf() argument list contains more than Z3660_PROF_U64_SLOTS
+ *     calls to the ring form. The cap is mechanical now, not a convention in a comment.
+ *
+ * Widening the ring was considered and rejected: it moves the cliff rather than removing
+ * it, and the next line to fall off it would fail exactly as silently.
+ *
+ * Single-threaded on core1 by construction. */
+#define Z3660_PROF_U64_SLOTS 4      /* rotating ring depth -- the per-printf cap  */
+#define Z3660_PROF_U64_CHARS 24     /* 20 digits of uint64 + NUL, rounded up      */
+
+/* The formatter proper, into a buffer the CALLER owns. Use this -- with a local
+ * `char b[Z3660_PROF_U64_CHARS]` -- for the fifth and later 64-bit value in one printf. */
+static char *z3660_prof_u64_into(char *buf, uint64_t v)
+{
+   uint64_t t = v;
+   int n = 1;
+   char *p;
+   while (t >= 10u) { t /= 10u; n++; }
+   p = buf + n;
+   *p = 0;
+   do { *--p = (char)('0' + (int)(v % 10u)); v /= 10u; } while (v);
+   return buf;
+}
+
 static const char *z3660_prof_u64(uint64_t v)
 {
-   static char buf[4][24];
-   static int  which = 0;
-   char *p;
-   which = (which + 1) & 3;
-   p = &buf[which][23];
-   *p = 0;
-   if (!v) { *--p = '0'; return p; }
-   while (v) { *--p = (char)('0' + (int)(v % 10u)); v /= 10u; }
-   return p;
+   static char buf[Z3660_PROF_U64_SLOTS][Z3660_PROF_U64_CHARS];
+   static unsigned which = 0;
+   which = (which + 1u) & (Z3660_PROF_U64_SLOTS - 1u);
+   return z3660_prof_u64_into(buf[which], v);
 }
 
 /* ------------------------------------------------------------------ PMU */
@@ -1010,11 +1047,21 @@ extern "C" void z3660_prof_dump_stats(void)
          }
          if (wsum) {
             unsigned w0i, w0f;
+            /* THE FIFTH 64-BIT VALUE ON THIS LINE OWNS ITS OWN BUFFER, and that is the
+             * whole of F1's fix. Four ways plus the total is five, one past the ring;
+             * as written before, `wsum` overwrote `w[0]` and the line reported way0 as
+             * 100 % of hits -- which is the reading that strikes this rung from the
+             * ladder, against the verdict computed from the integers immediately below.
+             * The line is kept as ONE line deliberately: the histogram and the share
+             * derived from it are read together, and this console interleaves two
+             * cores. */
+            char wsumb[Z3660_PROF_U64_CHARS];
+            z3660_prof_u64_into(wsumb, wsum);
             z3660_prof_pct(w[0], wsum, &w0i, &w0f);
             z3660_printf("[PROF] r dopc ways: %s / %s / %s / %s (way0 %u.%02u%% of %s hits)\r\n",
                          z3660_prof_u64(w[0]), z3660_prof_u64(w[1]),
                          z3660_prof_u64(w[2]), z3660_prof_u64(w[3]),
-                         w0i, w0f, z3660_prof_u64(wsum));
+                         w0i, w0f, wsumb);
             if (w0i >= 85)
                z3660_printf("[PROF] r dopc way VERDICT: way0 >= 85%% -- the walk is already "
                             "short, way prediction is worth < 0.5%%, and the rung is STRUCK "
