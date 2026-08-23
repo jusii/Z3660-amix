@@ -4765,6 +4765,13 @@ extern "C" void z3660_knobs_sync(void)
       unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
       if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
    }
+   {                                                                                   // IFAST
+      /* CYBERSTORM C2 rung 3, and the same change-only rule for the same reason. The two
+       * knobs are read independently and either arm() rebuilds all three tables, so a
+       * boot that moves both still costs one rebuild per change and not one per resync. */
+      unsigned f = z3660_ifast_resolve((unsigned)shared->ifast_on);
+      if ((int)f != z3660_ifast_armed()) z3660_ifast_arm((int)f);
+   }
 }
 
 /* Read-back + direct set for the host harness and the serial console. The setter takes a

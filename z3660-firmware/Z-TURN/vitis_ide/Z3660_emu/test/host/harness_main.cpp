@@ -2816,7 +2816,8 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, blk_chunk),       0xE4, "blk_chunk       @ 0xFFFF00E4 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, dopc_on),         0xE8, "dopc_on         @ 0xFFFF00E8 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, dfast_on),        0xEC, "dfast_on        @ 0xFFFF00EC (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xF0, "SHARED is 0xF0 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, ifast_on),        0xF0, "ifast_on        @ 0xFFFF00F0 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xF4, "SHARED is 0xF4 bytes -- new fields go on the END");
 
 	/* C2 rung 2: the knob's RULE, not just its offset. UNSET must mean ON -- a core0
 	 * built before this field existed publishes a zeroed struct, and reading that as
@@ -2827,6 +2828,16 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)z3660_dfast_resolve(Z3660_DFAST_DEFAULT),   1u, "DEFAULT means ON");
 	CHECK_EQ32((uae_u32)z3660_dfast_resolve(Z3660_DFAST_OFF),       0u, "the OFF sentinel means off");
 	CHECK_EQ32((uae_u32)z3660_dfast_resolve(12345u),                1u,
+	           "and anything else means ON -- only the sentinel disarms");
+	/* C2 rung 3: the second knob's rule, pinned the same way and for the same reason.
+	 * The two sentinels are the SAME VALUE, which is fine and deliberate -- they are read
+	 * out of different words -- but each rule is asserted against its own resolver so a
+	 * copy-paste that made IFAST read dfast_on would fail here rather than on metal. */
+	CHECK_EQ32((uae_u32)z3660_ifast_resolve(0u),                    1u,
+	           "an UNSET ifast_on means ON, not off");
+	CHECK_EQ32((uae_u32)z3660_ifast_resolve(Z3660_IFAST_DEFAULT),   1u, "DEFAULT means ON");
+	CHECK_EQ32((uae_u32)z3660_ifast_resolve(Z3660_IFAST_OFF),       0u, "the OFF sentinel means off");
+	CHECK_EQ32((uae_u32)z3660_ifast_resolve(7u),                    1u,
 	           "and anything else means ON -- only the sentinel disarms");
 }
 
@@ -3186,8 +3197,13 @@ static void test_prof_wire_format(void)
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_MISALIGN_I], "MISALIGN_I") == 0,
 	      "names line up with ids (MISALIGN_I)\n");
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DFAST_XPAR], "DFAST_XPAR") == 0,
-	      "names line up with ids (DFAST_XPAR, the last counter)\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   46, "46 counters");
+	      "names line up with ids (DFAST_XPAR)\n");
+	/* rung 3's pair, appended after rung 2's, same rule as everything above. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_IFAST_HIT,  46, "IFAST_HIT at 46");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_IFAST_XPAR, 47, "IFAST_XPAR at 47");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_IFAST_XPAR], "IFAST_XPAR") == 0,
+	      "names line up with ids (IFAST_XPAR, the last counter)\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   48, "48 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -5057,6 +5073,515 @@ static void test_dfast_state_equivalence(void)
 	z3660_dfast_arm(1);
 }
 
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 3 -- THE INSTRUCTION TABLE, REPLAYED EXHAUSTIVELY
+ *
+ * Same argument as rung 2's verdict-table test and the same shape, against
+ * mmu_match_ttr_ins() and the ITT registers. It is a separate test rather than a third
+ * loop inside that one because the EXPECTED mapping differs in one place -- TTR_NO_WRITE
+ * is XPAR for a fetch, not SLOW -- and folding it in would have hidden that difference
+ * inside a shared `want` expression, which is the one line a reader of either rung most
+ * needs to see stated.
+ * ================================================================== */
+static void test_ifast_verdict_table(void)
+{
+	printf("[test] C2 fetch fast path: the verdict table replays mmu_match_ttr_ins exactly\n");
+
+	static const struct { uae_u32 itt0, itt1; const char *what; } CFG[] = {
+		{ 0, 0, "no window enabled" },
+		/* The AMIX-040 kernel's own instruction registers, from pstart040.s. ITT1 is
+		 * left disabled there, which is exactly why the fetch side is XPAR-dominated
+		 * below 1 GB and PAGE above it. */
+		{ 0x003fc000u, 0, "AMIX-040: ITT0 0-1GB, both privilege levels" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED, 0,
+		  "one 16MB window, both privilege levels" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED, 0, "one 16MB window, USER only (S=00)" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_SUPER, 0,
+		  "one 16MB window, SUPERVISOR only (S=01)" },
+		/* THE ONE THAT DIFFERS FROM THE DATA SIDE. A write-protected window is
+		 * TTR_NO_WRITE, which the data table maps to XPAR-read/SLOW-write. A fetch is a
+		 * read and mmu_get_iword() only tests for TTR_NO_MATCH, so here it is simply
+		 * transparent -- and this configuration is in the corpus to say so. */
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_BIT_WRITE_PROTECT, 0, "write-protected window: transparent to a FETCH" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_CACHE_DISABLE, 0, "cache-inhibited window" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_CACHE_MODE, 0, "copyback window" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED,
+		  0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_CACHE_DISABLE, "overlapping windows: itt0 must win" },
+		{ 0, 0x0C000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED,
+		  "itt0 off, itt1 on" },
+		{ 0x00ff0000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED, 0,
+		  "mask 0xff: every fetch is transparent" },
+	};
+	const int NCFG = (int)(sizeof CFG / sizeof CFG[0]);
+	int c, mmuon, super, msb, mismatched = 0, checked = 0;
+
+	mmu040_gen_init();
+
+	for (mmuon = 1; mmuon >= 0; mmuon--) {
+		mmu_set_tc((uae_u16)(mmuon ? 0x8000 : 0));
+		for (c = 0; c < NCFG; c++) {
+			regs.itt0 = CFG[c].itt0;
+			regs.itt1 = CFG[c].itt1;
+			mmu_tt_modified();                 /* rebuilds all three tables */
+			for (super = 0; super < 2; super++) {
+				for (msb = 0; msb < 256; msb++) {
+					uae_u32 addr = (uae_u32)msb << 24;
+					uae_u16 vi = z3660_ifv[super][msb];
+					int live, want;
+					uae_u8 live_cs;
+
+					mmu_cache_state = 0xEE;
+					live = mmu_match_ttr_ins(addr, super != 0);
+					live_cs = mmu_cache_state;
+
+					if (live == TTR_OK_MATCH || live == TTR_NO_WRITE)
+						want = Z3660_DFAST_XPAR;
+					else if (mmuon)
+						want = Z3660_DFAST_PAGE;
+					else
+						want = Z3660_DFAST_SLOW;
+
+					checked++;
+					if ((int)Z3660_DFAST_VERDICT(vi) != want) {
+						if (!mismatched)
+							printf("  FAIL: %s: mmuon=%d super=%d msb=%02x live=%d "
+							       "table=%u want=%d\n", CFG[c].what, mmuon, super,
+							       msb, live, (unsigned)Z3660_DFAST_VERDICT(vi), want);
+						mismatched++;
+					}
+					if (live == TTR_OK_MATCH || live == TTR_NO_WRITE) {
+						if (Z3660_DFAST_CSTATE(vi) != live_cs) {
+							if (!mismatched)
+								printf("  FAIL: %s: msb=%02x cache state table=%02x "
+								       "live=%02x\n", CFG[c].what, msb,
+								       (unsigned)Z3660_DFAST_CSTATE(vi),
+								       (unsigned)live_cs);
+							mismatched++;
+						}
+					}
+				}
+			}
+		}
+	}
+	CHECK(mismatched == 0,
+	      "the table agrees with mmu_match_ttr_ins over all %d (config x mmu-state x "
+	      "super x top-byte) points (%d mismatches)\n", checked, mismatched);
+	printf("       %d points checked across %d register configurations\n", checked, NCFG);
+
+	/* THE TWO SWITCHES MUST NOT BLEED INTO EACH OTHER. The rebuild builds all three
+	 * tables in one pass, so the disarm of one is exactly the place where it could
+	 * silently disarm the other -- and a rung that is quietly never engaged in the
+	 * reference arm of the OTHER rung's A/B would make both numbers wrong with no
+	 * symptom. Pinned in both directions. */
+	{
+		int i, s, i_slow = 1, d_armed = 1, i_armed = 1, d_slow = 1;
+		regs.itt0 = 0x003fc000u; regs.itt1 = 0;
+		regs.dtt0 = 0x003fc060u; regs.dtt1 = 0x807fa060u;
+		mmu_set_tc(0x8000);
+
+		z3660_ifast_arm(0);
+		z3660_dfast_arm(1);
+		mmu_tt_modified();
+		for (s = 0; s < 2; s++)
+			for (i = 0; i < 256; i++) {
+				if (z3660_ifv[s][i] != Z3660_DFAST_SLOW) i_slow = 0;
+				if (z3660_dfv_r[s][i] == Z3660_DFAST_SLOW) d_armed = 0;
+			}
+		CHECK(i_slow, "IFAST off: every instruction verdict is SLOW, even after a rebuild\n");
+		CHECK(d_armed, "...and DFAST stayed ARMED through it\n");
+
+		z3660_ifast_arm(1);
+		z3660_dfast_arm(0);
+		mmu_tt_modified();
+		for (s = 0; s < 2; s++)
+			for (i = 0; i < 256; i++) {
+				if (z3660_dfv_r[s][i] != Z3660_DFAST_SLOW ||
+				    z3660_dfv_w[s][i] != Z3660_DFAST_SLOW) d_slow = 0;
+				if (z3660_ifv[s][i] == Z3660_DFAST_SLOW) i_armed = 0;
+			}
+		CHECK(d_slow, "DFAST off: every data verdict is SLOW\n");
+		CHECK(i_armed, "...and IFAST stayed ARMED through it -- the 2x2 is real\n");
+		z3660_dfast_arm(1);
+	}
+
+	regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+	mmu040_off();
+}
+
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 3 -- THE FETCH FAST PATH, BY STATE EQUIVALENCE
+ *
+ * Rung 2's corpus, aimed at the instruction stream. The reference arm is the DISARMED
+ * fast path -- the original mmu_get_iword()/mmu_get_ilong() text -- and every case
+ * declares whether the fast path MUST serve or MUST NOT, because "the two agree" is
+ * trivially true of a path that never fired.
+ *
+ * The pre-registration this corpus has to protect is that the INSTRUCTION page-cache hit
+ * rate does not move: `IPAGE_HIT`/`IPAGE_MISS` are how a metal capture will decide whether
+ * the comparison is like-for-like, and a fast path that probes the one-entry cache and
+ * then declines would inflate them exactly as rung 2's first draft inflated the data
+ * ones. That defect is why the counters are compared here on every case rather than at
+ * the end.
+ * ================================================================== */
+struct ifast_obs {
+	uae_u32 val;
+	int     faulted;
+	uae_u32 fault_addr;
+	uae_u32 pc;
+	uae_u32 mmu_ssw;
+	uae_u8  cache_state;
+	uae_u64 ihit, imiss;          /* the instruction page cache MUST NOT MOVE */
+	uae_u64 ifast_hit;            /* the PROFILING build's counter (0 elsewhere) */
+	unsigned long serves;         /* the harness counter -- present in ALL variants */
+	unsigned long io_hits;
+};
+
+#define IF_WORD 0
+#define IF_LONG 1
+#define IF_MUST  0
+#define IF_NEVER 1
+
+static void if_run(struct ifast_obs *o, int op, uae_u32 addr)
+{
+	memset(o, 0, sizeof *o);
+	mmu_cache_state = 0xEE;
+	regs.mmu_fault_addr = 0;
+	hdirect_io_hits = 0;
+	z3660_ifast_serves = 0;
+	z3660_prof_zero();
+
+	SAVE_EXCEPTION;
+	TRY(p) {
+		if (op == IF_WORD) o->val = uae_mmu040_get_iword(addr);
+		else               o->val = uae_mmu040_get_ilong(addr);
+	} CATCH(p) { o->faulted = 1; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+
+	o->fault_addr  = regs.mmu_fault_addr;
+	o->pc          = m68k_getpc();
+	o->mmu_ssw     = regs.mmu_ssw;
+	o->cache_state = mmu_cache_state;
+	o->io_hits     = hdirect_io_hits;
+#if Z3660_EMU_PROF
+	o->ihit      = z3660_prof_cnt[Z3660_PROF_C_IPAGE_HIT];
+	o->imiss     = z3660_prof_cnt[Z3660_PROF_C_IPAGE_MISS];
+	o->ifast_hit = z3660_prof_cnt[Z3660_PROF_C_IFAST_HIT];
+#endif
+	o->serves    = z3660_ifast_serves;
+}
+
+static void if_case(int op, uae_u32 addr, int engage, const char *what)
+{
+	struct ifast_obs ref, fast;
+	char lbl[192];
+	int prev;
+
+	snprintf(lbl, sizeof lbl, "%s %s @%08x", what,
+	         op == IF_WORD ? "iword" : "ilong", (unsigned)addr);
+
+	prev = z3660_ifast_arm(0);
+	if_run(&ref, op, addr);      /* warm: fills the one-entry instruction page cache */
+	if_run(&ref, op, addr);      /* observed */
+	CHECK_EQ32((uae_u32)ref.serves, 0,
+	           "the reference arm serves nothing from the fetch fast path");
+
+	z3660_ifast_arm(1);
+	if_run(&fast, op, addr);
+	if_run(&fast, op, addr);
+
+	CHECK_EQ32(fast.val,                    ref.val,                    lbl);
+	CHECK_EQ32((uae_u32)fast.faulted,       (uae_u32)ref.faulted,       lbl);
+	CHECK_EQ32(fast.fault_addr,             ref.fault_addr,             lbl);
+	CHECK_EQ32(fast.pc,                     ref.pc,                     lbl);
+	CHECK_EQ32(fast.mmu_ssw,                ref.mmu_ssw,                lbl);
+	CHECK_EQ32((uae_u32)fast.cache_state,   (uae_u32)ref.cache_state,   lbl);
+	/* The pre-registration, asserted per case rather than at the end. */
+	CHECK_EQ32((uae_u32)fast.ihit,          (uae_u32)ref.ihit,          lbl);
+	CHECK_EQ32((uae_u32)fast.imiss,         (uae_u32)ref.imiss,         lbl);
+
+	if (engage == IF_MUST)
+		CHECK(fast.serves == 1,
+		      "%s: the fetch fast path SERVED it (serves %lu, expected 1)\n",
+		      lbl, fast.serves);
+	else
+		CHECK(fast.serves == 0,
+		      "%s: the fetch fast path DECLINED it (serves %lu, expected 0)\n",
+		      lbl, fast.serves);
+	if (z3660_prof_present())
+		CHECK_EQ32((uae_u32)fast.ifast_hit, (uae_u32)fast.serves,
+		           "IFAST_HIT agrees with the harness's own serve count");
+
+	z3660_ifast_arm(prev);
+}
+
+static void test_ifast_state_equivalence(void)
+{
+	printf("[test] C2 fetch fast path: state equivalence against the un-flattened path\n");
+
+	CHECK(harness_direct_ok(),
+	      "the identity window is mapped -- without it every case below would DECLINE\n");
+	if (!harness_direct_ok()) return;
+
+	const uae_u32 P0 = HDIRECT_BASE + 0x20000u;   /* code page 0 */
+	const uae_u32 P1 = HDIRECT_BASE + 0x21000u;   /* code page 1 */
+	const uae_u32 V0 = 0x00400000u;               /* kernel-ish text VA for P0 */
+	const uae_u32 V1 = 0x00401000u;
+	const uae_u32 VU = 0x80900000u;               /* a USER text VA */
+	const uae_u32 VNONE = 0x00410000u;            /* mapped to nothing */
+
+	mmu040_gen_init();
+	harness_direct_reset();
+	harness_direct_map(1);
+	mmu040_gen_map(V0, P0, 0);
+	mmu040_gen_map(V1, P1, 0);
+	hdirect_poke32(P0 + 0, 0x4E714E75u);          /* nop ; rts -- plausible text */
+	hdirect_poke32(P0 + 4, 0x70427207u);
+	hdirect_poke32(P0 + 0xFFCu, 0x2F00203Cu);
+	hdirect_poke32(P1 + 0, 0x4E5E4E75u);
+	regs.s = 1;
+
+	/* ---- stage A: the ordinary instruction-page-cache hit -------------------------- */
+	if_case(IF_WORD, V0 + 0, IF_MUST, "supervisor ipagecache hit");
+	if_case(IF_WORD, V0 + 2, IF_MUST, "supervisor ipagecache hit");
+	if_case(IF_LONG, V0 + 4, IF_MUST, "supervisor ipagecache hit");
+	/* The ends of a page: an aligned fetch cannot cross one, which is the whole basis of
+	 * the structural page-boundary argument, so they must serve like the middle. */
+	if_case(IF_LONG, V0 + 0xFFCu, IF_MUST, "last aligned longword in the page");
+	if_case(IF_WORD, V0 + 0xFFEu, IF_MUST, "last word in the page");
+	if_case(IF_WORD, V1 + 0,      IF_MUST, "first word of the next page");
+
+	/* ---- stage B: user text, and the tag's privilege bit ---------------------------- */
+	mmu040_gen_map(VU, P1, 0);
+	regs.s = 0;
+	if_case(IF_WORD, VU + 0, IF_MUST, "user ipagecache hit");
+	regs.s = 1;
+	if_case(IF_WORD, V0 + 0, IF_MUST, "supervisor after user (tag carries regs.s)");
+
+	/* ---- stage C: misalignment ------------------------------------------------------
+	 * An ODD instruction address must not be fast-pathed -- a word at page_end-1 would
+	 * read its second byte out of an unrelated frame. The original path is unchanged and
+	 * still does whatever it did, which is what the equivalence assertions check; only
+	 * the ENGAGEMENT claim is new. And a longword at addr = 2 (mod 4) goes through the
+	 * ISSUE-52 splitter above the fast path, as it always has. */
+	if_case(IF_WORD, V0 + 1,      IF_NEVER, "ODD instruction address");
+	if_case(IF_WORD, V0 + 0xFFFu, IF_NEVER, "ODD address at the very end of the page");
+	if_case(IF_LONG, V0 + 2,      IF_NEVER, "longword fetch at 2 (mod 4): the splitter");
+	if_case(IF_LONG, V0 + 1,      IF_NEVER, "longword fetch at an odd address");
+
+	/* ---- stage D: faults ------------------------------------------------------------ */
+	if_case(IF_WORD, VNONE, IF_NEVER, "fetch from an unmapped page");
+	if_case(IF_LONG, VNONE, IF_NEVER, "longword fetch from an unmapped page");
+	{
+		const uae_u32 VSO = 0x00420000u, PSO = HDIRECT_BASE + 0x22000u;
+		mmu040_gen_map(VSO, PSO, MMU_DES_SUPER);
+		hdirect_poke32(PSO, 0x4E714E71u);
+		regs.s = 1;
+		if_case(IF_WORD, VSO, IF_MUST,  "supervisor-only text page, from supervisor");
+		regs.s = 0;
+		if_case(IF_WORD, VSO, IF_NEVER, "supervisor-only text page, from USER: faults");
+		regs.s = 1;
+	}
+
+	/* ---- stage E: not plain RAM ----------------------------------------------------- */
+	/* Fetching out of a bank with function pointers -- a ROM overlay, autoconfig space,
+	 * anything with a wgeti. Same page tables, same cache entry, only the bank changes. */
+	harness_direct_map(0);
+	{
+		struct ifast_obs o;
+		if_case(IF_WORD, V0, IF_NEVER, "device bank: the fetch declines");
+		z3660_ifast_arm(1);
+		if_run(&o, IF_WORD, V0);
+		CHECK(o.io_hits > 0,
+		      "the declined fetch reached the bank's own get function (%lu calls)\n",
+		      o.io_hits);
+	}
+	harness_direct_map(1);
+
+	/* ---- stage F: transparent translation, the 87 % arm ----------------------------- */
+	regs.s = 1;
+	regs.itt0 = (HDIRECT_BASE & MMU_TTR_LOGICAL_BASE) | MMU_TTR_BIT_ENABLED
+	          | MMU_TTR_BIT_SFIELD_ENABLED;
+	regs.itt1 = 0;
+	mmu_tt_modified();
+	mmu_flush_atc_all(true);
+	hdirect_poke32(P0, 0x4E714E75u);
+	if_case(IF_WORD, P0,      IF_MUST, "ITT0 transparent fetch");
+	if_case(IF_LONG, P0,      IF_MUST, "ITT0 transparent longword fetch");
+	if_case(IF_WORD, P0 + 1,  IF_NEVER, "ITT0 transparent, ODD address");
+
+	/* THE DIFFERENCE FROM RUNG 2, ON A LIVE ACCESS. A write-protected DTT declines the
+	 * write; a write-protected ITT is simply transparent to a fetch, because there is no
+	 * write to protect and mmu_get_iword() only tests for TTR_NO_MATCH. If the table
+	 * ever copies the data side's TTR_NO_WRITE -> SLOW mapping, this case fails. */
+	regs.itt0 |= MMU_TTR_BIT_WRITE_PROTECT;
+	mmu_tt_modified();
+	if_case(IF_WORD, P0, IF_MUST, "write-protected ITT0 is transparent to a FETCH");
+
+	regs.itt0 = (HDIRECT_BASE & MMU_TTR_LOGICAL_BASE) | MMU_TTR_BIT_ENABLED
+	          | MMU_TTR_BIT_SFIELD_SUPER;      /* S-field ENABLE clear => S is checked */
+	mmu_tt_modified();
+	mmu_flush_atc_all(true);
+	regs.s = 1;
+	if_case(IF_WORD, P0, IF_MUST,  "supervisor-only ITT0, from supervisor");
+	regs.s = 0;
+	if_case(IF_WORD, P0, IF_NEVER, "supervisor-only ITT0, from USER");
+	regs.s = 1;
+	regs.itt0 = regs.itt1 = 0;
+	mmu_tt_modified();
+
+	/* ---- stage G: invalidation ------------------------------------------------------ */
+	/* The one-entry instruction page cache is invalidated by writing an impossible tag
+	 * into atc_last_ins_laddr. The fast path READS that variable rather than shadowing
+	 * it, so it must go stale in the same instant the original does. */
+	{
+		struct ifast_obs o;
+		mmu040_gen_map(V0, P0, 0);
+		hdirect_poke32(P0, 0x11111111u);
+		z3660_ifast_arm(1);
+		if_run(&o, IF_LONG, V0);
+		CHECK_EQ32(o.val, 0x11111111u, "warm fetch before the remap");
+
+		hdirect_poke32(P1, 0x22222222u);
+		mmu040_gen_map(V0, P1, 0);                 /* re-point + flush */
+		if_run(&o, IF_LONG, V0);
+		CHECK_EQ32(o.val, 0x22222222u,
+		           "after a remap+flush the fetch reads the NEW frame, not a stale entry");
+
+		mmu040_gen_map(V0, P0, 0);
+		mmu_flush_atc(V0, true, false);            /* the narrower PFLUSH */
+		if_run(&o, IF_LONG, V0);
+		CHECK_EQ32(o.val, 0x11111111u, "and after a single-page PFLUSH");
+	}
+
+	/* ---- stage H: the MMU off ------------------------------------------------------- */
+	{
+		regs.itt0 = regs.itt1 = 0;
+		mmu_tt_modified();
+		mmu_set_tc(0);
+		harness_direct_map(1);
+		hdirect_poke32(P0, 0x4E714E75u);
+		if_case(IF_WORD, P0, IF_NEVER, "MMU off: the fetch fast path declines");
+	}
+
+	/* ---- stage I: the disarm is a real reference ------------------------------------ */
+	{
+		int i, s, allslow = 1;
+		z3660_ifast_arm(0);
+		for (s = 0; s < 2; s++)
+			for (i = 0; i < 256; i++)
+				if (z3660_ifv[s][i] != Z3660_DFAST_SLOW) allslow = 0;
+		CHECK(allslow, "disarmed: every verdict in the instruction table is SLOW\n");
+		CHECK_EQ32((uae_u32)z3660_ifast_armed(), 0, "...and the switch reads back off");
+		z3660_ifast_arm(1);
+		CHECK_EQ32((uae_u32)z3660_ifast_armed(), 1, "re-arming restores it");
+	}
+
+	/* ---- stage J: the whole machine ------------------------------------------------
+	 *
+	 * Everything above calls the accessor directly. This runs real guest code through the
+	 * run loop's own dispatch, with its TEXT in the identity window so the fetch path
+	 * actually serves, once with IFAST off and once on, and compares the whole visible
+	 * machine. It is the case the direct calls cannot cover: a fetch feeds the DECODER,
+	 * so a resolver that clobbered a register here would corrupt an opcode rather than
+	 * return a wrong value to a test that was watching.
+	 *
+	 * It also runs the 2x2's diagonal: DFAST is held ON throughout, so what this measures
+	 * is exactly what the metal A/B will measure -- the fetch rung on top of the shipped
+	 * data rung. */
+	{
+		const uae_u32 VCODE = 0x00430000u, PCODE = HDIRECT_BASE + 0x24000u;
+		const uae_u32 VDATA = 0x00431000u, PDATA = HDIRECT_BASE + 0x25000u;
+		struct { uae_u32 d[8], a[8], pc, sr, mem[4]; int faulted;
+		         unsigned long iserves, dserves; } arm[2];
+		int pass, rep;
+
+		for (pass = 0; pass < 2; pass++) {
+			int i;
+			mmu040_gen_init();
+			harness_direct_reset();
+			harness_direct_map(1);
+			mmu040_gen_map(VCODE, PCODE, 0);
+			mmu040_gen_map(VDATA, PDATA, 0);
+			regs.s = 1;
+			z3660_dfast_arm(1);             /* the shipped data rung, both arms */
+			z3660_ifast_arm(pass);          /* 0 = reference, 1 = armed */
+
+			hdirect_poke32(PCODE + 0,  0x70427207u);   /* moveq #$42,d0 ; moveq #7,d1    */
+			hdirect_poke32(PCODE + 4,  0xd2802081u);   /* add.l d0,d1   ; move.l d1,(a0) */
+			hdirect_poke32(PCODE + 8,  0x2410d481u);   /* move.l (a0),d2; add.l d1,d2    */
+			hdirect_poke32(PCODE + 12, 0x21420004u);   /* move.l d2,4(a0)                */
+
+			arm[pass].faulted = 0;
+			for (rep = 0; rep < 2; rep++) {
+				cpu_set_context(VCODE);
+				for (i = 0; i < 8; i++) { m68k_dreg(regs, i) = 0; m68k_areg(regs, i) = 0; }
+				m68k_areg(regs, 0) = VDATA;
+				z3660_ifast_serves = 0;     /* so the count is the WARM pass's */
+				z3660_dfast_serves = 0;
+
+				SAVE_EXCEPTION;
+				TRY(p) {
+					for (i = 0; i < 7; i++) {
+						regs.instruction_pc = m68k_getpc();
+						regs.opcode = x_prefetch(0);
+						(*cpufunctbl[regs.opcode])(regs.opcode);
+					}
+				} CATCH(p) { arm[pass].faulted = 1; (void)p; } ENDTRY
+				RESTORE_EXCEPTION;
+			}
+
+			for (i = 0; i < 8; i++) { arm[pass].d[i] = m68k_dreg(regs, i);
+			                          arm[pass].a[i] = m68k_areg(regs, i); }
+			arm[pass].pc = m68k_getpc();
+			arm[pass].sr = regs.sr;
+			for (i = 0; i < 4; i++) arm[pass].mem[i] = hdirect_peek32(PDATA + (uae_u32)i * 4);
+			arm[pass].iserves = z3660_ifast_serves;
+			arm[pass].dserves = z3660_dfast_serves;
+		}
+
+		CHECK_EQ32((uae_u32)arm[0].iserves, 0, "interpreted run, IFAST off: no fetch served");
+		CHECK(arm[1].iserves >= 8,
+		      "interpreted run, IFAST on and warm: the fetches were served (%lu, "
+		      "expected at least one per instruction plus the extension words)\n",
+		      arm[1].iserves);
+		/* The DATA rung is on in both arms, so its serve count must be IDENTICAL across
+		 * them. If it moves, the two rungs are not independent and every A/B that holds
+		 * one fixed while moving the other is measuring something else. */
+		CHECK_EQ32((uae_u32)arm[1].dserves, (uae_u32)arm[0].dserves,
+		           "interpreted run: the DATA fast path served the same either way");
+		CHECK_EQ32((uae_u32)arm[1].faulted, (uae_u32)arm[0].faulted,
+		           "interpreted run: same fault outcome");
+		CHECK_EQ32(arm[1].pc, arm[0].pc, "interpreted run: same PC");
+		CHECK_EQ32(arm[1].sr, arm[0].sr, "interpreted run: same SR");
+		{
+			int i;
+			for (i = 0; i < 8; i++) {
+				CHECK_EQ32(arm[1].d[i], arm[0].d[i], "interpreted run: same D register");
+				CHECK_EQ32(arm[1].a[i], arm[0].a[i], "interpreted run: same A register");
+			}
+			for (i = 0; i < 4; i++)
+				CHECK_EQ32(arm[1].mem[i], arm[0].mem[i], "interpreted run: same memory");
+		}
+		/* ...and the run computed something, so "identical" is not two identically-failed
+		 * runs agreeing. */
+		CHECK_EQ32(arm[1].d[1], 0x49u, "interpreted run: d1 = 0x42 + 7");
+		CHECK_EQ32(arm[1].mem[0], 0x49u, "interpreted run: the store landed");
+		CHECK_EQ32(arm[1].d[2], 0x92u,
+		           "interpreted run: d2 = the READ-BACK of that store, plus d1");
+		CHECK_EQ32(arm[1].mem[1], 0x92u, "interpreted run: and the second store landed");
+	}
+
+	mmu040_off();
+	harness_direct_map(1);
+	z3660_ifast_arm(1);
+	z3660_dfast_arm(1);
+}
+
 static void test_blk_state_equivalence(void)
 {
 	printf("[test] C2 block-idiom fast path: state equivalence against the interpreted path\n");
@@ -6590,6 +7115,8 @@ int main(int argc, char **argv)
 	test_shared_mailbox_offsets();
 	test_dfast_verdict_table();
 	test_dfast_state_equivalence();
+	test_ifast_verdict_table();
+	test_ifast_state_equivalence();
 	test_blk_state_equivalence();
 	test_dopc_state_equivalence();
 	test_dopc_coherence();

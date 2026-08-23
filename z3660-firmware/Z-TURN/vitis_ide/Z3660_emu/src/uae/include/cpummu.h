@@ -842,6 +842,94 @@ Z3660_DFAST_INLINE int z3660_dfast_write(uaecptr addr, uaecptr *pa, uae_u8 *cs)
 }
 
 /* ==========================================================================
+ * CYBERSTORM C2 rung 3 -- THE SAME RESOLVER, FOR THE INSTRUCTION STREAM.
+ *
+ * z3660_dfast.h carries the design. The differences from the two above are all
+ * consequences of what a fetch is, and each one is load-bearing:
+ *
+ *   - `likely()` IS ON THE XPAR ARM. ITT0 covers 0-1 GB for both privilege levels and the
+ *     AMIX kernel's text lives under it, so 87 % of fetches (53.3 M of 61.3 M measured)
+ *     are transparent -- the opposite weighting to the data side, where the page cache is
+ *     the common arm. This is the one branch hint in the rung and it is measured, not
+ *     assumed.
+ *   - THE PAGE ARM IS ONE ENTRY, NOT 256. MMU_IPAGECACHE is a single laddr/paddr/cache
+ *     triple, and the tag expression below is copied from mmu_get_iword() unchanged --
+ *     which is what keeps IPAGE_HIT/IPAGE_MISS counting the same events, and what makes
+ *     "the fetch hit rates must not move" checkable instead of hoped for.
+ *   - THE CALLER OWNS THE ALIGNMENT PRECONDITION. get_ilong tests is_unaligned_bus above
+ *     this; get_iword gates on `!(addr & 1)`. Both are there so that an access reaching
+ *     here is naturally aligned and therefore cannot cross a page or a 64 KB bank window.
+ *
+ * Nothing is written before the answer is certain, same as rung 2: `mmu_cache_state` is
+ * handed back rather than stored, so a decline leaves no trace.
+ * ========================================================================== */
+Z3660_DFAST_INLINE int z3660_ifast(uaecptr addr, uaecptr *pa, uae_u8 *cs)
+{
+	unsigned short v = z3660_ifv[regs.s ? 1 : 0][addr >> 24];
+	unsigned verdict = Z3660_DFAST_VERDICT(v);
+	uaecptr phys;
+
+	if (likely(verdict == Z3660_DFAST_XPAR)) {
+		/* An instruction TTR matched -- including a write-protected one, which is
+		 * transparent to a fetch because mmu_get_iword()'s guard only tests for
+		 * TTR_NO_MATCH. The 68040 uses the logical address as the physical one and the
+		 * window's CM field supplies the cache state; both are in the table. */
+		phys = addr;
+		*cs  = Z3660_DFAST_CSTATE(v);
+	} else if (verdict == Z3660_DFAST_PAGE) {
+		/* THE TAG EXPRESSION IS mmu_get_iword()'s, CHARACTER FOR CHARACTER, including
+		 * `| regs.s` unnormalised -- the one-entry instruction page cache is the same
+		 * cache, not a second one. */
+		if (((addr & mmu_pagemaski) | regs.s) != atc_last_ins_laddr)
+			return 0;              /* a miss: mmu_translate must run from the original
+			                        * path, with its faults and its own bucket. */
+		phys = atc_last_ins_paddr | (addr & mmu_pagemask);
+		*cs  = atc_last_ins_cache;
+	} else {
+		return 0;
+	}
+
+	/* Live out of mem_banks[], exactly as memory_get_word() consults it. A fetch out of a
+	 * device bank -- ROM overlay space, autoconfig, anything with a wgeti function --
+	 * declines here and the original path issues it with its side effects intact. */
+	if (unlikely(!addrbank_is_direct_r(&get_mem_bank(phys))))
+		return 0;
+
+	/* BELOW EVERY DECLINE, for the reason rung 2's corpus established the hard way: with
+	 * the hit counted at the probe, a decline at the bank test would charge IPAGE_HIT
+	 * here and again when the original path re-probes the same entry, and the
+	 * pre-registration that the fetch hit rates must not move would fail on exactly the
+	 * case it exists to protect. */
+	if (verdict == Z3660_DFAST_PAGE) {
+#if CACHE_HIT_COUNT
+		mmu_ins_hit++;   /* the PAGE arm only: a TTR match never probes the instruction
+		                  * page cache, so counting one here would invent a hit the
+		                  * original path does not have. */
+#endif
+	} else {
+		Z3660_PROF_CNT(Z3660_PROF_C_IFAST_XPAR);
+	}
+	*pa = phys;
+	Z3660_PROF_CNT(Z3660_PROF_C_IFAST_HIT);
+	Z3660_IFAST_SERVED();
+	return 1;
+}
+
+/* BOTH FAST PATHS BYPASS phys_get_*(), AND THEREFORE BYPASS AMIX_HIDE08.
+ *
+ * That is correct today only because `AMIX_HIDE08(a)` is `(0)` -- mmu_common.h retired it
+ * when the kernel stopped relocating to $07000000, and uae_emulator.cpp records why. If
+ * it is ever re-armed to its old runtime form, the fast paths would keep serving a window
+ * the slow paths hide, and the symptom would be a guest reading real memory where the
+ * emulator means it to read 0xFF: a divergence with no error message anywhere.
+ *
+ * So it fails the BUILD instead. The old form is `amix_mmu_on && ...` -- not a constant
+ * expression -- so restoring it makes this array size non-constant and the compile stops
+ * here, at a comment that says what to do about it (decline the hidden window in both
+ * resolvers, or route the fast paths back through phys_get_*). */
+typedef char z3660_fastpath_requires_hide08_disabled[AMIX_HIDE08(0x08000000u) ? -1 : 1];
+
+/* ==========================================================================
  * CYBERSTORM C1 -- where the interpreter's stage buckets are actually charged.
  *
  * This is the choke layer, and picking it was the whole design decision. The named
@@ -892,6 +980,25 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_get_iword(uaecptr addr)
 #if MMU_ICACHE
 	Z3660_PROF_RET(uae_mmu040_getc_iword(addr));
 #else
+	/* C2 rung 3. BELOW the bucket and the FETCH counter on purpose: a served fetch is
+	 * still a fetch and must still be charged to FETCHOP/FETCHEX, or the profile would
+	 * report the rung working as the fetch having stopped happening. (The dopc
+	 * extension-word window above IS charged elsewhere -- a word served from it costs no
+	 * fetch at all, which is a different claim.)
+	 *
+	 * THE ODD-ADDRESS GATE IS NOT A REROUTE. This accessor has never split a misaligned
+	 * instruction fetch and must not start: an odd instruction address is an address
+	 * error the 68040 raises elsewhere, and the original path below still handles it
+	 * exactly as it always did. The test is here so the fast path's "cannot cross a page
+	 * or a bank window" property is structural -- a word at page_end-1, served, would
+	 * read its second byte out of an unrelated physical frame. */
+	if (likely(!(addr & 1))) {
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_ifast(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RET((uae_u16)direct_get_word(pa));
+		}
+	}
 	Z3660_PROF_RET(mmu_get_iword(addr, sz_word));
 #endif
 }
@@ -917,6 +1024,18 @@ static ALWAYS_INLINE uae_u32 uae_mmu040_get_ilong(uaecptr addr)
 		 * makes MISALIGN_R - MISALIGN_I the genuine misaligned DATA reads. */
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_I);
 		Z3660_PROF_RET(mmu_get_ilong_unaligned(addr));
+	}
+	/* C2 rung 3. Below the misalignment test, which is what makes "never fast-path across
+	 * a page boundary" structural here -- exactly as it is in uae_mmu040_get_long. Note
+	 * that this arm is the MINORITY of instruction fetches: half of all longword fetches
+	 * sit at an address = 2 (mod 4) and went through the splitter above before this rung
+	 * existed, and still do. */
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_ifast(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RET(direct_get_long(pa));
+		}
 	}
 	Z3660_PROF_RET(mmu_get_ilong(addr, sz_long));
 #endif

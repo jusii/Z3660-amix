@@ -74,8 +74,10 @@ uae_u32 mmu040_move16[4];
  * layer. Harness build only; the firmware binary is unchanged. */
 unsigned long mmu_unaligned_split_count = 0;
 /* C2 rung 2: how many accesses the fast path SERVED. See z3660_dfast.h for why this is
- * a harness-only counter rather than the profiler's DFAST_HIT. */
+ * a harness-only counter rather than the profiler's DFAST_HIT. C2 rung 3 adds the
+ * instruction side's own, separate for the reason the second knob is separate. */
 extern "C" { unsigned long z3660_dfast_serves = 0; }
+extern "C" { unsigned long z3660_ifast_serves = 0; }
 #endif
 
 extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
@@ -109,7 +111,10 @@ struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
  * ========================================================================== */
 unsigned short z3660_dfv_r[2][256];
 unsigned short z3660_dfv_w[2][256];
+/* Rung 3: the instruction side's table, built from itt0/itt1 by the same replay below. */
+unsigned short z3660_ifv[2][256];
 static int z3660_dfast_on = 1;
+static int z3660_ifast_on = 1;
 
 /* One window's verdict for one (msb, super), or TTR_NO_MATCH. `cs` is written only on a
  * match, exactly as mmu_do_match_ttr() writes mmu_cache_state only on a match. */
@@ -150,42 +155,80 @@ void z3660_dfast_rebuild(void)
 			int res;
 			unsigned short vr, vw;
 
+			/* THE TWO SWITCHES DISARM INDEPENDENTLY, which is why the disarm is an
+			 * `else` around the data half rather than the `continue` it used to be:
+			 * rung 3's table is built below in the same pass, and an early exit here
+			 * would have made DFAST OFF silently disarm IFAST too -- turning the 2x2 the
+			 * two knobs exist to make possible into a 1x2, with no symptom but a number. */
 			if (!z3660_dfast_on) {
 				z3660_dfv_r[super][i] = Z3660_DFAST_SLOW;
 				z3660_dfv_w[super][i] = Z3660_DFAST_SLOW;
-				continue;
-			}
-
-			/* mmu_match_ttr() walks dtt0 first and returns on a match. */
-			res = z3660_dfast_win(regs.dtt0, (uae_u32)i, super, &cs);
-			if (res == TTR_NO_MATCH)
-				res = z3660_dfast_win(regs.dtt1, (uae_u32)i, super, &cs);
-
-			if (res == TTR_OK_MATCH) {
-				/* Transparent both ways. Nothing else in the original path runs. */
-				vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
-				vw = vr;
-			} else if (res == TTR_NO_WRITE) {
-				/* Reads are transparent; a WRITE takes the bus-error path in
-				 * mmu_match_ttr_write(), which is not reimplemented here. */
-				vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
-				vw = Z3660_DFAST_SLOW;
-			} else if (regs.mmu_enabled) {
-				vr = Z3660_DFAST_PAGE;
-				vw = Z3660_DFAST_PAGE;
 			} else {
-				/* MMU OFF and no TTR match. The original path uses the address raw --
-				 * but with mmu_cache_state left at cache_default_data, which is NOT
-				 * constant (mmu_bus_error() clears CACHE_DISABLE_ALLOCATE in it), and
-				 * for a WRITE mmu_match_ttr_write() can still raise a TCR_DWO bus error
-				 * on exactly this arm. Both are rare and both are pre-MMU-boot only, so
-				 * this arm is SLOW rather than a second implementation of two edge
-				 * cases. It costs a table lookup on a phase that lasts seconds. */
-				vr = Z3660_DFAST_SLOW;
-				vw = Z3660_DFAST_SLOW;
+				/* mmu_match_ttr() walks dtt0 first and returns on a match. */
+				res = z3660_dfast_win(regs.dtt0, (uae_u32)i, super, &cs);
+				if (res == TTR_NO_MATCH)
+					res = z3660_dfast_win(regs.dtt1, (uae_u32)i, super, &cs);
+
+				if (res == TTR_OK_MATCH) {
+					/* Transparent both ways. Nothing else in the original path runs. */
+					vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
+					vw = vr;
+				} else if (res == TTR_NO_WRITE) {
+					/* Reads are transparent; a WRITE takes the bus-error path in
+					 * mmu_match_ttr_write(), which is not reimplemented here. */
+					vr = (unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
+					vw = Z3660_DFAST_SLOW;
+				} else if (regs.mmu_enabled) {
+					vr = Z3660_DFAST_PAGE;
+					vw = Z3660_DFAST_PAGE;
+				} else {
+					/* MMU OFF and no TTR match. The original path uses the address raw
+					 * -- but with mmu_cache_state left at cache_default_data, which is
+					 * NOT constant (mmu_bus_error() clears CACHE_DISABLE_ALLOCATE in
+					 * it), and for a WRITE mmu_match_ttr_write() can still raise a
+					 * TCR_DWO bus error on exactly this arm. Both are rare and both are
+					 * pre-MMU-boot only, so this arm is SLOW rather than a second
+					 * implementation of two edge cases. It costs a table lookup on a
+					 * phase that lasts seconds. */
+					vr = Z3660_DFAST_SLOW;
+					vw = Z3660_DFAST_SLOW;
+				}
+				z3660_dfv_r[super][i] = vr;
+				z3660_dfv_w[super][i] = vw;
 			}
-			z3660_dfv_r[super][i] = vr;
-			z3660_dfv_w[super][i] = vw;
+
+			/* ---- CYBERSTORM C2 rung 3: the same (super, msb) point, ITT windows ----
+			 *
+			 * Same replay, same order (itt0 first, itt1 only on a no-match), same
+			 * cache-state encoding. Two things differ from the data arms above and both
+			 * are properties of what a FETCH is rather than choices made here:
+			 *
+			 *  - TTR_NO_WRITE is XPAR, not SLOW. A fetch is a read, and
+			 *    mmu_get_iword()'s guard tests `mmu_match_ttr_ins(...) == TTR_NO_MATCH`
+			 *    -- so a write-protected window is transparent to it, with the window's
+			 *    own cache state installed. There is no write arm to protect.
+			 *  - there is only one table, because there is only one direction.
+			 *
+			 * The MMU-off-and-no-match arm stays SLOW for the reason the data side
+			 * gives: cache_default_ins is not a constant (mmu_bus_error() clears
+			 * CACHE_DISABLE_ALLOCATE in the pair), and that arm lasts seconds of
+			 * pre-MMU boot. A table lookup is what it costs. */
+			if (!z3660_ifast_on) {
+				z3660_ifv[super][i] = Z3660_DFAST_SLOW;
+			} else {
+				cs = 0;
+				res = z3660_dfast_win(regs.itt0, (uae_u32)i, super, &cs);
+				if (res == TTR_NO_MATCH)
+					res = z3660_dfast_win(regs.itt1, (uae_u32)i, super, &cs);
+
+				if (res == TTR_OK_MATCH || res == TTR_NO_WRITE)
+					z3660_ifv[super][i] =
+						(unsigned short)(Z3660_DFAST_XPAR | ((unsigned)cs << 8));
+				else if (regs.mmu_enabled)
+					z3660_ifv[super][i] = Z3660_DFAST_PAGE;
+				else
+					z3660_ifv[super][i] = Z3660_DFAST_SLOW;
+			}
 		}
 	}
 }
@@ -199,10 +242,28 @@ int z3660_dfast_arm(int on)
 }
 int z3660_dfast_armed(void) { return z3660_dfast_on; }
 
+int z3660_ifast_arm(int on)
+{
+	int prev = z3660_ifast_on;
+	z3660_ifast_on = on ? 1 : 0;
+	z3660_dfast_rebuild();
+	return prev;
+}
+int z3660_ifast_armed(void) { return z3660_ifast_on; }
+
 unsigned long long z3660_dfast_served(void)
 {
 #if Z3660_EMU_PROF
 	return (unsigned long long)z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
+#else
+	return 0;
+#endif
+}
+
+unsigned long long z3660_ifast_served(void)
+{
+#if Z3660_EMU_PROF
+	return (unsigned long long)z3660_prof_cnt[Z3660_PROF_C_IFAST_HIT];
 #else
 	return 0;
 #endif
@@ -265,10 +326,12 @@ void mmu_tt_modified (void)
 	mmu_ttr_enabled_ins = ((regs.itt0 | regs.itt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled_data = ((regs.dtt0 | regs.dtt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled = mmu_ttr_enabled_ins || mmu_ttr_enabled_data;
-	/* CYBERSTORM C2 rung 2. The fast path's verdict tables are derived from the SAME four
-	 * registers as the three flags above, so they are rebuilt in the same breath and
-	 * cannot be stale in any way those flags are not. This is the only reason the tables
-	 * need no invalidation protocol of their own. */
+	/* CYBERSTORM C2 rungs 2 and 3. The fast paths' verdict tables are derived from the
+	 * SAME four registers as the three flags above -- rung 2's from dtt0/dtt1, rung 3's
+	 * from itt0/itt1 -- so they are rebuilt in the same breath and cannot be stale in any
+	 * way those flags are not. This is the only reason the tables need no invalidation
+	 * protocol of their own. Note this function is reached by EVERY MOVEC to any of the
+	 * four, and by CPU reset, so the instruction half needed no new site. */
 	z3660_dfast_rebuild();
 }
 

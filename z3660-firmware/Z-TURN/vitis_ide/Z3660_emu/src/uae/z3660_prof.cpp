@@ -58,7 +58,9 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
    "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3",
    /* rung 2: the misaligned-read denominator split, and the fast path's coverage. */
-   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR"
+   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR",
+   /* rung 3: the same coverage pair for the instruction-fetch fast path. */
+   "IFAST_HIT", "IFAST_XPAR"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -1008,6 +1010,41 @@ extern "C" void z3660_prof_dump_stats(void)
       z3660_prof_pct(su, in, &ip, &fp);
       z3660_printf("[PROF] r supervisor instructions %u.%02u%% of %s\r\n",
                    ip, fp, z3660_prof_u64(in));
+   }
+
+   /* CYBERSTORM C2 rungs 2 and 3 -- COVERAGE, derived here for the same reason rung 1b's
+    * rows are: the 2026-08-23 verdict had to form all four of these by hand out of a
+    * counter dump, and coverage is the FIRST thing to read when a wall clock moves. A
+    * rung that shows a big wall-clock win with low coverage moved something else.
+    *
+    * The XPAR share is printed WITHOUT a threshold beside it, deliberately. It is a
+    * property of the window's supervisor/user mix, not a constant -- the same verdict
+    * measured 22.63 % on the data side against a 30-33 % pre-registration copied from an
+    * earlier capture, and the miss was the pre-registration's, not the counter's. Read it
+    * per capture; do not re-pin it. */
+   {
+      uint64_t dh = z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
+      uint64_t dx = z3660_prof_cnt[Z3660_PROF_C_DFAST_XPAR];
+      uint64_t ifh = z3660_prof_cnt[Z3660_PROF_C_IFAST_HIT];
+      uint64_t ifx = z3660_prof_cnt[Z3660_PROF_C_IFAST_XPAR];
+      uint64_t rw = z3660_prof_cnt[Z3660_PROF_C_READ] + z3660_prof_cnt[Z3660_PROF_C_WRITE];
+      uint64_t fe = z3660_prof_cnt[Z3660_PROF_C_FETCH];
+      unsigned ip, fp, xi, xf;
+
+      if (rw) {
+         z3660_prof_pct(dh, rw, &ip, &fp);
+         z3660_prof_pct(dx, dh, &xi, &xf);
+         z3660_printf("[PROF] r dfast coverage %u.%02u%% of READ+WRITE (%s of %s), "
+                      "XPAR share %u.%02u%%\r\n",
+                      ip, fp, z3660_prof_u64(dh), z3660_prof_u64(rw), xi, xf);
+      }
+      if (fe) {
+         z3660_prof_pct(ifh, fe, &ip, &fp);
+         z3660_prof_pct(ifx, ifh, &xi, &xf);
+         z3660_printf("[PROF] r ifast coverage %u.%02u%% of FETCH (%s of %s), "
+                      "XPAR share %u.%02u%%\r\n",
+                      ip, fp, z3660_prof_u64(ifh), z3660_prof_u64(fe), xi, xf);
+      }
    }
 
    /* CYBERSTORM C2 rung 1b -- the decoded-op cache's own derived rows, computed here for
