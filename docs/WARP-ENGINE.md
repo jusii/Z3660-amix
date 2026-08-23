@@ -5,10 +5,11 @@ card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 1
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
 **Status:** `M0 IN PROGRESS` — the grill ran on **2026-08-23** and every question in §7 is
-answered. §0 is the freeze: it is the authority for everything below it, and where a §2
-claim disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place
-with the correction marked. **Still no engine code: M1 opens when M0's deliverable —
-this document plus the committed M1 pre-registration — is complete.**
+answered; the metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with the
+§1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2). §0 is the freeze: it is the authority for
+everything below it, and where a §2 claim disagrees with §0's censuses, §0 wins and the §2 text
+has been corrected in place with the correction marked. **Still no engine code: M1 opens when
+M0's deliverable — this document plus the committed M1 pre-registration — is complete.**
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -91,11 +92,15 @@ the base register at block entry. All three are closed by exclusion rather than 
 (`MOVE16` is a bail family; the FPU is interpreter-only by Q13; the base load is the line Route C
 deletes), so the confinement holds where it has to.
 
-### Q2 — exceptions: **design as if a throw cannot cross generated code** `DECIDED`
+### Q2 — exceptions: **design as if a throw cannot cross generated code** `DECIDED, MEASURED`
 
 The posture is assumed-terminates: **bail before the fault, everywhere** (§2e option 2), so no
 `throw` is ever raised on a stack that has a generated frame on it. Every fault-visible
 decision in §2e follows from this and none of them is contingent on the probe's answer.
+
+> **Measured on metal 2026-08-23: `B: RESULT = TERMINATED`.** The EHABI unwinder refused the
+> generated frame and `std::terminate` was reached, exactly as §2e derived. The posture is no
+> longer assumed-terminates; it **is** terminates. §0.4.1.
 
 **The probe confirms or kills the posture; it does not choose it.** `make q2probe` builds
 `BOOT-q2probe.BIN`, a fourth image that exists only for this question: it emits a
@@ -441,11 +446,11 @@ this census puts a number on rather than leaving to discovery. **(measured)**
 
 | item | state | note |
 |---|---|---|
-| 1. the unwind probe (Q2) | `BUILT, AWAITING ONE BOOT` | `make q2probe` → `BOOT-q2probe.BIN`. Excluded from all three shipping images by two independent gates; their CRCs are unchanged with it in the tree. |
+| 1. the unwind probe (Q2) | `DONE` | **`B: RESULT = TERMINATED`**, metal 2026-08-23 22:21:46. §2e's derivation is a measurement — §0.4.1. |
 | 2. the route audit (Q1), zero build | `DONE` | §0.3(a) — 79.44 % |
 | 3. the family census (Q7), zero build | `DONE` | §0.3(a), read against the dhrystone window per Q11 |
 | 4. the block-length census, zero build | `DONE` | §0.3(a) — faultable-site density; block length is predicted, not read out, in §2a |
-| 5. the §1.5 base re-take (optional) | `TODO` | one profiling boot; worth taking if a metal session is booked anyway |
+| 5. the §1.5 base re-take (optional) | `DONE` | **base = 48.68 – 49.91 % on one capture**; the stitched ~50 % survives — §0.4.2 |
 | 6. the state-discipline census | `DONE` | §0.3(b) — added at the grill as Q1's contract input |
 | 7. the M1 pre-registration commit | `TODO` | the remaining half of M0's deliverable; must precede the first code commit, provably |
 
@@ -485,6 +490,153 @@ would mean, so the capture is decidable in all outcomes:
 One line that arrives free in the same capture is worth reading beside them:
 `Cache_Alloc of 33556480 at 0x........`, the code cache's 32 MB, allocated on every boot of
 every image today (§0.3(c)).
+
+### 0.4.1 The Q2 capture — `TERMINATED`, and what it settles
+
+**Metal, 2026-08-23 22:21:46, one boot of `BOOT-q2probe.BIN` (on-card CRC `FCC0CB3F`), preset 7
+(`UAE_040_MMU`, `amix_ram 128`, `service_cadence 4`, `arm_frequency 1100`), piscsi root.**
+
+```
+[WARP-Q2] A: stub @ 0x308edca0 = e92d4010 e12fff30 e8bd4010 e12fff1e  (icache seq: shipped, as-is)
+[WARP-Q2] A: RESULT = CONTAINED (status=0x57515221, prb=22353)
+[WARP-Q2] B: stub @ 0x308edcb8 = e92d4010 e12fff30 e8bd4010 e12fff1e  (icache seq: shipped + BPIALL/DSB/ISB)
+[WARP-Q2] B: RESULT = TERMINATED -- std::terminate reached; the ARM EHABI
+[WARP-Q2] B:          unwinder refused the generated frame (no .ARM.exidx entry).
+[WARP-Q2] ==== probe end ====
+```
+
+Three results, in the order they matter:
+
+1. **`B: TERMINATED` is the predicted row.** A `throw` raised in a helper called *from* generated
+   code cannot be unwound on this target: the unwinder finds no `.ARM.exidx` entry for a stub in
+   `malloc`'d DDR, returns `_URC_FAILURE`, and `__cxa_throw` terminates. **§2e's derivation is
+   promoted from `derived` to `measured`, and bail-before-fault is the fault contract by
+   measurement rather than by posture.** It terminated *cleanly* — terminate itself got to speak —
+   so this is the `TERMINATED` row and not the silence-after-`B: SENTINEL` row, and the probe
+   recovered through a `longjmp` out of the terminate handler, so the boot survived and the guest
+   reached a TCP accept 49 s later. **The probe cost exactly one boot, as designed.**
+2. **`A: CONTAINED` says generated code executes at all, with the shipped sequence.** Four
+   hand-encoded ARM words published with `arm_flush_cache` + `arm_icache_invalidate` **only** — no
+   `ISB`, no `BPIALL` — ran, called into C++, and returned. §2e option 1 is available. The
+   silence-after-`A: SENTINEL` anomaly, which would have been an I-cache or execute-permission
+   failure and *a different bug*, did not occur. This is one stub and not a volume: **Q3's
+   `UAEJIT` A/B stays booked separately and the platform caveat rides unchanged** — adding
+   barriers is not evidence of a fix; only a soak on metal is.
+3. **The stubs were allocated from the code cache's own arena.** `Cache_Alloc of 33556480 at
+   0x30A6DD60` on the same boot, against stubs at `0x308edca0` / `0x308edcb8` — 1.6 MB apart on
+   the same heap, from the same allocator (`cache_alloc` *is* `malloc`), with the same page
+   attributes. **Experiment A is therefore evidence about the actual code cache, not an analogue
+   of it** — which is more than §0.3(c) could claim from source. On the lean boot the same line
+   reads `0x30A6DAB8`, 680 B lower: the probe's two stub `malloc`s plus bookkeeping, taken and
+   given back.
+
+**The load-bearing check made before the boot, and it is why the result means anything:**
+`mmu_common.h:11`–`:24` selects the **C++ arm** of `TRY`/`CATCH`/`THROW` under `__cplusplus` — a
+real `throw` and a real EHABI unwind, not the `setjmp`/`longjmp` arm at `:26`–`:45`. Against the
+`longjmp` arm the experiment would have been vacuous: a `longjmp` needs no unwind tables and
+would "cross" any frame whatever. **(measured)**
+
+*(One probe cosmetic, pre-registered before it was seen and recorded rather than tidied away:
+`status = MAGIC | (prb << 16)` ORs `MAGIC`'s high half `0x5741` into the field the probe then
+prints as `prb`, so a thrown `0x5750` = 22 352 prints as 22 353. The gate the probe actually
+checks — `status & 0xffff == 0x5221` — is unaffected. Worth one line if the probe is ever
+reused.)*
+
+### 0.4.2 The §1.5 base, re-taken on one capture — 48.68 – 49.91 %
+
+**One profiling boot, `BOOT-prof.BIN` (on-card CRC `5225BD9C`), same preset, same session.** The
+capture measured its own price bracket — `probe calibration 40 marginal / 51 in-bucket`,
+`s usable sweep: [40, 51]` — against map v3.4's `[40, 50]`: comparable, not identical.
+
+| bucket | spans | share @40 | share @51 | pre-registered (map v3.4 §46.1) | |
+|---|---|---|---|---|---|
+| `DOPCFIND` | 65 607 634 | 15.18 % | 17.35 % | 16.10 – 17.96 | overlaps → hit |
+| `LOOPRES` | 207 822 213 | 16.48 % | 13.38 % | 16.89 – 19.35 | **no overlap → MISS, low** |
+| `FETCHOP` | 2 764 650 | 0.94 % | 1.13 % | — | |
+| `FETCHEX` | 11 832 901 | 6.24 % | 7.74 % | pair 7.23 – 8.60 vs 7.18 – 8.87 | overlaps → hit |
+| `TAILPOLL` | 65 607 043 | 9.49 % | 9.86 % | 6.8 (c4) | **no overlap → MISS, high** |
+| `TAILSPEC` | 414 709 | 0.35 % | 0.44 % | 0.2 | high, below noise |
+| **§1.5 base** | | **48.68 %** | **49.91 %** | 49.68 – 50.45 | overlaps → hit |
+
+> ### The base is **48.68 – 49.91 %** — one capture, one window, one band.
+> §1.5's stitched three-window estimate was 49.68 – 50.45 %, *"call it ~50 %"*. The re-take
+> **overlaps it at 49.68 – 49.91 %. The base survives**, §1.5's declared comparability caveat is
+> closed with a measurement instead of a hedge, and the first-generation band **1.25× – 1.55×**
+> that stands on it does not move. **(measured)**
+
+**The two per-bucket misses are the finding, and they cancel.** §1.5 named `TAILPOLL` as the one
+row whose window disagreement is *not* below the noise, and it was right — on one capture it reads
+9.49 – 9.86 %, above all three prior windows. What it could not know is that `LOOPRES` moves the
+other way by about the same amount. **The stitched base was right for a reason it had not earned.
+It has now earned it.**
+
+**Free in the same capture, and carried into M1's cost side:** `TAILADV` reads **10.22 % at price
+40 and 5.58 % at price 51** — it nearly halves inside one capture. That is §1.4's price artefact
+reproducing on this session's own window. It is excluded from the base on purpose and it stays
+excluded.
+
+**The rows that ride beside every verdict, per Q11**, from the same boot:
+
+| row | window | dhry | `INSNS` | `INSNS_SUPER` | super share |
+|---|---|---|---|---|---|
+| boot | MMU-enable → first guest TCP accept = **68 s** | — | 194 120 148 | 137 590 570 | **70.88 %** |
+| dhry, counters | `PROFZ`-fenced, 100 000 pinned runs | **4 870.1** | 64 321 345 | 10 346 526 | **16.09 %** |
+| dhry, buckets | `PROFZ`-fenced, 100 000 pinned runs | 1 977.6 | 65 607 043 | 11 677 205 | **17.80 %** |
+
+**The discriminator earned its keep inside one boot:** the same pinned workload reads 16.09 %
+supervisor in the counters window and 17.80 % in the bucket window, because the bucket window
+takes ~53 s against ~16 s and absorbs ~3× the clock-tick interrupts. That is exactly why a share
+swept at one band is not comparable with one swept at another. **(measured)**
+
+### 0.4.3 The standing lean, and one instrument anomaly that is owed a mechanism
+
+**`BOOT-lean.BIN` `F294E75A` is validated and is the standing lean.** Its first metal boot, same
+session, same preset: dhry `8164 / 8151 / 8163 / 8129 / 8151`, **median 8 151**, mean 8 151.6,
+**within-arm spread 0.43 %** (inside the rig's banked 0.04 – 0.70 %); direct-binary cross-check
+8 152.2 in the same boot, 0.01 % from the median; **−0.15 %** of the same-day cross-build
+reference (`DEC21748` median 8 163) and −0.42 % of the standing 8 185; boot window **46 s**; the
+dhrystone value block printed in full with `Arr_2_Glob[8][7] = 100010 == Number_Of_Runs + 10`;
+236 console line shapes against the reference boot's 236, **no new first-of-a-kind line**; clean
+`haltsys`. **This is the interpreter lineage M1 is measured against. (measured)**
+
+> **⚠ One pre-registered miss, and it is an instrument property until someone names the
+> mechanism.** The *profiling* build's own dhrystone row moved **+7.22 %** between two builds
+> (`2530C3F4` 4 542.0 → `5225BD9C` 4 870.1) on **identical work**: `INSNS` 64 337 234 vs
+> 64 321 345 (0.025 % apart), same ARM clock, same probe calibration, same fence, same pinned
+> count. Predicted 4 500 ± 250; measured 4 871. **MISS.**
+>
+> - **Candidate 1 — the `IVSUP` removal took work off a hot path: refuted by call count.** The
+>   removed code sits in `z3660_knobs_sync()`, `z3660_dopc_do_invalidate()` and file-scope
+>   accessors. This capture counts **32 372 invalidation requests against 65 607 043 retired
+>   instructions — 1 per 2 026.** A per-request check cannot buy 7 % at that ratio, and nothing
+>   was removed from the per-instruction dispatch path. **(measured)**
+> - **Candidate 2 — code layout: plausible, unproven.** −881 source lines shifted every later
+>   function while the image shrank by **24 bytes** (12 811 700 → 12 811 676): the code *moved*
+>   far more than it *shrank*, and an interpreter dispatch loop in a 32 KB Cortex-A9 L1I is
+>   exactly the workload sensitive to that. **(assumed)**
+>
+> **It damages neither §0.4.2 nor §1.5** — those shares are computed inside one capture against
+> that capture's own `corrected_total`, and a build that runs 7 % faster in absolute terms
+> redistributes nothing between its own buckets. **And the lean answers the question that made it
+> worth chasing:** the lean carries the same two commits and lands at −0.15 % of the same-day
+> reference — inside the noise, in the opposite direction, nowhere near +7 %. **The delta is
+> confined to the instrument.**
+>
+> **Standing rule this imposes on every WARP verdict, adopted here:** *counters come from the
+> profiling build, wall clock comes from the lean build, and **no WARP row ever quotes a
+> wall-clock comparison between two different profiling builds** until that mechanism is named.*
+> It is an open F-class item; it blocks nothing and it is not allowed to be forgotten.
+
+**Session posture, for the record.** Four boots, three images, one config that was never edited —
+`z3660cfg.txt`, `preset.txt` and `preset7.txt` byte-identical to as-found and to the previous
+session's close-out, which is a proof of *absence* of change. This session ran the **installed**
+040 system as its test bed (all three images are sound builds; the probe runs before emulation
+even starts), so the installed root's CRC moved `30FE1733` → `9C5E9CF8` — expected, three boots to
+multiuser and three `haltsys` writes — and the frozen-root pairing of the previous session is
+neither claimed nor available here. No panic, no bus error, no corruption, no assertion, in any of
+the four boots. `[PROF] l WARNING` appears nowhere in the session span; the `DOPCFILL` note
+(`6afc8f9`) printed as a `note:` with its fault term, `spans=2747114` 222 short of
+`DOPC_MISS=2747336` and bounded by `FAULTS=591`, in its first metal boot.
 
 ---
 
@@ -625,6 +777,13 @@ with compilation, which is dearer per event and rarer); `BLKREC` (rung 0 stays �
 > here rather than contradicting it. **The base is therefore ~50 % ± the width of one bucket's
 > window disagreement, and the honest way to close it is to re-take all five on one capture at M0 —
 > which costs one profiling boot and nothing else.**
+
+> **⚠ CLOSED at M0 by the boot it asked for.** All six rows re-taken on one capture at one band
+> (sweep `[40, 51]`): **base = 48.68 – 49.91 %**, which overlaps the stitched estimate at
+> 49.68 – 49.91 %. `TAILPOLL` missed high (9.49 – 9.86 % against 6.8 %) and `LOOPRES` missed low
+> by about the same amount, so **the two errors largely cancel and the stitched base was right for
+> a reason it had not earned**. The caveat is closed with a measurement rather than a hedge, and
+> the band below does not move. §0.4.2. **(measured)**
 
 **Step 2 — two deflators, both `assumed`, both directly measurable from day one.**
 
@@ -1173,14 +1332,12 @@ are confined to the flags and the fixups. **(measured, `newcpu.cpp:5841-6177`)**
 > which becomes `std::terminate`. **(derived, from the EHABI contract and the linker script — not
 > measured. It is the single cheapest thing to settle before a line of codegen is written: Q2.)**
 
-> **M0 status: the probe is built and awaits one boot.** `make q2probe` →
-> `BOOT-q2probe.BIN`, from `Z3660_emu/src/warp_q2probe.cpp`. It runs two experiments before
-> emulation starts — a throw *contained* inside the helper (§2e option 1 in miniature) and a
-> throw *crossing* the generated frame — and prints a sentinel before each, so the outcome that
-> destroys its own reporting is still readable as silence-after-a-named-sentinel. **The design
-> posture below does not depend on the answer** (§0.1 Q2): bail-before-fault is assumed either
-> way, and a CROSSED result would only mean option 1 is available as well, not that option 2 is
-> abandoned.
+> **⚠ MEASURED 2026-08-23 — the derivation above is now a measurement, and the `derived` tag on it
+> is left standing because that is what it was when it was written.** The probe booted once and
+> printed `B: RESULT = TERMINATED`: the unwinder refused the generated frame and `std::terminate`
+> was reached. Experiment A additionally showed that generated code *executes* with the shipped
+> I-cache sequence alone, from the code cache's own arena. **The bail-before-fault contract below
+> stands on metal, not on an argument.** §0.4.1.
 
 ### The bail-to-interpreter contract
 
@@ -1547,10 +1704,11 @@ that is why its numbers are trustworthy. Session counts are **assumed**.
 
 ### M0 — Design freeze `IN PROGRESS`
 
-**State on 2026-08-23: the grill has run and §0 is the freeze. Items 2, 3 and 4 are `DONE`
-(§0.3), item 1 is `BUILT, AWAITING ONE BOOT`, item 5 is `TODO` and optional, and the M1
-pre-registration — the other half of the deliverable below — is `TODO`. The per-item ledger is
-§0.4.** One census was added at the grill and is not in the list of five: the state-discipline
+**State on 2026-08-23: the grill has run, §0 is the freeze, and the metal half has run.
+Items 1 – 6 are `DONE` — the unwind probe answered `TERMINATED` on one boot (§0.4.1), the
+optional §1.5 base re-take was taken and the base survived (§0.4.2), and the four zero-build
+censuses are §0.3. The M1 pre-registration — the other half of the deliverable below — is
+`TODO`. The per-item ledger is §0.4.** One census was added at the grill and is not in the list of five: the state-discipline
 census (§0.3(b)), which is the input to Q1's pre-registered state-sync measurement.
 
 Five cheap things, all before any codegen. Only the first needs the card.
