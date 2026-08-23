@@ -4730,17 +4730,6 @@ static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
 #include "z3660_dopc.h"
 static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
 
-/* CYBERSTORM C2: the HANDLER discriminator. Not a rung -- the §30.3 experiment that
- * decides whether the ladder's #1 rung is ever funded. z3660_spec.h carries the family,
- * the covered shapes and the switch rule; docs/handler-discriminator.md carries the
- * pre-registered bands the metal row is scored against. */
-#include "z3660_spec.h"
-static int z3660_spec_on = 1;
-#ifdef HOST_TEST_HARNESS
-extern "C" unsigned long z3660_spec_serves = 0;
-static int z3660_spec_mutant = 0;
-#endif
-
 #if Z3660_EMU_PERF
 /* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
  * disagree about it -- a read-back that recomputes the answer proves nothing about the
@@ -4776,13 +4765,6 @@ extern "C" void z3660_knobs_sync(void)
       unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
       if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
    }
-   {                                                                                   // SPEC
-      /* The HANDLER discriminator. Only on a CHANGE, because arming invalidates the
-       * decoded-op cache -- the verdict bit lives in its entries, so entries filled in
-       * one state must not be believed in the other. */
-      unsigned s = z3660_spec_resolve((unsigned)shared->spec_on);
-      if ((int)s != z3660_spec_armed()) z3660_spec_arm((int)s);
-   }
 }
 
 /* Read-back + direct set for the host harness and the serial console. The setter takes a
@@ -4806,27 +4788,6 @@ extern "C" unsigned z3660_dopc_set(unsigned requested)
    z3660_dopc_on = z3660_dopc_resolve(requested);
    z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB);
    return z3660_dopc_on;
-}
-
-/* Same pair for the HANDLER discriminator, and it invalidates for a reason the other two
- * switches do not share: this verdict is STORED IN THE ENTRIES, not derived beside them.
- * An entry filled while armed carries M_SPEC for ever, so disarming without invalidating
- * would leave the reference arm dispatching through the specialised body -- the A/B would
- * compare a machine with itself. Always, not only on a change, for z3660_dopc_set()'s
- * reason: it removes the question rather than answering it. */
-extern "C" int z3660_spec_armed(void) { return z3660_spec_on; }
-extern "C" int z3660_spec_arm(int on)
-{
-   int prev = z3660_spec_on;
-   z3660_spec_on = on ? 1 : 0;
-   z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB);
-   return prev;
-}
-extern "C" unsigned z3660_spec_get(void) { return (unsigned)z3660_spec_on; }
-extern "C" unsigned z3660_spec_set(unsigned requested)
-{
-   z3660_spec_arm((int)z3660_spec_resolve(requested));
-   return (unsigned)z3660_spec_on;
 }
 
 /* Read-back for the harness (and any future serial dump).
@@ -5819,14 +5780,8 @@ void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 e
    s->opcode[w]  = op;
    s->handler[w] = cpufunctbl[op];
    s->ext0[w]    = ext0;
-   /* The discriminator's verdict is stored ARMED-CONDITIONALLY, which is what makes the
-    * disarmed arm a genuine reference: with the switch off no entry ever says M_SPEC, so
-    * the run loop's two added instructions are the whole of the disarm penalty. Moving
-    * the switch invalidates (z3660_spec_arm), so no entry outlives its own state. */
    s->meta[w]    = (uae_u8)((shape     ? Z3660_DOPC_M_IDIOM : 0u)
-                          | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u)
-                          | ((z3660_spec_on && z3660_spec_covered(op))
-                                        ? Z3660_DOPC_M_SPEC : 0u));
+                          | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u));
 
    /* NOTHING ELSE IS PUBLISHED HERE, and rung 1c is why that is worth a line. Rung 1b
     * marked a page-presence filter at this point -- two hashed bit-sets and a flag store,
@@ -5842,192 +5797,6 @@ void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 e
     * servicing, and will matter more the first time anything here becomes reentrant. */
    s->tag[w] = key;
 }
-
-/* ==========================================================================
- * CYBERSTORM C2 -- THE HANDLER DISCRIMINATOR'S SPECIALISED MOVE BODY
- * ==========================================================================
- *
- * See z3660_spec.h for the family and the mechanism, and docs/handler-discriminator.md
- * for the pre-registered bands. This is the whole of the code under test.
- *
- * IT IS TRANSCRIBED FROM THE GENERATED HANDLERS, NOT REDESIGNED. gencpu emits one body
- * per (size, source mode, destination mode) from a single template, and the template's
- * ORDER is load-bearing on a 68040 -- so the order here is the generated order, verified
- * against op_2000/2008/2010/2018/2020/2028/2068/2090/2098/20a8/20c0/20d8/2100/2110/2118/
- * 2120/2140/2148/2168 and the byte and word forms, and asserted opcode by opcode over the
- * whole covered space by test_spec_opcode_sweep. The three rules that matter:
- *
- *   mmufixup[0]      armed across a (An)+ / -(An) SOURCE read so a fault can undo the
- *                    register update, and cleared once the destination address is in
- *                    hand. When the source needs no fixup and the DESTINATION is
- *                    (An)+ / -(An), the slot is armed for the destination register
- *                    instead and cleared immediately before the store. Never both: with
- *                    an auto-increment source the destination's own update rides inside
- *                    the source's window, exactly as op_20d8/2118/2120 do.
- *
- *   mmu_restart      cleared, with regs.instruction_pc republished, BEFORE any store --
- *                    the 68040 completes the instruction and leaves the write to the
- *                    write-back path rather than restarting it. Getting this wrong is not
- *                    a slow path, it is a corrupt fault.
- *
- *   the cycle count  2 units when BOTH operands are memory, 1 otherwise.
- *
- * THE MEMORY ACCESS IS THE EXISTING ACCESSOR. get_/put_*_mmu040() are the same static
- * header functions every generated handler calls, so rung 2's fast path, the fault
- * semantics, the write-back contract, the device decline and the misalignment split are
- * not reimplemented here and cannot drift from the fallback.
- *
- * ALWAYS_INLINE in this tree is a bare hint and gcc has declined it at -Os before (see
- * accessor-fastpath.md, and z3660_dopc_find's note). This is the site the whole
- * experiment measures, so the attribute is spelled out and the result is CHECKED in the
- * disassembly rather than assumed. */
-#define Z3660_SPEC_INLINE static __inline__ __attribute__((always_inline))
-
-/* The extension word, from the decoded-op entry when it describes this offset.
- *
- * At offset 2 with the window armed this is PROVABLY the same value the accessor would
- * return: the run loop published ext_pc = pc + 2 and ext_val = ext0 from the very entry
- * this dispatch came from, the pc has not moved yet, and uae_mmu040_get_iword() keys its
- * window on exactly that address. What is removed is the call and the window compare --
- * §30.3 site C, the one that sits next to no guest-DRAM access at all. */
-Z3660_SPEC_INLINE uae_s16 z3660_spec_iword(int off, uae_u16 ext0, int have_ext0)
-{
-   if (off == 2 && have_ext0) {
-      /* DOPC_EXT keeps meaning "extension words the cache supplied", which is the only
-       * way it stays comparable with every capture taken before this experiment existed.
-       * The counter lives in the accessor's window arm and this path no longer goes
-       * there, so it is counted here instead -- Z3660_PROF_CNT is a no-op outside the
-       * profiling build, so the shipping image pays nothing for it.
-       *
-       * FETCH / IFETCH_CALLS is the counter that genuinely FALLS, because the accessor
-       * really is not called. That is declared in docs/handler-discriminator.md rather
-       * than papered over: it is the one place this rung is deliberately not
-       * like-for-like with the captures before it. */
-      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_EXT);
-      return (uae_s16)ext0;
-   }
-   return (uae_s16)get_iword_mmu040(off);
-}
-
-Z3660_SPEC_INLINE int z3660_spec_move(uae_u16 op, uae_u16 ext0, int have_ext0)
-{
-   const unsigned line    = (unsigned)(op >> 12) & 0xFu;
-   const unsigned dstreg  = (unsigned)(op >> 9)  & 7u;
-   const unsigned dstmode = (unsigned)(op >> 6)  & 7u;
-   const unsigned srcmode = (unsigned)(op >> 3)  & 7u;
-   const unsigned srcreg  = (unsigned)op         & 7u;
-   const int size = (line == Z3660_SPEC_SIZE_L) ? 4 : (line == Z3660_SPEC_SIZE_W) ? 2 : 1;
-   const int srcmem = (srcmode >= 2u);
-   const int dstmem = (dstmode >= 2u);
-   const int len = 2 + (srcmode == 5u ? 2 : 0) + (dstmode == 5u ? 2 : 0);
-   uaecptr srca = 0, dsta = 0;
-   uae_u32 src;
-   int srcfix = 0, dstfix = 0;
-
-   Z3660_PROF_CNT(Z3660_PROF_C_SPEC_HIT);
-   Z3660_SPEC_SERVED();
-
-   /* ---- source ------------------------------------------------------------------- */
-   if (srcmode == 0u) {
-      src = m68k_dreg(regs, srcreg);
-   } else if (srcmode == 1u) {
-      src = m68k_areg(regs, srcreg);
-   } else {
-      if (srcmode == 4u)      srca = m68k_areg(regs, srcreg) - (uae_u32)size;
-      else if (srcmode == 5u) srca = m68k_areg(regs, srcreg)
-                                     + (uae_u32)(uae_s32)z3660_spec_iword(2, ext0, have_ext0);
-      else                    srca = m68k_areg(regs, srcreg);
-
-      if (srcmode == 3u || srcmode == 4u) {
-         mmufixup[0].reg   = (int)srcreg;
-         mmufixup[0].value = m68k_areg(regs, srcreg);
-         srcfix = 1;
-      }
-
-      src = (size == 4) ? (uae_u32)get_long_mmu040(srca)
-          : (size == 2) ? (uae_u32)(uae_u16)get_word_mmu040(srca)
-                        : (uae_u32)(uae_u8)get_byte_mmu040(srca);
-
-      if (srcmode == 3u)      m68k_areg(regs, srcreg) += (uae_u32)size;
-      else if (srcmode == 4u) m68k_areg(regs, srcreg) = srca;
-   }
-
-   /* ---- destination address ------------------------------------------------------ */
-   if (dstmem) {
-      if (dstmode == 4u)      dsta = m68k_areg(regs, dstreg) - (uae_u32)size;
-      else if (dstmode == 5u) dsta = m68k_areg(regs, dstreg)
-                                     + (uae_u32)(uae_s32)z3660_spec_iword(srcmode == 5u ? 4 : 2,
-                                                                          ext0, have_ext0);
-      else                    dsta = m68k_areg(regs, dstreg);
-
-      if ((dstmode == 3u || dstmode == 4u) && !srcfix) {
-         mmufixup[0].reg   = (int)dstreg;
-         mmufixup[0].value = m68k_areg(regs, dstreg);
-         dstfix = 1;
-      }
-      if (dstmode == 3u)      m68k_areg(regs, dstreg) += (uae_u32)size;
-      else if (dstmode == 4u) m68k_areg(regs, dstreg) = dsta;
-   }
-   if (srcfix) mmufixup[0].reg = -1;
-
-   /* ---- flags: MOVE sets them from the moved value, MOVEA touches nothing --------- */
-   if (dstmode != 1u) {
-      CLEAR_CZNV();
-      if (size == 4)      { SET_ZFLG(((uae_s32)src) == 0); SET_NFLG(((uae_s32)src) < 0); }
-      else if (size == 2) { SET_ZFLG(((uae_s16)src) == 0); SET_NFLG(((uae_s16)src) < 0); }
-      else                { SET_ZFLG(((uae_s8) src) == 0); SET_NFLG(((uae_s8) src) < 0); }
-   }
-
-   /* ---- destination -------------------------------------------------------------- */
-   if (!dstmem) {
-      if (dstmode == 0u) {
-         if (size == 4)      m68k_dreg(regs, dstreg) = src;
-         else if (size == 2) m68k_dreg(regs, dstreg) =
-                                (m68k_dreg(regs, dstreg) & ~0xffffu) | (src & 0xffffu);
-         else                m68k_dreg(regs, dstreg) =
-                                (m68k_dreg(regs, dstreg) & ~0xffu) | (src & 0xffu);
-      } else {
-         /* MOVEA: word sign-extends to the full register, long moves it whole. */
-         m68k_areg(regs, dstreg) = (size == 4) ? src : (uae_u32)(uae_s32)(uae_s16)src;
-      }
-      m68k_incpci(len);
-   } else {
-      m68k_incpci(len);
-      regs.instruction_pc = m68k_getpci();
-      mmu_restart = false;
-      if (dstfix) mmufixup[0].reg = -1;
-      if (size == 4)      put_long_mmu040(dsta, src);
-      else if (size == 2) put_word_mmu040(dsta, (uae_u16)src);
-      else                put_byte_mmu040(dsta, (uae_u8)src);
-   }
-
-#ifdef HOST_TEST_HARNESS
-   /* THE MUTATION ARM, and it is here rather than in a second build because a guard that
-    * has never been seen to fail is not known to be a guard. Armed, a long MOVE leaves V
-    * set where the generated handler clears it -- one bit, one size -- and
-    * test_spec_mutation asserts the sweep NOTICES. Absent from every firmware binary:
-    * nothing outside the harness defines HOST_TEST_HARNESS. */
-   if (z3660_spec_mutant && size == 4 && dstmode != 1u) SET_VFLG(1);
-#endif
-
-   return (((srcmem && dstmem) ? 2 : 1) * 4 * CYCLE_UNIT / 2) * 4;
-}
-
-#ifdef HOST_TEST_HARNESS
-/* Harness only. Nothing on the board calls these.
- *
- * The probe exists so the equivalence sweep can compare the specialised body against
- * cpufunctbl[op] DIRECTLY -- same registers, same memory, same window state -- instead of
- * inferring agreement from two run-loop passes. The claim under test is *"this body
- * computes what the generated handler computes"*, and that is the shape the assertion
- * should have. `have_ext0` is exposed so both supply paths are swept: the entry's cached
- * word, and the fetch accessor. */
-extern "C" int z3660_spec_move_probe(uae_u16 op, uae_u16 ext0, int have_ext0)
-{
-   return z3660_spec_move(op, ext0, have_ext0);
-}
-extern "C" void z3660_spec_set_mutant(int on) { z3660_spec_mutant = on ? 1 : 0; }
-#endif
 
 // UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
 // (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
@@ -6129,20 +5898,11 @@ void m68k_run_mmu040(void)
             int     z3660_dopc_way    = 0;
             int     z3660_dopc_ext_ok = 0;
             uae_u16 z3660_dopc_ext0   = 0;
-            /* The entry's meta byte, read ONCE. It is consulted three times below --
-             * M_EXT0 here, M_IDIOM at the recognizer, M_SPEC at the dispatch -- and the
-             * third consultation is on the far side of a branch, where gcc rematerialized
-             * the address and reloaded the byte: two extra instructions on EVERY dispatch,
-             * measured in the first build of the discriminator. The whole §30.3 step-3
-             * charge is those instructions, so it is worth one local to keep it at two.
-             * Zero when there is no entry, which reads the same as "no verdicts". */
-            uae_u8  z3660_dopc_meta   = 0;
             Z3660_PROF_ENTER(Z3660_PROF_B_DOPCFIND);
             struct z3660_dopc_set *z3660_dopc_e = z3660_dopc_find(z3660_dopc_pc, &z3660_dopc_way);
             if (z3660_dopc_e) {
                mmu_opcode = regs.opcode = z3660_dopc_e->opcode[z3660_dopc_way];
-               z3660_dopc_meta = z3660_dopc_e->meta[z3660_dopc_way];
-               if (z3660_dopc_meta & Z3660_DOPC_M_EXT0) {
+               if (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_EXT0) {
                   z3660_dopc_ext_val = z3660_dopc_e->ext0[z3660_dopc_way];
                   z3660_dopc_ext_pc  = (unsigned int)(z3660_dopc_pc + 2u);
                } else {
@@ -6313,7 +6073,7 @@ void m68k_run_mmu040(void)
                 * as it always has and reports the verdict the fill will store. */
                z3660_blk_did =
                   (z3660_dopc_e == NULL
-                   || (z3660_dopc_meta & Z3660_DOPC_M_IDIOM))
+                   || (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_IDIOM))
                   && Z3660_PROF_BLK_RUN(z3660_dopc_op, &z3660_blk_cyc, &z3660_blk_shape);
 
                /* Cache maintenance BEFORE the dispatch, so nothing here depends on state
@@ -6346,24 +6106,10 @@ void m68k_run_mmu040(void)
                if (z3660_blk_did) {
                   cpu_cycles = z3660_blk_cyc;
                } else {
-                  /* CYBERSTORM C2, the HANDLER discriminator. The verdict rides in the
-                   * meta byte the hit path already holds, so a dispatch that is not
-                   * specialised pays a `tst` and a not-taken branch -- which is the
-                   * whole of §30.3 step 3's added-work charge, and why the disarmed arm
-                   * is a much better estimator of the shipping row here than it was for
-                   * rungs 2 and 3. The bracket stays where it was: the specialised body
-                   * is HANDLER work and must be charged to HANDLER, or the bucket this
-                   * experiment is about stops being comparable across its own switch. */
                   Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
-                  if (z3660_dopc_meta & Z3660_DOPC_M_SPEC) {
-                     cpu_cycles = z3660_spec_move(
-                           z3660_dopc_op, z3660_dopc_e->ext0[z3660_dopc_way],
-                           (z3660_dopc_meta & Z3660_DOPC_M_EXT0) != 0);
-                  } else {
-                     cpu_cycles = z3660_dopc_e
-                           ? (*z3660_dopc_e->handler[z3660_dopc_way])(regs.opcode)
-                           : (*cpufunctbl[regs.opcode])(regs.opcode);
-                  }
+                  cpu_cycles = z3660_dopc_e
+                        ? (*z3660_dopc_e->handler[z3660_dopc_way])(regs.opcode)
+                        : (*cpufunctbl[regs.opcode])(regs.opcode);
                   Z3660_PROF_EXIT();
                }
             }

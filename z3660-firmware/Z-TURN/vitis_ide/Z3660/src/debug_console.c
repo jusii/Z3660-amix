@@ -42,10 +42,6 @@ int  piscsi_stats_reporting(void);
  * self-contained (plain types, no emulator headers) so the ONE rule that turns a mailbox
  * word into a state lives in one file that both cores compile. */
 #include "../../Z3660_emu/src/uae/z3660_dfast.h"
-/* CYBERSTORM C2, the HANDLER discriminator: same reasoning once more -- z3660_spec.h's
- * core0-visible half is #defines and two static inlines over plain unsigned, no emulator
- * types at all, so the switch rule has exactly one definition for both cores. */
-#include "../../Z3660_emu/src/uae/z3660_spec.h"
 typedef enum {
    A,
 
@@ -110,8 +106,6 @@ typedef enum {
    DOPC,    DECODED_OP_CACHE,
    /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
    DFAST,   ACCESSOR_FAST_PATH,
-   /* CYBERSTORM C2: the HANDLER discriminator. APPEND-ONLY. */
-   SPEC,    HANDLER_SPECIALISE,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -176,7 +170,6 @@ const char *command_names[] = {
       "BLK",     "BLOCK IDIOM",
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
-      "SPEC",    "HANDLER SPECIALISE",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -704,26 +697,6 @@ int debug_thread(struct pt *pt)
                            xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
                         else
                            xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
-                     }
-                     debug_console.subcmd=0;
-                     break;
-                  case SPEC:
-                  case HANDLER_SPECIALISE:
-                     {  /* CYBERSTORM C2, the HANDLER discriminator. OFF is the REFERENCE
-                        * MACHINE -- every MOVE takes the generated handler through the
-                        * ordinary indirect call -- so this is the same-boot arm of the
-                        * §30.3 experiment. Unlike DFAST there IS something to invalidate
-                        * on the way through: the verdict bit lives in the decoded-op
-                        * entries, and core1's z3660_spec_arm() does it when the resync
-                        * sees the change. The rule that turns this word into a state is
-                        * z3660_spec.h's z3660_spec_resolve() and nothing else. */
-                        uint32_t c=shared->spec_on;
-                        c = (z3660_spec_resolve(c)!=0u) ? Z3660_SPEC_OFF : Z3660_SPEC_DEFAULT;
-                        shared->spec_on=c;
-                        if(c==Z3660_SPEC_OFF)
-                           xil_printf("HANDLER SPECIALISE OFF (every MOVE takes the generated handler -- this is the reference arm)\r\n");
-                        else
-                           xil_printf("HANDLER SPECIALISE ON (covered MOVE/MOVEA shapes dispatch through the inline body)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1472,7 +1445,6 @@ void debug_console_help(void)
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
    xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
-   xil_printf("'SPEC'    or 'HANDLER SPECIALISE' toggles the C2 HANDLER discriminator ON/OFF (EMU); OFF is the reference arm\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

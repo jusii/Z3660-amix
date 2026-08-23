@@ -58,9 +58,7 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
    "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3",
    /* rung 2: the misaligned-read denominator split, and the fast path's coverage. */
-   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR",
-   /* the HANDLER discriminator's coverage. */
-   "SPEC_HIT"
+   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];

@@ -791,3 +791,138 @@ cannot conclude "`HANDLER` is latency-hidden" either: a **null** was the reading
 have said that, and this is not a null. **`HANDLER` remains unclassified.** The ladder's #1
 rung is neither struck nor funded — it is unbought, and it now costs a rebuild to buy rather
 than a measurement.
+
+---
+
+# THE GATE, AND THE VERDICT ON THE CODE — 2026-08-23, **REVERTED**
+
+The metal row above decides the *rung*; it does not decide what to do with the *code*. That
+was put on a hard static gate, checked on the built lean ELF, with reverting mandatory if it
+could not be met:
+
+> **(a)** ZERO fetch-accessor calls reachable from the served `SPEC` body.
+> **(b)** the served body's instruction count **LESS THAN** the generated handler path it
+> replaces.
+> **(c)** sp-relative accesses in the body counted and stated.
+
+## The gate, measured
+
+Both loops disassembled with `arm-none-eabi-objdump -d`; `6ADABE4A` is the image metal
+measured, `DEC21748` the reference arm.
+
+| `m68k_run_mmu040` | reference `DEC21748` | as built `6ADABE4A` | delta |
+|---|---|---|---|
+| instructions | 572 | 879 | **+307** |
+| `bl uae_mmu040_get_iword` sites | **7** | **9** | **+2** |
+| sp-relative accesses | 65 (11.4 %) | 108 (12.3 %) | **+43** |
+| frame | `sub sp,#68` | `sub sp,#76` | +8 B |
+
+**(a) FAILED — 2, not 0.** The static census that prompted this round counted *nine*
+`get_iword` sites in the run loop; **seven of them pre-date the experiment** (the decoded-op
+fill's own ext0 fetch, and rung 0's block-idiom recognizer, which walks up to four
+instruction words looking for a `CPUSHL` loop head). **Two are the body's**, and they are
+real: `z3660_spec_iword()` takes its offset as a *runtime* value, so the `have_ext0` test
+cannot fold and both arms survive into the binary.
+
+**(b) FAILED, by 2.2–3.1×** — the table under *The mechanism* above. 65 / 85 / 77 / 118
+against 21 / 39 / 34 / 43. The requirement was *shorter*.
+
+**(c) STATED.** 108 sp-relative accesses in an 879-instruction loop — but **65 of them were
+already there**, so the body's own contribution is **+43**, of which 34 sit inside its own
+span and the rest are the pre-existing loop spilling harder under the added pressure (four
+of those are the *As built* +5 disarm charge: the meta-byte spill store and its
+three-instruction reload). **The 108 was smoke; +43 is the measurement.**
+
+## Why the gate cannot be met — priced, not argued
+
+**(a) is fixable and (b) is not**, and the second is what decides it.
+
+Fixing (a) means never letting the body need a word the entry does not hold: require
+`M_EXT0` before setting `M_SPEC` on a `d16(An)` shape, and drop `d16(An) → d16(An)`
+altogether. **The entry cannot be extended to cover it.** The decoded-op set is *exactly*
+64 bytes — `tag[4]` 16 + `stamp` 4 + `victim` 4 + `handler[4]` 16 + `opcode[4]` 8 +
+`ext0[4]` 8 + `meta[4]` 4 + `pad[4]` 4 — behind a compile-time tripwire that refuses any
+build where it is not, because one set is one pair of Cortex-A9 cache lines and that is the
+property the hit path is designed around. A second extension word costs **8 bytes** and
+**4 are spare**. So the second word is out, by the geometry, not by preference.
+
+**(b) cannot be met at all**, and the reason is structural:
+
+1. **The excess is a runtime mode/size ladder.** The body spends **27 instructions on its
+   prologue alone** — five field extractions, the size ladder, the `srcmem`/`dstmem` tests,
+   the length computation — before it touches guest state. `op_2000_31_ff`'s *entire*
+   handler is 15 instructions.
+2. **Getting under the handler therefore requires compile-time specialisation per shape** —
+   36 straight-line bodies — because that is precisely what `gencpu` already did and what a
+   single body taking the opcode at runtime undoes.
+3. **Selecting among 36 inlined bodies is a jump table**, i.e. an indirect branch with 36
+   targets on a Cortex-A9 BTB that holds one target per site. **That is §30.3 site A** — the
+   largest removal the pre-registration priced. Removing the handler's indirect call by
+   adding the body's own nets zero.
+4. **What is left to remove, counted from this binary:**
+
+```
+   handler call frame        0 on op_2000 (a LEAF -- gcc ended it in `bx lr`), 2 elsewhere
+   the loop's dispatch triple   3   -- but the jump table needs ~3 of its own
+   site B, field re-extraction  2-3
+   site C, the window hit       9   -- on the ~45 % of served shapes with a displacement
+
+   weighted  0.45x(9+2+3) + 0.55x(0+3)  =  ~8 removed, ~3 added back  =  ~5 net
+   on a dispatch of ~180 instructions                     ->  R ~= 2.8 %   (was 7-11 %)
+   x 21.12 % measured coverage, constant IPC              ->  +0.59 %
+   pre-registered PAY floor                                   +0.90 %
+   the machinery's own measured cost                          -1.07 %
+   ---------------------------------------------------------------------
+   best case for a gate-compliant body                    ->  about -0.5 %
+```
+
+5. **A compliant body's own arithmetic still loses**, before any deflator — and this round
+   has just demonstrated the count model optimistic by 3–4× in the other direction, while
+   36 inlined bodies would raise the register pressure that produced the −1.07 % in the
+   first place.
+
+So the gate is unmeetable inside the entry's fields, and a body that met (b) would no longer
+be this experiment: it would have given back site A to buy sites B and C, and the arithmetic
+says that trade is a loss.
+
+## The consequence
+
+**The `SPEC` machinery is removed in full**, rung-3 style and for rung 3's reason: an
+experiment that has returned its answer should not be left in the tree behind a switch,
+because the switch is not free and the answer does not improve with age.
+`Z3660_DOPC_M_SPEC`, `z3660_spec.h`, the inline body, the `SPEC` console command, the
+`spec_on` mailbox word (SHARED's next free offset is `0xFFFF00F0` again), `SPEC_HIT`
+(`Z3660_PROF_C_COUNT` back to **46**) and the harness's SPEC corpus all go.
+
+**Proof that the removal is exactly a removal, and nothing else:** rebuilding the reverted
+tree reproduces all three pre-experiment images **byte for byte** —
+
+| image | bytes | `zlib crc32` |
+|---|---|---|
+| `BOOT.BIN` | 12 795 220 | `E687C5CF` |
+| `BOOT-lean.BIN` | 12 795 204 | **`DEC21748`** |
+| `BOOT-prof.BIN` | 12 811 676 | `4183F88C` |
+
+`BOOT-lean.BIN` is now byte-identical to the image that produced the reference row this
+document is scored against.
+
+> # PARKED — `HANDLER` remains unclassified.
+>
+> A classification attempt requires a body that **provably removes work**. Two compiler
+> strikes and an off-scale loss say **the generated handlers are better than they look**:
+> gcc left the accessors out of line (site D, strike one), it did not fold the extension-word
+> test (site C, strike two), and it had already turned the commonest handler into a
+> 15-instruction leaf with no frame to remove at all (site A, worth zero there).
+>
+> **What a future attempt would have to bring**, so it is not re-derived: compile-time
+> per-shape bodies **and** a dispatch that is not an indirect branch — which on this loop
+> means the pre-decoded EA in the entry plus a threaded dispatch. That is the *design* this
+> experiment existed to decide whether to fund, so it cannot be the discriminator for it.
+> The cheap classification of `HANDLER` is not available; the map's #1 rung is still
+> unbought, and it now costs a design round rather than a measurement.
+>
+> **What this round did buy, and it is not nothing:** the fill-path price (75.9–81.9
+> cyc/miss, refuting the stale 62–64 upward), the `DOPC_EXT`-vs-`FETCH` bookkeeping error in
+> finding 4c, the −1.07 % standing cost of inlining *anything* into this run loop, and a
+> counted demonstration that instruction-path length in the run loop is dominated by
+> ladders the pre-registration did not count.

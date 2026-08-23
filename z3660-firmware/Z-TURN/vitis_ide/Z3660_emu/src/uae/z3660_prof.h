@@ -714,14 +714,7 @@ enum {
    Z3660_PROF_C_DFAST_HIT       = 44, /* data accesses served by the accessor fast path */
    Z3660_PROF_C_DFAST_XPAR      = 45, /* ... of those, via a TTR match rather than the
                                        *     page cache                                 */
-   /* CYBERSTORM C2, the HANDLER discriminator (z3660_spec.h). Coverage, and it is here
-    * for the reason rung 2's and rung 3's coverage counters were: the existing buckets
-    * cannot answer the first question a NULL result raises -- did it fire? A null with
-    * zero coverage is a build failure, not a classification. SPEC_HIT / INSNS is also the
-    * direct measurement of the family's instruction share that the sampler rings can only
-    * approximate. APPENDED, so every existing capture reads exactly as it did. */
-   Z3660_PROF_C_SPEC_HIT        = 46, /* dispatches served by the specialised MOVE body  */
-   Z3660_PROF_C_COUNT           = 47,
+   Z3660_PROF_C_COUNT           = 46,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,
