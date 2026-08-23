@@ -5827,8 +5827,15 @@ static void dopc_m_dma(void)      { z3660_dopc_invalidate_dma(DOPC_PCODE, 0x1000
 static void dopc_m_tbl(void)      { build_cpufunctbl(); }
 static void dopc_m_knob(void)     { shared->dopc_on = Z3660_DOPC_OFF; z3660_knobs_sync();
                                     shared->dopc_on = Z3660_DOPC_DEFAULT; z3660_knobs_sync(); }
+/* THE WRAP IS NOT A CAUSE A CALL SITE RAISES, so this fixture no longer pretends it is.
+ * It is raised BY z3660_dopc_do_invalidate() when the generation it just bumped lands on
+ * 0 -- so the only honest way to drive it is to arrive at the boundary and then perform
+ * one ORDINARY invalidation. `dopc_m_dma()` is the vehicle because it is a real firmware
+ * site and is not the f switch's suppressed cause, so this still wraps with the switch
+ * armed. Typing INV_WRAP out here, as this did before, drove a counter increment and
+ * NOT the wrap arm's own attribution -- which is exactly the gap being closed. */
 static void dopc_m_wrap(void)     { z3660_dopc_force_generation(0xFFFFFFFFu);
-                                    z3660_dopc_invalidate(Z3660_DOPC_INV_WRAP); }
+                                    dopc_m_dma(); }
 
 static void dopc_coh_one(dopc_maint_fn m, uae_u32 want_delta, const char *what)
 {
@@ -6013,10 +6020,12 @@ struct ivsup_row {
  * kept in Z3660_DOPC_INV_* order so a cause added without a row here is visible as a gap
  * rather than as a silent omission -- the count is asserted against INV_COUNT below.
  *
- * `real_site` is honest rather than aspirational. WRAP has no firmware call site at all
- * (the wrap inside z3660_dopc_do_invalidate() does not raise its own cause -- a
- * pre-existing gap, noted and not fixed here), and MAP's is map_banks(). Both are raised
- * directly and say so; the other eight go through flush_mmu040(), m68k_move2c(),
+ * `real_site` is honest rather than aspirational. WRAP's site is now real -- the wrap arm
+ * inside z3660_dopc_do_invalidate() raises its own cause, and dopc_m_wrap() reaches it by
+ * forcing the generation to the boundary and performing an ordinary DMA invalidation, so
+ * nothing here types the cause id out. MAP is the one row still raised directly:
+ * map_banks() rewrites the bank table under the fixture. The other eight go through
+ * flush_mmu040(), m68k_move2c(),
  * z3660_dopc_invalidate_dma(), build_cpufunctbl(), the knob resync, mmu_flush_atc() and
  * mmu_flush_atc_all(). */
 static const struct ivsup_row ivsup_rows[] = {
@@ -6025,7 +6034,7 @@ static const struct ivsup_row ivsup_rows[] = {
 	{ Z3660_DOPC_INV_DMA,     "DMA",     dopc_m_dma,          1, 0 },
 	{ Z3660_DOPC_INV_TABLE,   "TABLE",   dopc_m_tbl,          1, 0 },
 	{ Z3660_DOPC_INV_KNOB,    "KNOB",    dopc_m_knob,         1, 0 },
-	{ Z3660_DOPC_INV_WRAP,    "WRAP",    dopc_m_wrap,         0, 0 },
+	{ Z3660_DOPC_INV_WRAP,    "WRAP",    dopc_m_wrap,         1, 0 },
 	{ Z3660_DOPC_INV_MAP,     "MAP",     dopc_m_map,          0, 0 },
 	{ Z3660_DOPC_INV_PFLUSH,  "PFLUSH",  dopc_m_pflush_other, 1, 0 },
 	{ Z3660_DOPC_INV_PFLUSHA, "PFLUSHA", dopc_m_pflush_all,   1, 0 },
@@ -6663,7 +6672,7 @@ static void test_dopc_counters(void)
 		uae_u64 f0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH];
 		uae_u64 d0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA];
 		uae_u64 p0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_PFLUSH];
-		uae_u64 req = 0, iv;
+		uae_u64 req = 0, iv, wr;
 		int c;
 
 		flush_mmu040(0, 0);                                 /* CPUSHL / CINV */
@@ -6685,13 +6694,69 @@ static void test_dopc_counters(void)
 		 * inequality; with it gone, every request that reaches the invalidator performs
 		 * one, so the block sums to the aggregate exactly. It is the check that would
 		 * catch a call site bypassing the attribution, or a cause id out of range landing
-		 * outside the block and silently incrementing a neighbour. */
+		 * outside the block and silently incrementing a neighbour.
+		 *
+		 * IV_WRAP COMES OUT, for the same reason z3660_prof.cpp takes it out: it is in
+		 * the block but is not a request -- the wrap arm raises it from INSIDE the
+		 * invalidation another cause asked for, so it adds to the sum without adding to
+		 * DOPC_INVAL. Written as `req - wr` rather than asserted against a wrap-free
+		 * window, because a window that happens to contain no wrap would make the
+		 * subtraction untested and the identity accidentally true. */
 		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
 			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
 		iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
-		CHECK(req == iv,
-		      "sum(IV_*) == DOPC_INVAL: every invalidation is attributed to exactly one "
-		      "cause (%llu vs %llu)\n", (unsigned long long)req, (unsigned long long)iv);
+		wr = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP];
+		CHECK(req - wr == iv,
+		      "sum(IV_*) - IV_WRAP == DOPC_INVAL: every invalidation is attributed to "
+		      "exactly one cause (%llu - %llu vs %llu)\n",
+		      (unsigned long long)req, (unsigned long long)wr, (unsigned long long)iv);
+	}
+
+	/* ---- THE GENERATION WRAP RAISES ITS OWN CAUSE ------------------------------------
+	 *
+	 * INV_WRAP was defined with the cause block in rung 1b and had no firmware call site
+	 * until now: z3660_dopc_do_invalidate() did its memset silently, so the only thing
+	 * that ever incremented IV_WRAP was a caller typing the id out -- which no board code
+	 * does and which this harness's own fixture used to do. On metal the counter read zero
+	 * however many times a boot wrapped, i.e. it could not mean what its name says.
+	 *
+	 * THE ANTI-VACUITY ARM IS THE FIRST HALF: an ordinary invalidation that does NOT wrap
+	 * must leave IV_WRAP alone. Without it, a wrap arm that raised the cause on every
+	 * invalidation would pass the second half unchanged.
+	 *
+	 * The wrap itself -- the memset and the resume at generation 1 -- is pinned by
+	 * dopc_coh_one(dopc_m_wrap, ...) in test_dopc_coherence(), which runs in all three
+	 * variants and asserts the guest-visible effect rather than a counter. What is added
+	 * here is only the attribution, which needs counters and is therefore prof-only. */
+	{
+		uae_u64 w0, d0, v0;
+
+		z3660_dopc_force_generation(0x1000u);
+		w0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP];
+		d0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA];
+		v0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+
+		dopc_m_dma();
+		CHECK_EQ32(z3660_dopc_generation(), 0x1001u,
+		           "an ordinary invalidation bumps the generation and does not wrap");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP] - w0), 0u,
+		           "...and IV_WRAP does NOT move for it (anti-vacuity: the arm being "
+		           "tested is the wrap, not the invalidation carrying it)");
+
+		z3660_dopc_force_generation(0xFFFFFFFFu);
+		dopc_m_dma();
+
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP] - w0), 1u,
+		           "the generation wrap raises IV_WRAP ITSELF -- the cause the firmware "
+		           "defined in rung 1b and never gave a call site");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA] - d0), 2u,
+		           "...the requesting cause is still attributed to ITS own counter: the "
+		           "wrap adds a cause, it does not steal one");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - v0), 2u,
+		           "...and a wrap is ONE performed invalidation, not two: the memset IS "
+		           "that invalidation at the boundary, not a second one");
+		CHECK_EQ32(z3660_dopc_generation(), 1u,
+		           "...and the generation resumes at 1, never at the reserved 0");
 	}
 
 	/* ---- THE CALL-SITE NARROWING'S OWN COUNTER (C2 rung 1c) --------------------------

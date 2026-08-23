@@ -340,9 +340,12 @@ Profiling build only, appended counter ids 24–27 (rung 1) and 28–37 (rung 1b
   re-warm, but not *which* flush was causing them. It is what decided rung 1c, before any
   timing was consulted.
 
-  With the cache on, **`sum(IV_*) == DOPC_INVAL`** exactly — every request that reaches the
-  invalidator performs one. (Rung 1b's short-circuit made this an inequality; the revert
-  restored the identity, and the harness asserts equality again.)
+  With the cache on, **`sum(IV_*) − IV_WRAP == DOPC_INVAL`** exactly — every request that
+  reaches the invalidator performs one. (Rung 1b's short-circuit made this an inequality; the
+  revert restored the identity, and the harness asserts equality again.) **`IV_WRAP` is the
+  one member of the block that is not a request**: the generation wrap raises it for itself
+  from inside another cause's invalidation, so it is subtracted rather than counted. Before
+  2026-08-23 it had no call site at all and read zero however often a boot wrapped.
 
 - **`IV_CACR_SKIP`** (id 38, rung 1c) — **not a cause.** `MOVEC` to CACR that changes no
   retained bit is proved inert *at its call site*, so it never reaches the invalidator and

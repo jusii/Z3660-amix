@@ -557,7 +557,7 @@ correctly.
 | 25 | `DOPC_MISS` | ... consulted and not found; the fetch still ran |
 | 26 | `DOPC_EXT` | ... extension words served from the entry's single slot |
 | 27 | `DOPC_INVAL` | ... whole-cache invalidations **actually performed** |
-| 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) |
+| 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) — **except `IV_WRAP`**, which is not a request: the generation wrap raises it from *inside* another cause's invalidation, so it is subtracted from the block's identities. See below |
 | 38 | `IV_CACR_SKIP` | ... a `MOVEC` to CACR proved **inert at its call site** (C2 rung 1c) — **not a cause**, and not a member of the block above |
 | 39–42 | `DOPC_WAY0` `DOPC_WAY1` `DOPC_WAY2` `DOPC_WAY3` | ... **which way a hit was served from** (C2 v3.1 §25.2). Incremented on the hit arm only — a miss has no way |
 | 43 | `MISALIGN_I` | of `MISALIGN_R`, the **instruction-stream** half (C2 rung 2). `MISALIGN_R` is incremented at `get_ilong` as well as at the two data sites, so `MISALIGN_R − MISALIGN_I` is the genuine misaligned **data** reads. See `docs/accessor-fastpath.md` |
@@ -593,10 +593,21 @@ four figures, the way-0 share, and **the map's pre-registered verdict** on its o
 the rule and the arithmetic behind its thresholds.
 
 A third arrives with the `IV_` block: on a capture taken entirely with the cache on,
-**`sum(IV_*) == DOPC_INVAL`** — every request that reaches `z3660_dopc_invalidate()` performs
-one. `sum(IV_*) < DOPC_INVAL` is impossible and the firmware warns if it sees it. The gap in
-the other direction is the requests made while the cache was **off**, which is a fact about the
-window rather than a defect.
+**`sum(IV_*) − IV_WRAP == DOPC_INVAL`** — every request that reaches
+`z3660_dopc_invalidate()` performs one. Less than that is impossible and the firmware warns if
+it sees it. The gap in the other direction is the requests made while the cache was **off**,
+which is a fact about the window rather than a defect.
+
+> **`IV_WRAP` is subtracted because it is in the block but is not a request.** Every other id
+> in 28–37 is raised by a call site *asking* for an invalidation. `IV_WRAP` is raised by
+> `z3660_dopc_do_invalidate()` itself, from inside the invalidation some other cause
+> requested, when the generation it just bumped lands on 0 — so it adds to the sum without
+> adding to `DOPC_INVAL`. It sits in the block because its id does. **It read zero on every
+> capture before 2026-08-23**: the wrap did its `memset` silently and nothing but a caller
+> typing the id out could increment the counter, so it could not mean what its name says.
+> A non-zero `IV_WRAP` says the table was **cleared outright** rather than re-stamped, and the
+> misses following each wrap are therefore **cold**, not re-warm — the firmware prints a line
+> saying so when it happens, and no line at all when it does not.
 
 > **`IV_CACR_SKIP` is separate because the row that would otherwise score it cannot see it.**
 > C2 rung 1b briefly defined "the narrowing's yield" as `sum(IV_*) − DOPC_INVAL`. That is
@@ -617,7 +628,7 @@ window rather than a defect.
 > in `sum(IV_*)` while performing nothing. The identity a capture off that build satisfies is
 >
 > ```
-> sum(IV_*) − IV_SUPPRESSED  ==  DOPC_INVAL      cache ON
+> sum(IV_*) − IV_SUPPRESSED − IV_WRAP  ==  DOPC_INVAL      cache ON
 > ```
 >
 > with the standing identity being its `IV_SUPPRESSED == 0` special case, which is what every
@@ -630,9 +641,12 @@ window rather than a defect.
 `z3660_dopc_invalidate()` consults the switch too. **The `IV_*` counters still move**,
 by design: they count what the *guest* asked for, and the guest issues `CPUSHL` and `PFLUSH`
 whatever the switch says. That makes a cache-off arm a free, uncontaminated measurement of the
-guest's own invalidation rate. (Before rung 1b, `DOPC_INVAL` also counted with the cache off —
-`z3660_dopc_invalidate()` had no switch test at all — and the 2026-08-23 metal session found it
-reading 164 311 and 2 951 874 in the two off arms while the docs claimed zero.)
+guest's own invalidation rate. `IV_WRAP` is the exception in this direction too — it is raised
+*below* the switch test, so with the cache off there is no generation to wrap and it stays
+zero, which is correct: nothing was cleared because nothing was cached. (Before rung 1b,
+`DOPC_INVAL` also counted with the cache off — `z3660_dopc_invalidate()` had no switch test at
+all — and the 2026-08-23 metal session found it reading 164 311 and 2 951 874 in the two off
+arms while the docs claimed zero.)
 
 > **Read that arm in a `PROFZ`-zeroed window or it will look broken.** The counters accumulate
 > from power-on and the console cannot fire before core1 starts, so an OFF arm armed during
@@ -1232,7 +1246,7 @@ minimum correct implementation:
    switch was armed inside the window and the emulator was executing decodes the guest had
    told it to drop. The counter is **not** part of the `IV_` cause block, so a tool that
    sums the block by arithmetic index must stop at `IV_CACR` — and on such a capture the
-   identity is `sum(IV_*) − IV_SUPPRESSED == DOPC_INVAL`. **Surface it prominently or
+   identity is `sum(IV_*) − IV_SUPPRESSED − IV_WRAP == DOPC_INVAL`. **Surface it prominently or
    refuse the file**; the id was appended without a wire bump, so a symbolizer that does
    not know 46 will report it uninterpreted and say nothing at all.
 5. **Split by `SUPER`** — kernel and user-space hot spots are different questions and both

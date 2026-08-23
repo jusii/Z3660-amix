@@ -793,8 +793,8 @@ static void z3660_prof_ivsup_banner(void)
                 z3660_prof_u64(sup));
    z3660_printf("[PROF] *** switch is %s right now. docs/f-measurement.md       ***\r\n",
                 z3660_dopc_ivsup_armed() ? "ARMED " : "disarmed");
-   z3660_printf("[PROF] *** sum(IV_*) - IV_SUPPRESSED == DOPC_INVAL is the      ***\r\n");
-   z3660_printf("[PROF] *** identity that holds here; the standing one does not.***\r\n");
+   z3660_printf("[PROF] *** sum(IV_*) - IV_SUPPRESSED - IV_WRAP == DOPC_INVAL   ***\r\n");
+   z3660_printf("[PROF] *** is the identity here; the standing one does not.    ***\r\n");
    z3660_printf("[PROF] **********************************************************\r\n");
 }
 
@@ -1094,12 +1094,22 @@ extern "C" void z3660_prof_dump_stats(void)
       uint64_t iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
       uint64_t sk = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_CACR_SKIP];
       uint64_t su = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED];
+      uint64_t wr = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP];
       uint64_t req = 0;
       unsigned ip, fp;
       int c;
 
       for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
          req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
+      /* IV_WRAP IS IN THE BLOCK BUT IS NOT A REQUEST, so it comes straight back out.
+       * Every other id in 28..37 is raised by a call site asking for an invalidation;
+       * WRAP is raised by z3660_dopc_do_invalidate() itself when the generation it just
+       * bumped lands on 0, INSIDE the invalidation some other cause requested. It rides
+       * in the block because its id does, and leaving it in would inflate the guest's
+       * request rate by one per wrap and cost the identity below its exactness -- which
+       * would mask exactly one bypassed attribution, the thing that identity is for.
+       * `wr <= req` always: it is one of the terms just summed. */
+      req -= wr;
 
       if (hi + mi) {
          z3660_prof_pct(hi, hi + mi, &ip, &fp);
@@ -1191,7 +1201,17 @@ extern "C" void z3660_prof_dump_stats(void)
                          "(%u.%02u%% of requests) -- UNSOUND, see the banner\r\n",
                          z3660_prof_u64(su), ip, fp);
          }
+         /* The generation wrap, printed only when it happened -- so no capture's output
+          * shape changes until one does. It is worth a line of its own because a wrap
+          * MEMSETS the whole table rather than bumping a stamp: the misses that follow it
+          * are a cold cache, not re-warm, and DOPC_MISS carries no other sign of it. */
+         if (wr)
+            z3660_printf("[PROF] r dopc %s generation WRAP(s) in this window -- the table "
+                         "was cleared outright, so the misses after each are COLD\r\n",
+                         z3660_prof_u64(wr));
          /* `req >= iv` ALWAYS: every invalidation performed was requested and counted.
+          * (`req` is the IV_ block MINUS IV_WRAP -- see the subtraction above; with the
+          * wrap left in, both of the statements below would be wrong by one per wrap.)
           * `req == iv` additionally holds for a capture taken entirely with the cache ON,
           * and the gap when it does not is the requests made while the cache was OFF --
           * which is a fact about the window, not a defect, so it is not warned about.
@@ -1203,8 +1223,8 @@ extern "C" void z3660_prof_dump_stats(void)
           * the unsigned subtraction cannot underflow when su exceeds req -- which is
           * itself impossible, and impossible is what this line is for. */
          if (req < iv + su)
-            z3660_printf("[PROF] r WARNING: sum(IV_*)=%s is less than DOPC_INVAL=%s plus "
-                         "IV_SUPPRESSED=%s -- a cause id is out of range or a call site "
+            z3660_printf("[PROF] r WARNING: sum(IV_*)-IV_WRAP=%s is less than DOPC_INVAL=%s "
+                         "plus IV_SUPPRESSED=%s -- a cause id is out of range or a call site "
                          "bypasses the attribution\r\n",
                          z3660_prof_u64(req), z3660_prof_u64(iv), z3660_prof_u64(su));
       }

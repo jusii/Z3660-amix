@@ -625,7 +625,16 @@ enum {
    Z3660_PROF_C_DOPC_IV_DMA     = 30, /* core0 wrote guest DRAM                        */
    Z3660_PROF_C_DOPC_IV_TABLE   = 31, /* cpufunctbl rebuilt                            */
    Z3660_PROF_C_DOPC_IV_KNOB    = 32, /* the switch moved                              */
-   Z3660_PROF_C_DOPC_IV_WRAP    = 33, /* the generation wrapped                        */
+   /* THE ONE ID IN THE BLOCK THAT IS NOT A REQUEST. Every other 28..37 id is raised by
+    * a call site asking for an invalidation; this one is raised by
+    * z3660_dopc_do_invalidate() itself, from INSIDE the invalidation another cause
+    * requested, when the generation it just bumped lands on 0. So it adds to sum(IV_*)
+    * without adding to DOPC_INVAL, and both identities subtract it back out. It lives in
+    * the block because its id does, and renumbering to move it would change the meaning
+    * of ids a symbolizer already knows. Zero on every capture before 2026-08-23: the
+    * wrap did its memset silently and only a caller typing the id out could increment
+    * this, so it could not mean what its name says. */
+   Z3660_PROF_C_DOPC_IV_WRAP    = 33, /* the generation wrapped: the table was CLEARED */
    Z3660_PROF_C_DOPC_IV_MAP     = 34, /* map_banks()                                   */
    Z3660_PROF_C_DOPC_IV_PFLUSH  = 35, /* PFLUSH of one page -- the narrowed cause      */
    Z3660_PROF_C_DOPC_IV_PFLUSHA = 36, /* PFLUSHA / TC write / MMU reset                */
@@ -728,10 +737,12 @@ enum {
     *
     * The identity, and it is what makes the confession self-checking:
     *
-    *     sum(IV_*) - IV_SUPPRESSED  ==  DOPC_INVAL        cache ON
+    *     sum(IV_*) - IV_SUPPRESSED - IV_WRAP  ==  DOPC_INVAL     cache ON
     *
     * with the standing identity being its IV_SUPPRESSED == 0 special case. Over a window
-    * armed throughout, IV_SUPPRESSED == IV_FLUSH exactly.
+    * armed throughout, IV_SUPPRESSED == IV_FLUSH exactly. (IV_WRAP is subtracted in both
+    * forms and for a different reason -- it is in the block but is not a request; see its
+    * own id below.)
     *
     * Appended, like every id here, and NO WIRE BUMP: no id below it changed meaning, the
     * binary header layout is untouched, and a symbolizer that does not know id 46 reports

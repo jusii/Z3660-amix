@@ -5670,6 +5670,19 @@ unsigned int   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
 unsigned short z3660_dopc_ext_val = 0;
 }
 
+/* Count the request. Bounds-checked because the alternative to a bad `cause` is a silent
+ * increment of whatever counter follows the block, and a corrupted neighbour is a worse
+ * failure than a lost one -- an out-of-range cause lands on the aggregate instead, where
+ * the sum identity will show it.
+ *
+ * Defined ahead of z3660_dopc_do_invalidate() because the WRAP cause is raised from
+ * inside it -- see the wrap arm below. */
+static __inline__ void z3660_dopc_count_cause(int cause)
+{
+   if ((unsigned)cause < (unsigned)Z3660_DOPC_INV_COUNT)
+      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_BASE + cause);
+}
+
 /* The work, separated from the cause counting above it. */
 static void z3660_dopc_do_invalidate(void)
 {
@@ -5699,21 +5712,27 @@ static void z3660_dopc_do_invalidate(void)
    if (++z3660_dopc_gen == 0) {
       /* 2^32 invalidations later. Every stamp must be made unequal to the generation we
        * are about to resume at, and zeroing does that for generation 1 -- so this is a
-       * real clear and not a wrap that silently revalidates the whole table. */
+       * real clear and not a wrap that silently revalidates the whole table.
+       *
+       * THE WRAP RAISES ITS OWN CAUSE, and until this line it did not. INV_WRAP has
+       * existed since rung 1b and has never had a firmware call site: the memset was done
+       * silently here while the counter could only be incremented by a caller typing the
+       * id out, which no board code does. IV_WRAP therefore read zero on every metal
+       * capture no matter how many wraps a boot performed -- a counter that could not mean
+       * what its name says. It is not an unreachable arm either: at the 3 k/s invalidation
+       * rate a dhrystone run measures, 2^32 requests is on the order of a fortnight's
+       * uptime.
+       *
+       * It is raised HERE rather than by recursing through z3660_dopc_invalidate(): a
+       * nested call would bump the generation a second time and re-enter this branch. The
+       * wrap is an event of the PERFORMING path, not a request -- so it adds to sum(IV_*)
+       * without adding to DOPC_INVAL, and z3660_prof.cpp subtracts it back out to keep the
+       * request identity exact. */
+      z3660_dopc_count_cause(Z3660_DOPC_INV_WRAP);
       memset(z3660_dopc_tab, 0, sizeof z3660_dopc_tab);
       z3660_dopc_gen = 1;
    }
    Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
-}
-
-/* Count the request. Bounds-checked because the alternative to a bad `cause` is a silent
- * increment of whatever counter follows the block, and a corrupted neighbour is a worse
- * failure than a lost one -- an out-of-range cause lands on the aggregate instead, where
- * the sum identity will show it. */
-static __inline__ void z3660_dopc_count_cause(int cause)
-{
-   if ((unsigned)cause < (unsigned)Z3660_DOPC_INV_COUNT)
-      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_BASE + cause);
 }
 
 extern "C" void z3660_dopc_invalidate(int cause)

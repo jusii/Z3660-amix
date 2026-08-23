@@ -282,7 +282,12 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
 #define Z3660_DOPC_INV_DMA     2  /* core0 wrote guest DRAM (piscsi / floppy). PHYSICAL  */
 #define Z3660_DOPC_INV_TABLE   3  /* cpufunctbl rebuilt: every cached handler is stale   */
 #define Z3660_DOPC_INV_KNOB    4  /* the switch moved                                    */
-#define Z3660_DOPC_INV_WRAP    5  /* the generation counter wrapped (see the memset)     */
+#define Z3660_DOPC_INV_WRAP    5  /* the generation counter wrapped (see the memset).
+                                   * NOT a cause a call site raises: the wrap arm inside
+                                   * z3660_dopc_do_invalidate() raises it for itself, from
+                                   * inside the invalidation another cause requested. It
+                                   * therefore adds to sum(IV_*) without adding to
+                                   * DOPC_INVAL, and the identities subtract it out.      */
 #define Z3660_DOPC_INV_MAP     6  /* the emulator's own memory map changed               */
 #define Z3660_DOPC_INV_PFLUSH  7  /* PFLUSH of ONE page -- the ONLY cause that names a
                                    * LOGICAL page, and therefore the only one narrowable
