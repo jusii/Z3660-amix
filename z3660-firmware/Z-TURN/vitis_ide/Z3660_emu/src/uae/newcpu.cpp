@@ -5448,6 +5448,20 @@ static int z3660_blk_run(uae_u16 op, int *cycp, int *shapep)
  * invalidation is affordable as the DEFAULT policy here because it is O(1) -- one
  * generation increment -- rather than a walk.
  *
+ * RUNG 1b HAS NOW DONE THE "AND ONLY THEN NARROW IT" HALF, and it changed the list below
+ * in exactly one place. The list of EVENTS is unchanged; every one of them still arrives
+ * here and still results in a whole-cache invalidation when it has anything to
+ * invalidate. What changed is that two of those requests can now be answered with
+ * "nothing to do", and only when that is provable:
+ *
+ *   - nothing has been filled since the last invalidation (any cause, any namespace); or
+ *   - the request names a LOGICAL page -- which only PFLUSH does -- and the
+ *     page-presence filter says no live entry lies in it.
+ *
+ * Note what is NOT on that list, because it is the shape of the whole problem: CPUSHL and
+ * the DMA arm both carry an address, and both of those addresses are PHYSICAL while every
+ * tag here is logical. See z3660_dopc.h.
+ *
  * The events, and why each one is in the list:
  *
  *   mmu_flush_cache()   The single choke point for the 68040's own instruction-cache and
@@ -5533,6 +5547,41 @@ typedef char z3660_dopc_table_is_64k[
  * memset on wrap below) is entirely stale rather than entirely valid. */
 static uae_u32 z3660_dopc_gen = 1;
 
+/* ------------------------------------------------------------------------------------
+ * RUNG 1b -- the page-presence filter and the empty-cache short-circuit.
+ *
+ * Both exist to stop paying a ~285-entry re-warm for an invalidation that cannot matter,
+ * which the 2026-08-23 metal verdict measured as the dominant cost of this cache. The
+ * design, the namespace wall that decides which causes can be narrowed at all, and the
+ * filter invariant are all in z3660_dopc.h -- read that first; this is the mechanism.
+ * ------------------------------------------------------------------------------------ */
+
+/* Set by every fill, cleared by every invalidation that actually moves the generation.
+ * When it is 0 the table holds nothing live, so ANY invalidation -- of any cause, in any
+ * address namespace -- is a no-op, and the shortest correct implementation of a no-op is
+ * to not do it. This is the arm that survives the CPUSHL storm: consecutive iterations of
+ * AMIX's flush loop dispatch nothing between them, so all but the first find this at 0. */
+static int z3660_dopc_live_f = 0;
+
+/* One bit per 4 KB of guest LOGICAL address, hashed. See z3660_dopc.h for the invariant
+ * and for why a collision is a performance defect and never a correctness one. */
+static uae_u32 z3660_dopc_pf[Z3660_DOPC_PF_WORDS];
+
+typedef char z3660_dopc_pf_is_512_bytes[
+   (sizeof(z3660_dopc_pf) == Z3660_DOPC_PF_BYTES) ? 1 : -1];
+
+static __inline__ void z3660_dopc_pf_mark(uaecptr addr)
+{
+   unsigned b = z3660_dopc_pf_slot((unsigned)addr);
+   z3660_dopc_pf[b >> 5] |= 1u << (b & 31u);
+}
+
+static __inline__ int z3660_dopc_pf_get(uaecptr addr)
+{
+   unsigned b = z3660_dopc_pf_slot((unsigned)addr);
+   return (z3660_dopc_pf[b >> 5] >> (b & 31u)) & 1u;
+}
+
 /* The extension-word window (z3660_dopc.h). C linkage: cpummu.h's single out-of-line
  * uae_mmu040_get_iword() reads it from other translation units. */
 extern "C" {
@@ -5540,13 +5589,32 @@ unsigned int   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
 unsigned short z3660_dopc_ext_val = 0;
 }
 
-/* The work, separated from the cause counting above it. */
+/* The work. Separated from z3660_dopc_invalidate() so that the CAUSE is counted on every
+ * request while the generation moves only when there is something to invalidate -- which
+ * is what makes `sum(DOPC_IV_*) - DOPC_INVAL` the narrowing's measured yield rather than
+ * a quantity that has to be inferred. */
 static void z3660_dopc_do_invalidate(void)
 {
    /* The window came out of an entry, so it dies with the entries. Doing this FIRST
     * matters: a handler that invalidates and then reads its own extension word must get
-    * a real fetch, and the ordering here is the only thing that guarantees it. */
+    * a real fetch, and the ordering here is the only thing that guarantees it. It is also
+    * OUTSIDE the short-circuit below, because the window is armed by a HIT and not by a
+    * fill -- so it can be live at a moment when nothing has been filled since the last
+    * generation move, and returning early without disarming it would be the one way this
+    * whole rung could serve a stale word. */
    z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+
+   /* THE EMPTY-CACHE SHORT-CIRCUIT. Nothing has been filled since the last generation
+    * move, so no set has a live stamp and there is no entry to make stale. Skipping is
+    * exact rather than approximate: this is not "probably nothing", it is "nothing". */
+   if (!z3660_dopc_live_f)
+      return;
+   z3660_dopc_live_f = 0;
+
+   /* The filter describes the entries that are about to die, so it dies with them. Doing
+    * it here rather than in fill() is what keeps the invariant one-directional: bits go
+    * up with entries and down with the generation, never independently. */
+   memset(z3660_dopc_pf, 0, sizeof z3660_dopc_pf);
 
    if (++z3660_dopc_gen == 0) {
       /* 2^32 invalidations later. Every stamp must be made unequal to the generation we
@@ -5574,16 +5642,65 @@ extern "C" void z3660_dopc_invalidate(int cause)
    z3660_dopc_do_invalidate();
 }
 
-/* The DMA arm. Takes the range core0 wrote even though it currently invalidates
- * everything: a narrowed invalidation needs that range, and a call site that never
- * carried it could not grow one later without touching main.cpp again.
+/* The narrowed arm. LOGICAL range only -- see the namespace paragraph in z3660_dopc.h.
  *
- * WORTH RECORDING WHILE THE ATTRIBUTION IS GOING IN, because it decides what a narrowing
- * here could even look like: that range is a guest PHYSICAL address (it is a DMA
- * descriptor) while every tag in this cache is a guest LOGICAL pc. The host corpus already
- * shows the two are not comparable -- dopc_m_dma() flushes DOPC_PCODE for an entry tagged
- * at DOPC_VCODE, so a range test would skip a flush that was required. IV_DMA is what says
- * whether a physical index would be worth building. */
+ * A 68040 page is 4 KB or 8 KB and the filter granule is 4 KB, so this tests one or two
+ * bits. The loop is written over granules rather than "test addr, then addr+4096" so that
+ * a caller which one day passes a larger logical extent gets a correct answer instead of
+ * a truncated one; the bound below is what keeps that from becoming an unbounded walk. */
+extern "C" void z3660_dopc_invalidate_log_range(unsigned int addr, unsigned int len,
+                                                int cause)
+{
+   unsigned int first, last, g;
+
+   z3660_dopc_count_cause(cause);
+
+   /* Nothing live: the range does not even need looking at. Checking this before the
+    * filter also means the storm case costs one load and one branch. */
+   if (!z3660_dopc_live_f) {
+      z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+      return;
+   }
+
+   /* An UNKNOWN extent is the whole cache, never an empty range. Guessing small here is
+    * the direction that executes overwritten instructions. */
+   if (len == 0u) {
+      z3660_dopc_do_invalidate();
+      return;
+   }
+
+   first = addr >> Z3660_DOPC_PF_SHIFT;
+   last  = (unsigned int)(addr + (len - 1u)) >> Z3660_DOPC_PF_SHIFT;
+
+   /* More granules than a walk is worth, or an arithmetic wrap at the top of the address
+    * space (last < first). Either way, fall back to the policy that is always correct. */
+   if (last < first || (last - first) >= 8u) {
+      z3660_dopc_do_invalidate();
+      return;
+   }
+
+   for (g = first; g <= last; g++) {
+      if (z3660_dopc_pf_get((uaecptr)(g << Z3660_DOPC_PF_SHIFT))) {
+         z3660_dopc_do_invalidate();
+         return;
+      }
+   }
+
+   /* Provably no live entry in the flushed page. The window is still disarmed: it is
+    * keyed on an address rather than on a page, so leaving it armed would be sound, but
+    * the cost is one store and the invariant "an invalidation request always leaves the
+    * window disarmed" is worth more than the store. */
+   z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+}
+
+/* The DMA arm. Takes the range core0 wrote and STILL invalidates everything, and the
+ * reason is not conservatism for its own sake: the range is a guest PHYSICAL address (it
+ * is a DMA descriptor) while every tag in this cache is a guest LOGICAL pc. Comparing
+ * them would be comparing two different numbers -- the host corpus demonstrates it, since
+ * dopc_m_dma() flushes DOPC_PCODE for an entry tagged at DOPC_VCODE and a range test
+ * would skip it. Narrowing this needs a physical index, which is a later rung with its
+ * own evidence. The empty-cache short-circuit inside do_invalidate() still applies, and
+ * it is namespace-free. */
 extern "C" void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len)
 {
    (void)addr; (void)len;
@@ -5592,8 +5709,47 @@ extern "C" void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len)
 
 extern "C" unsigned int z3660_dopc_generation(void) { return z3660_dopc_gen; }
 /* Harness only: drive the counter to the wrap boundary without performing 2^32
- * invalidations. Nothing on the board calls it. */
-extern "C" void z3660_dopc_force_generation(unsigned int gen) { z3660_dopc_gen = gen; }
+ * invalidations. Nothing on the board calls it.
+ *
+ * It marks the cache LIVE, and that is not bookkeeping tidiness -- it closes the one hole
+ * rung 1b's short-circuit could have. Moving the generation by hand can land it on a
+ * stamp still sitting in some set, which revives that set without any fill having
+ * happened; a later invalidation would then find live_f clear, skip, and leave a live
+ * entry the caller believes it has just killed. Assuming the worst here makes a test
+ * helper unable to construct a state the real code cannot reach, which is the only
+ * property that keeps a harness-only door from becoming a firmware bug. */
+extern "C" void z3660_dopc_force_generation(unsigned int gen)
+{
+   z3660_dopc_gen = gen;
+   z3660_dopc_live_f = 1;
+}
+/* Harness only: the empty-cache short-circuit's own predicate, and the filter's. */
+extern "C" int z3660_dopc_live(void) { return z3660_dopc_live_f; }
+extern "C" int z3660_dopc_pf_test(unsigned int addr)
+{
+   return z3660_dopc_pf_get((uaecptr)addr);
+}
+/* Harness only: THE FILTER INVARIANT, walked over the real table rather than argued.
+ * Returns the number of LIVE entries whose filter bit is clear -- which must be 0, because
+ * every one of them is a page a narrowed PFLUSH would skip while a stale decode sat in it.
+ * This is the check that would catch a fill path that grew a second early return. */
+extern "C" int z3660_dopc_pf_audit(void)
+{
+   unsigned idx, w;
+   int bad = 0;
+
+   for (idx = 0; idx < Z3660_DOPC_SETS; idx++) {
+      const struct z3660_dopc_set *s = &z3660_dopc_tab[idx];
+      if (s->stamp != z3660_dopc_gen) continue;          /* not live: nothing to promise */
+      for (w = 0; w < Z3660_DOPC_WAYS; w++) {
+         uae_u32 t = s->tag[w];
+         if (t == Z3660_DOPC_TAG_EMPTY(idx)) continue;
+         /* The tag is (pc & ~1) | super, so the pc is the tag with bit 0 masked off. */
+         if (!z3660_dopc_pf_get((uaecptr)(t & ~1u))) bad++;
+      }
+   }
+   return bad;
+}
 /* Harness only: the geometry as the COMPILER laid it out, not as the header meant it. */
 extern "C" unsigned z3660_dopc_set_bytes(void)   { return (unsigned)sizeof(struct z3660_dopc_set); }
 extern "C" unsigned z3660_dopc_table_bytes(void) { return (unsigned)sizeof(z3660_dopc_tab); }
@@ -5694,6 +5850,26 @@ void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 e
    s->ext0[w]    = ext0;
    s->meta[w]    = (uae_u8)((shape     ? Z3660_DOPC_M_IDIOM : 0u)
                           | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u));
+
+   /* RUNG 1b: publish this entry to the page-presence filter BEFORE the tag below makes
+    * it findable, for the same reason the tag is stored last -- there must be no ordering
+    * in which a live entry exists whose bit is not yet set. The filter invariant is what
+    * lets a page-scoped PFLUSH be skipped, so an entry that slipped past this line would
+    * be an entry a later flush declines to invalidate.
+    *
+    * BOTH pc AND pc+3, which is not belt-and-braces. The entry can carry the extension
+    * word at pc+2, so its content spans pc..pc+3; z3660_dopc_ext_reachable() bounds that
+    * to one MMU page, but the MMU page is 4 KB or 8 KB (or, with translation off, the
+    * 64 KB bank) while this filter's granule is 4 KB -- so with 8 KB pages the two words
+    * can legitimately fall in different granules. Marking pc+3 unconditionally closes
+    * that without the filter having to know anything about the current page size, which
+    * is the sort of coupling that breaks quietly when TC changes.
+    *
+    * live_f LAST of the three, so that every state this function can be interrupted in
+    * still satisfies "live => the bits are set". */
+   z3660_dopc_pf_mark(pc);
+   z3660_dopc_pf_mark(pc + 3u);
+   z3660_dopc_live_f = 1;
 
    /* The tag LAST. Everything above is dead until this line makes the way findable, so
     * there is no window in which a lookup can see a half-built entry -- which matters

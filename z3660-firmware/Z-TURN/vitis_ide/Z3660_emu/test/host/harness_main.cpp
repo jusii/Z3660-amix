@@ -4800,11 +4800,58 @@ static uae_u32 dopc_coh_probe(dopc_maint_fn maintain, int *cached_before, int *c
 
 static void dopc_m_cpushl(void)   { flush_mmu040(0, 0); }
 static void dopc_m_pflush_pg(void){ mmu_flush_atc(DOPC_VCODE, true, true); }
+/* C2 rung 1b: PFLUSH of a page that holds no cached decode. DOPC_VDATA is mapped, is a
+ * different guest page, and hashes to a different filter slot, so the narrowed path must
+ * take the "provably nothing here" branch. Chosen from the fixture's OWN address map
+ * rather than an invented constant: a page the fixture never maps would also pass, and
+ * would pass for the wrong reason if the narrowing ever started keying on mapped-ness. */
+static void dopc_m_pflush_other(void){ mmu_flush_atc(DOPC_VDATA, true, true); }
+/* The ADJACENT page. At the fixture's 4 KB page size this is a different guest page and
+ * must be skipped -- which is what says the flush extent is the page the guest named and
+ * not something rounded up to be safe. Over-reaching would be invisible in every other
+ * test here, because over-invalidating is never WRONG, only slower; this is the only case
+ * that can see it. */
+static void dopc_m_pflush_adj(void){ mmu_flush_atc(DOPC_VCODE + 0x1000u, true, true); }
+/* ...and the same address again with the core told it is running 8 KB pages, where that
+ * address is the SECOND HALF OF THE CACHED PAGE and the flush must therefore land.
+ *
+ * mmu_pagesize_8k is poked directly, and deliberately: the code under test is the extent
+ * arithmetic in mmu_flush_atc(), which reads exactly this variable, and driving it is the
+ * difference between testing that arithmetic and testing the page-table generator. It is
+ * the one line that would make a 4 KB filter granule silently miss the upper half of an
+ * 8 KB guest page -- an AMIX-040 kernel that chose 8 KB pages would execute overwritten
+ * instructions, and no other fixture in this file runs at 8 KB. Saved and restored, so
+ * nothing after it inherits the lie. */
+static void dopc_m_pflush_adj_8k(void)
+{
+	extern bool mmu_pagesize_8k;
+	bool was = mmu_pagesize_8k;
+	mmu_pagesize_8k = true;
+	mmu_flush_atc(DOPC_VCODE + 0x1000u, true, true);
+	mmu_pagesize_8k = was;
+}
 static void dopc_m_pflush_all(void){ mmu_flush_atc_all(true); }
 static void dopc_m_settc(void)    { mmu_set_tc(0x8000); }
 static void dopc_m_urp(void)      { uae_u32 v = regs.urp; m68k_move2c(0x806, &v); }
 static void dopc_m_srp(void)      { uae_u32 v = regs.srp; m68k_move2c(0x807, &v); }
-static void dopc_m_cacr(void)     { uae_u32 v = 0; m68k_move2c(2, &v); }
+/* CHANGES CACR, which rung 1b made the condition. Bit 15 is the 68040's instruction-cache
+ * enable -- the bit uae_mmu040_getc_iword() consults and the one the decoded-op cache is
+ * standing in for -- so this is the write whose semantics actually reach this cache, not
+ * merely a write to the register's address. The harness brings the CPU up with CACR 0, so
+ * the pre-1b `v = 0` version of this asked whether an INERT write invalidates; that it did
+ * was an accident of the policy rather than a requirement of the architecture, and the
+ * negative case below now pins the opposite. */
+static void dopc_m_cacr(void)     { uae_u32 v = regs.cacr ^ 0x8000u; m68k_move2c(2, &v); }
+static void dopc_m_cacr_same(void){ uae_u32 v = regs.cacr; m68k_move2c(2, &v); }
+/* NO FIXTURE FOR THE cacr_mask == 0 ARM, and the reason is a finding rather than an
+ * omission: m68k_move2c()'s own movec_illg() returns "illegal" for every CPU model the
+ * mask ladder does not name -- 68060 included -- so `case 2:` is reachable only on the
+ * 68020/030/040, and all three of those HAVE a mask. The guard is therefore unreachable
+ * today. It stays as a tripwire for the change that would otherwise break the narrowing
+ * silently (teaching movec_illg() about the 68060 without teaching the mask ladder), and
+ * it is documented as unreachable in newcpu_common.cpp rather than given a test that
+ * would have to lie about what it exercises.
+ */
 static void dopc_m_dma(void)      { z3660_dopc_invalidate_dma(DOPC_PCODE, 0x1000u); }
 static void dopc_m_tbl(void)      { build_cpufunctbl(); }
 static void dopc_m_knob(void)     { shared->dopc_on = Z3660_DOPC_OFF; z3660_knobs_sync();
@@ -4840,13 +4887,35 @@ static void test_dopc_coherence(void)
 	             "no maintenance: the stale decode runs (the 68040 contract, pinned)");
 
 	dopc_coh_one(dopc_m_cpushl,    2u, "CPUSHL / CINV (flush_mmu040) invalidates");
-	dopc_coh_one(dopc_m_pflush_pg, 2u, "PFLUSH of one page invalidates");
+	dopc_coh_one(dopc_m_pflush_pg, 2u, "PFLUSH of the page holding the cached decode "
+	                                   "invalidates (rung 1b: the filter says PRESENT)");
 	dopc_coh_one(dopc_m_pflush_all,2u, "PFLUSHA invalidates");
 
+	/* C2 rung 1b -- THE NARROWING, from both sides. The positive case above is the one
+	 * that must never regress; these two are the yield. A narrowing is only worth having
+	 * if it skips something, and only safe if what it skips is provably empty -- so both
+	 * halves are pinned, and the skip is asserted as delta 1 (the cached decode ran)
+	 * rather than merely tolerated. */
+	dopc_coh_one(dopc_m_pflush_other, 1u,
+	             "PFLUSH of a DIFFERENT page is skipped: no live entry can lie in it, so "
+	             "the cached decode survives (rung 1b)");
+	dopc_coh_one(dopc_m_pflush_adj, 1u,
+	             "...and so is the adjacent page at 4 KB -- the extent is the page the "
+	             "guest named, not a rounded-up neighbourhood");
+	dopc_coh_one(dopc_m_pflush_adj_8k, 2u,
+	             "...but at 8 KB that same address IS the cached page's second half, and "
+	             "the flush lands: the extent follows the guest's page size, not the "
+	             "filter's 4 KB granule");
 	dopc_coh_one(dopc_m_settc,     2u, "a TC write (MOVEC to TC -> mmu_set_tc) invalidates");
 	dopc_coh_one(dopc_m_urp,       2u, "MOVEC to URP -- an MMU ROOT change -- invalidates");
 	dopc_coh_one(dopc_m_srp,       2u, "MOVEC to SRP invalidates");
-	dopc_coh_one(dopc_m_cacr,      2u, "MOVEC to CACR invalidates");
+	dopc_coh_one(dopc_m_cacr,      2u, "MOVEC to CACR that CHANGES it invalidates");
+	/* C2 rung 1b's CACR narrowing, from the other side. A write that leaves every retained
+	 * bit where it was has changed no cache-enable, so the machine's cache configuration is
+	 * bit-identical and the cached decode is still the right one. Delta 1 == the cached
+	 * decode ran, which is the ASSERTION here and not a tolerated outcome. */
+	dopc_coh_one(dopc_m_cacr_same, 1u,
+	             "...but a CACR write that changes nothing does not (rung 1b)");
 	dopc_coh_one(dopc_m_dma,       2u,
 	             "DMA into an instruction page invalidates -- core1's own side of the "
 	             "piscsi mailbox calls exactly this, after core0 has written guest DRAM");
@@ -4925,6 +4994,198 @@ static void test_dopc_coherence(void)
 	shared->dopc_on = Z3660_DOPC_UNSET;
 	shared->blk_chunk = Z3660_BLK_UNSET;
 	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
+ * CYBERSTORM C2 rung 1b -- THE NARROWING'S MECHANISM
+ *
+ * test_dopc_coherence() above asserts the CONSEQUENCE: which instruction runs after which
+ * maintenance. That is the contract, and it is the right thing to pin. But it cannot see
+ * whether the narrowing works for the reason it is supposed to -- a filter that returned
+ * "present" for every address would pass every case in that corpus while delivering
+ * nothing, and a filter that lost an entry would pass every case in it except one
+ * carefully chosen page. So this asserts the mechanism directly: the live flag, the
+ * filter's answers, and above all THE FILTER INVARIANT walked over the real table.
+ * ================================================================== */
+static void dopc_narrow_teardown(void)
+{
+	regs.spcflags     = 0;
+	harness_shared_defaults();
+	shared->dopc_on   = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+}
+
+static void test_dopc_narrowing(void)
+{
+	printf("[test] C2 rung 1b: the narrowed invalidation -- the live flag, the filter, "
+	       "and the invariant that makes skipping safe\n");
+
+	/* ---- THE EMPTY-CACHE SHORT-CIRCUIT ----------------------------------------------
+	 * The arm that applies to EVERY cause, including the two whose addresses are in the
+	 * wrong namespace to narrow any other way. The 2026-08-23 verdict measured 2.94 M
+	 * invalidations in a BLK-off dhrystone against 160 k with the recognizer on -- an 18x
+	 * storm out of AMIX's per-instruction CPUSHL loop, whose iterations dispatch nothing
+	 * in between. Everything after the first has an empty cache to clear. */
+	{
+		uae_u32 g0, g1, g2;
+
+		dopc_coh_build();
+		dopc_coh_step(4);
+		CHECK_EQ32((uae_u32)z3660_dopc_live(), 1u,
+		           "a fill marks the cache live");
+		g0 = z3660_dopc_generation();
+
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		g1 = z3660_dopc_generation();
+		CHECK(g1 != g0, "an invalidation with entries live MOVES the generation\n");
+		CHECK_EQ32((uae_u32)z3660_dopc_live(), 0u,
+		           "...and leaves the cache reporting itself empty");
+
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
+		z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT);
+		g2 = z3660_dopc_generation();
+		CHECK_EQ32(g2, g1,
+		           "further invalidations with NOTHING cached do not move it at all -- "
+		           "any cause, the empty-cache short-circuit");
+
+		/* And the cache is genuinely usable again afterwards, which is the half a
+		 * short-circuit could plausibly break: skipping the bump must not leave the
+		 * table in a state where the next fill lands in a set that reads live-but-stale. */
+		dopc_coh_step(4);
+		CHECK_EQ32((uae_u32)z3660_dopc_live(), 1u,
+		           "...and the next fill brings it back to life");
+		CHECK_EQ32((uae_u32)z3660_dopc_peek(DOPC_VCODE, 1), DOPC_C_ADD1,
+		           "...with the head cached again, so the skip cost nothing permanent");
+		dopc_narrow_teardown();
+	}
+
+	/* ---- THE SHORT-CIRCUIT'S ONE HOLE, DRIVEN OPEN AND SHOWN SHUT -------------------
+	 *
+	 * live_f says "nothing has been filled since the generation last moved", and it is a
+	 * sound proxy for "no set is live" only because the generation moves in exactly one
+	 * place. z3660_dopc_force_generation() is the exception -- the harness's own wrap
+	 * helper -- and moving the generation by hand can land it back on a stamp still
+	 * sitting in the table, reviving entries with no fill involved. The short-circuit
+	 * would then skip an invalidation that was genuinely required.
+	 *
+	 * This drives that exact sequence. The anti-vacuity check in the middle is the load-
+	 * bearing one: without it the case would pass just as happily against a helper that
+	 * revived nothing. */
+	{
+		uae_u32 g;
+
+		dopc_coh_build();
+		dopc_coh_step(4);
+		g = z3660_dopc_generation();
+
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		CHECK_EQ32((uae_u32)z3660_dopc_live(), 0u, "invalidated: the cache reads empty");
+
+		z3660_dopc_force_generation(g);
+		CHECK_EQ32((uae_u32)z3660_dopc_peek(DOPC_VCODE, 1), DOPC_C_ADD1,
+		           "a hand-moved generation really does revive the table (anti-vacuity: "
+		           "without this the case below would pass against a no-op)");
+
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		CHECK_EQ32((uae_u32)z3660_dopc_peek(DOPC_VCODE, 1), 0xFFFFFFFFu,
+		           "...and the next invalidation still kills it -- force_generation marks "
+		           "the cache live, so the short-circuit cannot skip a needed flush");
+		dopc_narrow_teardown();
+	}
+
+	/* ---- THE FILTER, AND THE INVARIANT THE SKIP RESTS ON ----------------------------- */
+	{
+		dopc_coh_build();
+		dopc_coh_step(4);
+
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_audit(), 0u,
+		           "THE INVARIANT: every live entry's page reads PRESENT in the filter "
+		           "(walked over the real table, not argued)");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VCODE), 1u,
+		           "...the cached code page reads PRESENT");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VDATA), 0u,
+		           "...and a page with no cached decode reads ABSENT -- without this the "
+		           "filter would be sound and worthless");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VCODE + 0x1000u), 0u,
+		           "...as does the adjacent page");
+
+		/* The filter dies WITH the entries it describes. If it outlived them it would
+		 * saturate and the narrowing would quietly stop narrowing; if it were cleared
+		 * without them the invariant would break and the narrowing would skip a flush
+		 * that was required. Both directions are checked, in that order. */
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VCODE), 0u,
+		           "an invalidation clears the filter with the entries");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_audit(), 0u,
+		           "...and the invariant still holds over the emptied table");
+		dopc_narrow_teardown();
+	}
+
+	/* ---- THE pc+3 MARK, ISOLATED --------------------------------------------------
+	 *
+	 * z3660_dopc_fill() marks the filter for `pc` AND for `pc + 3`, and the second mark
+	 * needs a case that fails without it or it is decoration. Here is the argument it
+	 * rests on, because it is narrower than it first looks:
+	 *
+	 *   With translation ON, z3660_dopc_ext_reachable() bounds an entry's cached
+	 *   extension word to the same MMU PAGE as its pc, and a PFLUSH names a whole MMU
+	 *   page -- so pc's own granule is always inside the flushed extent and the pc+3 mark
+	 *   is redundant. Including at 8 KB, where the extent spans both 4 KB granules.
+	 *
+	 *   With translation OFF it is not redundant. ext_reachable()'s granule is then the
+	 *   64 KB BANK, not a page, so an entry's cached extension word can sit in a
+	 *   different 4 KB granule -- and a different 4 KB page -- from its pc, while PFLUSH
+	 *   still names 4 KB. The mark is what keeps such an entry findable from the page its
+	 *   extension word actually lives in.
+	 *
+	 * So the mark is unconditional rather than gated on have_ext0 or on regs.mmu_enabled:
+	 * the filter is not the place to re-derive which granule rule was in force when an
+	 * entry was built. This fixture pins that it fires, in the one shape where the two
+	 * marks land in different granules and NOTHING ELSE touches the second one:
+	 *
+	 *   +0x0FFC  5289  ADDQ.L #1,A1
+	 *   +0x0FFE  60FC  BRA.S -4   -> +0x0FFC
+	 *
+	 * The loop lives entirely in the last two words of the page, so page 2 is never
+	 * fetched from -- it is not even mapped. A fill that marked only `pc` would leave
+	 * VCODE+0x1000 reading ABSENT, and this case is the only one in the corpus that would
+	 * notice. */
+	{
+		mmu040_gen_init();
+		mmu040_gen_map(DOPC_VCODE, DOPC_PCODE, 0);
+		mmu040_gen_map(DOPC_VVEC,  DOPC_PVEC,  0);
+		mmu040_gen_map(DOPC_VSTK,  DOPC_PSTK,  0);
+		hram_poke16(DOPC_PCODE + 0x0FFC, DOPC_C_ADD1);   /* ADDQ.L #1,A1 */
+		hram_poke16(DOPC_PCODE + 0x0FFE, 0x60FC);        /* BRA.S -4     */
+
+		cpu_set_context(DOPC_VCODE + 0x0FFCu);
+		regs.vbr = DOPC_VVEC;
+		regs.s = 1;
+		m68k_areg(regs, 7) = DOPC_VSTK | 0xF00;
+		m68k_areg(regs, 1) = 0;
+		MakeSR();
+		shared->dopc_on   = Z3660_DOPC_DEFAULT;
+		shared->blk_chunk = Z3660_BLK_OFF;
+		z3660_knobs_sync();
+
+		dopc_coh_step(4);
+
+		CHECK_EQ32((uae_u32)z3660_dopc_peek(DOPC_VCODE + 0x0FFEu, 1), 0x60FCu,
+		           "the BRA at the very last word of the page is cached (anti-vacuity)");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VCODE + 0x0FFCu), 1u,
+		           "...its own granule reads PRESENT");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_test(DOPC_VCODE + 0x1000u), 1u,
+		           "...and so does the NEXT granule, which nothing here ever fetched from "
+		           "and which is not even mapped -- only fill()'s pc+3 mark can have set it");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_audit(), 0u,
+		           "...with the invariant intact at the page boundary");
+		dopc_narrow_teardown();
+		mmu040_off();
+	}
+
 	cpu_bringup(68030);
 }
 
@@ -5120,46 +5381,94 @@ static void test_dopc_counters(void)
 
 	/* ---- INVALIDATION ATTRIBUTION (C2 rung 1b) --------------------------------------
 	 *
-	 * DOPC_INVAL says how high the invalidation rate is; it has never said WHAT is driving
-	 * it, and the 2026-08-23 verdict needed exactly that -- it could establish that the
-	 * misses were invalidation re-warm but not which flush was causing them, so it could
-	 * not say which narrowing was worth the correctness risk. One counter per cause.
+	 * Two counters, two questions, and the whole narrowing verdict is the gap between
+	 * them: the IV_ block counts what the guest ASKED for, DOPC_INVAL counts what
+	 * actually happened. The 2026-08-23 verdict could read neither -- the firmware
+	 * reported one aggregate and discarded the cause -- so it could say the misses were
+	 * re-warm but not which flush caused them.
 	 *
-	 * The block is indexed arithmetically (BASE + cause), so what is pinned here is that
-	 * each cause lands in ITS OWN counter and that the block totals the aggregate. A cause
-	 * filed under its neighbour's name would fail nothing otherwise. */
+	 * Driven here from a cache in a KNOWN state rather than from a workload, because the
+	 * identity has to hold on both sides of the short-circuit and only a hand-driven
+	 * fixture can put it on both. */
 	{
 		uae_u64 v0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
 		uae_u64 f0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH];
 		uae_u64 d0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA];
-		uae_u64 p0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_PFLUSH];
-		uae_u64 req = 0, iv;
+		uae_u64 req, iv;
 		int c;
 
-		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
-		z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
-		z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSH);
+		/* Warm it, so the FIRST invalidation has something to do. */
+		dopc_coh_build();
+		dopc_coh_step(4);
 
-		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH] - f0), 1u,
-		           "IV_FLUSH counts the CPUSHL arm and only that");
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);   /* live -> performs  */
+		z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);     /* empty -> skipped  */
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);   /* empty -> skipped  */
+
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH] - f0), 2u,
+		           "IV_FLUSH counts REQUESTS: both CPUSHLs, including the skipped one");
 		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA] - d0), 1u,
-		           "IV_DMA counts the DMA arm and only that");
-		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_PFLUSH] - p0), 1u,
-		           "IV_PFLUSH counts the per-page flush -- the cause that was summed into "
-		           "the aggregate FLUSH before and could not be seen");
-		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - v0), 3u,
-		           "DOPC_INVAL still counts invalidations, whatever the cause");
+		           "IV_DMA counts its request too, and lands in its OWN counter -- the "
+		           "cause is no longer summed away");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - v0), 1u,
+		           "DOPC_INVAL counts only the one that had anything to invalidate");
 
-		/* THE SUM IDENTITY. Every invalidation performed is attributed to exactly one
-		 * cause, so the block sums to the aggregate. It is the check that would catch a
-		 * call site bypassing the attribution, or a cause id out of range landing outside
-		 * the block and silently incrementing a neighbour. */
+		/* THE IDENTITY, over the whole block rather than the two causes touched above:
+		 * requests are never fewer than performed, and the difference is the yield. It is
+		 * the check that would catch a call site bypassing the attribution, or a cause id
+		 * out of range landing outside the block. */
+		req = 0;
 		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
 			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
 		iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
-		CHECK(req == iv,
-		      "sum(IV_*) == DOPC_INVAL: every invalidation is attributed to exactly one "
-		      "cause (%llu vs %llu)\n", (unsigned long long)req, (unsigned long long)iv);
+		CHECK(req >= iv,
+		      "sum(IV_*) >= DOPC_INVAL: every invalidation performed was requested "
+		      "(%llu >= %llu)\n", (unsigned long long)req, (unsigned long long)iv);
+		printf("       invalidation attribution: %llu requests, %llu performed, "
+		       "%llu narrowed away\n",
+		       (unsigned long long)req, (unsigned long long)iv,
+		       (unsigned long long)(req - iv));
+
+		regs.spcflags = 0;
+	}
+
+	/* ---- THE OFF ARM'S COUNTER CONTRACT, CORRECTED ----------------------------------
+	 *
+	 * docs/decoded-op-cache.md claimed "with the cache off, none of them move at all",
+	 * and the 2026-08-23 verdict caught that being false: DOPC_INVAL read 164,311 and
+	 * 2,951,874 in the two cache-off arms, because z3660_dopc_invalidate() never had an
+	 * on/off test -- only the LOOKUP consults the switch. Rung 1b changes the fact as
+	 * well as the sentence, and in opposite directions for the two kinds of counter, so
+	 * the corrected contract is pinned here rather than left to prose:
+	 *
+	 *   HIT / MISS / EXT   exactly 0 -- the lookup returns before it can count.
+	 *   DOPC_INVAL         exactly 0 NOW, because nothing is ever filled with the cache
+	 *                      off, so the empty-cache short-circuit fires on every request.
+	 *   IV_*               DO MOVE. They count what the guest asked for, and the guest
+	 *                      goes on issuing CPUSHL and PFLUSH whatever this switch says.
+	 *
+	 * That last line is the useful one: it makes the OFF arm a free measurement of the
+	 * guest's own invalidation rate, which is the denominator every narrowing decision
+	 * needs and which the ON arm cannot supply uncontaminated. */
+	{
+		uae_u64 v0, f0;
+		struct dopc_cnt offc;
+
+		z3660_prof_zero();
+		dopc_count_run(&offc, Z3660_DOPC_OFF, N);
+		v0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		f0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH];
+
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH] - f0), 1u,
+		           "OFF: the CAUSE still counts -- the guest's flush rate is measurable "
+		           "with the cache switched off");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - v0), 0u,
+		           "OFF: but no invalidation is PERFORMED -- nothing was ever filled");
+		CHECK_EQ32((uae_u32)z3660_dopc_live(), 0u,
+		           "OFF: the cache never reports itself live");
+		CHECK_EQ32((uae_u32)z3660_dopc_pf_audit(), 0u,
+		           "OFF: and the filter invariant is trivially, checkably intact");
 	}
 
 	z3660_prof_zero();
@@ -5226,6 +5535,7 @@ int main(int argc, char **argv)
 	test_blk_state_equivalence();
 	test_dopc_state_equivalence();
 	test_dopc_coherence();
+	test_dopc_narrowing();
 	test_prof_wire_format();
 	test_prof_build_variant();
 #if Z3660_EMU_PROF

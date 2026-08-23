@@ -63,6 +63,7 @@ int m68k_move2c (int regno, uae_u32 *regp)
 		case 2:
 			{
 				uae_u32 cacr_mask = 0;
+				uae_u32 cacr_was  = regs.cacr;
 				if (currprefs.cpu_model == 68020)
 					cacr_mask = 0x0000000f;
 				else if (currprefs.cpu_model == 68030)
@@ -78,10 +79,37 @@ int m68k_move2c (int regno, uae_u32 *regp)
 				 * the instruction cache off has asked for its contents to stop being
 				 * authoritative, so honour that here as well.
 				 *
-				 * RUNG 1b gives it its OWN cause id, split out of ROOT: it is a
-				 * cache-enable write rather than an address-space change, and AMIX's
-				 * rate of it was never separately visible. */
-				z3660_dopc_invalidate(Z3660_DOPC_INV_CACR);
+				 * RUNG 1b narrows it to writes that CHANGE the register, and gives it its
+				 * own cause id so AMIX's rate of it is finally visible on its own rather
+				 * than summed into URP/SRP. The argument is exact rather than statistical:
+				 * on a 68040 the retained bits are the two cache ENABLES and nothing else
+				 * (cacr_mask 0x80008000 -- the 68040 has no clear-cache bits in CACR; it
+				 * uses CINV/CPUSH instructions, which arrive at mmu_flush_cache()). If
+				 * neither enable moved, the machine's cache configuration is bit-identical
+				 * and nothing a cached decode depends on has changed.
+				 *
+				 * Comparing the whole masked register, not just bit 15, keeps that true on
+				 * the 020/030 masks as well -- where the retained bits DO include
+				 * clear-cache bits, so any write that asks for a clear differs from the
+				 * previous value and still invalidates.
+				 *
+				 * cacr_mask == 0 is the case that WOULD turn this narrowing into a silent
+				 * regression: the ladder above leaves it 0 for every CPU it does not
+				 * model, so regs.cacr is pinned at 0 there and "did it change?" would
+				 * answer NO for every write the guest makes. A register the emulator does
+				 * not model is one whose write it cannot prove inert, so that arm keeps
+				 * the rung-1 behaviour outright.
+				 *
+				 * IT IS UNREACHABLE TODAY, and saying so is worth more than pretending
+				 * otherwise: movec_illg() above returns illegal for every model this
+				 * ladder does not name -- the 68060 included -- so `case 2:` is reached
+				 * only on the 68020/030/040, and all three have a mask. This is a
+				 * TRIPWIRE for the one-line change that would otherwise break the
+				 * narrowing quietly: teaching movec_illg() about the 68060 without
+				 * teaching the ladder here. The host corpus has no fixture for it,
+				 * deliberately -- a test that cannot reach a branch should not claim to. */
+				if (cacr_mask == 0 || regs.cacr != cacr_was)
+					z3660_dopc_invalidate(Z3660_DOPC_INV_CACR);
 			}
 			break;
 		/* 68040 only */

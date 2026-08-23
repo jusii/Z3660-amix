@@ -1518,12 +1518,31 @@ void REGPARAM2 mmu_flush_atc(uaecptr addr, bool super, bool global)
 	}	
 	flush_shortcut_cache(addr, super);
 	mmu_flush_icache_only();
-	/* CYBERSTORM C2 rung 1b. PFLUSH of one page gets its OWN cause id, split out of the
-	 * aggregate FLUSH: it is the only invalidation cause that names a guest LOGICAL page --
-	 * the namespace this cache tags in -- and therefore the only one that could ever be
-	 * narrowed by address. Whether that is worth doing is what the counter is for. Whole
-	 * cache for now, exactly as before. */
-	z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSH);
+	/* CYBERSTORM C2 rung 1b -- THE ONE NARROWED CAUSE.
+	 *
+	 * PFLUSH is the only invalidation cause that names a guest LOGICAL page, which is the
+	 * namespace the decoded-op cache tags in; CPUSHL's operand and the DMA arm's range are
+	 * both physical and cannot be compared against a tag at all (z3660_dopc.h). So this is
+	 * where a narrowing is available, and the cache is asked whether the page it is about
+	 * to be flushed for could hold any decode. If it provably cannot, nothing happens.
+	 *
+	 * `super` and `global` are deliberately NOT passed. Narrowing by address space as well
+	 * would be architecturally defensible -- the tag carries the S bit -- but it doubles
+	 * the number of ways to be subtly wrong for a second-order gain, and `global` selects
+	 * which ATC lines survive rather than what the page means. Flushing both address
+	 * spaces' entries for the page is strictly more conservative than the architecture
+	 * requires, and costs one bit test either way.
+	 *
+	 * The extent is the GUEST page, not the filter granule: the granule is 4 KB and a 68040
+	 * page may be 8 KB, so the size is what makes the second half of an 8 KB page get
+	 * tested. It is read from `mmu_pagesize_8k` -- the same variable the ATC index above is
+	 * built from, twelve lines up -- rather than from a cached copy elsewhere, so the flush
+	 * and the page it names cannot disagree about how big a page is. */
+	{
+		unsigned int pgsz = mmu_pagesize_8k ? 8192u : 4096u;
+		z3660_dopc_invalidate_log_range((unsigned int)(addr & ~(pgsz - 1u)), pgsz,
+		                                Z3660_DOPC_INV_PFLUSH);
+	}
 }
 
 void REGPARAM2 mmu_flush_atc_all(bool global)

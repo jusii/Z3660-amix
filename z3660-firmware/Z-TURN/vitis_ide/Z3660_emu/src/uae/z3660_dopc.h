@@ -49,6 +49,65 @@
  * the architecture: core0 writes guest DRAM directly on a piscsi or floppy read, and the
  * interpreter never sees those bytes go past.
  *
+ * ------------------------------------------------------------------------------------
+ * RUNG 1b -- NARROWING, AND THE NAMESPACE WALL THAT DECIDES WHAT CAN BE NARROWED
+ * ------------------------------------------------------------------------------------
+ *
+ * The 2026-08-23 metal verdict measured the cost of the conservative policy and it is
+ * the dominant term: **274-292 misses per invalidation across three unrelated workloads**
+ * (boot, dhrystone, raw disk). A constant that does not move with the workload's code
+ * footprint is not capacity -- and 285 is far below the 4096 entries the cache holds, so
+ * the guest never comes close to filling it between flushes. The misses are re-warm.
+ *
+ * THE OBVIOUS NARROWING IS NOT AVAILABLE, and the reason is worth stating first because
+ * it is the fact that shapes everything below. **This cache is tagged by guest LOGICAL
+ * address. The two largest invalidation causes name PHYSICAL ones.**
+ *
+ *   CPUSHL / CINV   The 68040's caches are physically tagged, so `CPUSHL <cache>,(An)`
+ *                   takes a PHYSICAL address in An. (Upstream's flush_mmu040() discards
+ *                   the argument for exactly this reason.)
+ *   DMA             core0 is handed the guest driver's DMA target, which is a physical
+ *                   address by construction -- a descriptor a device could execute.
+ *
+ * Scoping either one against a logical tag would compare two different numbers and skip
+ * an invalidation that was required. The host corpus already proves it: `dopc_m_dma()`
+ * invalidates DOPC_PCODE (0x001C0000) for an entry tagged at DOPC_VCODE (0x00800000), so
+ * a naive range test refuses the flush and the stale decode runs. Narrowing those two
+ * needs a PHYSICAL index this cache does not maintain, and building one costs a
+ * translation on the fill path. That is a separate rung with its own evidence, not this
+ * one; **PFLUSH is the only cause that names a logical page**, and it is narrowed here.
+ *
+ * SO RUNG 1b NARROWS TWO THINGS, and both are namespace-free or logical:
+ *
+ *  1. THE EMPTY-CACHE SHORT-CIRCUIT, which applies to EVERY cause including the two
+ *     above. If nothing has been filled since the last invalidation, no entry is live,
+ *     so the invalidation has nothing to do and does not move the generation. This is
+ *     the one that addresses the measured storm: with the block-idiom recognizer off the
+ *     verdict measured 18x more invalidations (2.94 M against 160 k), because AMIX's
+ *     CPUSHL loop invalidates once per instruction -- and consecutive iterations of that
+ *     loop dispatch nothing in between, so all but the first have an empty cache to
+ *     clear. It cannot be wrong: "no entry exists" is not an approximation.
+ *
+ *  2. PFLUSH OF ONE PAGE, through a PAGE-PRESENCE FILTER (below) -- a conservative
+ *     summary of which logical pages the cache holds entries from. If the filter says no
+ *     entry can lie in the flushed page, the flush is skipped; if it says one might, the
+ *     whole cache goes exactly as before. The filter is allowed to say "maybe" when the
+ *     answer is "no" (that is today's behaviour, merely slower) and is NEVER allowed to
+ *     say "no" when the answer is "yes" -- which is the same asymmetry the policy above
+ *     is built on, moved one level down.
+ *
+ * WHY A FILTER AND NOT A TAG WALK. A 4 KB guest page spans pc[11:1], and the set index is
+ * pc[10:1] -- so a page touches EVERY ONE of the 1024 sets. "Invalidate just this page"
+ * is therefore a full 4096-tag walk over 32 KB of tag lines, which is the whole Cortex-A9
+ * L1 D-cache; it would evict the interpreter's working set on every PFLUSH to save a
+ * re-warm of ~285 entries. The filter answers the same question with one load and one
+ * test, and adds NOTHING to the hit path -- which is the constraint this rung exists
+ * under ("a high hit rate with a low speedup" is its pre-registered failure mode).
+ *
+ * WHAT IS DELIBERATELY LEFT WHOLE-CACHE: MOVEC to URP/SRP, MOVEC to TC, PFLUSHA,
+ * build_cpufunctbl() and map_banks(). Root and table changes are genuinely global and
+ * genuinely rare, and a narrowing there would buy a rounding error at real risk.
+ *
  * THE RULE LIVES IN A HEADER, and it is a RULE rather than a measurement, for the reason
  * amix_ram.h, overhead_switches.h and z3660_blk.h give: the host harness compiles it
  * directly and asserts every branch, including the ones no metal session will exercise.
@@ -104,6 +163,11 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
  * half of that stamp is per-SET (z3660_dopc_set::stamp) and not per-entry, because every
  * invalidation this cache performs is whole-cache: a per-entry stamp would cost three
  * more compares on the hit path and could never disagree with its neighbours.
+ *
+ * RUNG 1b DOES NOT CHANGE THAT, and the distinction is the reason it costs nothing on the
+ * hit path: the narrowing decides WHETHER an invalidation happens, never how much of the
+ * cache it covers. Every invalidation that does happen is still the whole cache, still
+ * one generation increment, and still read by one per-set compare.
  *
  * An ODD pc would collide with the supervisor tag of the instruction before it, so the
  * lookup refuses one outright rather than encoding it. Nothing can execute at an odd pc
@@ -163,6 +227,51 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
                                    * of it was never separately visible.                 */
 #define Z3660_DOPC_INV_COUNT  10
 
+/* ---- The page-presence filter (rung 1b) --------------------------------------------
+ *
+ * A conservative summary of which logical pages the cache holds entries from, so a
+ * page-scoped PFLUSH can be skipped outright when it cannot possibly matter.
+ *
+ * THE INVARIANT, and it is the whole correctness argument:
+ *
+ *     for every LIVE entry (a way in a set whose stamp == the current generation, whose
+ *     tag is not the empty marker), the filter bit for that entry's pc IS SET.
+ *
+ * It holds because entries come into existence in exactly one place -- z3660_dopc_fill()
+ * -- which sets the bit before it stores the tag that makes the way findable; and bits
+ * are cleared in exactly one place, z3660_dopc_invalidate(), which in the same call moves
+ * the generation, after which no set is live and the invariant is vacuous. Nothing else
+ * writes a tag or a filter bit. `z3660_dopc_pf_audit()` walks the real table and asserts
+ * it, so the harness checks the mechanism rather than a consequence of it.
+ *
+ * CONTRAPOSITIVE, which is what the skip uses: bit clear => no live entry in that page =>
+ * an invalidation on account of that page is provably a no-op. A hash COLLISION sets a
+ * bit for a page that holds nothing, which produces a needless whole-cache invalidation
+ * -- i.e. exactly the rung-1 behaviour. So hash quality is a performance question and
+ * never a correctness one.
+ *
+ * GRANULE 4 KB, the smaller of the two 68040 page sizes, so one guest page is one or two
+ * granules and never a fraction of one. 4096 bits = 512 bytes = 16 Cortex-A9 lines: it
+ * stays L1-resident, and clearing it costs ~100 cycles against a re-warm this is trying
+ * to avoid paying ~50000 for.
+ *
+ * THE FOLD is A12..A23 xor A24..A35. Without it the AMIX kernel's text at 0x08000000 and
+ * a user text page at 0x00000000 would land on the same bit, which is the single most
+ * likely collision on this guest and would have made the filter useless on the workload
+ * it was built for. */
+#define Z3660_DOPC_PF_SHIFT  12u
+#define Z3660_DOPC_PF_GRAN   (1u << Z3660_DOPC_PF_SHIFT)
+#define Z3660_DOPC_PF_BITS   4096u
+#define Z3660_DOPC_PF_WORDS  (Z3660_DOPC_PF_BITS / 32u)
+#define Z3660_DOPC_PF_BYTES  (Z3660_DOPC_PF_WORDS * 4u)
+
+static inline unsigned z3660_dopc_pf_slot(unsigned addr)
+{
+   unsigned pg = (unsigned)addr >> Z3660_DOPC_PF_SHIFT;
+   pg ^= pg >> 12;
+   return pg & (Z3660_DOPC_PF_BITS - 1u);
+}
+
 /* ---- The extension-word window -----------------------------------------------------
  *
  * The map asks the entry to hold "the instruction's extension words", but the generated
@@ -195,9 +304,27 @@ extern unsigned short z3660_dopc_ext_val;
  * disarms the extension-word window. Safe to call from any core1 context, including one
  * that has never touched the 68040 run loop.
  *
- * From rung 1b it also counts the CAUSE, so a capture can say WHICH events are driving the
- * invalidation rate rather than only how high it is. */
+ * From rung 1b it counts the CAUSE unconditionally and then does the work only if there
+ * is work to do (the empty-cache short-circuit). So the two counters answer two different
+ * questions and the difference between them is the narrowing's yield:
+ *
+ *     sum of DOPC_IV_*   how often the guest ASKED for an invalidation
+ *     DOPC_INVAL         how often one actually happened
+ *
+ * That identity is why the skips need no counter of their own, and it is checked in the
+ * harness rather than assumed. */
 void z3660_dopc_invalidate(int cause);
+
+/* Narrowed invalidation for a LOGICAL address range -- today, PFLUSH of one page.
+ *
+ * The range must be the guest page the flush names, in the SAME namespace the tags use.
+ * Do not call this with a physical address: see the namespace paragraph at the top of
+ * this file, which is the reason CPUSHL and DMA do not come through here.
+ *
+ * len == 0 means "unknown extent" and is treated as the whole cache, not as an empty
+ * range -- an unknown range is the one case where guessing small is the dangerous
+ * direction. */
+void z3660_dopc_invalidate_log_range(unsigned int addr, unsigned int len, int cause);
 
 /* The DMA arm, called from core1's side of the cross-core mailbox once core0 has written
  * guest DRAM. Takes the range core0 wrote even though it invalidates everything: the
@@ -215,18 +342,35 @@ unsigned z3660_dopc_set(unsigned requested);
 /* Harness only. Nothing on the board calls any of these.
  *
  *   generation()        the live stamp, so a test can watch it move
- *   force_generation()  drive it to the wrap boundary without performing 2^32 invalidations
+ *   force_generation()  drive it to the wrap boundary without performing 2^32
+ *                       invalidations. It also marks the cache LIVE: a hand-moved
+ *                       generation can land on a stamp still in the table and revive a
+ *                       set no fill touched, and the short-circuit would then skip an
+ *                       invalidation that was needed. A test helper must not be able to
+ *                       construct a state the firmware cannot reach.
  *   set_bytes()/        the REAL sizeof() of the table and one set, so the geometry is
  *   table_bytes()       asserted against the struct rather than against the constants it
  *                       was supposed to be built from
  *   peek()              the cached opcode at (pc, space), or -1 for "not cached". A
  *                       coherence test that can ask this directly asserts the mechanism;
- *                       one that can only infer it from execution asserts a consequence. */
+ *                       one that can only infer it from execution asserts a consequence.
+ *   live()              has anything been filled since the last invalidation? This is
+ *                       the empty-cache short-circuit's own predicate, exposed so a test
+ *                       can drive both sides of it deliberately instead of hoping.
+ *   pf_test()           the filter's answer for one address: 1 == "an entry MAY lie in
+ *                       this page", 0 == "provably none does".
+ *   pf_audit()          walks the REAL table and returns the number of live entries whose
+ *                       filter bit is clear. Must be 0 -- it is the filter invariant
+ *                       stated as a number, and the only check that would catch a fill
+ *                       path that forgot to set a bit. */
 unsigned int z3660_dopc_generation(void);
 void         z3660_dopc_force_generation(unsigned int gen);
 unsigned     z3660_dopc_set_bytes(void);
 unsigned     z3660_dopc_table_bytes(void);
 int          z3660_dopc_peek(unsigned int pc, int super);
+int          z3660_dopc_live(void);
+int          z3660_dopc_pf_test(unsigned int addr);
+int          z3660_dopc_pf_audit(void);
 
 #ifdef __cplusplus
 }
