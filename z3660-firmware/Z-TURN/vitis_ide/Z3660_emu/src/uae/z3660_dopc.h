@@ -159,9 +159,9 @@
  * Invalidation is whole-cache again for every cause, exactly as in rung 1; the only
  * narrowing in the firmware is the CACR compare, which happens before this file is
  * reached at all. The next narrowing worth attempting is a PHYSICAL INDEX, because that
- * is the only thing the namespace wall leaves standing and IV_FLUSH's 47-64 % is what
- * would fund it. It is its own design round: it costs a translation on the fill path,
- * which is the cost class that just failed here, so it needs its own pre-registration
+ * is the only thing the namespace wall leaves standing and IV_FLUSH's measured 46.70-63.89 %
+ * is what would fund it. It is its own design round: it costs a translation on the fill
+ * path, which is the cost class that just failed here, so it needs its own pre-registration
  * with the fill-path price measured rather than assumed.
  *
  * WHAT IS DELIBERATELY LEFT WHOLE-CACHE: MOVEC to URP/SRP, MOVEC to TC, PFLUSHA,

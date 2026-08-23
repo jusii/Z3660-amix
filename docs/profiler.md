@@ -320,8 +320,19 @@ correctly.
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
-`DOPC_HIT + DOPC_MISS == INSNS` when the decoded-op cache is on — every dispatch consults it
-exactly once, which is what makes `DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate.
+
+```
+DOPC_HIT + DOPC_MISS  ==  INSNS + FAULTS        with the decoded-op cache on
+```
+
+— every dispatch consults the cache exactly once, which is what makes
+`DOPC_HIT / (DOPC_HIT + DOPC_MISS)` a hit rate. **The `+ FAULTS` term is not slack**: a
+faulting instruction *consults the cache* (so it is a dispatch) and then *throws before
+retiring through the run-loop tail* (so `INSNS` never counts it), and twelve metal captures
+across three sessions and three firmware builds put the sum above `INSNS` by exactly `FAULTS`,
+every time, to the unit. This document previously stated the identity as `== INSNS`, and the
+rung-1 session read the gap as a live-print artefact of the dump loop; it is a mechanism. A
+difference that reproduces another counter in the same dump exactly, twelve times, is not skew.
 
 > `IFETCH_CALLS == FETCH` says nothing about how often the ifetch **buckets** are entered — see
 > the `s`-block section above, where the measured spans refute that inference by 1.97×.
@@ -811,6 +822,17 @@ counter, then a few `[PROF] r` derived rates. Its header line carries
 > magic is present, rather than refusing a capture that is provably intact. The firmware
 > cannot fix either from its end; the second one is a shared-UART property (see the PSTAT
 > law below).
+>
+> **And a third, of the same family: the stats dump's banner.** `PROFD`'s first line
+> (`[PROF] === stage attribution ===`) collides with the console echo of the `PROFD` that
+> requested it, in exactly the way the ring dump's first header line does and for exactly the
+> same reason — one UART behind one semaphore, and the echo is already in flight when the
+> firmware takes it. The banner arrives mangled or short; **every `b`, `t`, `s`, `c` and `r`
+> line after it is intact**, because each is a separate `printf` that acquires the semaphore
+> cleanly. **This one is handled host-side and the firmware cannot fix it**: there is no
+> ordering the dumping core can impose on an echo the other core has already begun. A
+> symbolizer must key on the `[PROF] ver=` line rather than on the banner, and must not treat
+> a missing or corrupt banner as a truncated capture.
 
 ---
 

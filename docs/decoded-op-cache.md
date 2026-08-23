@@ -406,6 +406,19 @@ logical tag. The one cause the page filter was built for is 6–9 %.** The attri
 before a single timing was taken, and it is the reason the revert is a decomposition rather
 than a coin-toss.
 
+> **★ The figure to quote for `IV_FLUSH` is its measured range: 46.70 – 63.89 %** — raw disk at
+> the bottom, boot at the top, dhrystone at 51.21 % in between. That is the range C2 map v3
+> §17.3 carries and the one a decision should cite, because `IV_FLUSH` is **the only large
+> cause that carries a namespace a physical index could match against**, and it is therefore
+> the number that would fund building one. The other 27–36 % (`IV_PFLUSHA`) names no page and
+> is not reachable by this or any tag-based narrowing.
+>
+> The table above and the map's are two independent derivations of the same session and agree
+> to within 0.07 pp on every row (63.83/51.16/46.63 here against 63.89/51.21/46.70 there); the
+> map's are the ones quoted downstream, so they are the ones named here. Nothing in either set
+> changes a conclusion, and the discrepancy is recorded rather than harmonised away because a
+> silently unified number is how two captures become one imaginary one.
+
 ### What rung 1b did, and what happened to each arm
 
 1. **The empty-cache short-circuit** — applies to **every** cause, in either namespace. If
@@ -480,6 +493,13 @@ Current sizes, lean build, **counted in ARM instructions** from `objdump -d`:
 | `uae_mmu040_get_iword` | **76** (0x130 = 304 bytes) | the hit path — unchanged across 1, 1b, 1c |
 | `m68k_run_mmu040` | **572** (0x8f0 = 2288 bytes) | unchanged across 1, 1b, 1c |
 | `z3660_dopc_fill` | **65** (0x104 = 260 bytes) | the marks are gone |
+
+> **A unit note on the rows above, since this table has been bitten by one before.** These
+> are the symbols' sizes in 32-bit *words* (`bytes ÷ 4`), which on a fixed-width target is
+> instructions **plus each symbol's literal pool**. Counting instructions alone —
+> `objdump -d` minus the `.word` lines — gives `m68k_run_mmu040` **552** and
+> `uae_mmu040_get_iword` **64** on the same lean build. Neither measure is wrong; they are
+> not the same measure, and the difference is the constant pool.
 
 > **Unit correction.** The rung-1 table above read "`uae_mmu040_get_iword` 136 → 152
 > instructions" beside "`m68k_run_mmu040` 572 instructions". The two rows were **not in the
@@ -588,29 +608,67 @@ where the *interactive* login path (fork/exec/page-fault/bzero) is exactly the w
 accelerates. Run the sweep with `AMIX_CMD_TIMEOUT=300`, and raising the fieldkit default is an
 `amix-kerntools` change.
 
-### PRE-REGISTERED for the rung-1c verdict
+### PRE-REGISTERED for the rung-1c verdict — and how it scored
 
 Rung 1c removes two of rung 1b's three arms and keeps the third, so it is scored **against rung
 1b's measured figures and against rung 1's**, not against a fresh model. Written before the
-session that will judge it.
+session that will judge it; the **measured** and **verdict** columns were added after and the
+pre-registered ones were not touched.
 
-| row | rung 1 | rung 1b | **rung-1c expectation** | reasoning |
-|---|---|---|---|---|
-| **dhrystone, cadence 1, lean** | 5432.0 | 5306.0 | **≥ 5432** | the revert removes the per-fill marks that cost 1b its 2.32 %; the kept CACR arm costs one compare, so ~neutral-to-slightly-positive against rung 1 is the honest expectation. **This is the row the rung stands or falls on.** |
-| hit rate, **dhrystone** | 77.48 % | 84.56 % | **78–82 %** | gives back most of 1b's +7.08 pp: the CACR arm is kept and it removed ~93 % of the invalidations, but re-warm from the restored PFLUSH/short-circuit traffic returns |
-| hit rate, **boot** | 69.76 % | 74.60 % | **70–74 %** | as dhrystone; boot's `IV_PFLUSH` share (6.15 %) is the part coming back |
-| hit rate, **raw disk** | 67.74 % | 73.85 % | **69–73 %** | as boot |
-| **`DOPC_INVAL`, dhrystone** | 80 719 | 36 472 | **well below 80 719, near 40 000** | the CACR arm alone accounted for ≈41 k of the 44 k rung 1b removed, so most of 1b's invalidation win must survive the revert. **If it lands near 80 000 the CACR arm is not working** and the keep was mis-attributed. |
-| **`IV_CACR_SKIP`** | — | (uncounted) | **≈ 40 000 on a dhrystone run**, and `sum(IV_*) == DOPC_INVAL` exactly | the new counter should make visible, in one dump, the quantity the verdict reconstructed across two sessions |
-| **boot window, lean** | 52 s | 53 s | **52–54 s, unchanged** | nothing on the boot path changed; a move here means something else did |
-| `FETCHOP + FETCHEX` | 12.64 % | 11.04 % | **10–13 %** | tracks the hit rate back down; it must not exceed rung 1's 12.64 % |
+| row | rung 1 | rung 1b | **rung-1c expectation** | **measured** | verdict | reasoning |
+|---|---|---|---|---|---|---|
+| **dhrystone, cadence 1, lean** | 5432.0 | 5306.0 | **≥ 5432** | **5584.0** | **HIT**, +2.80 % | the revert removes the per-fill marks that cost 1b its 2.32 %; the kept CACR arm costs one compare, so ~neutral-to-slightly-positive against rung 1 is the honest expectation. **This is the row the rung stands or falls on.** |
+| hit rate, **dhrystone** | 77.48 % | 84.56 % | **78–82 %** | **85.32 %** | **above band** — and the band was wrong, see below | gives back most of 1b's +7.08 pp: the CACR arm is kept and it removed ~93 % of the invalidations, but re-warm from the restored PFLUSH/short-circuit traffic returns |
+| hit rate, **boot** | 69.76 % | 74.60 % | **70–74 %** | **72.83 %** | in band | as dhrystone; boot's `IV_PFLUSH` share (6.15 %) is the part coming back |
+| hit rate, **raw disk** | 67.74 % | 73.85 % | **69–73 %** | **75.53 %** | **above band** | as boot |
+| **`DOPC_INVAL`, dhrystone** | 80 719 | 36 472 | **well below 80 719, near 40 000** | **39 858** | **HIT** | the CACR arm alone accounted for ≈41 k of the 44 k rung 1b removed, so most of 1b's invalidation win must survive the revert. **If it lands near 80 000 the CACR arm is not working** and the keep was mis-attributed. |
+| **`IV_CACR_SKIP`** | — | (uncounted) | **≈ 40 000 on a dhrystone run**, and `sum(IV_*) == DOPC_INVAL` exactly | **39 353**, and the identity held **exactly** | **HIT** | the new counter should make visible, in one dump, the quantity the verdict reconstructed across two sessions |
+| **boot window, lean** | 52 s | 53 s | **52–54 s, unchanged** | **52 s** | **HIT** | nothing on the boot path changed; a move here means something else did |
+| `FETCHOP + FETCHEX` | 12.64 % | 11.04 % | **10–13 %** | **not taken** | **owed** | tracks the hit rate back down; it must not exceed rung 1's 12.64 % |
+
+**Six hits, two hit-rate rows above band, one row untaken.** The rung is taken: the row it was
+said to stand or fall on cleared its bar by 2.80 % on a three-run arm with 0.125 % spread, the
+invalidation attribution came in where the keep predicted, and the new counter made in one dump
+what the previous verdict reconstructed across two sessions.
+
+#### The hit-rate bands were refuted, and the lesson is bigger than the rows
+
+**The three hit-rate rows assumed 1b's +7.08 pp would be *given back* when its two arms were
+reverted. It was not, because it was never theirs**: the gain belonged to the kept CACR arm all
+along, and reverting the page filter and the short-circuit did not touch it. Two of the three
+rows therefore came in *above* their bands, and the bands should be read as **refuted, not
+narrowly missed** — an expectation built on a mis-attribution does not become right by landing
+close to it.
+
+> **★ And the rung's own completed lesson, which is why those rows should not have been
+> load-bearing in the first place: the hit rate is not what pays. The fill-path cost is.**
+>
+> Rung 1b had the **higher** hit rate (84.56 % against rung 1's 77.48 %) and was **slower**
+> (5306.0 against 5432.0). Rung 1c has a hit rate higher again (85.32 %) and is faster than
+> both (5584.0). Across three measured configurations the hit rate and the speed do not track
+> each other at all; what tracks the speed is **what the fill path costs**, because the fill
+> path runs on every miss and its price is paid whether or not the miss it serves was
+> expensive. 1b's two hashed filter marks and flag store were paid on every fill to remove
+> misses that were **re-warm** — still hot in `ipagecache` (91.61 %) and in the ARM's own
+> caches — and re-warm misses are the cheap ones.
+>
+> So: **do not pre-register a hit-rate band as a proxy for a speed prediction on this cache.**
+> Pre-register the fill path's cost, and price avoided misses by *which* misses they are. That
+> is also the bar the next rung has to clear — see the physical index below, whose whole cost
+> lands exactly there.
 
 **Stop conditions.** (a) An OFF arm whose `DOPC_HIT`/`MISS`/`EXT`/`INVAL` are not all exactly
 zero **in a `PROFZ`-zeroed window** — the counters accumulate from power-on and the console
 cannot fire before core1 starts, so an un-zeroed OFF arm legitimately carries a warm-up window
 (2.49 M dispatches, 1.5 % of a boot) and is *not* a stop. (b) `sum(IV_*) != DOPC_INVAL` on a
 cache-on capture. (c) `STACK_OVF` non-zero. (d) any new panic, bus error or filesystem error in
-the span.
+the span. **None fired.**
+
+**What is still owed on this rung**, carried here so it is not lost between documents: the
+`FETCHOP + FETCHEX` row above (C2 map §19 item 1, the cheapest thing on that list); a same-boot
+`DOPC` ON/OFF A/B defending the +2.80 % against the rig's proven ~9 % cross-session drift (§19
+item 3 — 2.80 % sits inside that band, and no same-boot ratio was taken in the 1c session); and
+the cache's worth **on disk** for 1c, which has no arm at all.
 
 ## PRE-REGISTERED (rung 1) — and how it scored
 
