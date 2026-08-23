@@ -473,6 +473,9 @@ correctly.
 | 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) |
 | 38 | `IV_CACR_SKIP` | ... a `MOVEC` to CACR proved **inert at its call site** (C2 rung 1c) — **not a cause**, and not a member of the block above |
 | 39–42 | `DOPC_WAY0` `DOPC_WAY1` `DOPC_WAY2` `DOPC_WAY3` | ... **which way a hit was served from** (C2 v3.1 §25.2). Incremented on the hit arm only — a miss has no way |
+| 43 | `MISALIGN_I` | of `MISALIGN_R`, the **instruction-stream** half (C2 rung 2). `MISALIGN_R` is incremented at `get_ilong` as well as at the two data sites, so `MISALIGN_R − MISALIGN_I` is the genuine misaligned **data** reads. See `docs/accessor-fastpath.md` |
+| 44 | `DFAST_HIT` | data accesses served by the **accessor fast path** (C2 rung 2) — its coverage of `READ + WRITE` |
+| 45 | `DFAST_XPAR` | ... of those, via a **TTR match** rather than the page cache. The supervisor/user access split, measured |
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and

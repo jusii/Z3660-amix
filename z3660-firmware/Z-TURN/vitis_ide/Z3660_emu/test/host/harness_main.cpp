@@ -2966,18 +2966,28 @@ static void test_prof_wire_format(void)
 	/* C2 v3.1 SS25.2: the way histogram, appended at 39..42 and pinned by the same
 	 * argument as the cause block -- it is indexed WAY_BASE + way inside the lookup, so
 	 * an off-by-one in the base would file every hit under the wrong way and the verdict
-	 * the map pre-registered would be a verdict about the wrong number. This block IS
-	 * last, so pinning it to COUNT is correct here and is what the tripwire in
-	 * z3660_prof.cpp asserts at compile time. */
+	 * the map pre-registered would be a verdict about the wrong number. Pinned to the
+	 * counter that FOLLOWS the block rather than to COUNT -- the block was last for
+	 * exactly one commit, and against COUNT this would have gone on passing while way 3
+	 * aliased onto rung 2's MISALIGN_I. */
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_WAY0, 39, "DOPC_WAY0 at 39");
 	CHECK_EQ32((uae_u32)(Z3660_PROF_C_DOPC_WAY_BASE + Z3660_DOPC_WAYS),
-	           (uae_u32)Z3660_PROF_C_COUNT,
-	           "...and the way block runs to the end of the counter space");
+	           (uae_u32)Z3660_PROF_C_MISALIGN_I,
+	           "...and the way block ends where the counter after it begins");
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_WAY0], "DOPC_WAY0") == 0,
 	      "names line up with ids (DOPC_WAY0)\n");
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_WAY3], "DOPC_WAY3") == 0,
 	      "names line up with ids (DOPC_WAY3, the far end of the block)\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   43, "43 counters");
+	/* C2 rung 2's three: the misaligned-read denominator split, and the fast path's
+	 * coverage counters. Appended after the way block, same rule as everything above. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_MISALIGN_I, 43, "MISALIGN_I at 43");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DFAST_HIT,  44, "DFAST_HIT at 44");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DFAST_XPAR, 45, "DFAST_XPAR at 45");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_MISALIGN_I], "MISALIGN_I") == 0,
+	      "names line up with ids (MISALIGN_I)\n");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DFAST_XPAR], "DFAST_XPAR") == 0,
+	      "names line up with ids (DFAST_XPAR, the last counter)\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   46, "46 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -4208,6 +4218,548 @@ static void blk_case(const struct blk_desc *c, unsigned cap, int engage,
 		      lbl, g_blk_fast.steps, g_blk_ref.steps);
 	else
 		CHECK_EQ32((uae_u32)g_blk_fast.steps, (uae_u32)g_blk_ref.steps, lbl);
+}
+
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 2 -- THE VERDICT TABLE, REPLAYED EXHAUSTIVELY
+ *
+ * The fast path replaces an out-of-line call to mmu_match_ttr() with one load out of a
+ * 2 x 256 table. The table's build (cpummu.cpp, z3660_dfast_rebuild) is written as a
+ * transcription of mmu_do_match_ttr(), and a transcription is exactly the kind of thing
+ * that is right in the four cases someone thought of.
+ *
+ * So this does not sample. For each register configuration it walks the WHOLE (super x
+ * top-byte) space -- 512 points -- and demands that the table agree with the live
+ * mmu_match_ttr(), verdict AND installed cache state. 512 points is small enough to be
+ * exhaustive and that is the entire argument for indexing the table this way in the
+ * first place: the match depends on the address only through its top byte.
+ * ================================================================== */
+static void test_dfast_verdict_table(void)
+{
+	printf("[test] C2 accessor fast path: the verdict table replays mmu_match_ttr exactly\n");
+
+	static const struct { uae_u32 dtt0, dtt1; const char *what; } CFG[] = {
+		{ 0, 0, "no window enabled" },
+		/* The AMIX-040 kernel's own registers, from pstart040.s. The configuration this
+		 * rung was designed against, so it is in the corpus by name rather than by luck. */
+		{ 0x003fc060u, 0x807fa060u, "AMIX-040: DTT0 0-1GB both, DTT1 2GB+ supervisor" },
+		{ 0x003fc000u, 0, "0-1GB, S-field enabled (matches both), copyback" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED, 0,
+		  "one 16MB window, both privilege levels" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED, 0, "one 16MB window, USER only (S=00)" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_SUPER, 0,
+		  "one 16MB window, SUPERVISOR only (S=01)" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_BIT_WRITE_PROTECT, 0, "write-protected window" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_CACHE_DISABLE, 0, "cache-inhibited window" },
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_CACHE_MODE, 0, "copyback window" },
+		/* Both windows live, and OVERLAPPING, so the "dtt0 first, dtt1 only on a
+		 * no-match" ordering is exercised rather than assumed. */
+		{ 0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED,
+		  0x0A000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED
+		    | MMU_TTR_BIT_WRITE_PROTECT, "overlapping windows: dtt0 must win" },
+		/* dtt0 disabled but dtt1 live: the fall-through must actually fall through. */
+		{ 0, 0x0C000000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED,
+		  "dtt0 off, dtt1 on" },
+		/* A full-mask window: everything matches. */
+		{ 0x00ff0000u | MMU_TTR_BIT_ENABLED | MMU_TTR_BIT_SFIELD_ENABLED, 0,
+		  "mask 0xff: the whole address space is transparent" },
+	};
+	const int NCFG = (int)(sizeof CFG / sizeof CFG[0]);
+	int c, mmuon, super, msb, mismatched = 0, checked = 0;
+
+	mmu040_gen_init();
+
+	for (mmuon = 1; mmuon >= 0; mmuon--) {
+		mmu_set_tc((uae_u16)(mmuon ? 0x8000 : 0));
+		for (c = 0; c < NCFG; c++) {
+			regs.dtt0 = CFG[c].dtt0;
+			regs.dtt1 = CFG[c].dtt1;
+			mmu_tt_modified();                 /* rebuilds the table */
+			for (super = 0; super < 2; super++) {
+				for (msb = 0; msb < 256; msb++) {
+					uae_u32 addr = (uae_u32)msb << 24;
+					uae_u16 vr = z3660_dfv_r[super][msb];
+					uae_u16 vw = z3660_dfv_w[super][msb];
+					int live, want_r, want_w;
+					uae_u8 live_cs;
+
+					mmu_cache_state = 0xEE;
+					live = mmu_match_ttr(addr, super != 0, true);
+					live_cs = mmu_cache_state;
+
+					if (live == TTR_OK_MATCH) {
+						want_r = Z3660_DFAST_XPAR; want_w = Z3660_DFAST_XPAR;
+					} else if (live == TTR_NO_WRITE) {
+						want_r = Z3660_DFAST_XPAR; want_w = Z3660_DFAST_SLOW;
+					} else if (mmuon) {
+						want_r = Z3660_DFAST_PAGE; want_w = Z3660_DFAST_PAGE;
+					} else {
+						want_r = Z3660_DFAST_SLOW; want_w = Z3660_DFAST_SLOW;
+					}
+					checked++;
+					if ((int)Z3660_DFAST_VERDICT(vr) != want_r ||
+					    (int)Z3660_DFAST_VERDICT(vw) != want_w) {
+						if (!mismatched)
+							printf("  FAIL: %s: mmuon=%d super=%d msb=%02x live=%d "
+							       "table r=%u w=%u want r=%d w=%d\n",
+							       CFG[c].what, mmuon, super, msb, live,
+							       (unsigned)Z3660_DFAST_VERDICT(vr),
+							       (unsigned)Z3660_DFAST_VERDICT(vw), want_r, want_w);
+						mismatched++;
+					}
+					/* The cache state a match installs is the OTHER half of the
+					 * equivalence and the half a transcription is likeliest to get
+					 * wrong -- it is three bits of CM decoded into three constants. */
+					if (live == TTR_OK_MATCH || live == TTR_NO_WRITE) {
+						if (Z3660_DFAST_CSTATE(vr) != live_cs) {
+							if (!mismatched)
+								printf("  FAIL: %s: msb=%02x cache state table=%02x "
+								       "live=%02x\n", CFG[c].what, msb,
+								       (unsigned)Z3660_DFAST_CSTATE(vr),
+								       (unsigned)live_cs);
+							mismatched++;
+						}
+					}
+				}
+			}
+		}
+	}
+	CHECK(mismatched == 0,
+	      "the table agrees with mmu_match_ttr over all %d (config x mmu-state x super x "
+	      "top-byte) points (%d mismatches)\n", checked, mismatched);
+	printf("       %d points checked across %d register configurations\n", checked, NCFG);
+
+	/* And the disarm has to survive every one of those rebuilds: mmu_tt_modified() is
+	 * called on each configuration above, so a rebuild that ignored the switch would
+	 * silently re-arm the fast path in the middle of a reference run. */
+	{
+		int i, s, allslow = 1;
+		z3660_dfast_arm(0);
+		regs.dtt0 = 0x003fc060u; regs.dtt1 = 0x807fa060u;
+		mmu_tt_modified();
+		for (s = 0; s < 2; s++)
+			for (i = 0; i < 256; i++)
+				if (z3660_dfv_r[s][i] != Z3660_DFAST_SLOW ||
+				    z3660_dfv_w[s][i] != Z3660_DFAST_SLOW) allslow = 0;
+		CHECK(allslow, "a rebuild while disarmed still produces an all-SLOW table\n");
+		z3660_dfast_arm(1);
+	}
+
+	regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+	mmu040_off();
+}
+
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 2 -- THE ACCESSOR FAST PATH, BY STATE EQUIVALENCE
+ *
+ * The map's instruction, quoted: "state equivalence, not spot checks -- for a corpus of
+ * start states, run each access inlined and out-of-line and assert register file,
+ * affected memory, fault outcome and guest PC are byte-identical."
+ *
+ * The reference arm is not a second implementation: `z3660_dfast_arm(0)` rebuilds the
+ * verdict tables all-SLOW, so every access falls through to the ORIGINAL accessor -- the
+ * same text that ran before rung 2 existed. That is what makes this an equivalence test
+ * rather than two new things agreeing with each other.
+ *
+ * AND IT PINS ENGAGEMENT, because "the two agree" is trivially true when the fast path
+ * silently never fired -- the failure a state-equivalence test is blindest to. Every case
+ * says whether the fast path MUST serve, MUST NOT serve, or may do either, and the
+ * DFAST_HIT counter is checked against that. Half this corpus is decline cases; without
+ * the engagement check they would all pass against a fast path that was never compiled in.
+ * ================================================================== */
+
+/* The whole observable outcome of one guest access. */
+struct dfast_obs {
+	uae_u32 val;              /* what a read returned                                  */
+	int     faulted;          /* did it throw                                          */
+	uae_u32 fault_addr;       /* regs.mmu_fault_addr                                   */
+	uae_u32 pc;               /* m68k_getpc() afterwards -- the 68040 restarts the      *
+	                           * instruction, so a fault must not have moved it         */
+	uae_u32 wb3_status, wb2_status, wb3_data, wb2_address;
+	uae_u32 mmu_ssw;
+	uae_u8  cache_state;      /* mmu_cache_state: real state, and the field the fast    *
+	                           * path is most likely to get wrong                       */
+	uae_u32 mem[4];           /* the destination longwords after a write               */
+	uae_u32 regs_d[8], regs_a[8];
+	uae_u64 rhit, rmiss, whit, wmiss;   /* the page-cache counters MUST NOT MOVE       */
+	uae_u64 dfast_hit;        /* the PROFILING build's counter (0 elsewhere)           */
+	unsigned long serves;     /* the harness counter -- present in ALL three variants   */
+	unsigned long io_hits;    /* did the access reach a device bank's functions        */
+};
+
+/* What the corpus case does. */
+#define DF_RD_L 0
+#define DF_RD_W 1
+#define DF_RD_B 2
+#define DF_WR_L 3
+#define DF_WR_W 4
+#define DF_WR_B 5
+
+/* Whether the fast path is allowed / required to serve. */
+#define DF_MUST   0   /* it has to fire: this is a hit case                            */
+#define DF_NEVER  1   /* it must decline: fault, device, miss, TTR-write-protect        */
+
+static const char *df_opname(int op)
+{
+	switch (op) {
+	case DF_RD_L: return "read.l";  case DF_RD_W: return "read.w";  case DF_RD_B: return "read.b";
+	case DF_WR_L: return "write.l"; case DF_WR_W: return "write.w"; default: return "write.b";
+	}
+}
+
+/* One access, fully observed. `probe` is the address; `pobs` the physical window base to
+ * snapshot afterwards (0 = do not snapshot memory). */
+static void df_run(struct dfast_obs *o, int op, uae_u32 addr, uae_u32 val, uae_u32 pobs)
+{
+	int i;
+
+	memset(o, 0, sizeof *o);
+	mmu_cache_state = 0xEE;                 /* a poison the accessor must overwrite */
+	regs.mmu_fault_addr = 0;
+	regs.wb3_status = regs.wb2_status = 0;
+	hdirect_io_hits = 0;
+	z3660_dfast_serves = 0;
+	z3660_prof_zero();
+
+	SAVE_EXCEPTION;
+	TRY(p) {
+		switch (op) {
+		case DF_RD_L: o->val = get_long_mmu040(addr); break;
+		case DF_RD_W: o->val = get_word_mmu040(addr); break;
+		case DF_RD_B: o->val = get_byte_mmu040(addr); break;
+		case DF_WR_L: put_long_mmu040(addr, val);     break;
+		case DF_WR_W: put_word_mmu040(addr, val);     break;
+		default:      put_byte_mmu040(addr, val);     break;
+		}
+	} CATCH(p) { o->faulted = 1; (void)p; } ENDTRY
+	RESTORE_EXCEPTION;
+
+	o->fault_addr  = regs.mmu_fault_addr;
+	o->pc          = m68k_getpc();
+	o->wb3_status  = regs.wb3_status;
+	o->wb2_status  = regs.wb2_status;
+	o->wb3_data    = regs.wb3_data;
+	o->wb2_address = regs.wb2_address;
+	o->mmu_ssw     = regs.mmu_ssw;
+	o->cache_state = mmu_cache_state;
+	o->io_hits     = hdirect_io_hits;
+	for (i = 0; i < 8; i++) { o->regs_d[i] = m68k_dreg(regs, i); o->regs_a[i] = m68k_areg(regs, i); }
+	if (pobs)
+		for (i = 0; i < 4; i++) o->mem[i] = hdirect_peek32(pobs + (uae_u32)i * 4);
+#if Z3660_EMU_PROF
+	/* The page-cache counters exist only in the profiling build (CACHE_HIT_COUNT), so
+	 * the "hit rates must not move" half of the equivalence is checkable there and
+	 * nowhere else. It is the half that catches a fast path which probes the cache and
+	 * then declines -- which is exactly the defect this corpus found on its first run --
+	 * so the profiling variant is where that claim is made, and the harness's own serve
+	 * counter carries the engagement half in all three. */
+	o->rhit  = z3660_prof_cnt[Z3660_PROF_C_DPAGE_RHIT];
+	o->rmiss = z3660_prof_cnt[Z3660_PROF_C_DPAGE_RMISS];
+	o->whit  = z3660_prof_cnt[Z3660_PROF_C_DPAGE_WHIT];
+	o->wmiss = z3660_prof_cnt[Z3660_PROF_C_DPAGE_WMISS];
+	o->dfast_hit = z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
+#endif
+	o->serves    = z3660_dfast_serves;
+}
+
+static void df_equal(const struct dfast_obs *r, const struct dfast_obs *f, const char *what)
+{
+	int i;
+	CHECK_EQ32(f->val,        r->val,        what);
+	CHECK_EQ32((uae_u32)f->faulted, (uae_u32)r->faulted, what);
+	CHECK_EQ32(f->fault_addr, r->fault_addr, what);
+	CHECK_EQ32(f->pc,         r->pc,         what);
+	CHECK_EQ32(f->wb3_status, r->wb3_status, what);
+	CHECK_EQ32(f->wb2_status, r->wb2_status, what);
+	CHECK_EQ32(f->wb3_data,   r->wb3_data,   what);
+	CHECK_EQ32(f->wb2_address,r->wb2_address,what);
+	CHECK_EQ32(f->mmu_ssw,    r->mmu_ssw,    what);
+	CHECK_EQ32((uae_u32)f->cache_state, (uae_u32)r->cache_state, what);
+	for (i = 0; i < 4; i++) CHECK_EQ32(f->mem[i], r->mem[i], what);
+	for (i = 0; i < 8; i++) {
+		CHECK_EQ32(f->regs_d[i], r->regs_d[i], what);
+		CHECK_EQ32(f->regs_a[i], r->regs_a[i], what);
+	}
+	/* THE MAP'S OWN PRE-REGISTRATION, asserted here rather than left to metal: "the
+	 * dpagecache hit rates must not move -- if they change, the change altered WHAT is
+	 * being cached and the speed comparison is not like-for-like." The fast path shares
+	 * the existing index and tag arithmetic precisely so this holds. */
+	CHECK_EQ32((uae_u32)f->rhit,  (uae_u32)r->rhit,  what);
+	CHECK_EQ32((uae_u32)f->rmiss, (uae_u32)r->rmiss, what);
+	CHECK_EQ32((uae_u32)f->whit,  (uae_u32)r->whit,  what);
+	CHECK_EQ32((uae_u32)f->wmiss, (uae_u32)r->wmiss, what);
+}
+
+/* One corpus entry: run it disarmed, then armed, demand agreement, and demand the
+ * engagement the case declares. Both arms are run TWICE with the caches warmed the same
+ * way, so a case whose first access is a page-cache miss is compared warm-against-warm. */
+static void df_case(int op, uae_u32 addr, uae_u32 val, uae_u32 pobs, int engage,
+                    const char *what)
+{
+	struct dfast_obs ref, fast;
+	char lbl[192];
+	int prev;
+
+	snprintf(lbl, sizeof lbl, "%s %s @%08x", what, df_opname(op), (unsigned)addr);
+
+	prev = z3660_dfast_arm(0);
+	df_run(&ref, op, addr, val, pobs);      /* warm */
+	df_run(&ref, op, addr, val, pobs);      /* observed */
+	CHECK_EQ32((uae_u32)ref.serves, 0,
+	           "the reference arm serves nothing from the fast path");
+
+	z3660_dfast_arm(1);
+	df_run(&fast, op, addr, val, pobs);     /* warm */
+	df_run(&fast, op, addr, val, pobs);     /* observed */
+
+	df_equal(&ref, &fast, lbl);
+
+	if (engage == DF_MUST)
+		CHECK(fast.serves == 1,
+		      "%s: the fast path SERVED it (serves %lu, expected 1)\n", lbl, fast.serves);
+	else
+		CHECK(fast.serves == 0,
+		      "%s: the fast path DECLINED it (serves %lu, expected 0)\n", lbl, fast.serves);
+	/* In a profiling build the instrument's own counter must agree with the harness's.
+	 * They are incremented on the same line for exactly this cross-check: a DFAST_HIT
+	 * that disagreed would make every coverage figure in a metal dump a figure about
+	 * something else. */
+	if (z3660_prof_present())
+		CHECK_EQ32((uae_u32)fast.dfast_hit, (uae_u32)fast.serves,
+		           "DFAST_HIT agrees with the harness's own serve count");
+
+	z3660_dfast_arm(prev);
+}
+
+static void test_dfast_state_equivalence(void)
+{
+	printf("[test] C2 accessor fast path: state equivalence against the un-flattened path\n");
+
+	CHECK(harness_direct_ok(),
+	      "the identity window is mapped -- without it every case below would DECLINE "
+	      "and this corpus would test nothing\n");
+	if (!harness_direct_ok()) return;
+
+	/* Physical layout inside the identity window. Two adjacent pages so a page-crossing
+	 * case has somewhere to cross INTO, and one page left unmapped. */
+	const uae_u32 P0 = HDIRECT_BASE + 0x10000u;   /* data page 0 */
+	const uae_u32 P1 = HDIRECT_BASE + 0x11000u;   /* data page 1 */
+	const uae_u32 V0 = 0x00300000u;               /* kernel-ish VA for P0 */
+	const uae_u32 V1 = 0x00301000u;               /* ... P1, contiguous     */
+	const uae_u32 VU = 0x80800000u;               /* a USER VA              */
+	const uae_u32 VNONE = 0x00310000u;            /* mapped to nothing      */
+
+	/* ---- stage A: the ordinary hit, every size, supervisor ------------------------- */
+	mmu040_gen_init();
+	harness_direct_reset();
+	harness_direct_map(1);
+	mmu040_gen_map(V0, P0, 0);
+	mmu040_gen_map(V1, P1, 0);
+	hdirect_poke32(P0 + 0, 0xDEADBEEFu);
+	hdirect_poke32(P0 + 4, 0x01020304u);
+	regs.s = 1;
+
+	df_case(DF_RD_L, V0 + 0, 0, P0, DF_MUST, "supervisor page-cache hit");
+	df_case(DF_RD_W, V0 + 4, 0, P0, DF_MUST, "supervisor page-cache hit");
+	df_case(DF_RD_B, V0 + 6, 0, P0, DF_MUST, "supervisor page-cache hit");
+	df_case(DF_WR_L, V0 + 8, 0xA5A5F00Du, P0, DF_MUST, "supervisor page-cache hit");
+	df_case(DF_WR_W, V0 + 12, 0x1234u,    P0, DF_MUST, "supervisor page-cache hit");
+	df_case(DF_WR_B, V0 + 14, 0x77u,      P0, DF_MUST, "supervisor page-cache hit");
+
+	/* THE LAST BYTE AND THE FIRST BYTE OF A PAGE. An aligned access cannot cross a page,
+	 * which is the whole basis of "never fast-path across a page boundary" -- so the ends
+	 * of a page must serve exactly like its middle rather than being special-cased. */
+	df_case(DF_RD_L, V0 + 0xFFC, 0, P0, DF_MUST, "last aligned longword in the page");
+	df_case(DF_RD_B, V0 + 0xFFF, 0, P0, DF_MUST, "last byte in the page");
+	df_case(DF_RD_L, V1 + 0,     0, P1, DF_MUST, "first longword of the next page");
+
+	/* ---- stage B: user space, and the supervisor/user tag split -------------------- */
+	mmu040_gen_map(VU, P1, 0);
+	regs.s = 0;
+	df_case(DF_RD_L, VU + 0, 0, P1, DF_MUST, "user page-cache hit");
+	df_case(DF_WR_L, VU + 4, 0xFEEDFACEu, P1, DF_MUST, "user page-cache hit");
+	/* The same VA in the other privilege state is a DIFFERENT tag. V0 is mapped for
+	 * both, but the entry cached under one `regs.s` must not answer for the other -- the
+	 * fast path carries `| regs.s` in its tag exactly as the original does. */
+	regs.s = 1;
+	df_case(DF_RD_L, V0 + 0, 0, P0, DF_MUST, "supervisor after user (tag carries regs.s)");
+
+	/* ---- stage C: misalignment -- the split path must not be fast-pathed ----------- */
+	regs.s = 1;
+	df_case(DF_RD_L, V0 + 1, 0, P0, DF_NEVER, "misaligned longword read (odd)");
+	df_case(DF_RD_L, V0 + 2, 0, P0, DF_NEVER, "misaligned longword read (odd word)");
+	df_case(DF_RD_W, V0 + 1, 0, P0, DF_NEVER, "misaligned word read");
+	df_case(DF_WR_L, V0 + 2, 0x11223344u, P0, DF_NEVER, "misaligned longword write");
+	df_case(DF_WR_W, V0 + 1, 0x5566u,     P0, DF_NEVER, "misaligned word write");
+
+	/* THE MAP'S MANDATORY CASE: a misaligned access CROSSING a page boundary where the
+	 * SECOND page is unmapped. The fault must arrive with the same fault address and the
+	 * same guest PC, because the 68040 restarts the instruction. V1 is mapped, so unmap
+	 * the page after it and straddle that edge. */
+	df_case(DF_RD_L, V1 + 0xFFE, 0, P1, DF_NEVER,
+	        "misaligned read crossing into an UNMAPPED page");
+	df_case(DF_WR_L, V1 + 0xFFE, 0x99887766u, P1, DF_NEVER,
+	        "misaligned write crossing into an UNMAPPED page");
+
+	/* ---- stage D: faults ----------------------------------------------------------- */
+	df_case(DF_RD_L, VNONE, 0, 0, DF_NEVER, "read of an unmapped page");
+	df_case(DF_WR_L, VNONE, 0xCAFEBABEu, 0, DF_NEVER, "write to an unmapped page");
+
+	/* Write-protected page: the read serves, the write must fault through the original
+	 * path. Both arms of one page, which is the case a fast path that forgot to use the
+	 * WRITE cache would pass anyway -- so the read is asserted MUST and the write NEVER. */
+	{
+		const uae_u32 VWP = 0x00320000u, PWP = HDIRECT_BASE + 0x12000u;
+		mmu040_gen_map(VWP, PWP, MMU_DES_WP);
+		hdirect_poke32(PWP, 0x0BADF00Du);
+		df_case(DF_RD_L, VWP, 0, PWP, DF_MUST,  "write-protected page: the READ serves");
+		df_case(DF_WR_L, VWP, 0xFFFFFFFFu, PWP, DF_NEVER,
+		        "write-protected page: the WRITE faults through the original path");
+	}
+
+	/* Supervisor-only page accessed from user state. */
+	{
+		const uae_u32 VSO = 0x00330000u, PSO = HDIRECT_BASE + 0x13000u;
+		mmu040_gen_map(VSO, PSO, MMU_DES_SUPER);
+		hdirect_poke32(PSO, 0x5150F00Du);
+		regs.s = 1;
+		df_case(DF_RD_L, VSO, 0, PSO, DF_MUST,  "supervisor-only page, from supervisor");
+		regs.s = 0;
+		df_case(DF_RD_L, VSO, 0, PSO, DF_NEVER, "supervisor-only page, from USER: faults");
+		regs.s = 1;
+	}
+
+	/* ---- stage E: not plain RAM ---------------------------------------------------- */
+	/* The map: "an access to a destination that is NOT plain RAM must fall back rather
+	 * than fast-path a device write." Same window, same page tables, same page-cache
+	 * entries -- only the bank changes, so this isolates the bank test exactly. */
+	harness_direct_map(0);
+	{
+		struct dfast_obs o;
+		df_case(DF_RD_L, V0, 0, 0, DF_NEVER, "device bank: read declines");
+		df_case(DF_WR_L, V0, 0x0D0E0F10u, 0, DF_NEVER, "device bank: write declines");
+		/* ...and it really did reach the device's own accessor rather than being
+		 * optimised away. Without this the DF_NEVER above is satisfied by an access that
+		 * did not happen at all. */
+		z3660_dfast_arm(1);
+		df_run(&o, DF_WR_L, V0, 0x21222324u, 0);
+		CHECK(o.io_hits > 0,
+		      "the declined write reached the device bank's own put function (%lu calls)\n",
+		      o.io_hits);
+	}
+	harness_direct_map(1);
+
+	/* ---- stage F: transparent translation ------------------------------------------ */
+	/* A DTT window over the identity window: the whole point of the rung's redesign, and
+	 * the arm the AMIX-040 kernel puts ~30 % of its data accesses through. No page tables
+	 * are consulted at all here, so this also proves the XPAR arm does not silently fall
+	 * into the page cache. */
+	regs.s = 1;
+	regs.dtt0 = (HDIRECT_BASE & MMU_TTR_LOGICAL_BASE) | MMU_TTR_BIT_ENABLED
+	          | MMU_TTR_BIT_SFIELD_ENABLED;
+	regs.dtt1 = 0;
+	mmu_tt_modified();
+	mmu_flush_atc_all(true);
+	hdirect_poke32(P0, 0x7E571460u);
+	df_case(DF_RD_L, P0,     0,            P0, DF_MUST, "DTT0 transparent read");
+	df_case(DF_WR_L, P0 + 4, 0x33445566u,  P0, DF_MUST, "DTT0 transparent write");
+	df_case(DF_RD_B, P0 + 9, 0,            P0, DF_MUST, "DTT0 transparent byte read");
+	df_case(DF_RD_L, P0 + 1, 0,            P0, DF_NEVER, "DTT0 transparent, misaligned");
+
+	/* Write-protected TTR: reads transparent, writes must take the original path, which
+	 * is where mmu_match_ttr_write() raises the fault. */
+	regs.dtt0 |= MMU_TTR_BIT_WRITE_PROTECT;
+	mmu_tt_modified();
+	df_case(DF_RD_L, P0, 0, P0, DF_MUST, "write-protected DTT0: the READ serves");
+	df_case(DF_WR_L, P0, 0x0u, P0, DF_NEVER,
+	        "write-protected DTT0: the WRITE takes the original path");
+
+	/* A supervisor-only DTT accessed from user state: the table's S-field replay has to
+	 * agree with mmu_do_match_ttr()'s, per privilege level, per top byte. */
+	regs.dtt0 = (HDIRECT_BASE & MMU_TTR_LOGICAL_BASE) | MMU_TTR_BIT_ENABLED
+	          | MMU_TTR_BIT_SFIELD_SUPER;     /* S-field ENABLE bit clear => S is checked */
+	mmu_tt_modified();
+	mmu_flush_atc_all(true);
+	regs.s = 1;
+	df_case(DF_RD_L, P0, 0, P0, DF_MUST, "supervisor-only DTT0, from supervisor");
+	regs.s = 0;
+	/* From user the TTR does not match; there is no page mapping for this VA either, so
+	 * the original path faults and the fast path must not have served anything. */
+	df_case(DF_RD_L, P0, 0, P0, DF_NEVER, "supervisor-only DTT0, from USER");
+	regs.s = 1;
+
+	regs.dtt0 = regs.dtt1 = 0;
+	mmu_tt_modified();
+
+	/* ---- stage G: the invalidation ordering ---------------------------------------- */
+	/* The map: "an access whose page is invalidated between the cache lookup and the
+	 * use." There is no such window -- the lookup and the use are adjacent and nothing
+	 * can run between them -- so what is testable, and what actually matters, is that an
+	 * invalidation BEFORE the access is honoured: the fast path must not answer out of a
+	 * page-cache entry that PFLUSH has retired. */
+	{
+		struct dfast_obs o;
+		mmu040_gen_map(V0, P0, 0);
+		hdirect_poke32(P0, 0x11111111u);
+		z3660_dfast_arm(1);
+		df_run(&o, DF_RD_L, V0, 0, P0);                    /* warm the entry */
+		CHECK_EQ32(o.val, 0x11111111u, "warm read before the remap");
+
+		/* Re-point the VA at the OTHER frame and flush. If the fast path answered from a
+		 * stale entry it would return the old frame's contents. */
+		hdirect_poke32(P1, 0x22222222u);
+		mmu040_gen_map(V0, P1, 0);                          /* also flushes the ATC */
+		df_run(&o, DF_RD_L, V0, 0, P1);
+		CHECK_EQ32(o.val, 0x22222222u,
+		           "after a remap+flush the fast path reads the NEW frame, not a stale entry");
+
+		/* And a single-page PFLUSH, which is the narrower invalidation. */
+		mmu040_gen_map(V0, P0, 0);
+		mmu_flush_atc(V0, true, false);
+		df_run(&o, DF_RD_L, V0, 0, P0);
+		CHECK_EQ32(o.val, 0x11111111u, "and after a single-page PFLUSH");
+	}
+
+	/* ---- stage H: the MMU off ------------------------------------------------------ */
+	/* Pre-MMU boot. The fast path declines outright on this arm (z3660_dfast.h says why:
+	 * cache_default_data is not constant there and the write side can still raise a
+	 * TCR_DWO bus error), so what is asserted is that it declines and that the machine
+	 * still works. */
+	{
+		regs.dtt0 = regs.dtt1 = 0;
+		mmu_tt_modified();
+		mmu_set_tc(0);
+		harness_direct_map(1);
+		hdirect_poke32(P0, 0x0FF0FF00u);
+		df_case(DF_RD_L, P0, 0, P0, DF_NEVER, "MMU off: the fast path declines");
+		df_case(DF_WR_L, P0 + 4, 0x0BEEF00Du, P0, DF_NEVER, "MMU off: and on writes too");
+	}
+
+	/* ---- stage I: the disarm is a real reference ----------------------------------- */
+	/* Every case above compares against the disarmed arm, so the disarm being subtly
+	 * different from "rung 2 was never compiled in" would make the whole corpus agree
+	 * about the wrong thing. Pin the two properties that make it the original machine:
+	 * it serves nothing, and it leaves the verdict tables saying SLOW everywhere. */
+	{
+		int i, s, allslow = 1;
+		z3660_dfast_arm(0);
+		for (s = 0; s < 2; s++)
+			for (i = 0; i < 256; i++)
+				if (z3660_dfv_r[s][i] != Z3660_DFAST_SLOW ||
+				    z3660_dfv_w[s][i] != Z3660_DFAST_SLOW) allslow = 0;
+		CHECK(allslow, "disarmed: every verdict in both tables is SLOW\n");
+		CHECK_EQ32((uae_u32)z3660_dfast_armed(), 0, "...and the switch reads back off");
+		z3660_dfast_arm(1);
+		CHECK_EQ32((uae_u32)z3660_dfast_armed(), 1, "re-arming restores it");
+	}
+
+	mmu040_off();
+	harness_direct_map(1);
+	z3660_dfast_arm(1);
 }
 
 static void test_blk_state_equivalence(void)
@@ -5741,6 +6293,8 @@ int main(int argc, char **argv)
 	test_perf_line_clock();
 	test_runloop_build_variant();
 	test_shared_mailbox_offsets();
+	test_dfast_verdict_table();
+	test_dfast_state_equivalence();
 	test_blk_state_equivalence();
 	test_dopc_state_equivalence();
 	test_dopc_coherence();

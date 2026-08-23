@@ -21,6 +21,12 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cstring>
+#include <sys/mman.h>   /* the C2 rung-2 identity window: see harness_direct_init() */
+
+/* Older glibc headers know the kernel flag but do not define it. 0x100000 since 4.17. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 /* ---- Emulator config globals (normally in uae_emulator.cpp, excluded) ---- */
 struct uae_prefs currprefs, changed_prefs;
@@ -66,6 +72,93 @@ addrbank hram_bank = {
 
 void harness_mem_reset(void){ if (g_ram) memset(g_ram, 0, HRAM_SIZE); }
 
+/* =====================================================================
+ *  THE IDENTITY WINDOW (C2 rung 2) -- see harness.h for why it exists.
+ *
+ *  One mmap at a FIXED host address equal to the guest address it serves, so that inside
+ *  it `(uae_u8 *)guest_addr` is a valid host pointer and the board's direct-bank model is
+ *  literally true rather than approximated. Without it the accessor fast path declines in
+ *  every test and its whole hit case is untested.
+ * ===================================================================== */
+static uae_u8 *g_direct = NULL;
+
+int harness_direct_ok(void) { return g_direct != NULL; }
+void harness_direct_reset(void) { if (g_direct) memset(g_direct, 0, HDIRECT_SIZE); }
+
+void hdirect_poke32(uae_u32 a, uae_u32 v)
+{
+	uae_u8 *m = (uae_u8 *)(uintptr_t)a;
+	m[0]=(uae_u8)(v>>24); m[1]=(uae_u8)(v>>16); m[2]=(uae_u8)(v>>8); m[3]=(uae_u8)v;
+}
+uae_u32 hdirect_peek32(uae_u32 a)
+{
+	const uae_u8 *m = (const uae_u8 *)(uintptr_t)a;
+	return ((uae_u32)m[0]<<24)|((uae_u32)m[1]<<16)|((uae_u32)m[2]<<8)|m[3];
+}
+
+/* The NON-direct twin: same storage, reached through the bank's function pointers, and
+ * counting every call. A "device" for the purposes of the decline test. */
+unsigned long hdirect_io_hits = 0;
+static uae_u32 REGPARAM2 hdio_lget(uaecptr a){ hdirect_io_hits++; return hdirect_peek32(a); }
+static uae_u32 REGPARAM2 hdio_wget(uaecptr a){ hdirect_io_hits++; const uae_u8 *m=(const uae_u8*)(uintptr_t)a; return (uae_u32)((m[0]<<8)|m[1]); }
+static uae_u32 REGPARAM2 hdio_bget(uaecptr a){ hdirect_io_hits++; return *(const uae_u8*)(uintptr_t)a; }
+static void REGPARAM2 hdio_lput(uaecptr a, uae_u32 v){ hdirect_io_hits++; hdirect_poke32(a, v); }
+static void REGPARAM2 hdio_wput(uaecptr a, uae_u32 v){ hdirect_io_hits++; uae_u8 *m=(uae_u8*)(uintptr_t)a; m[0]=(uae_u8)(v>>8); m[1]=(uae_u8)v; }
+static void REGPARAM2 hdio_bput(uaecptr a, uae_u32 v){ hdirect_io_hits++; *(uae_u8*)(uintptr_t)a = (uae_u8)v; }
+
+/* baseaddr_direct_r/_w are the LAST two pointer fields; set non-NULL to make this bank
+ * direct. The VALUE is never dereferenced by the fork's identity formula -- only its
+ * non-NULL-ness is tested -- but pointing it at the window keeps it honest. */
+static addrbank hdirect_bank = {
+	hdio_lget, hdio_wget, hdio_bget,      /* never called while the bank is direct */
+	hdio_lput, hdio_wput, hdio_bput,
+	NULL, NULL, NULL, _T("hdirect"), _T("Harness identity window"),
+	hdio_lget, hdio_wget,
+	ABFLAG_RAM, 0, 0
+};
+static addrbank hdirect_io_bank = {
+	hdio_lget, hdio_wget, hdio_bget,
+	hdio_lput, hdio_wput, hdio_bput,
+	NULL, NULL, NULL, _T("hdirectio"), _T("Harness identity window (device)"),
+	hdio_lget, hdio_wget,
+	ABFLAG_IO, 0, 0
+};
+
+void harness_direct_map(int direct)
+{
+	addrbank *b = direct ? &hdirect_bank : &hdirect_io_bank;
+	unsigned i;
+	if (!g_direct) return;
+	for (i = 0; i < (HDIRECT_SIZE >> 16); i++)
+		mem_banks[(HDIRECT_BASE >> 16) + i] = b;
+}
+
+static void harness_direct_init(void)
+{
+	if (g_direct) return;
+	void *p = mmap((void *)(uintptr_t)HDIRECT_BASE, HDIRECT_SIZE,
+	               PROT_READ | PROT_WRITE,
+	               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED || (uintptr_t)p != (uintptr_t)HDIRECT_BASE) {
+		/* NOT fatal, and NOT silent: harness_direct_ok() stays 0 and the tests that
+		 * need the window fail with a message naming this. A skipped test that reports
+		 * PASS is worse than a failing one. */
+		if (p != MAP_FAILED) munmap(p, HDIRECT_SIZE);
+		fprintf(stderr, "[harness] WARNING: could not map the identity window at %08x -- "
+		                "the C2 rung-2 fast-path tests will FAIL rather than be skipped\n",
+		        (unsigned)HDIRECT_BASE);
+		return;
+	}
+	g_direct = (uae_u8 *)p;
+	/* Point the two banks' direct pointers at the window. Done here rather than in the
+	 * initialisers because HDIRECT_BASE has to survive being a pointer, and a static
+	 * initialiser casting an integer constant to uae_u8* is not portable C++. */
+	hdirect_bank.baseaddr_direct_r = g_direct;
+	hdirect_bank.baseaddr_direct_w = g_direct;
+	hdirect_io_bank.baseaddr_direct_r = NULL;
+	hdirect_io_bank.baseaddr_direct_w = NULL;
+}
+
 /* The firmware's power-on state for the cross-core knobs, reproduced here.
  *
  * On the board core0's config parser ALWAYS publishes these (resolve_amix_ram /
@@ -91,6 +184,10 @@ void harness_mem_init(void)
 	/* Point every 64KB bank slot at the flat RAM (whole 32-bit space resolves). */
 	for (unsigned i = 0; i < MEMORY_BANKS; i++)
 		mem_banks[i] = &hram_bank;
+	/* ...then hand the identity window's slots to the direct bank, so the board's
+	 * direct-bank model is exercised by default rather than only when a test asks. */
+	harness_direct_init();
+	harness_direct_map(1);
 }
 
 /* =====================================================================

@@ -677,7 +677,44 @@ enum {
    Z3660_PROF_C_DOPC_WAY1       = 40,
    Z3660_PROF_C_DOPC_WAY2       = 41,
    Z3660_PROF_C_DOPC_WAY3       = 42,
-   Z3660_PROF_C_COUNT           = 43,
+   /* CYBERSTORM C2 rung 2 -- THE MISALIGNED-READ DENOMINATOR, SPLIT.
+    *
+    * v3.1 SS25.1 reported "one guest read in five is misaligned (20.71 %) against one
+    * write in 800 (0.12 %)" and called the asymmetry the bucket's own unexplained
+    * sub-path. It is a DENOMINATOR DEFECT, and this counter is what settles it on the
+    * next capture instead of by argument.
+    *
+    * MISALIGN_R is incremented at THREE sites: uae_mmu040_get_long, _get_word -- and
+    * uae_mmu040_get_ILONG, which is an INSTRUCTION-STREAM fetch. C_READ is incremented
+    * at the data sites only. So the ratio divides (data + instruction) misalignments by
+    * data reads alone. There is no instruction-stream analogue on the write side, which
+    * is exactly why writes read 170x lower.
+    *
+    * And the instruction stream misaligns BY CONSTRUCTION: guest instructions are
+    * word-aligned, so a 32-bit fetch at pc+2 has a 50 % chance of sitting at an address
+    * = 2 (mod 4), which `is_unaligned_bus(addr, 4)` calls misaligned. It is not a
+    * property of the workload at all.
+    *
+    * MISALIGN_I counts the instruction-stream half separately, so that:
+    *
+    *     genuine misaligned DATA reads  ==  MISALIGN_R - MISALIGN_I
+    *
+    * and the map's row can be restated against the denominator it meant. Predicted, in
+    * advance of any capture: MISALIGN_I is the overwhelming majority of the 8 231 131,
+    * and the remainder is the same order as MISALIGN_W's 0.12 %. */
+   Z3660_PROF_C_MISALIGN_I      = 43, /* ... of MISALIGN_R, the instruction-stream half */
+   /* CYBERSTORM C2 rung 2 -- what the accessor fast path actually served.
+    *
+    * DFAST_HIT is coverage: the fast path's share of (READ + WRITE) is the fraction of
+    * the bucket the rung can possibly have moved, and a rung that measures a wall-clock
+    * win with a low coverage figure moved something else. DFAST_XPAR splits that by
+    * ARM: a transparent (TTR) serve against a page-cache serve. Their difference is the
+    * first direct measurement of the supervisor/user access split that the reasoning in
+    * z3660_dfast.h had to infer from a 30 % shortfall. */
+   Z3660_PROF_C_DFAST_HIT       = 44, /* data accesses served by the accessor fast path */
+   Z3660_PROF_C_DFAST_XPAR      = 45, /* ... of those, via a TTR match rather than the
+                                       *     page cache                                 */
+   Z3660_PROF_C_COUNT           = 46,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

@@ -56,7 +56,9 @@ extern "C" const char * const z3660_prof_counter_names[] = {
     * never reached the invalidator and is absent from every counter above. */
    "IV_CACR_SKIP",
    /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
-   "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3"
+   "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3",
+   /* rung 2: the misaligned-read denominator split, and the fast path's coverage. */
+   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -79,12 +81,15 @@ typedef char z3660_prof_iv_block_matches_causes[
     == Z3660_PROF_C_DOPC_IV_CACR_SKIP) ? 1 : -1];
 
 /* v3.1 SS25.2. Same hazard, same shape of tripwire: the way histogram is indexed
- * WAY_BASE + way inside the lookup, so the block must be exactly Z3660_DOPC_WAYS long and
- * must end where the counter space ends. Pinned to COUNT because this block IS last --
- * and if a later counter is appended after it, this line is what makes that visible
- * rather than letting way 3 increment the newcomer. */
+ * WAY_BASE + way inside the lookup, so the block must be exactly Z3660_DOPC_WAYS long.
+ *
+ * Pinned to the counter that FOLLOWS the block, not to C_COUNT -- for the same reason
+ * rung 1c re-pinned the IV_ block. The way block was last for exactly one commit; rung 2
+ * appended MISALIGN_I after it, and against C_COUNT this line would have gone on passing
+ * while way 3 aliased onto the newcomer, which is precisely the failure it exists to
+ * catch, one counter along. */
 typedef char z3660_prof_way_block_matches_ways[
-   (Z3660_PROF_C_DOPC_WAY_BASE + Z3660_DOPC_WAYS == Z3660_PROF_C_COUNT) ? 1 : -1];
+   (Z3660_PROF_C_DOPC_WAY_BASE + Z3660_DOPC_WAYS == Z3660_PROF_C_MISALIGN_I) ? 1 : -1];
 
 /* The record layout is a wire format shared with a host-side symbolizer, so pin it here
  * rather than trusting that no one ever adds a field. */

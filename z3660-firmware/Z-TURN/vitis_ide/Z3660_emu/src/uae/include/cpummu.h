@@ -48,6 +48,9 @@
  * here, so the single out-of-line copy of uae_mmu040_get_iword() below can answer from
  * it. Nothing else in this header depends on it. */
 #include "z3660_dopc.h"
+/* CYBERSTORM C2 rung 2: the data accessors' fast path. Read that header first -- it is
+ * where the design, the measurement that motivates it, and the coherence argument live. */
+#include "z3660_dfast.h"
 #if Z3660_EMU_PROF
 #define CACHE_HIT_COUNT 1
 #else
@@ -717,6 +720,128 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
 #endif
 
 /* ==========================================================================
+ * CYBERSTORM C2 rung 2 -- THE DATA-ACCESSOR FAST PATH, RESOLVED IN ONE PLACE.
+ *
+ * z3660_dfast.h carries the design and the measurement. What is here is the resolver
+ * these two functions are: given a guest address that the caller has ALREADY proved
+ * naturally aligned, either produce the host address it lands on and the cache state the
+ * access installs -- or say nothing, and let the caller run the original accessor
+ * verbatim.
+ *
+ * `super` is passed as `regs.s` UNNORMALISED, exactly as the existing page-cache index
+ * arithmetic below uses it (`... | regs.s`), so the tag this computes is bit-for-bit the
+ * tag `mmu_get_long()` computes and DPAGE_RHIT/WHIT go on counting the same events. The
+ * verdict table is indexed with it normalised, because a table index must not be a bit
+ * pattern: `regs.s` is 0 or 1 everywhere in this tree, and the harness pins that.
+ *
+ * NOTHING IS WRITTEN BEFORE THE ANSWER IS CERTAIN. `mmu_cache_state` is handed back
+ * rather than stored, so an arm that declines has left no trace and the original path
+ * starts from the state it always did. (The original's first statement is
+ * `mmu_cache_state = cache_default_data` anyway, so a stray store would be harmless --
+ * but "harmless because something else overwrites it" is not a property worth relying
+ * on.)
+ * ========================================================================== */
+Z3660_DFAST_INLINE int z3660_dfast_read(uaecptr addr, uaecptr *pa, uae_u8 *cs)
+{
+	uae_u16 v = z3660_dfv_r[regs.s ? 1 : 0][addr >> 24];
+	unsigned verdict = Z3660_DFAST_VERDICT(v);
+	uaecptr phys;
+
+	if (likely(verdict == Z3660_DFAST_PAGE)) {
+		/* No TTR matched and the MMU is on. THE INDEX AND TAG ARITHMETIC BELOW IS COPIED
+		 * FROM mmu_get_long() UNCHANGED -- that is what keeps the two caches the same
+		 * cache, and what makes the map's "the dpagecache hit rates must not move"
+		 * pre-registration checkable rather than aspirational. */
+		uae_u32 idx1 = ((addr & mmu_pagemaski) >> mmu_pageshift1m) | regs.s;
+		uae_u32 idx2 = idx1 & (MMUFASTCACHE_ENTRIES - 1);
+		if (atc_data_cache_read[idx2].log != idx1)
+			return 0;                 /* a miss: mmu_translate must run, and it must run
+			                           * from the original path, with its faults, its ATC
+			                           * refill and its own bucket. */
+		phys = atc_data_cache_read[idx2].phys | (addr & mmu_pagemask);
+		*cs  = atc_data_cache_read[idx2].cache_state;
+	} else if (verdict == Z3660_DFAST_XPAR) {
+		/* A data TTR matched: the 68040 uses the logical address as the physical one and
+		 * the register's CM field supplies the cache state. Both are in the table. */
+		phys = addr;
+		*cs  = Z3660_DFAST_CSTATE(v);
+	} else {
+		return 0;
+	}
+
+	/* The bank map is consulted LIVE, exactly as memory_get_long() consults it, so a
+	 * device bank declines here and the original path issues the access with its side
+	 * effects intact. Caching this decision would buy a load and owe map_banks() a hook;
+	 * it is not worth a coherence obligation. */
+	if (unlikely(!addrbank_is_direct_r(&get_mem_bank(phys))))
+		return 0;
+
+	/* EVERY COUNTER IS BELOW EVERY DECLINE, and that ordering is a bug this corpus
+	 * caught rather than a precaution. With the page-cache hit counted where the
+	 * original counts it -- at the probe -- a decline at the bank test above charged
+	 * DPAGE_RHIT once here and once again when the original path re-probed the same
+	 * entry, so the map's "the dpagecache hit rates must not move" pre-registration
+	 * failed on exactly the device case it exists to protect. Counting after the last
+	 * decline gives one increment per access on both arms: the fast path counts it when
+	 * it serves, and the original counts it when the fast path does not. */
+	if (verdict == Z3660_DFAST_PAGE) {
+#if CACHE_HIT_COUNT
+		mmu_data_read_hit++;   /* the PAGE arm only: a TTR match never probes the cache,
+		                        * so counting one here would invent a hit the original
+		                        * path does not have. */
+#endif
+	} else {
+		Z3660_PROF_CNT(Z3660_PROF_C_DFAST_XPAR);
+	}
+	*pa = phys;
+	Z3660_PROF_CNT(Z3660_PROF_C_DFAST_HIT);
+	Z3660_DFAST_SERVED();
+	return 1;
+}
+
+Z3660_DFAST_INLINE int z3660_dfast_write(uaecptr addr, uaecptr *pa, uae_u8 *cs)
+{
+	uae_u16 v = z3660_dfv_w[regs.s ? 1 : 0][addr >> 24];
+	unsigned verdict = Z3660_DFAST_VERDICT(v);
+	uaecptr phys;
+
+	if (likely(verdict == Z3660_DFAST_PAGE)) {
+		uae_u32 idx1 = ((addr & mmu_pagemaski) >> mmu_pageshift1m) | regs.s;
+		uae_u32 idx2 = idx1 & (MMUFASTCACHE_ENTRIES - 1);
+		if (atc_data_cache_write[idx2].log != idx1)
+			return 0;
+		phys = atc_data_cache_write[idx2].phys | (addr & mmu_pagemask);
+		/* NOT a transcription error: the original reads the cache state out of the READ
+		 * array here too (cpummu.h, mmu_put_long). Copied rather than corrected --
+		 * "state equivalence" means equivalence to what the machine does, and a
+		 * divergence introduced under the banner of a speed change is the worst kind. */
+		*cs  = atc_data_cache_read[idx2].cache_state;
+	} else if (verdict == Z3660_DFAST_XPAR) {
+		phys = addr;
+		*cs  = Z3660_DFAST_CSTATE(v);
+	} else {
+		return 0;
+	}
+
+	if (unlikely(!addrbank_is_direct_w(&get_mem_bank(phys))))
+		return 0;
+
+	/* Below every decline -- see z3660_dfast_read() for the double-count this ordering
+	 * closes. */
+	if (verdict == Z3660_DFAST_PAGE) {
+#if CACHE_HIT_COUNT
+		mmu_data_write_hit++;
+#endif
+	} else {
+		Z3660_PROF_CNT(Z3660_PROF_C_DFAST_XPAR);
+	}
+	*pa = phys;
+	Z3660_PROF_CNT(Z3660_PROF_C_DFAST_HIT);
+	Z3660_DFAST_SERVED();
+	return 1;
+}
+
+/* ==========================================================================
  * CYBERSTORM C1 -- where the interpreter's stage buckets are actually charged.
  *
  * This is the choke layer, and picking it was the whole design decision. The named
@@ -782,6 +907,15 @@ static ALWAYS_INLINE uae_u32 uae_mmu040_get_ilong(uaecptr addr)
 #else
 	if (unlikely(is_unaligned_bus(addr, 4))) {  /* ISSUE-52: see uae_mmu040_get_long */
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		/* C2 rung 2: MISALIGN_R has always been incremented here as well as at the two
+		 * DATA sites, so the map's "20.71 % of reads are misaligned" divided
+		 * (data + instruction) misalignments by data reads alone. This site is the
+		 * instruction-stream half, and it misaligns BY CONSTRUCTION -- guest
+		 * instructions are word-aligned, so a 32-bit fetch at pc+2 sits at an address
+		 * = 2 (mod 4) half the time. MISALIGN_R is left exactly as it was, so every
+		 * existing capture and identity still reads; MISALIGN_I is the subtrahend that
+		 * makes MISALIGN_R - MISALIGN_I the genuine misaligned DATA reads. */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_I);
 		Z3660_PROF_RET(mmu_get_ilong_unaligned(addr));
 	}
 	Z3660_PROF_RET(mmu_get_ilong(addr, sz_long));
@@ -810,6 +944,15 @@ static ALWAYS_INLINE uae_u32 uae_mmu040_get_long(uaecptr addr)
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
 		Z3660_PROF_RET(mmu_get_long_unaligned(addr, true));
 	}
+	/* C2 rung 2. Below the misalignment test on purpose: everything past it is naturally
+	 * aligned, which is what makes "never fast-path across a page boundary" structural. */
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_read(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RET(direct_get_long(pa));
+		}
+	}
 	Z3660_PROF_RET(mmu_get_long(addr, true, sz_long));
 }
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_word(uaecptr addr)
@@ -820,12 +963,28 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_get_word(uaecptr addr)
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
 		Z3660_PROF_RET(mmu_get_word_unaligned(addr, true));
 	}
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_read(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RET((uae_u16)direct_get_word(pa));
+		}
+	}
 	Z3660_PROF_RET(mmu_get_word(addr, true, sz_word));
 }
 static ALWAYS_INLINE uae_u8 uae_mmu040_get_byte(uaecptr addr)
 {
 	Z3660_PROF_ENTER(Z3660_PROF_B_READ);
 	Z3660_PROF_CNT(Z3660_PROF_C_READ);
+	/* A byte is aligned by definition, so there is no misalignment test above this one
+	 * and nothing else has to be true for the page-boundary argument to hold. */
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_read(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RET((uae_u8)direct_get_byte(pa));
+		}
+	}
 	Z3660_PROF_RET(mmu_get_byte(addr, true, sz_byte));
 }
 
@@ -837,12 +996,26 @@ static ALWAYS_INLINE void uae_mmu040_put_word(uaecptr addr, uae_u16 val)
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
 		Z3660_PROF_RETV(mmu_put_word_unaligned(addr, val, true));
 	}
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_write(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RETV(direct_put_word(pa, val));
+		}
+	}
 	Z3660_PROF_RETV(mmu_put_word(addr, val, true, sz_word));
 }
 static ALWAYS_INLINE void uae_mmu040_put_byte(uaecptr addr, uae_u8 val)
 {
 	Z3660_PROF_ENTER(Z3660_PROF_B_WRITE);
 	Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_write(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RETV(direct_put_byte(pa, val));
+		}
+	}
 	Z3660_PROF_RETV(mmu_put_byte(addr, val, true, sz_byte));
 }
 static ALWAYS_INLINE void uae_mmu040_put_long(uaecptr addr, uae_u32 val)
@@ -852,6 +1025,13 @@ static ALWAYS_INLINE void uae_mmu040_put_long(uaecptr addr, uae_u32 val)
 	if (unlikely(is_unaligned_bus(addr, 4))) {  /* ISSUE-52: see uae_mmu040_get_long */
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_W);
 		Z3660_PROF_RETV(mmu_put_long_unaligned(addr, val, true));
+	}
+	{
+		uaecptr pa; uae_u8 cs;
+		if (likely(z3660_dfast_write(addr, &pa, &cs))) {
+			mmu_cache_state = cs;
+			Z3660_PROF_RETV(direct_put_long(pa, val));
+		}
 	}
 	Z3660_PROF_RETV(mmu_put_long(addr, val, true, sz_long));
 }

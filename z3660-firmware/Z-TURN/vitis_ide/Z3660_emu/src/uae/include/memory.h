@@ -508,6 +508,62 @@ extern uae_u8 *baseaddr[MEMORY_BANKS];
 #if 0
 extern addrbank *get_mem_bank_real(uaecptr);
 #endif
+
+/* ==========================================================================
+ * CYBERSTORM C2 rung 2 -- THE DIRECT-BANK ACCESS, WRITTEN ONCE.
+ *
+ * `baseaddr_direct_r` / `_w` non-NULL means "this bank is plain memory the emulator may
+ * touch without going through the bank's function pointers". In THIS FORK the guest's
+ * physical address IS the host address -- core1 runs with the guest's DRAM mapped 1:1
+ * into the ARM's address space -- so the pointer arithmetic is the identity, which is
+ * why upstream's `baseaddr_direct_r + ((addr - startaccessmask) & mask)` sits commented
+ * out in memory.cpp rather than deleted.
+ *
+ * These live here, rather than being spelled out at each site, because rung 2's accessor
+ * fast path performs the same access and TWO COPIES OF A MEMORY-MODEL ASSUMPTION IS
+ * EXACTLY THE SHAPE OF BUG THIS REPOSITORY HAS ALREADY PAID FOR ONCE (the cdfs
+ * page-crossing DMA, invisible until it ate an ELF header). `memory_get_long` and the
+ * fast path call the same three lines, so if the identity assumption ever stops holding
+ * it stops holding in one place and both move together.
+ *
+ * `__builtin_bswap*` rather than the `swap32` macro from cpu_emulator.h: that header is
+ * a board header and memory.h is included by the host harness too. They are the same
+ * builtin -- cpu_emulator.h:41 defines swap32 AS __builtin_bswap32 -- so the generated
+ * code is unchanged.
+ *
+ * THE CALLER OWNS THE TWO PRECONDITIONS and neither is checked here, because both are
+ * checked more cheaply where the caller already has the information:
+ *   1. the bank at `addr` is direct in the required direction;
+ *   2. `addr` is naturally aligned for its size, so the access lies inside one 64 KB
+ *      bank window (and inside one guest page).
+ * ========================================================================== */
+STATIC_INLINE int addrbank_is_direct_r(const addrbank *ab) { return ab->baseaddr_direct_r != NULL; }
+STATIC_INLINE int addrbank_is_direct_w(const addrbank *ab) { return ab->baseaddr_direct_w != NULL; }
+
+STATIC_INLINE uae_u32 direct_get_long(uaecptr addr)
+{
+	return __builtin_bswap32(*(uae_u32 *)(uintptr_t)addr);
+}
+STATIC_INLINE uae_u32 direct_get_word(uaecptr addr)
+{
+	return __builtin_bswap16(*(uae_u16 *)(uintptr_t)addr);
+}
+STATIC_INLINE uae_u32 direct_get_byte(uaecptr addr)
+{
+	return *(uae_u8 *)(uintptr_t)addr;
+}
+STATIC_INLINE void direct_put_long(uaecptr addr, uae_u32 v)
+{
+	*(uae_u32 *)(uintptr_t)addr = __builtin_bswap32(v);
+}
+STATIC_INLINE void direct_put_word(uaecptr addr, uae_u32 v)
+{
+	*(uae_u16 *)(uintptr_t)addr = __builtin_bswap16((uae_u16)v);
+}
+STATIC_INLINE void direct_put_byte(uaecptr addr, uae_u32 v)
+{
+	*(uae_u8 *)(uintptr_t)addr = (uae_u8)v;
+}
 #ifdef JIT
 #define put_mem_bank(addr, b, realstart) do { \
 	(mem_banks[bankindex(addr)] = (b)); \

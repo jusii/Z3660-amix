@@ -73,6 +73,9 @@ uae_u32 mmu040_move16[4];
  * that a bus-misaligned 040 access never hands a misaligned address to the physical
  * layer. Harness build only; the firmware binary is unchanged. */
 unsigned long mmu_unaligned_split_count = 0;
+/* C2 rung 2: how many accesses the fast path SERVED. See z3660_dfast.h for why this is
+ * a harness-only counter rather than the profiler's DFAST_HIT. */
+extern "C" { unsigned long z3660_dfast_serves = 0; }
 #endif
 
 extern "C" volatile int a3000_amix_mode;  // AMIX (A3000 SCSI) mode active
@@ -89,6 +92,121 @@ uae_u8 atc_last_ins_cache;
 struct mmufastcache atc_data_cache_read[MMUFASTCACHE_ENTRIES];
 struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
 #endif
+
+/* ==========================================================================
+ * CYBERSTORM C2 rung 2 -- the data accessors' fast-path verdict tables.
+ *
+ * The design, the measurement and the coherence argument are in z3660_dfast.h. What is
+ * here is the build, and the build is the whole correctness claim: for every (super,
+ * msb) pair it must produce the SAME trichotomy that mmu_match_ttr(addr, super, true) /
+ * mmu_match_ttr_write(...) would produce for any address with that top byte, and the
+ * SAME mmu_cache_state that mmu_do_match_ttr() would install -- or it must say SLOW.
+ *
+ * It is written as a REPLAY of mmu_do_match_ttr() rather than as an equivalent
+ * expression, so a reader can diff the two, and the host harness compares the table
+ * against the live function over the whole (super x msb x register) space rather than
+ * over a sample.
+ * ========================================================================== */
+uae_u16 z3660_dfv_r[2][256];
+uae_u16 z3660_dfv_w[2][256];
+static int z3660_dfast_on = 1;
+
+/* One window's verdict for one (msb, super), or TTR_NO_MATCH. `cs` is written only on a
+ * match, exactly as mmu_do_match_ttr() writes mmu_cache_state only on a match. */
+static int z3660_dfast_win(uae_u32 ttr, uae_u32 msb, int super, uae_u8 *cs)
+{
+	uae_u8 hi, mask;
+
+	if (!(ttr & MMU_TTR_BIT_ENABLED))
+		return TTR_NO_MATCH;
+	/* mmu_do_match_ttr(): msb = ((addr ^ ttr) & MMU_TTR_LOGICAL_BASE) >> 24, and
+	 * MMU_TTR_LOGICAL_BASE is 0xff000000 -- so the match depends on the address ONLY
+	 * through its top byte, which is the fact this whole table rests on. */
+	hi   = (uae_u8)(msb ^ ((ttr & MMU_TTR_LOGICAL_BASE) >> 24));
+	mask = (uae_u8)((ttr & MMU_TTR_LOGICAL_MASK) >> 16);
+	if (hi & ~mask)
+		return TTR_NO_MATCH;
+	if ((ttr & MMU_TTR_BIT_SFIELD_ENABLED) == 0) {
+		if (((ttr & MMU_TTR_BIT_SFIELD_SUPER) == 0) != (super == 0))
+			return TTR_NO_MATCH;
+	}
+	if (ttr & MMU_TTR_CACHE_DISABLE) {
+		*cs = CACHE_DISABLE_MMU;
+	} else {
+		*cs = CACHE_ENABLE_ALL;
+		if (ttr & MMU_TTR_CACHE_MODE)
+			*cs |= CACHE_ENABLE_COPYBACK;
+	}
+	return (ttr & MMU_TTR_BIT_WRITE_PROTECT) ? TTR_NO_WRITE : TTR_OK_MATCH;
+}
+
+void z3660_dfast_rebuild(void)
+{
+	int super, i;
+
+	for (super = 0; super < 2; super++) {
+		for (i = 0; i < 256; i++) {
+			uae_u8 cs = 0;
+			int res;
+			uae_u16 vr, vw;
+
+			if (!z3660_dfast_on) {
+				z3660_dfv_r[super][i] = Z3660_DFAST_SLOW;
+				z3660_dfv_w[super][i] = Z3660_DFAST_SLOW;
+				continue;
+			}
+
+			/* mmu_match_ttr() walks dtt0 first and returns on a match. */
+			res = z3660_dfast_win(regs.dtt0, (uae_u32)i, super, &cs);
+			if (res == TTR_NO_MATCH)
+				res = z3660_dfast_win(regs.dtt1, (uae_u32)i, super, &cs);
+
+			if (res == TTR_OK_MATCH) {
+				/* Transparent both ways. Nothing else in the original path runs. */
+				vr = (uae_u16)(Z3660_DFAST_XPAR | ((uae_u16)cs << 8));
+				vw = vr;
+			} else if (res == TTR_NO_WRITE) {
+				/* Reads are transparent; a WRITE takes the bus-error path in
+				 * mmu_match_ttr_write(), which is not reimplemented here. */
+				vr = (uae_u16)(Z3660_DFAST_XPAR | ((uae_u16)cs << 8));
+				vw = Z3660_DFAST_SLOW;
+			} else if (regs.mmu_enabled) {
+				vr = Z3660_DFAST_PAGE;
+				vw = Z3660_DFAST_PAGE;
+			} else {
+				/* MMU OFF and no TTR match. The original path uses the address raw --
+				 * but with mmu_cache_state left at cache_default_data, which is NOT
+				 * constant (mmu_bus_error() clears CACHE_DISABLE_ALLOCATE in it), and
+				 * for a WRITE mmu_match_ttr_write() can still raise a TCR_DWO bus error
+				 * on exactly this arm. Both are rare and both are pre-MMU-boot only, so
+				 * this arm is SLOW rather than a second implementation of two edge
+				 * cases. It costs a table lookup on a phase that lasts seconds. */
+				vr = Z3660_DFAST_SLOW;
+				vw = Z3660_DFAST_SLOW;
+			}
+			z3660_dfv_r[super][i] = vr;
+			z3660_dfv_w[super][i] = vw;
+		}
+	}
+}
+
+int z3660_dfast_arm(int on)
+{
+	int prev = z3660_dfast_on;
+	z3660_dfast_on = on ? 1 : 0;
+	z3660_dfast_rebuild();
+	return prev;
+}
+int z3660_dfast_armed(void) { return z3660_dfast_on; }
+
+uae_u64 z3660_dfast_served(void)
+{
+#if Z3660_EMU_PROF
+	return (uae_u64)z3660_prof_cnt[Z3660_PROF_C_DFAST_HIT];
+#else
+	return 0;
+#endif
+}
 
 /* CYBERSTORM C1: in a profiling build these six names are macros for slots in
  * z3660_prof_cnt[] (cpummu.h), so there is nothing to define here -- and defining them
@@ -147,6 +265,11 @@ void mmu_tt_modified (void)
 	mmu_ttr_enabled_ins = ((regs.itt0 | regs.itt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled_data = ((regs.dtt0 | regs.dtt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled = mmu_ttr_enabled_ins || mmu_ttr_enabled_data;
+	/* CYBERSTORM C2 rung 2. The fast path's verdict tables are derived from the SAME four
+	 * registers as the three flags above, so they are rebuilt in the same breath and
+	 * cannot be stale in any way those flags are not. This is the only reason the tables
+	 * need no invalidation protocol of their own. */
+	z3660_dfast_rebuild();
 }
 
 
@@ -1642,6 +1765,11 @@ uae_u16 REGPARAM2 mmu_set_tc(uae_u16 tc)
 	}
 
 	mmu_flush_atc_all(true);
+	/* CYBERSTORM C2 rung 2. This function is the ONLY writer of regs.mmu_enabled and of
+	 * the page geometry the fast path's index arithmetic uses, so it is the second and
+	 * last rebuild site. (mmu_flush_atc_all above has already emptied both page caches,
+	 * so the PAGE arm cannot serve a translation made under the old geometry.) */
+	z3660_dfast_rebuild();
 
 	// AMIX on the 68040 core: the mirror of cpummu030.cpp's latch. amix_mmu_on is the
 	// "the AMIX kernel is up now" signal the emulated A3000 SCSI uses to leave

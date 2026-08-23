@@ -138,6 +138,15 @@ static ALWAYS_INLINE uae_u32 uae_mmu030_get_ilong(uaecptr addr)
 	Z3660_PROF_CNT(Z3660_PROF_C_FETCH);
 	if (unlikely(is_unaligned_bus(addr, 4))) {
 		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_R);
+		/* C2 rung 2: MISALIGN_R has always been incremented here as well as at the two
+		 * DATA sites, so the map's "20.71 % of reads are misaligned" divided
+		 * (data + instruction) misalignments by data reads alone. This site is the
+		 * instruction-stream half, and it misaligns BY CONSTRUCTION -- guest
+		 * instructions are word-aligned, so a 32-bit fetch at pc+2 sits at an address
+		 * = 2 (mod 4) half the time. MISALIGN_R is left exactly as it was, so every
+		 * existing capture and identity still reads; MISALIGN_I is the subtrahend that
+		 * makes MISALIGN_R - MISALIGN_I the genuine misaligned DATA reads. */
+		Z3660_PROF_CNT(Z3660_PROF_C_MISALIGN_I);
 		Z3660_PROF_RET(mmu030_get_ilong_unaligned(addr, fc, 0));
 	}
 	Z3660_PROF_RET(mmu030_get_ilong(addr, fc));

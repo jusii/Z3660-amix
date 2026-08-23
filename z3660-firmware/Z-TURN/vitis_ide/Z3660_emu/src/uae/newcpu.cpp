@@ -6635,6 +6635,15 @@ uae_u8 *restore_cpu (uae_u8 *src)
       regs.tcr = restore_u32 ();
       regs.urp = restore_u32 ();
       regs.srp = restore_u32 ();
+      /* CYBERSTORM C2 rung 2 found this hole rather than made it: every OTHER writer of
+       * the four TT registers calls mmu_tt_modified() to recompute mmu_ttr_enabled /
+       * _ins / _data from them, and this one never did -- so a restore left the three
+       * flags describing the PREVIOUS machine's TTRs. That is a pre-existing defect of
+       * the accessors' own TTR guard; rung 2's verdict tables are derived in the same
+       * function from the same registers, so closing it keeps both correct at once.
+       * Savestates are not used on the board, which is why nothing has ever noticed. */
+      if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060)
+         mmu_tt_modified ();
    }
    if (flags & 0x80000000) {
       int khz = restore_u32 ();

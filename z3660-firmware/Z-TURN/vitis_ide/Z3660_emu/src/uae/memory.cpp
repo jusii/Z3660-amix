@@ -3780,89 +3780,65 @@ uae_u32 memory_get_wordi(uaecptr addr)
 		return swap16(*((uae_u16*)m));
 	}
 }
+/* CYBERSTORM C2 rung 2: the direct arms now call the direct_get_ / direct_put_ inlines
+ * in memory.h instead of open-coding `m = (uae_u8*)addr; swap32(*(uae_u32*)m)`. The
+ * accessor fast path performs the same access on its hit path, and one copy of the
+ * fork's identity-mapping assumption is the whole point -- upstream's commented-out
+ * baseaddr_direct_r arithmetic now lives in the comment above those inlines rather than
+ * being repeated here. Generated code is unchanged: swap32 IS __builtin_bswap32. */
 uae_u32 memory_get_long(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->lget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return swap32(*((uae_u32*)m));
+		return direct_get_long(addr);
 	}
 }
 uae_u32 memory_get_word(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->wget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return swap16(*((uae_u16*)m));
+		return direct_get_word(addr);
 	}
 }
 uae_u32 memory_get_byte(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->bget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return *m;
+		return direct_get_byte(addr);
 	}
 }
 
 void memory_put_long(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->lput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*((uae_u32*)m)=swap32(v);
+		direct_put_long(addr, v);
 	}
 }
 void memory_put_word(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->wput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*((uae_u16*)m)=swap16(v);
+		direct_put_word(addr, v);
 	}
 }
 void memory_put_byte(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->bput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*m = (uae_u8)v;
+		direct_put_byte(addr, v);
 	}
 }
 //#endif
