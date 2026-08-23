@@ -470,6 +470,63 @@ over-reporting the bucket rather than under-reporting it.
 Adding this changed no id and no wire structure, so **the version stays 2**; the `s` block is
 additive text that an older symbolizer ignores.
 
+#### ★ The probe-density test — which shares are real and which are price artefacts
+
+The correction `corrected(p) = acc[b] − spans[b] × p` is **linear in the price**, and that is
+worth more than it looks: **two price columns of one capture recover the whole vector, exactly,
+and it costs no counter and no new instrument.** Take the corrected shares the dump already
+prints at two prices — the two ends of the swept band will do — and solve:
+
+```
+spans[b]  =  (corrected(p1) − corrected(p2)) / (p2 − p1)          ... the slope
+p0[b]     =  acc[b] / spans[b]                                    ... the ZERO-CROSSING price
+```
+
+`p0` is the price at which the bucket's subtraction takes it to zero, i.e. **the price at which
+the bucket is entirely probe**. So at any price `p`, the fraction `p / p0` is the share of the
+bucket's raw accumulator that is **bracket cost** rather than work. The firmware's ceiling line
+already prints the *minimum* of that vector (`min_b(acc/spans)`, above); this just reads the
+rest of it.
+
+Worked on the reference-posture capture of 2026-08-23, band `[54, 60]`, ceiling **60 bound by
+`TAILADV`**:
+
+| bucket | spans/INSN | zero-crossing `p0` | bracket cost at price 60 | reading |
+|---|---|---|---|---|
+| `TAILADV` | 3.007 | **60.4** | **99 %** | binds the ceiling — essentially all probe |
+| `LOOPRES` | 3.872 | 68.7 | **87 %** | mostly probe, and 15 % above the ceiling |
+| `BLKREC` | 0.325 | 70.7 | 85 % | mostly probe |
+| *`TAILSAMP`* (the instrument itself) | 1.000 | 76.4 | 79 % | — |
+| `TAILPOLL` | 1.000 | 93.0 | 65 % | real |
+| `HANDLER` | 1.902 | 102.4 | 59 % | real |
+| `DOPCFIND` | 1.000 | 130.8 | 46 % | real |
+| `DOPCFILL` | 0.2167 | 136.3 | 44 % | real |
+| `FETCHOP` | 0.220 | 149.8 | 40 % | real — **plus** the unsubtracted counter calls (row H caveat below) |
+| `READ` | 0.450 | 151.2 | 40 % | real |
+| `WRITE` | 0.320 | 159.3 | 38 % | real |
+| `FETCHEX` | 0.472 | 173.9 | 35 % | real — plus the same caveat |
+| **`XLATE` + `WALK`** | **0.0217** | **623** | **10 %** | **the least probe-contaminated bucket in the dump** |
+
+**Four cross-checks, none of them circular**, which is why the derivation can be trusted on a
+bucket that has no independent measurement:
+
+| check | derived here | known independently | agreement |
+|---|---|---|---|
+| `TAILADV` zero-crossing | 60.4 | the firmware printed *ceiling 60, bound by `TAILADV`* | the line reproduces |
+| `HANDLER` spans/INSN | 1.902 | 1.906, from that rung's own instrumentation | 0.2 % |
+| `DOPCFILL` spans/INSN | 0.2167 | fills per guest instruction, 0.2178 | 0.5 % |
+| `DOPCFIND` spans/INSN | 1.000 | `tcnt[DOPCFIND] == DOPC_HIT + DOPC_MISS`, one lookup per dispatch | exact |
+
+**What it does NOT measure**, and the limit is sharp: it separates a bucket from **its own
+bracket pair**, because that is the only thing the correction subtracts. The *counter* calls
+described under row H below — three per fetch, landing inside `FETCHOP`/`FETCHEX` — are
+subtracted by nothing and are invisible here. **Row H's ~3× inflation is untouched by this
+table.**
+
+> **Use it before ranking buckets.** A bucket whose `p0` sits at or just above the capture's
+> own ceiling is a bucket the instrument is mostly measuring itself in, and a share read off it
+> is a statement about a price band rather than about the interpreter.
+
 ### Counters
 
 | id | name | | id | name |
@@ -506,6 +563,7 @@ correctly.
 | 43 | `MISALIGN_I` | of `MISALIGN_R`, the **instruction-stream** half (C2 rung 2). `MISALIGN_R` is incremented at `get_ilong` as well as at the two data sites, so `MISALIGN_R − MISALIGN_I` is the genuine misaligned **data** reads. See `docs/accessor-fastpath.md` |
 | 44 | `DFAST_HIT` | data accesses served by the **accessor fast path** (C2 rung 2) — its coverage of `READ + WRITE` |
 | 45 | `DFAST_XPAR` | ... of those, via a **TTR match** rather than the page cache. The supervisor/user access split, measured |
+| 46 | `IV_SUPPRESSED` | `IV_FLUSH` requests the **`f` measurement switch counted and did not perform** (`docs/f-measurement.md`). **Not a cause**, and not a member of the block above — every entry there means *reached the invalidator*, which this one means the negation of. **Zero in every sound build.** A capture with a non-zero value here came off a deliberately UNSOUND machine, and the dump says so in a banner at both ends |
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
@@ -552,6 +610,20 @@ window rather than a defect.
 > counter, or it is invisible to its own verdict.** The guest's true request rate is
 > `sum(IV_*) + IV_CACR_SKIP`, and the firmware prints that row with the narrowed share out of
 > it.
+
+> **`IV_SUPPRESSED` widens the identity, and only on the measurement build.** The `f`
+> measurement switch (`docs/f-measurement.md`) decides *inside* `z3660_dopc_invalidate()` and
+> *after* the attribution, so — unlike the CACR narrowing above — a suppressed request **is**
+> in `sum(IV_*)` while performing nothing. The identity a capture off that build satisfies is
+>
+> ```
+> sum(IV_*) − IV_SUPPRESSED  ==  DOPC_INVAL      cache ON
+> ```
+>
+> with the standing identity being its `IV_SUPPRESSED == 0` special case, which is what every
+> sound build produces. Over a window armed throughout, `IV_SUPPRESSED == IV_FLUSH` exactly.
+> **Read the banner before reading any other row of such a capture**: it is not a profile of a
+> correct machine.
 
 **With the decoded-op cache off**, the four `DOPC_` counters are exactly zero — `HIT`/`MISS`/
 `EXT` because the lookup returns before it can count, and `DOPC_INVAL` because
@@ -799,6 +871,15 @@ the hit counter beside it that was not.
    the `DFAST` × `IFAST` question (spread 0.63 % across three arms) where the cross-session
    form could not.
 
+   **And the same applies to SHARES, which is the half that is easier to forget.** A corrected
+   share is the same first-order function of the price, so a share swept at one band cannot be
+   compared with a share swept at another — the cycles are identical and the percentages are
+   not. The fetch pair on one capture reads **14.21 – 16.59 %** at that boot's own `[39, 50]`
+   and **17.82 – 19.78 %** at `[54, 59]`: one capture, one set of counters, two bands, and only
+   the second is comparable with a session that swept `[54, 59]`. **Every cross-session share
+   comparison must name the band on BOTH sides**, and a row that moves against an earlier
+   table should have its band checked before its mechanism is theorised about.
+
    **What to price a capture at: sweep `[marginal, in-bucket]`, exactly as the C2 map swept
    50 → 59, and report the range.** Do not pick an end, and do not treat one as a correction of
    the other — the marginal figure is right for "the prof build with the probe bodies gated
@@ -854,6 +935,20 @@ the hit counter beside it that was not.
    fact about the bracket's historical range, not a property of the instrument. The line is
    the arbiter, per capture, in both directions; nothing about which form it printed last
    time may be carried into reading this one.
+
+   **The worked example, and it cost a rung.** `TAILADV` at its own capture's ceiling reads
+   **1.28 % falling to 0.00 %** — a bucket that vanishes at the price that binds the ceiling is
+   a bucket made of probe, and it was retired on that basis. On the rung-3 band the *same*
+   bucket, in the *same* firmware, reads **9.16 % – 5.29 %**. Nothing about the interpreter
+   changed; the price did. **A bucket's share is a price artefact in both directions**, and an
+   earlier version of the C2 attack map funded a rung off exactly that artefact — it ranked a
+   bucket by a share read at a cheap price, without asking how much of the bucket the probe
+   pair accounted for at that price.
+   
+   The retirement still stands (a bucket that is all probe cost at its own ceiling is not a
+   target), but the general rule is the one to carry: **before ranking a bucket, compute how
+   much of it is bracket cost** — the probe-density test above does that exactly, from two
+   price columns of the capture in hand.
 
    **And one consequence that matters to the C2 map.** Even the *upper* end of the bracket,
    and even the whole armed call at 43.9, sit **below** the 50.59 at which the map's span
@@ -1132,6 +1227,14 @@ minimum correct implementation:
    beside them so a share can be re-priced without rung 1d's own transitions.
 4d. **Use `ATC_HIT` (id 19) for the ATC hit rate, never id 12.** Id 12 is `XLATE_OK` and
    counts successful translates. `ATC_HIT + ATC_MISS == XLATE` when nothing faulted.
+4e. **Refuse to interpret a capture with `IV_SUPPRESSED` (id 46) non-zero as a profile of a
+   correct machine.** It is zero in every sound build; non-zero means the `f` measurement
+   switch was armed inside the window and the emulator was executing decodes the guest had
+   told it to drop. The counter is **not** part of the `IV_` cause block, so a tool that
+   sums the block by arithmetic index must stop at `IV_CACR` — and on such a capture the
+   identity is `sum(IV_*) − IV_SUPPRESSED == DOPC_INVAL`. **Surface it prominently or
+   refuse the file**; the id was appended without a wire bump, so a symbolizer that does
+   not know 46 will report it uninterpreted and say nothing at all.
 5. **Split by `SUPER`** — kernel and user-space hot spots are different questions and both
    are in the same ring.
 6. **Symbolize `pc` against the right image**: with `SUPER` set and `AMIX` armed, against
