@@ -726,7 +726,68 @@ enum {
    Z3660_PROF_C_DFAST_HIT       = 44, /* data accesses served by the accessor fast path */
    Z3660_PROF_C_DFAST_XPAR      = 45, /* ... of those, via a TTR match rather than the
                                        *     page cache                                 */
-   Z3660_PROF_C_COUNT           = 46,
+   /* ------------------------------------------------------------------------------
+    * ID 46 IS PERMANENTLY RETIRED, AND IT IS THE `IVSUP` LESSON'S REAL COST.
+    *
+    * 46 is arithmetically the next free index and it is NOT free. The withdrawn `f`
+    * measurement build used it for IV_SUPPRESSED -- a counter whose non-zero value means
+    * "this capture came from a deliberately unsound machine" -- and docs/profiler.md's
+    * standing reading rule is to REFUSE to interpret a capture carrying a non-zero id 46
+    * as a profile of a correct machine. A new counter at 46 would make every legitimate
+    * capture refusable by a tool obeying that rule, and the tools that must refuse it
+    * outlive the build that created it.
+    *
+    * So it stays retired, it carries a placeholder in the name table so the indices
+    * align, and WARP starts at 47. A capture from a firmware built after this line
+    * reports id 46 as zero, always, because nothing increments it.
+    * ------------------------------------------------------------------------------ */
+   Z3660_PROF_C_RETIRED_46      = 46, /* RETIRED -- never incremented. See above.       */
+   /* ------------------------------------------------------------------------------
+    * WARP ENGINE, ids 47..59. Pre-registered in docs/WARP-ENGINE.md §0.5.6 BEFORE any
+    * engine code existed, with every declared direction checked against the counter's
+    * position in the call topology -- the law being obeyed is that a counter reached only
+    * AFTER the branch being deleted cannot fall when it is deleted.
+    *
+    * APPENDED, so no existing id moves and no field changes shape: THE DUMP VERSION STAYS
+    * 2, the same reasoning IFETCH_CALLS (id 20) was appended under. A v2 symbolizer
+    * reports an id past the end of its table uninterpreted rather than mis-labelled.
+    * ------------------------------------------------------------------------------ */
+   Z3660_PROF_C_WARP_ENTER      = 47, /* block entries FROM THE RUN LOOP -- the site that
+                                       * costs exactly one INSNS, and NEVER a chained
+                                       * transfer, which costs none. Incrementing it on a
+                                       * site that costs no INSNS over-subtracts and
+                                       * reports coverage high. In M1 round 1 it is 0 by
+                                       * construction: a null block retires nothing and
+                                       * therefore never consumes a pass.               */
+   Z3660_PROF_C_WARP_BLK        = 48, /* block executions, INCLUDING chained entries. The
+                                       * arm attestation rides on this one, and
+                                       * z3660_warp_entered() is the SAME increment site  */
+   Z3660_PROF_C_WARP_INSNS      = 49, /* guest instructions retired inside blocks. This is
+                                       * also what feeds the CADENCE counter (Q10, frozen)
+                                       * -- a different counter from INSNS, and the two
+                                       * must not be confused:
+                                       *   guest stream = (INSNS - WARP_ENTER) + WARP_INSNS */
+   Z3660_PROF_C_WARP_BAIL       = 50, /* bails to the interpreter, once per bail          */
+   Z3660_PROF_C_WARP_BAIL_ST    = 51, /* writeback stores executed on bail arms. Zero for a
+                                       * null block -- and zero MEASURED, not omitted     */
+   Z3660_PROF_C_WARP_COMPILE    = 52, /* blocks compiled, success only                    */
+   Z3660_PROF_C_WARP_CINSNS     = 53, /* guest instructions compiled -- the denominator for
+                                       * code bytes per instruction                       */
+   Z3660_PROF_C_WARP_CBYTES     = 54, /* ARM code bytes emitted. Code bytes per guest
+                                       * instruction is a first-class metric here, not a
+                                       * footnote: DDR is not the constraint, L1I is       */
+   Z3660_PROF_C_WARP_CFETCH     = 55, /* guest instruction words read BY THE COMPILER, and
+                                       * NOT through the interpreter's ifetch bracket --
+                                       * which is what makes FETCH's declared fall
+                                       * possible. THIS IS Q6'S COUNTER                    */
+   Z3660_PROF_C_WARP_DISC       = 56, /* blocks discarded by invalidation, all causes      */
+   Z3660_PROF_C_WARP_DISC_ROOT  = 57, /* ... of those, at IV_ROOT. THIS IS Q5'S COUNTER    */
+   Z3660_PROF_C_WARP_FLUSH      = 58, /* full code-cache flushes (allocator exhausted)     */
+   Z3660_PROF_C_WARP_DECLINE    = 59, /* block-head PCs the engine declined. Supervisor PCs
+                                       * are gated BEFORE discovery and deliberately not
+                                       * counted here -- that rate is INSNS_SUPER, and a
+                                       * second copy of it would say nothing               */
+   Z3660_PROF_C_COUNT           = 60,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

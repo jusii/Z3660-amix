@@ -42,6 +42,10 @@ int  piscsi_stats_reporting(void);
  * self-contained (plain types, no emulator headers) so the ONE rule that turns a mailbox
  * word into a state lives in one file that both cores compile. */
 #include "../../Z3660_emu/src/uae/z3660_dfast.h"
+/* WARP ENGINE: same reasoning a fourth time -- z3660_warp.h is plain C, #defines and one
+ * static inline, so the ONE rule that turns this mailbox word into an arm state is compiled
+ * by both cores from one file rather than mirrored here. */
+#include "../../Z3660_emu/src/uae/z3660_warp.h"
 typedef enum {
    A,
 
@@ -106,6 +110,8 @@ typedef enum {
    DOPC,    DECODED_OP_CACHE,
    /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
    DFAST,   ACCESSOR_FAST_PATH,
+   /* WARP ENGINE: the 68040 MMU block engine. DEFAULT OFF. APPEND-ONLY. */
+   WARP,    WARP_ENGINE,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -170,6 +176,7 @@ const char *command_names[] = {
       "BLK",     "BLOCK IDIOM",
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
+      "WARP",    "WARP ENGINE",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -697,6 +704,44 @@ int debug_thread(struct pt *pt)
                            xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
                         else
                            xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case WARP:
+                  case WARP_ENGINE:
+                     {  /* WARP ENGINE (docs/WARP-ENGINE.md). Toggle the 68040 MMU block
+                        * engine: guest basic blocks compiled to ARM and executed in place
+                        * of the interpreter.
+                        *
+                        * DEFAULT OFF, AND THAT IS THE OPPOSITE OF BLK/DOPC/DFAST ABOVE, on
+                        * purpose (plan Q9). For those three the shipped behaviour IS the
+                        * optimisation, so an unwritten mailbox word must resolve to ON. The
+                        * reasoning here is identical and the value is inverted: unset means
+                        * the shipped behaviour, and an engine that is not shipped behaviour
+                        * until the M5 gate has a shipped behaviour of OFF.
+                        *
+                        * ARMING WRITES AN EXACT MAGIC, not 1 -- SHARED is hand-maintained
+                        * in two headers a beta resync has already mis-merged once, so a
+                        * neighbouring field bleeding into this one must DISARM. The rule is
+                        * z3660_warp.h's z3660_warp_resolve() and nothing else re-implements
+                        * it, and it never survives a reboot: core0 republishes the OFF
+                        * sentinel on every boot and there is no config key.
+                        *
+                        * core1 picks the change up at its next knob resync, discards the
+                        * whole code cache on the way through, and prints its own [WARP]
+                        * banner -- this line only says what was REQUESTED. And the banner
+                        * is not the attestation either: read the arm state from the
+                        * counter, because two cores share one unlocked UART. */
+                        uint32_t c=shared->warp_on;
+                        c = (z3660_warp_resolve(c)!=0u) ? Z3660_WARP_OFF : Z3660_WARP_ARM;
+                        shared->warp_on=c;
+                        if(c==Z3660_WARP_ARM)
+                        {
+                           xil_printf("WARP ENGINE ARM requested (guest blocks compiled to ARM; core1 confirms with its own [WARP] banner)\r\n");
+                           xil_printf("          M1 round 1: every block is a NULL BLOCK and bails immediately -- no speedup is expected or claimed\r\n");
+                        }
+                        else
+                           xil_printf("WARP ENGINE OFF requested (the interpreter is the whole machine -- this is the reference arm)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1445,6 +1490,9 @@ void debug_console_help(void)
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
    xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
+   xil_printf("'WARP'    or 'WARP ENGINE' toggles the WARP block engine ON/OFF (EMU). DEFAULT OFF -- the one knob here\r\n");
+   xil_printf("          whose unset state is OFF; it needs an exact magic to arm and never survives a reboot\r\n");
+   xil_printf("          M1 round 1: every block bails immediately, so no speedup is expected. docs/WARP-ENGINE.md\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

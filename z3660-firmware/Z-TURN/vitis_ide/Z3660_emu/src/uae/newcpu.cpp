@@ -4631,6 +4631,17 @@ static void amix_dump_wild(uae_u32 wildpc)
       Z3660_RUNLOOP_TAIL();                                                   \
       z3660_prof_exit();                                                      \
    } while (0)
+/* The same poll for the 040 loop, over a NAMED counter instead of a hidden one. WARP's
+ * cadence feed has to advance the very counter this poll gates on -- see Q10 and
+ * z3660_warp_cadence_feed() below -- and a `static int` inside a macro expansion is
+ * reachable from nowhere. Nothing else about it changes: same PERF arm, same test, same
+ * order. */
+#define Z3660_PROF_TAIL_POLL_040()                                            \
+   do {                                                                       \
+      z3660_prof_enter(Z3660_PROF_B_TAILPOLL);                                \
+      Z3660_RUNLOOP_TAIL_040();                                               \
+      z3660_prof_exit();                                                      \
+   } while (0)
 /* do_specialties(): trace, STOP, mode change. Kept behind the spcflags gate rather than
  * bracketed unconditionally, because it is entered rarely and two transitions per
  * instruction to measure a bucket that is usually empty would cost more than it reports.
@@ -4653,6 +4664,7 @@ static void amix_dump_wild(uae_u32 wildpc)
 #else
 #define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)  do { } while (0)
 #define Z3660_PROF_TAIL_POLL()   Z3660_RUNLOOP_TAIL()
+#define Z3660_PROF_TAIL_POLL_040()  Z3660_RUNLOOP_TAIL_040()
 #define Z3660_PROF_TAIL_SPECIALTIES(cyc)                                      \
    if (regs.spcflags) {                                                       \
       if (do_specialties(cyc)) {                                              \
@@ -4661,6 +4673,13 @@ static void amix_dump_wild(uae_u32 wildpc)
    }
 #endif
 static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
+/* The 040 loop's own service counter, named rather than hidden inside the tail macro's
+ * expansion. It is the SAME counter the loop has always had -- one per loop, so the two
+ * loops cannot silently couple their poll phase across a mode change -- lifted to file
+ * scope for exactly one reason: WARP's cadence feed must advance it by the number of guest
+ * instructions a block retired (Q10, FROZEN), and a function-local static is reachable from
+ * nowhere. The 030 loop keeps its own, still inside Z3660_RUNLOOP_TAIL(). */
+static int     z3660_serv_ctr_040    = 0;
 #if Z3660_EMU_PERF
 static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
 #endif
@@ -4730,6 +4749,61 @@ static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
 #include "z3660_dopc.h"
 static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
 
+/* WARP ENGINE: the 68040 MMU block engine (docs/WARP-ENGINE.md, z3660_warp.h). Compiled
+ * into EVERY variant, like rungs 0/1/2 and unlike the two instruments, because it is an
+ * optimisation and not a diagnostic -- and switchable at runtime so a metal session can A/B
+ * it on a live guest without reflashing, and so the host harness has an off state to compare
+ * against. The arm flag itself lives in z3660_warp.cpp; the run loop reads it directly. */
+#include "z3660_warp.h"
+
+#ifdef HOST_TEST_HARNESS
+/* MUTATION M-7, and it is in no firmware binary. Armed, the cadence feed is given 1 per
+ * block instead of the number of guest instructions the block retired -- which is the exact
+ * defect Q10's contract exists to forbid, and its symptom on metal is a MISSED INTERRUPT
+ * rather than a slow number. The corpus has to be able to show that it catches it; rung 1b's
+ * attribution test once passed a mutation that bypassed the whole attribution, which is how
+ * this lane learned to write the arm rather than assume it. */
+static int z3660_warp_cadence_mutant = 0;
+extern "C" void z3660_warp_set_cadence_mutant(int on) { z3660_warp_cadence_mutant = on ? 1 : 0; }
+extern "C" int  z3660_warp_serv_ctr(void) { return z3660_serv_ctr_040; }
+#endif
+
+/* THE CADENCE FEED (Q10, FROZEN, and it is the one item in the plan with cross-repo reach).
+ *
+ * A block must feed the service-cadence counter with the number of guest instructions it
+ * RETIRED. If it does not, one pump tick stops being 256 x service_cadence GUEST
+ * instructions and every latency statement in docs/AMIX.md silently changes meaning -- the
+ * A3000-SCSI interrupt-delay pump rides on this poll, at cadence 8 its bootstrap already
+ * hangs, and a network flood at cadence 16+ has panicked AMIX.
+ *
+ * IT FEEDS n-1, NOT n, and that is not an off-by-one. The pass's own tail supplies the last
+ * tick, so an interpreted pass and a block that retired exactly one instruction advance the
+ * counter identically -- which is what makes the two arms comparable at all.
+ *
+ * IT POLLS ONCE PER CROSSING, NOT ONCE PER BLOCK. Firing a single poll where interpretation
+ * would have fired three would stretch the pump tick by the block length, silently. The loop
+ * is the interpreted behaviour written out, so the timebase is preserved BY CONSTRUCTION
+ * rather than by argument -- rung 0's own standard -- and it costs a handful of instructions
+ * amortised over a whole block.
+ *
+ * It lives here rather than in z3660_warp.cpp because the counter, the cadence and the poll
+ * all live here, and a second file reaching into the run loop's state is how two copies of
+ * one rule come to disagree. Round 1 always calls it with 0. */
+extern "C" void z3660_warp_cadence_feed(unsigned insns)
+{
+   unsigned i;
+
+#ifdef HOST_TEST_HARNESS
+   if (z3660_warp_cadence_mutant && insns != 0u) insns = 1u;   /* M-7; never shipped */
+#endif
+   for (i = 1; i < insns; i++) {
+      if (++z3660_serv_ctr_040 >= z3660_service_cadence) {
+         z3660_serv_ctr_040 = 0;
+         check_uae_int_request();
+      }
+   }
+}
+
 #if Z3660_EMU_PERF
 /* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
  * disagree about it -- a read-back that recomputes the answer proves nothing about the
@@ -4764,6 +4838,34 @@ extern "C" void z3660_knobs_sync(void)
        * SLOW, and the original accessor is what runs. */
       unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
       if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
+   }
+   {                                                                                   // WARP
+      /* ON A CHANGE ONLY -- z3660_warp_arm() discards the whole code cache
+       * unconditionally, and this runs at every resync point, so calling it every time
+       * would throw the engine's work away sixty times a second.
+       *
+       * CORE1 PRINTS THE BANNER, not core0. The console can only write a mailbox word;
+       * this is the line that says the EMULATOR armed. It is not the attestation, though,
+       * and the difference matters: two cores share one unlocked UART and an arm banner
+       * arrives spliced, so every capture reads its arm state from a COUNTER --
+       * z3660_warp_entered(), compiled into every variant including the lean one the wall
+       * clock comes from. The banner is for a human watching the serial line. */
+      unsigned w = z3660_warp_resolve((unsigned)shared->warp_on);
+      if ((int)w != z3660_warp_armed()) {
+         z3660_warp_arm((unsigned)shared->warp_on);
+         if (w)
+            z3660_printf("\r\n[WARP] ENGINE ARMED -- guest basic blocks are compiled and "
+                         "executed as ARM code.\r\n"
+                         "[WARP] M1 round 1: every block is a NULL BLOCK and bails "
+                         "immediately. No speedup is expected or claimed.\r\n"
+                         "[WARP] Read the arm state back from the counter, never from this "
+                         "line. docs/WARP-ENGINE.md\r\n\r\n");
+         else
+            z3660_printf("\r\n[WARP] engine DISARMED -- the interpreter is the whole "
+                         "machine again; the code cache was discarded on the way out.\r\n"
+                         "[WARP] this boot executed %lu block(s) in total.\r\n\r\n",
+                         (unsigned long)z3660_warp_entered());
+      }
    }
 }
 
@@ -4923,6 +5025,14 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
       Z3660_RUNLOOP_PERF()                                                    \
       { static int serv_ctr = 0;                                               \
         if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } } \
+   } while(0)
+
+/* The 040 loop's tail: identical in every respect except that its counter has a name, so
+ * WARP's cadence feed can advance it. See z3660_serv_ctr_040 above and Q10. */
+#define Z3660_RUNLOOP_TAIL_040()                                              \
+   do {                                                                       \
+      Z3660_RUNLOOP_PERF()                                                    \
+      { if(++z3660_serv_ctr_040 >= z3660_service_cadence){ z3660_serv_ctr_040 = 0; check_uae_int_request(); } } \
    } while(0)
 
 /* ====================================================================================
@@ -5661,6 +5771,14 @@ extern "C" void z3660_dopc_invalidate(int cause)
 {
    z3660_dopc_count_cause(cause);
    z3660_dopc_do_invalidate();
+   /* WARP ENGINE: the code cache joins this choke point rather than inventing its own call
+    * sites, for the property the choke point exists to provide -- a new upstream cause
+    * inherits the whole-cache invalidation automatically and has to be opted OUT of it
+    * rather than into it. It is a CONSUMER of the guest's invalidation demand, not a cause,
+    * so nothing above it moves: sum(IV_*) - IV_WRAP == DOPC_INVAL is untouched, and WARP's
+    * own WARP_DISC reconciles against the same stream. Disarmed it returns immediately --
+    * nothing was compiled, so there is nothing to discard. */
+   z3660_warp_invalidate(cause);
 }
 
 /* Rung 1c: the CACR call site proved its request inert, so nothing is invalidated and
@@ -5886,6 +6004,35 @@ void m68k_run_mmu040(void)
 #endif /* Z3660_EMU_PROBES */
 
             do_cycles(cpu_cycles);
+
+            /* ================================================================= WARP =====
+             * THE BLOCK ENGINE'S DISCOVERY HOOK, and it sits here for the same reason the
+             * decoded-op cache's lookup sits twelve lines below: this is the last moment at
+             * which the loop still has a choice about paying for the fetch and the dispatch.
+             *
+             * DISARMED IT IS ONE LOAD, ONE TEST AND A PERFECTLY PREDICTED BRANCH, and that
+             * is a SHIPPED cost until the M5 gate rather than a free one. It is
+             * pre-registered at 3..6 ARM instructions per guest instruction (§0.6.4 G-R1.7)
+             * and read off the lean objdump, never estimated -- because §30's pricing law
+             * says work prepended to the path arrives in full, and the one thing this round
+             * must not do is charge itself nothing.
+             *
+             * ROUND 1 IGNORES THE RETURN VALUE, AND THAT IS THE NO-EMPTY-PASS INVARIANT
+             * SHOWING ITS OTHER HALF. A block entry either retires >= 1 guest instruction
+             * and consumes this pass, or retires 0 and falls through to the interpreter
+             * inside it. Every block in round 1 is a NULL BLOCK -- it retires nothing -- so
+             * the fall-through arm is the only one that exists, the loop below runs exactly
+             * as it always has, and the pass still retires exactly one instruction. The
+             * pass-consuming arm arrives in round 2 with the first block that retires
+             * something, priced by what this round measures.
+             *
+             * Consequence, and it is what makes an armed capture readable by tools that
+             * predate the engine: WARP_ENTER is 0 in round 1, so
+             * DOPC_HIT + DOPC_MISS == (INSNS - WARP_ENTER) + FAULTS holds exactly, in both
+             * arms, and reduces to the identity the firmware has always had.
+             * =========================================================================== */
+            if (z3660_warp_on)
+               z3660_warp_dispatch((unsigned)regs.instruction_pc, regs.s ? 1 : 0);
 
             mmu_opcode = -1;
             /* CYBERSTORM C2 rung 1. The decoded-op cache is consulted HERE, before
@@ -6148,7 +6295,7 @@ void m68k_run_mmu040(void)
             Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
             cpu_cycles = adjust_cycles(cpu_cycles);
             Z3660_PROF_RUNLOOP_SAMPLE(regs.instruction_pc, z3660_prof_op, 1);
-            Z3660_PROF_TAIL_POLL();
+            Z3660_PROF_TAIL_POLL_040();
             Z3660_PROF_TAIL_SPECIALTIES(cpu_cycles);
             Z3660_PROF_EXIT();
          }

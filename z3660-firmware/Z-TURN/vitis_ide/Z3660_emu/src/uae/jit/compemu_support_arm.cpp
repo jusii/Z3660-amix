@@ -2189,6 +2189,33 @@ STATIC_INLINE void create_popalls(void)
    flush_cpu_icache((void *)popallspace, (void *)get_target());
 }
 
+/* WARP ENGINE: hand the block engine the code cache's own arena.
+ *
+ * create_popalls() above has already malloc'd POPALLSPACE_SIZE + MAX_JIT_CACHE * 1024 --
+ * 32 MB + 2 KB -- and it is reached from build_comp(), which build_cpufunctbl() calls
+ * unconditionally under #ifdef JIT. That happens on EVERY boot of EVERY image, MMU modes
+ * included: the serial line `Cache_Alloc of 33556480 at 0x........` is it. Under the MMU
+ * alloc_cache() then returns early on cache_size == 0, so `compiled_code` stays NULL and the
+ * 32 MB behind the trampolines is allocated, zeroed, executable and entirely unused.
+ *
+ * So WARP costs no new heap and its arena's allocation is PROVEN on this card every boot
+ * rather than assumed. The accessor lives here, beside the allocation, rather than in the
+ * engine -- the knowledge of what that malloc contains belongs to the file that made it.
+ *
+ * IT REFUSES IF THE CLASSIC JIT OWNS THE ARENA (`compiled_code != NULL`, i.e. the UAEJIT_*
+ * bootmodes, where cachesize is non-zero). Two engines bump-allocating one arena is a
+ * wild-write generator, and refusing here makes that impossible rather than merely
+ * unlikely. */
+uae_u8 *z3660_warp_cache_arena(unsigned *bytes)
+{
+   if (popallspace == NULL || compiled_code != NULL) {
+      if (bytes) *bytes = 0;
+      return NULL;
+   }
+   if (bytes) *bytes = (unsigned)(MAX_JIT_CACHE * 1024);
+   return popallspace + POPALLSPACE_SIZE;
+}
+
 STATIC_INLINE void reset_lists(void)
 {
    int i;

@@ -14,6 +14,10 @@
 #include "amix_ram.h"
 #include "overhead_switches.h"   /* the single copy of the perf_stats/emu_probes/core0_stats rule */
 #include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (CYBERSTORM C1) */
+/* WARP ENGINE: the OFF sentinel this file publishes unconditionally on every boot. Included
+ * directly rather than mirrored, for debug_console.c's reason -- a mirrored copy is only a
+ * second place for the sentinel to drift away from the one core1 tests against. */
+#include "../../Z3660_emu/src/uae/z3660_warp.h"
 #include "core0_stats.h"         /* core0_stats_set_enabled() -- the core0_stats key */
 #include "main.h"
 #include "ARM_ztop/checkbox.h"
@@ -303,6 +307,28 @@ static void resolve_prof_config(int verbose)
       printf("[CFG] profiler: prof_hz %d, prof_buckets %s "
              "(PROFILING build only -- the default and lean images ignore this)\n",
              config.prof_hz, yesno_names[config.prof_buckets]);
+}
+
+/* WARP ENGINE: DISARM THE BLOCK ENGINE, ON EVERY BOOT, UNCONDITIONALLY.
+ *
+ * THE MAILBOX IS DDR THAT SURVIVES A WARM RESET -- resolve_prof_config() above says so about
+ * prof_ctl, and the consequence is the same one: a boot that leaves this field alone would
+ * let core1 act on the PREVIOUS boot's arm. For a switch between two proven machines
+ * (blk_chunk / dopc_on / dfast_on, which are deliberately NOT published here) that is
+ * harmless. For an engine that is not shipped behaviour until the M5 gate it would mean an
+ * unproven emulator coming up after a reset nobody connected to a console. Writing the
+ * sentinel every time makes "not armed" an explicit instruction rather than the absence of
+ * one.
+ *
+ * DELIBERATELY NOT A CONFIG KEY, and this function takes no argument for that reason: there
+ * is nothing to parse, nothing to resolve, and no way to ask for the armed state from a
+ * file. The console command WARP is the only way in, and it lasts one boot.
+ *
+ * Called from BOTH config paths, exactly like resolve_amix_ram() and
+ * resolve_overhead_switches(), so the value is settled before core1 is dispatched. */
+static void publish_warp_default(void)
+{
+   shared->warp_on = Z3660_WARP_OFF;
 }
 
 static void resolve_amix_ram(int verbose)
@@ -1300,6 +1326,7 @@ load_successful:;
    shared->service_cadence=config.service_cadence;
    resolve_overhead_switches(verbose);      /* perf_stats / emu_probes / core0_stats */
    resolve_prof_config(verbose);            /* CYBERSTORM C1: prof_hz / prof_buckets */
+   publish_warp_default();                  /* WARP ENGINE: never armed at boot */
 
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
@@ -1741,6 +1768,7 @@ retry:
       shared->service_cadence=config.service_cadence;
       resolve_overhead_switches(verbose);   /* perf_stats / emu_probes / core0_stats */
       resolve_prof_config(verbose);         /* CYBERSTORM C1: prof_hz / prof_buckets */
+      publish_warp_default();               /* WARP ENGINE: never armed at boot */
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 

@@ -58,7 +58,16 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
    "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3",
    /* rung 2: the misaligned-read denominator split, and the fast path's coverage. */
-   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR"
+   "MISALIGN_I", "DFAST_HIT", "DFAST_XPAR",
+   /* Id 46 is PERMANENTLY RETIRED -- the withdrawn `f` measurement build's IV_SUPPRESSED,
+    * whose non-zero value a reading tool is required to treat as "this capture is not a
+    * profile of a correct machine". The placeholder keeps every later index aligned and
+    * says out loud, in the dump itself, that nothing increments it. */
+   "(retired)",
+   /* WARP ENGINE, ids 47..59, in the order docs/WARP-ENGINE.md §0.5.6 pre-registered. */
+   "WARP_ENTER", "WARP_BLK", "WARP_INSNS", "WARP_BAIL", "WARP_BAIL_ST",
+   "WARP_COMPILE", "WARP_CINSNS", "WARP_CBYTES", "WARP_CFETCH",
+   "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
