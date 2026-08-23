@@ -407,7 +407,9 @@ static __inline__ uint32_t z3660_prof_pick_wall_hz(uint32_t published, uint32_t 
  * dump and any reordering silently relabels a previous capture.
  * --------------------------------------------------------------------------- */
 enum {
-   Z3660_PROF_B_LOOP    = 0,  /* run-loop bookkeeping outside every named stage        */
+   Z3660_PROF_B_LOOP    = 0,  /* v2+1d "LOOPRES": the dispatch loop's RESIDUE -- see
+                               * the LOOP split below. In v2 id 0 was printed as
+                               * "LOOP" and meant the whole of it.                     */
    Z3660_PROF_B_FETCHOP = 1,  /* the run loop's own opcode fetch (x_prefetch)          */
    Z3660_PROF_B_FETCHEX = 2,  /* extension / EA words fetched by the handler           */
    Z3660_PROF_B_READ    = 3,  /* data reads, excluding translation                     */
@@ -423,7 +425,13 @@ enum {
    Z3660_PROF_B_TAILSAMP = 11, /* the profiler's OWN sampler hook + INSNS counters     */
    Z3660_PROF_B_TAILPOLL = 12, /* the service-cadence interrupt poll                   */
    Z3660_PROF_B_TAILSPEC = 13, /* do_specialties(): trace / STOP / mode change         */
-   Z3660_PROF_B_COUNT   = 14
+   /* --- C2 rung 1d: the LOOP split. The three below NEST INSIDE id 0, exactly as
+    * 11..13 nest inside id 8, so id 0 keeps only the residue and the whole dispatch
+    * loop is the sum of all four. --------------------------------------------------- */
+   Z3660_PROF_B_DOPCFIND = 14, /* the decoded-op cache LOOKUP and the window it arms   */
+   Z3660_PROF_B_DOPCFILL = 15, /* ... and its FILL: the miss path only                 */
+   Z3660_PROF_B_BLKREC   = 16, /* rung 0's block-idiom recognizer, test and chunk      */
+   Z3660_PROF_B_COUNT   = 17
 };
 
 /* WHY THE TAIL IS SPLIT, AND WHAT ID 8 NOW MEANS.
@@ -461,6 +469,103 @@ enum {
  * the whole tail; v2's id 8 is the residue. Rather than leave one name covering two
  * meanings across a version boundary, the name moves with the meaning -- and because
  * the name tables are emitted in every dump, a capture says which it is. */
+
+/* WHY `LOOP` IS SPLIT (C2 rung 1d), AND WHAT ID 0 NOW MEANS.
+ *
+ * This is the tail split's argument, one bucket over, against a bucket that is now
+ * larger than the tail was. The C2 map's v3 (amix-040-060-port/docs/C2-ATTACK-MAP.md
+ * SS15, SS17) measured `LOOP` at 26.38-26.54 % of the interpreter with per-bucket spans --
+ * a 0.31-point bracket, the best-measured share on the page -- and then RANKED IT FIRST
+ * AND WITHHELD ITS RECLAIM ESTIMATE, on the grounds that "a reclaim fraction for a 26 %
+ * bucket whose contents have never been enumerated would be a guess dressed as a number".
+ * SS19 item 4 asks for the enumeration and calls it "the highest-value instrument change
+ * available, in the same sense the tail split was in v1". This is it.
+ *
+ * THE HYPOTHESIS THIS EXISTS TO TEST, stated so the capture can refute it. Map SS15.4
+ * observes that between the pre-rung-1 and rung-1b sessions `FETCHOP` lost 8.7 points of
+ * raw share while `LOOP` gained 5.4, and proposes that some of rung 1's win is
+ * RE-ATTRIBUTION rather than saving: with the decoded-op cache on, a hit never enters
+ * `FETCHOP` at all, so the cache's own hit path -- which is in the run loop and was not
+ * bracketed -- is charged to `LOOP`. If that is right, `LOOP` now CONTAINS the thing rung
+ * 1 added, and attacking `LOOP` means attacking rung 1's hit path. `DOPCFIND` is the
+ * bracket that decides it, and it decides it in one capture.
+ *
+ * The three parts, in the order the loop runs them:
+ *
+ *   id 14  DOPCFIND  z3660_dopc_find(): the set index, the generation compare, up to four
+ *                    tag compares -- and, on a hit, publishing the opcode and arming the
+ *                    extension-word window; on a miss, disarming it. Entered on EVERY
+ *                    dispatch, and closed BEFORE the miss path's opcode fetch, so the
+ *                    fetch stays in FETCHOP where it has always been.
+ *   id 15  DOPCFILL  z3660_dopc_fill(): the miss path's set reclaim, way choice and entry
+ *                    publish. Entered once per MISS and not at all on a hit -- so the
+ *                    hit path pays two transitions for this split and not four.
+ *   id 16  BLKREC    z3660_blk_run(), rung 0's recognizer. Entered only when the cached
+ *                    idiom verdict did not already veto the call.
+ *   id  0  LOOPRES   the residue: the flag snapshot, mmu_restart, m68k_getpc(),
+ *                    do_cycles(), count_instr(), the extension-lookahead reachability
+ *                    test, the cached idiom verdict's own test and its write-back, the
+ *                    handler selection and the `for(;;)` back edge.
+ *
+ * FOUR IDENTITIES A CAPTURE CAN CHECK, and they are what makes these brackets worth more
+ * than their cost. Neither z3660_dopc_find() nor z3660_dopc_fill() touches guest memory,
+ * so neither can throw and neither span can be abandoned by an unwind -- which is what
+ * makes the first two EXACT rather than approximate:
+ *
+ *     tcnt[DOPCFIND] == DOPC_HIT + DOPC_MISS        cache ON: one lookup per dispatch
+ *     tcnt[DOPCFIND] == INSNS + FAULTS              cache ON, via the dispatch identity
+ *     tcnt[DOPCFILL] == DOPC_MISS                   cache ON: one fill per miss
+ *     tcnt[BLKREC]   <= tcnt[DOPCFIND]              the recognizer is called at most once
+ *                                                   per dispatch, and the cached verdict
+ *                                                   is what makes it fewer
+ *
+ * With the cache OFF all three change shape and none of the three is a defect: the lookup
+ * returns before it counts, so DOPC_HIT+DOPC_MISS is 0 while tcnt[DOPCFIND] still counts
+ * every dispatch; and the fill bracket then measures the switch test alone, on every
+ * dispatch rather than on every miss. An off arm reads DOPCFIND and DOPCFILL as the price
+ * of the two switch tests, which is a real number and not the one a cache-on capture
+ * reports.
+ *
+ * BLKREC IS THE ONE THAT IS NOT PURE, and it is bracketed anyway. When the recognizer
+ * DECLINES -- the case map SS19.4 calls "the recognizer's residual test", and the
+ * overwhelmingly common one -- the bucket holds the three masked compares and nothing
+ * else. When it FIRES it holds the whole serviced chunk, because the bracket cannot know
+ * which it will be until the call returns. That is not a conflation a reader has to
+ * untangle by hand: BLK_HIT and BLK_INSNS say exactly how many chunks and how many guest
+ * instructions landed in there, and on a workload with BLK_HIT == 0 the bucket IS the
+ * residual test. z3660_blk.h argues against bucketing the fast path because "a bucket
+ * would need a phase transition around the fast path, and the fast path's entire value is
+ * that it does not pay per-instruction machinery" -- and that argument survives here
+ * intact, because this bracket is per CALL, so a chunk of 256 guest instructions pays two
+ * transitions in total rather than 512.
+ *
+ * WHAT THE SPLIT COSTS, stated rather than discovered, exactly as the tail split's was.
+ * Two transitions per dispatch for DOPCFIND, two per miss for DOPCFILL, two per
+ * recognizer call for BLKREC -- so between two and six added to v2's twelve-to-eighteen,
+ * and about two-and-a-bit on a cache-on workload at a typical hit rate. The profiling
+ * image therefore distorts MORE again than it did in v2. THE FIRMWARE MEASURES IT AND
+ * PRINTS IT: the `[PROF] l` line reports the added transitions and their share of all
+ * transitions, computed from the three buckets' own spans, so the cost of this
+ * decomposition is a number in every capture that carries it rather than a paragraph
+ * here. And shares survive the distortion, which is the whole reason the transition count
+ * is reported beside them.
+ *
+ * THE VERSION IS DELIBERATELY NOT BUMPED, and the reasoning is the tail split's. Ids
+ * 14..16 are a pure APPEND: the binary header and the sample record are untouched, every
+ * id 0..13 still occupies the same slot, and a v2 symbolizer reports an id past the end
+ * of its table uninterpreted rather than mis-labelled. What DOES move is what id 0 means,
+ * and that is handled the way v2 handled `TAIL` -- BY MOVING THE NAME WITH THE MEANING.
+ * The dump prints id 0 as `LOOPRES`, not `LOOP`, so a reader (or a tool) comparing a new
+ * capture against the map's 26.38-26.54 % `LOOP` sees a different name rather than a
+ * silently smaller number. The v2-comparable quantity is printed outright on the
+ * `[PROF] l` line, exactly as `[PROF] t` prints the v1-comparable whole tail. Bumping
+ * would instead make every existing tool refuse a capture it can read correctly, and the
+ * capture session that needs this decomposition is the next one.
+ *
+ * THE ENUM SYMBOL STAYS `Z3660_PROF_B_LOOP` while the printed name moves, which is also
+ * v2's precedent (`Z3660_PROF_B_TAIL` prints as `TAILADV`). The phase machine's floor,
+ * the loop reset and the unwind recovery all name this bucket, and renaming the symbol
+ * would churn every one of them to say nothing new. */
 
 /* ---------------------------------------------------------------------------
  * Counters. All 64-bit: a 32-bit counter overflows in ~7 minutes of hot interpretation,

@@ -31,9 +31,16 @@ extern SHARED *shared;
  * firmware can check the names against the ids it knows. Unsized on purpose -- the
  * tripwires below turn a forgotten name into a compile error instead of a NULL. */
 extern "C" const char * const z3660_prof_bucket_names[] = {
-   "LOOP", "FETCHOP", "FETCHEX", "READ", "WRITE",
+   /* id 0 prints as LOOPRES, not LOOP: rung 1d moved three stages out of it, so the name
+    * moves with the meaning exactly as v1's TAIL became v2's TAILADV. A capture that says
+    * LOOP is a v2 capture and holds the whole dispatch loop; one that says LOOPRES holds
+    * the residue, and its v2-comparable total is on the `[PROF] l` line. */
+   "LOOPRES", "FETCHOP", "FETCHEX", "READ", "WRITE",
    "XLATE", "WALK", "HANDLER", "TAILADV", "FAULT", "PROF",
-   "TAILSAMP", "TAILPOLL", "TAILSPEC"
+   "TAILSAMP", "TAILPOLL", "TAILSPEC",
+   /* rung 1d: the LOOP split. Named after the functions they bracket, so a dump row and a
+    * source symbol cannot drift apart. */
+   "DOPCFIND", "DOPCFILL", "BLKREC"
 };
 extern "C" const char * const z3660_prof_counter_names[] = {
    "INSNS", "INSNS_SUPER", "FETCH", "READ", "WRITE",
@@ -722,6 +729,64 @@ extern "C" void z3660_prof_dump_stats(void)
       z3660_printf("[PROF] t whole tail (TAILADV+TAILSAMP+TAILPOLL+TAILSPEC) cyc=%s %3u.%02u%% "
                    "-- this is what v1 reported as TAIL\r\n",
                    z3660_prof_u64(tail), ip, fp);
+   }
+
+   /* CYBERSTORM C2 rung 1d -- the LOOP split, rolled back up and PRICED.
+    *
+    * Three lines, and each answers a question the `b` rows on their own cannot:
+    *
+    *   the ROLLUP     is the v2-comparable quantity. The C2 map quotes LOOP at
+    *                  26.38-26.54 % and id 0 no longer means that, so the number a reader
+    *                  would otherwise form by habit is printed outright next to the parts.
+    *   the COST       is what the split charged to get the parts. Two transitions per
+    *                  DOPCFIND span, per DOPCFILL span and per BLKREC span -- computed
+    *                  from the buckets' OWN spans rather than from a per-instruction
+    *                  estimate, so it is measured on this capture and not carried in from
+    *                  a doc. A reader can subtract it from TRANSITIONS to price a capture
+    *                  as if this decomposition had not been taken.
+    *   the IDENTITIES are what say the brackets are wired to the quantities they claim.
+    *                  Neither the lookup nor the fill touches guest memory, so neither can
+    *                  be abandoned by an unwind and both counts are exact -- which is why
+    *                  a mismatch here is a defect and not a rounding note. */
+   if (total) {
+      uint64_t find = z3660_prof_tcnt[Z3660_PROF_B_DOPCFIND];
+      uint64_t fill = z3660_prof_tcnt[Z3660_PROF_B_DOPCFILL];
+      uint64_t brec = z3660_prof_tcnt[Z3660_PROF_B_BLKREC];
+      uint64_t loop = z3660_prof_acc[Z3660_PROF_B_LOOP]
+                    + z3660_prof_acc[Z3660_PROF_B_DOPCFIND]
+                    + z3660_prof_acc[Z3660_PROF_B_DOPCFILL]
+                    + z3660_prof_acc[Z3660_PROF_B_BLKREC];
+      uint64_t split = 2u * (find + fill + brec);
+      uint64_t trans = z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS];
+      uint64_t hi = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
+      uint64_t mi = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
+      unsigned ip, fp;
+
+      z3660_prof_pct(loop, total, &ip, &fp);
+      z3660_printf("[PROF] l whole loop (LOOPRES+DOPCFIND+DOPCFILL+BLKREC) cyc=%s %3u.%02u%% "
+                   "-- this is what v2 reported as LOOP\r\n",
+                   z3660_prof_u64(loop), ip, fp);
+      z3660_prof_pct(split, trans, &ip, &fp);
+      z3660_printf("[PROF] l split cost: %s transitions (%u.%02u%% of %s) -- 2 per span of "
+                   "the three; a capture taken before rung 1d has none of them\r\n",
+                   z3660_prof_u64(split), ip, fp, z3660_prof_u64(trans));
+      /* Cache ON only. With it off the lookup returns before it counts, so the left side
+       * keeps counting dispatches while the right side stays at zero -- a fact about the
+       * switch, not a defect, and saying so here is cheaper than having it re-derived. */
+      if (hi + mi) {
+         if (find != hi + mi)
+            z3660_printf("[PROF] l WARNING: DOPCFIND spans=%s but DOPC_HIT+DOPC_MISS=%s -- "
+                         "the lookup bracket and the dispatch counters disagree\r\n",
+                         z3660_prof_u64(find), z3660_prof_u64(hi + mi));
+         if (fill != mi)
+            z3660_printf("[PROF] l WARNING: DOPCFILL spans=%s but DOPC_MISS=%s -- the fill "
+                         "bracket and the miss counter disagree\r\n",
+                         z3660_prof_u64(fill), z3660_prof_u64(mi));
+      } else if (find) {
+         z3660_printf("[PROF] l note: DOPCFIND spans=%s with DOPC_HIT+DOPC_MISS=0 -- the "
+                      "cache was OFF for this window, so these two buckets price the two "
+                      "switch tests and nothing else\r\n", z3660_prof_u64(find));
+      }
    }
 
    /* The instrument's own weight, stated rather than left to be discovered.

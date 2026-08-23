@@ -2894,7 +2894,25 @@ static void test_prof_wire_format(void)
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_LOOP,    0,  "bucket LOOP == 0");
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_FETCHOP, 1,  "bucket FETCHOP == 1");
 	CHECK_EQ32((uae_u32)Z3660_PROF_B_HANDLER, 7,  "bucket HANDLER == 7");
-	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   14, "14 buckets");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_TAILSPEC, 13, "bucket TAILSPEC == 13 (v2's last)");
+	/* C2 rung 1d's appends, pinned individually for the reason the counter appends below
+	 * are: a bare count check would pass just as happily if one had been INSERTED in the
+	 * middle, which is the change that silently relabels every capture ever taken. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_DOPCFIND, 14, "bucket DOPCFIND == 14 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_DOPCFILL, 15, "bucket DOPCFILL == 15 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_BLKREC,   16, "bucket BLKREC == 16 (appended)");
+	CHECK_EQ32((uae_u32)Z3660_PROF_B_COUNT,   17, "17 buckets");
+	/* Id 0's NAME moved with its meaning, exactly as v1's TAIL became v2's TAILADV. A
+	 * capture whose dump says LOOP holds the whole dispatch loop; one that says LOOPRES
+	 * holds the residue and prints the whole on the [PROF] l line. That distinction is the
+	 * only thing standing between the map's 26.4 % LOOP and a silently smaller number, so
+	 * it is pinned rather than left to the name table's good intentions. */
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_LOOP], "LOOPRES") == 0,
+	      "id 0 prints as LOOPRES, not LOOP -- the name moves with the meaning\n");
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_DOPCFIND], "DOPCFIND") == 0,
+	      "names line up with ids (DOPCFIND, the C2 rung-1d append)\n");
+	CHECK(strcmp(z3660_prof_bucket_names[Z3660_PROF_B_BLKREC], "BLKREC") == 0,
+	      "names line up with ids (BLKREC)\n");
 	CHECK_EQ32((uae_u32)Z3660_PROF_C_INSNS,   0,  "counter INSNS == 0");
 	/* Appended ids, pinned individually: the whole safety of an append is that every id
 	 * BELOW it still means what a v2 symbolizer thinks it means, and a bare count check
@@ -5060,7 +5078,14 @@ static void test_blk_counters(void)
  * still performs with the cache live. That is the numerator of the whole rung, and a
  * capture where the fetches did not fall is a cache that is hitting and not saving.
  * ================================================================== */
-struct dopc_cnt { uae_u64 c[Z3660_PROF_C_COUNT]; int steps; };
+struct dopc_cnt {
+	uae_u64 c[Z3660_PROF_C_COUNT];
+	/* C2 rung 1d: the per-bucket SPANS as well, so the LOOP split's identities can be
+	 * asserted against the same run the counters come from rather than against a second
+	 * one. Zero unless the caller armed the buckets first. */
+	uae_u64 t[Z3660_PROF_B_COUNT];
+	int steps;
+};
 
 static void dopc_count_run(struct dopc_cnt *out, unsigned knob, uae_u32 n)
 {
@@ -5089,6 +5114,7 @@ static void dopc_count_run(struct dopc_cnt *out, unsigned knob, uae_u32 n)
 	regs.spcflags = 0;
 
 	memcpy(out->c, (const void *)z3660_prof_cnt, sizeof out->c);
+	memcpy(out->t, (const void *)z3660_prof_tcnt, sizeof out->t);
 	out->steps = steps;
 
 	shared->dopc_on   = Z3660_DOPC_UNSET;
@@ -5352,6 +5378,169 @@ static void test_dopc_counters(void)
 	z3660_knobs_sync();
 	cpu_bringup(68030);
 }
+
+/* ==================================================================
+ * CYBERSTORM C2 RUNG 1d -- THE `LOOP` SPLIT
+ *
+ * The C2 map's v3 ranked `LOOP` FIRST at 26.38-26.54 % of the interpreter and then
+ * REFUSED to give it a reclaim estimate, because nothing had ever enumerated what is in
+ * it: "a reclaim fraction for a 26 % bucket whose contents have never been enumerated
+ * would be a guess dressed as a number". SS19 item 4 asks for one probe bracket around the
+ * decoded-op lookup and calls it the highest-value instrument change available. Ids 14/15/
+ * 16 are that bracket and two more beside it.
+ *
+ * This test has two halves and they fail differently on purpose.
+ *
+ *   THE PHASE-MACHINE HALF drives the buckets by hand against the injectable clock, so
+ *   exclusivity and the residue are asserted as ARITHMETIC. It is the half that would
+ *   catch an ENTER without its EXIT, or a sub-stage whose cycles also land in the parent.
+ *
+ *   THE EXECUTION HALF runs the real 040 loop and asserts the four IDENTITIES the split
+ *   claims. They matter more than they look: the whole reason the map can consume a
+ *   bucket's corrected share is that per-bucket spans self-check, and a bracket wired to
+ *   the wrong quantity would produce a number that balances and means something else --
+ *   which is the failure this profiler has already had twice (v1's ATC_HIT, and the
+ *   2 x IFETCH_CALLS substitute the spans replaced).
+ * ================================================================== */
+static void test_prof_loop_split(void)
+{
+	printf("[test] C2 rung 1d LOOP split: the lookup, the fill and the recognizer leave the residue\n");
+
+	/* ---- 1. the phase machine, by hand ------------------------------------------- */
+	z3660_prof_set_buckets(1);
+	z3660_prof_zero();
+	prof_clock(2000);
+	z3660_prof_loop_reset();
+
+	/* One dispatch's worth of loop, in the order m68k_run_mmu040 runs it -- including the
+	 * tail bracket at the end, because in the real loop THAT is what closes the residue.
+	 * Leaving it off is not a shorter test, it is a different one: the last stretch of
+	 * LOOPRES is charged by the next transition, so with no next transition it is charged
+	 * to nothing and the totals quietly come up short. Spans are chosen distinct so a
+	 * mis-attribution cannot alias onto another bucket's expectation. */
+	prof_clock(2004);                            /* 4 cyc of LOOPRES: the loop head     */
+	z3660_prof_enter(Z3660_PROF_B_DOPCFIND);
+	prof_clock(2013); z3660_prof_exit();         /* 9 of DOPCFIND                       */
+	prof_clock(2020);                            /* 7 more of LOOPRES                   */
+	z3660_prof_enter(Z3660_PROF_B_BLKREC);
+	prof_clock(2023); z3660_prof_exit();         /* 3 of BLKREC (a decline)             */
+	prof_clock(2027);                            /* 4 more of LOOPRES                   */
+	z3660_prof_enter(Z3660_PROF_B_DOPCFILL);
+	prof_clock(2048); z3660_prof_exit();         /* 21 of DOPCFILL                      */
+	prof_clock(2050);
+	z3660_prof_enter(Z3660_PROF_B_TAIL);         /* 2 more of LOOPRES, charged here     */
+	prof_clock(2060); z3660_prof_exit();         /* 10 of TAILADV                       */
+
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_DOPCFIND], 9,  "DOPCFIND gets its 9");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_BLKREC],   3,  "BLKREC gets its 3");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_DOPCFILL], 21, "DOPCFILL gets its 21");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_TAIL],     10, "TAILADV is untouched by the split");
+	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_LOOP], 17,
+	           "id 0 keeps only the RESIDUE (4 + 7 + 4 + 2) -- it is LOOPRES now, not LOOP");
+	{
+		uae_u64 loop = z3660_prof_acc[Z3660_PROF_B_LOOP]
+		             + z3660_prof_acc[Z3660_PROF_B_DOPCFIND]
+		             + z3660_prof_acc[Z3660_PROF_B_DOPCFILL]
+		             + z3660_prof_acc[Z3660_PROF_B_BLKREC];
+		uae_u64 total = 0; int i;
+		CHECK_EQ32((uae_u32)loop, 50,
+		           "the four ids re-sum to the whole dispatch loop -- which is what v2 "
+		           "reported as LOOP, and what the [PROF] l line prints");
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) total += z3660_prof_acc[i];
+		CHECK_EQ32((uae_u32)total, 60,
+		           "and the split changes no total: sum(buckets) is still the elapsed span");
+	}
+	/* The cost, and it has to be VISIBLE in TRANSITIONS or the probe subtraction
+	 * under-corrects -- the same rule the tail split was held to. */
+	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 8,
+	           "four bracketed stages = eight transitions");
+	CHECK_EQ32((uae_u32)(2u * (z3660_prof_tcnt[Z3660_PROF_B_DOPCFIND]
+	                         + z3660_prof_tcnt[Z3660_PROF_B_DOPCFILL]
+	                         + z3660_prof_tcnt[Z3660_PROF_B_BLKREC])), 6,
+	           "...six of which are rung 1d's, which is exactly the arithmetic the "
+	           "[PROF] l cost line prints so a capture can be re-priced without them");
+
+	/* ---- 2. the identities, under real execution --------------------------------- */
+	{
+		struct dopc_cnt on, off;
+		const uae_u32 N = 40;
+
+		z3660_prof_set_buckets(1);
+		dopc_count_run(&on, Z3660_DOPC_DEFAULT, N);
+
+		printf("       spans: DOPCFIND %llu DOPCFILL %llu BLKREC %llu | dispatches %llu "
+		       "miss %llu\n",
+		       (unsigned long long)on.t[Z3660_PROF_B_DOPCFIND],
+		       (unsigned long long)on.t[Z3660_PROF_B_DOPCFILL],
+		       (unsigned long long)on.t[Z3660_PROF_B_BLKREC],
+		       (unsigned long long)(on.c[Z3660_PROF_C_DOPC_HIT] + on.c[Z3660_PROF_C_DOPC_MISS]),
+		       (unsigned long long)on.c[Z3660_PROF_C_DOPC_MISS]);
+
+		/* Neither z3660_dopc_find() nor z3660_dopc_fill() touches guest memory, so neither
+		 * can be abandoned by a fault unwind and both of these are EXACT -- which is what
+		 * makes them assertions rather than tolerances, and what makes the firmware's
+		 * matching warnings a defect report rather than a rounding note. */
+		CHECK_EQ32((uae_u32)on.t[Z3660_PROF_B_DOPCFIND],
+		           (uae_u32)(on.c[Z3660_PROF_C_DOPC_HIT] + on.c[Z3660_PROF_C_DOPC_MISS]),
+		           "DOPCFIND spans == DOPC_HIT + DOPC_MISS: the bracket is entered exactly "
+		           "once per dispatch, which is what makes its share the LOOKUP's share");
+		CHECK_EQ32((uae_u32)on.t[Z3660_PROF_B_DOPCFIND], (uae_u32)on.c[Z3660_PROF_C_INSNS],
+		           "...and equals INSNS on a run with no faults in it -- the dispatch "
+		           "identity the map states as HIT + MISS == INSNS + FAULTS");
+		CHECK_EQ32((uae_u32)on.t[Z3660_PROF_B_DOPCFILL], (uae_u32)on.c[Z3660_PROF_C_DOPC_MISS],
+		           "DOPCFILL spans == DOPC_MISS: the fill bracket is on the MISS arm only, "
+		           "so a hit pays two transitions for this split and not four");
+		CHECK(on.t[Z3660_PROF_B_BLKREC] <= on.t[Z3660_PROF_B_DOPCFIND],
+		      "BLKREC is entered at most once per dispatch (%llu <= %llu)\n",
+		      (unsigned long long)on.t[Z3660_PROF_B_BLKREC],
+		      (unsigned long long)on.t[Z3660_PROF_B_DOPCFIND]);
+
+		/* AND HERE IT IS EQUAL, which is a real property and not a fixture artefact:
+		 * dopc_count_run() pins BLK OFF, and a cap-0 recognizer returns before the head
+		 * discrimination that would clear *shapep -- so every entry is filled with the
+		 * conservative "may be an idiom" verdict and every later HIT calls the recognizer
+		 * anyway. WITH RUNG 0 SWITCHED OFF, RUNG 1's IDIOM-VERDICT OPTIMISATION CANNOT
+		 * ENGAGE. That is worth a line here because it is exactly the confound rung 1c's
+		 * verdict was caught by one level up: a justification measured with another rung
+		 * switched off is not a justification for the shipping configuration. */
+		CHECK_EQ32((uae_u32)on.t[Z3660_PROF_B_BLKREC], (uae_u32)on.t[Z3660_PROF_B_DOPCFIND],
+		           "...and with BLK OFF it is entered on every one of them: a cap-0 "
+		           "recognizer never clears the shape bit, so no cached verdict can veto it");
+
+		/* The sum identity the whole `s` block rests on has to survive three more buckets:
+		 * every transition ends exactly one span and it is charged to exactly one id. */
+		{
+			uae_u64 spans = 0; int i;
+			for (i = 0; i < Z3660_PROF_B_COUNT; i++) spans += on.t[i];
+			CHECK(spans == on.c[Z3660_PROF_C_TRANSITIONS],
+			      "sum(spans) == TRANSITIONS still holds across 17 buckets (%llu vs %llu)\n",
+			      (unsigned long long)spans,
+			      (unsigned long long)on.c[Z3660_PROF_C_TRANSITIONS]);
+		}
+
+		/* THE CACHE-OFF SHAPE, stated so it is not read as a defect on the day a session
+		 * takes an off arm. The lookup returns before it counts, so the two dispatch
+		 * counters stay at zero while DOPCFIND goes on being entered every pass -- and
+		 * DOPCFILL, whose bracket is on the (now universal) miss arm, prices the fill's
+		 * own switch test on every dispatch instead of on every miss. */
+		z3660_prof_set_buckets(1);
+		dopc_count_run(&off, Z3660_DOPC_OFF, N);
+		CHECK_EQ32((uae_u32)(off.c[Z3660_PROF_C_DOPC_HIT] + off.c[Z3660_PROF_C_DOPC_MISS]), 0u,
+		           "OFF: the lookup returns before it can count, as it always has");
+		CHECK_EQ32((uae_u32)off.t[Z3660_PROF_B_DOPCFIND], (uae_u32)off.c[Z3660_PROF_C_INSNS],
+		           "OFF: but DOPCFIND is still entered every dispatch -- with the cache off "
+		           "these two buckets price the two switch tests and nothing else");
+		CHECK_EQ32((uae_u32)off.t[Z3660_PROF_B_DOPCFILL], (uae_u32)off.c[Z3660_PROF_C_INSNS],
+		           "OFF: ...and DOPCFILL with it, because every pass takes the miss arm");
+	}
+
+	z3660_prof_set_buckets(0);
+	z3660_prof_zero();
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_UNSET;
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
 #endif /* Z3660_EMU_PROF */
 
 int main(int argc, char **argv)
@@ -5422,6 +5611,7 @@ int main(int argc, char **argv)
 	test_prof_ifetch_calls();
 	test_blk_counters();
 	test_dopc_counters();
+	test_prof_loop_split();
 	test_prof_ring();
 	test_prof_under_execution();
 #endif

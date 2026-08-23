@@ -486,12 +486,24 @@ per miss and the saving was worth a fraction of a miss.** That is the shape to l
 next narrowing, and it is why a physical index (which costs a *translation* on the fill path)
 needs its own pre-registration rather than an argument by analogy.
 
+> **★ The fill path now has a bucket (C2 rung 1d): `DOPCFILL`, profiler id 15.** Every
+> statement above about fill-path cost was reasoned from ARM instruction counts and from what
+> happened to dhrystone; none of it was ever measured *as a share*, because there was nowhere
+> for it to land — the fill fell into `LOOP` along with everything else the run loop does. It
+> is bracketed now, entered once per miss, with `tcnt[DOPCFILL] == DOPC_MISS` as an exact
+> identity the dump checks. **The physical-index study's pre-registration should be written
+> against that measurement rather than against this paragraph**, which is what map §17.3's bar
+> asks for in as many words: *"this study must pre-register its cost site and measure the
+> fill-path price, not assume it."* The lookup half is bracketed too (`DOPCFIND`, id 14), so
+> the same capture prices the hit path a physical index must not slow down. See
+> `docs/profiler.md`, "The LOOP split".
+
 Current sizes, lean build, **counted in ARM instructions** from `objdump -d`:
 
 | symbol | lean | |
 |---|---|---|
 | `uae_mmu040_get_iword` | **76** (0x130 = 304 bytes) | the hit path — unchanged across 1, 1b, 1c |
-| `m68k_run_mmu040` | **572** (0x8f0 = 2288 bytes) | unchanged across 1, 1b, 1c |
+| `m68k_run_mmu040` | **572** (0x8f0 = 2288 bytes) | unchanged across 1, 1b, 1c — **and 1d**, proven byte-for-byte |
 | `z3660_dopc_fill` | **65** (0x104 = 260 bytes) | the marks are gone |
 
 > **A unit note on the rows above, since this table has been bitten by one before.** These
@@ -499,7 +511,8 @@ Current sizes, lean build, **counted in ARM instructions** from `objdump -d`:
 > instructions **plus each symbol's literal pool**. Counting instructions alone —
 > `objdump -d` minus the `.word` lines — gives `m68k_run_mmu040` **552** and
 > `uae_mmu040_get_iword` **64** on the same lean build. Neither measure is wrong; they are
-> not the same measure, and the difference is the constant pool.
+> not the same measure, and the difference is the constant pool. `docs/profiler.md`'s
+> prof-versus-lean table counts instructions.
 
 > **Unit correction.** The rung-1 table above read "`uae_mmu040_get_iword` 136 → 152
 > instructions" beside "`m68k_run_mmu040` 572 instructions". The two rows were **not in the

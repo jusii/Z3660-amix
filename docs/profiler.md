@@ -107,17 +107,29 @@ the answer; its *rate* is not.
 ### What each of them actually costs
 
 Counted out of the generated ARM (`objdump -d` of the lean and profiling `Z3660_emu.elf`),
-not estimated:
+not estimated. **Re-measured 2026-08-23 on the rung-1d build** — the figures this table
+carried before were from the C1-era loop, three rungs of optimisation ago, and
+`m68k_run_mmu040` in particular had grown 5× since. Instruction counts exclude each symbol's
+literal pool, so they are instructions and not words:
 
 | | lean | profiling | delta |
 |---|---|---|---|
-| `m68k_run_mmu040` | 101 | 173 | +72 |
-| `m68k_run_mmu030` | 205 | 268 | +63 |
-| `mmu_translate` | 210 | 225 | +15 |
-| `uae_mmu040_get_long` | 77 | 100 | +23 |
-| `uae_mmu040_put_long` | 85 | 107 | +22 |
-| `uae_mmu040_get_iword` | 68 | 96 | +28 |
-| `z3660_prof_enter` / `_exit` / `_count` | — | 51 / 44 / 10 | (out of line) |
+| `m68k_run_mmu040` | 552 | 689 | +137 |
+| `m68k_run_mmu030` | 187 | 253 | +66 |
+| `mmu_translate` | 194 | 215 | +21 |
+| `uae_mmu040_get_long` | 68 | 90 | +22 |
+| `uae_mmu040_put_long` | 75 | 96 | +21 |
+| `uae_mmu040_get_iword` | 64 | 95 | +31 |
+| `z3660_dopc_fill` | 60 | 60 | **0** — the fill is bracketed at its *call site*, so the function itself is untouched |
+| `z3660_prof_enter` / `_exit` / `_count` | — | 52 / 45 / 9 | (out of line) |
+
+**Rung 1d's own share of that `+137`, isolated by building the profiling image with and
+without it:** `m68k_run_mmu040` goes 687 → 689 instructions, and its `bl z3660_prof_enter`
+sites go **6 → 9** (one each for `DOPCFIND`, `DOPCFILL`, `BLKREC`) with the matching exits
+5 → 11 (gcc duplicates exits into branch tails; the count is code size, not per-dispatch
+cost). Net **+2 instructions of straight-line code** — the register setup for three more
+calls was absorbed by re-scheduling. **The per-dispatch cost that actually matters is the
+transitions, not the instructions, and the dump prints it** (see "The LOOP split" below).
 
 The shape that matters is not in the deltas above but in the last row. **Every instrumented
 accessor makes three out-of-line calls** — `enter`, `count`, `exit` — and it makes them
@@ -161,7 +173,7 @@ gives you exact hit rates for free.
 
 | id | name | what lands here |
 |---|---|---|
-| 0 | `LOOP` | run-loop bookkeeping outside every named stage |
+| 0 | `LOOPRES` | **rung 1d**: the dispatch loop's *residue* — run-loop bookkeeping outside every named stage. **In v2 id 0 was printed as `LOOP` and meant the whole of it.** |
 | 1 | `FETCHOP` | the run loop's own opcode fetch (`x_prefetch`) |
 | 2 | `FETCHEX` | extension / EA words fetched by the handler |
 | 3 | `READ` | data reads, **excluding** translation |
@@ -175,6 +187,9 @@ gives you exact hit rates for free.
 | 11 | `TAILSAMP` | **v2**: the profiler's own sampler hook + the `INSNS` counters — *instrument cost, not interpreter cost* |
 | 12 | `TAILPOLL` | **v2**: `check_uae_int_request()` when the service cadence lets it through |
 | 13 | `TAILSPEC` | **v2**: `do_specialties()` — trace, `STOP`, mode change |
+| 14 | `DOPCFIND` | **rung 1d**: the decoded-op cache **lookup** — set index, generation compare, tag compares, and the extension-window arm/disarm. Every dispatch. |
+| 15 | `DOPCFILL` | **rung 1d**: the decoded-op cache **fill**. The miss path only. |
+| 16 | `BLKREC` | **rung 1d**: `z3660_blk_run()`, rung 0's block-idiom recognizer — the residual test, and the serviced chunk when it fires |
 
 Time is **exclusive**: a translate inside a data read appears in `XLATE` and *not* also in
 `READ`. `sum(buckets) == total measured cycles` by construction, and the host harness
@@ -203,6 +218,107 @@ Two things about the split are worth knowing before reading a number out of it:
 `PROFD` prints `TAILADV + TAILSAMP + TAILPOLL + TAILSPEC` on its own `[PROF] t` line, so a
 v2 capture can be laid beside a v1 one without the reader having to know which four ids to
 add up.
+
+### The LOOP split (C2 rung 1d) — and why id 0 is now called `LOOPRES`
+
+Same move, one bucket over, against a bucket that had become larger than the tail ever was.
+
+C2 map v3 §15 measured `LOOP` at **26.38–26.54 %** of the interpreter — with per-bucket
+spans, so a 0.31-point bracket and the best-measured share on the page — **ranked it first,
+and then refused to give it a reclaim estimate**: *"a reclaim fraction for a 26 % bucket
+whose contents have never been enumerated would be a guess dressed as a number."* §19 item 4
+asks for one probe bracket around the decoded-op lookup and calls it *"the highest-value
+instrument change available, in the same sense the tail split was in v1"*. Ids 14–16 are
+that bracket and two more beside it.
+
+**The hypothesis they exist to settle** is map §15.4's. Between the pre-rung-1 and rung-1b
+sessions `FETCHOP` lost 8.7 points of raw share while `LOOP` gained 5.4 — so some of rung 1's
+win may be **re-attribution rather than saving**: with the cache on a hit never enters
+`FETCHOP` at all, and the cache's own hit path is in the run loop and was not bracketed. If
+that is right, `LOOP` *contains* the thing rung 1 added, and attacking `LOOP` means attacking
+rung 1's hit path. `DOPCFIND` decides it in one capture.
+
+The four parts, in the order the loop runs them:
+
+| id | name | what it is |
+|---|---|---|
+| 14 | `DOPCFIND` | `z3660_dopc_find()`: the set index, the generation compare, up to four tag compares — and on a hit, publishing the opcode and arming the extension-word window; on a miss, disarming it. Entered on **every** dispatch, and **closed before the miss path's opcode fetch**, so the fetch stays in `FETCHOP` where every earlier capture has it. |
+| 15 | `DOPCFILL` | `z3660_dopc_fill()`: the set reclaim, the way choice, the entry publish. Entered once per **miss** — so a hit pays two transitions for this split, not four. |
+| 16 | `BLKREC` | `z3660_blk_run()`. Entered only when the cached idiom verdict did not already veto the call. |
+| 0 | `LOOPRES` | the residue: the flag snapshot, `mmu_restart`, `m68k_getpc()`, `do_cycles()`, `count_instr()`, the extension-lookahead reachability test, the cached idiom verdict's own test and its write-back, the handler selection and the `for(;;)` back edge. |
+
+**Four identities a capture can check**, and they are what makes these brackets worth their
+cost. Neither the lookup nor the fill touches guest memory, so neither can throw and neither
+span can be abandoned by an unwind — which is why the first two are *exact* rather than
+approximate, and why the firmware **warns** rather than notes when they fail:
+
+```
+tcnt[DOPCFIND] == DOPC_HIT + DOPC_MISS      cache ON: one lookup per dispatch
+tcnt[DOPCFIND] == INSNS + FAULTS            cache ON, via the dispatch identity below
+tcnt[DOPCFILL] == DOPC_MISS                 cache ON: one fill per miss
+tcnt[BLKREC]   <= tcnt[DOPCFIND]            at most one recognizer call per dispatch
+```
+
+**With the cache OFF all three change shape, and none of it is a defect.** The lookup returns
+before it counts, so `DOPC_HIT + DOPC_MISS` is 0 while `DOPCFIND` goes on being entered every
+pass; and `DOPCFILL`, whose bracket sits on the now-universal miss arm, prices the fill's own
+switch test on every dispatch instead of on every miss. An off arm reads those two buckets as
+the price of the two switch tests — a real number, and not the one a cache-on capture reports.
+The dump says so on a `[PROF] l note:` line rather than warning.
+
+> **`BLKREC` is the one that is not pure, and it is bracketed anyway.** On a **decline** —
+> map §19.4's "recognizer's residual test", and the overwhelmingly common case — the bucket
+> holds three masked compares and a return. On a **fire** it holds the whole serviced chunk,
+> because a bracket cannot know which it will be until the call returns. `BLK_HIT` and
+> `BLK_INSNS` separate the two in the same dump, and on a workload with `BLK_HIT == 0` the
+> bucket *is* the residual test. `z3660_blk.h`'s objection to bucketing the fast path — *"the
+> fast path's entire value is that it does not pay per-instruction machinery"* — survives
+> intact, because this bracket is per **call**: a chunk of 256 guest instructions pays two
+> transitions in total, not 512.
+
+**What the split costs, and the firmware measures it rather than asserting it here.** Two
+transitions per dispatch for `DOPCFIND`, two per miss for `DOPCFILL`, two per recognizer call
+for `BLKREC` — so between two and six added to v2's twelve-to-eighteen. `PROFD` prints the
+total on its own line, computed from the three buckets' own spans:
+
+```
+[PROF] l whole loop (LOOPRES+DOPCFIND+DOPCFILL+BLKREC) cyc=<n> <pct>% -- this is what v2 reported as LOOP
+[PROF] l split cost: <n> transitions (<pct>% of <total>) -- 2 per span of the three; a capture taken before rung 1d has none of them
+```
+
+so a capture can be re-priced *as if this decomposition had not been taken* by subtracting
+that figure from `TRANSITIONS`. The first line is the v2-comparable quantity, and it exists
+for the same reason `[PROF] t` does: the map quotes `LOOP` at 26.4 % and id 0 no longer means
+that, so the number a reader would otherwise form by habit is printed outright.
+
+**The lean loop is unchanged, and that is measured rather than argued.** One thing rung 1d
+had to move in *lean* source: the two extension-slot locals used to be declared after the
+lookup, and bracketing the lookup would have put their two zero-stores inside `DOPCFIND` —
+roughly a sixth of a bucket whose whole content is a generation compare and four tag
+compares. They are hoisted two lines instead, and neither is readable by
+`z3660_dopc_find()`, so the reorder cannot be observed. Checked, not assumed:
+
+| | result |
+|---|---|
+| host `newcpu.o`, `-O0`, lean and default | identical instruction multiset; the two stores change position and **nothing else differs** |
+| **ARM `Z3660_emu.elf`, `-Os`, lean — `m68k_run_mmu040`** | **byte-for-byte identical, at the same addresses** (552 instructions before and after) |
+| ARM lean `.text`, whole image | **one** instruction differs: a `movw r2, #6286` → `#6351` — the `__LINE__` operand of `m68k_go`'s *"Bug! m68k_go is not reentrant"* `abort()` path |
+
+At `-Os` the scheduler put the two stores back where they were. The lean `BOOT-lean.BIN`
+checksum still moves, and only because the **bucket name table is compiled into every
+variant** by design (it is what makes a dump self-describing) — `LOOPRES` plus three names is
+rodata that no lean code path reads.
+
+**The version is deliberately not bumped**, and the reasoning is the tail split's. Ids 14–16
+are a pure append — the binary header and the sample record are untouched, every id 0–13 sits
+where it did, and a v2 symbolizer reports an id past the end of its table uninterpreted rather
+than mis-labelled. What *does* move is what id 0 means, and that is handled the way v2 handled
+`TAIL`: **by moving the name with the meaning.** A dump that says `LOOP` is a v2 dump and holds
+the whole dispatch loop; one that says `LOOPRES` holds the residue. Bumping would instead make
+every existing tool refuse a capture it can read correctly, and the capture session that needs
+this decomposition is the next one. (The *enum symbol* stays `Z3660_PROF_B_LOOP`, exactly as
+`Z3660_PROF_B_TAIL` prints as `TAILADV` — the phase machine's floor, the loop reset and the
+unwind recovery all name it, and renaming them would say nothing new.)
 
 ### Per-bucket transition spans — the `[PROF] s` lines (C2 rung 1b)
 
@@ -275,6 +391,11 @@ A **0.31 pp bracket in place of a 5.8 pp interval of upper bounds**, and the who
 self-checks (`sum(spans) == TRANSITIONS`, 800 774 653 on that capture; boot-line price bracket
 39 (marginal) .. 50 (in-bucket) from `armed 105342, unarmed 23707, empty 2090, 1024 pairs`).
 This is the `LOOP`-interval closure the C2 map was owed; it can be consumed directly.
+
+> **Both rows above are the v2 `LOOP` — the whole dispatch loop.** From rung 1d the bucket
+> that carries id 0 is the *residue* and prints as `LOOPRES`; the quantity these rows measure
+> is now `LOOPRES + DOPCFIND + DOPCFILL + BLKREC`, printed on the `[PROF] l` line. See "The
+> LOOP split" above before comparing a new capture against 24.80–25.11 %.
 
 **`FAULT` is reported uncorrected**, and deliberately. An unwind (`z3660_prof_unwound()`) charges
 FAULT cycles but counts no span, because an unwind is not a probe transition and has never been
@@ -437,8 +558,9 @@ the hit counter beside it that was not.
      emulated device) yields one heavy sample, not several: correct total, coarse
      resolution.
 2. **The buckets charge the probe's own cost to the buckets.** Each transition is a
-   counter read, a subtract, a 64-bit accumulate and a stack push/pop, and there are 12–18
-   transitions per emulated instruction (v2's tail split added four to v1's 8–14). The
+   counter read, a subtract, a 64-bit accumulate and a stack push/pop, and there are 14–24
+   transitions per emulated instruction (v2's tail split added four to v1's 8–14; rung 1d's
+   LOOP split adds two to six more, and **prints its own share** on the `[PROF] l` line). The
    firmware **measures** this at arm time and reports it as `probe_cyc` alongside the
    `TRANSITIONS` count, so the inflation is computable and, if you care, subtractable per
    bucket by its share of transitions.
@@ -808,8 +930,9 @@ is detectable rather than merely mis-parsed**. `rec_count` in the header must eq
 on the `ring end` line; if it does not, the capture lost lines.
 
 The stats dump (`PROFD`) is line-oriented in the same way: `[PROF] b <id> <NAME> cyc=<n>
-<pct>%` per bucket, one `[PROF] t` whole-tail rollup, `[PROF] c <id> <NAME> <n>` per
-counter, then a few `[PROF] r` derived rates. Its header line carries
+<pct>%` per bucket, one `[PROF] t` whole-tail rollup, **the `[PROF] l` whole-loop rollup and
+its split-cost line (rung 1d)**, the `[PROF] s` per-bucket span block, `[PROF] c <id> <NAME>
+<n>` per counter, then a few `[PROF] r` derived rates. Its header line carries
 `probe_cyc_per_transition=` and `clk=` too.
 
 > **Capture-path defects a symbolizer should tolerate, not refuse.** The C2 audit found
@@ -827,10 +950,10 @@ counter, then a few `[PROF] r` derived rates. Its header line carries
 > (`[PROF] === stage attribution ===`) collides with the console echo of the `PROFD` that
 > requested it, in exactly the way the ring dump's first header line does and for exactly the
 > same reason — one UART behind one semaphore, and the echo is already in flight when the
-> firmware takes it. The banner arrives mangled or short; **every `b`, `t`, `s`, `c` and `r`
-> line after it is intact**, because each is a separate `printf` that acquires the semaphore
-> cleanly. **This one is handled host-side and the firmware cannot fix it**: there is no
-> ordering the dumping core can impose on an echo the other core has already begun. A
+> firmware takes it. The banner arrives mangled or short; **every `b`, `t`, `l`, `s`, `c` and
+> `r` line after it is intact**, because each is a separate `printf` that acquires the
+> semaphore cleanly. **This one is handled host-side and the firmware cannot fix it**: there
+> is no ordering the dumping core can impose on an echo the other core has already begun. A
 > symbolizer must key on the `[PROF] ver=` line rather than on the banner, and must not treat
 > a missing or corrupt banner as a truncated capture.
 
@@ -857,6 +980,11 @@ minimum correct implementation:
    produced a plausible table instead of an error.
 4c. **Sum the tail from four ids.** `TAILADV + TAILSAMP + TAILPOLL + TAILSPEC` is what v1
    called `TAIL`. `TAILSAMP` is instrument cost — subtract it rather than ranking it.
+4c2. **And the loop from four more.** `LOOPRES + DOPCFIND + DOPCFILL + BLKREC` is what v2
+   called `LOOP`. **Do not report id 0 alone against a figure quoted from a v2 capture** —
+   check the name: `LOOP` is the whole loop, `LOOPRES` is the residue. Report the four parts
+   *and* the rollup, exactly as for the tail, and carry the `[PROF] l split cost:` figure
+   beside them so a share can be re-priced without rung 1d's own transitions.
 4d. **Use `ATC_HIT` (id 19) for the ATC hit rate, never id 12.** Id 12 is `XLATE_OK` and
    counts successful translates. `ATC_HIT + ATC_MISS == XLATE` when nothing faulted.
 5. **Split by `SUPER`** — kernel and user-space hot spots are different questions and both
@@ -922,9 +1050,19 @@ the console echo of the command that requested it.
    `PROFD`. Expect the reported instruction rate to be far below the lean figure — that is
    the instrument, not the interpreter. Read the per-bucket **shares**, the whole-tail
    rollup and the `probe overhead inside the totals` line, the **`s` per-bucket span block**
-   (which is what makes each bucket's corrected share a number rather than an interval), and
-   take the counters (`IPAGE_*`, `DPAGE_*`, `ATC_*`, `MISALIGN_*`, `IV_*`, `IV_CACR_SKIP`)
-   from this run: they are exact regardless of the timing distortion.
+   (which is what makes each bucket's corrected share a number rather than an interval), the
+   **`l` whole-loop rollup and its split-cost line**, and take the counters (`IPAGE_*`,
+   `DPAGE_*`, `ATC_*`, `MISALIGN_*`, `IV_*`, `IV_CACR_SKIP`) from this run: they are exact
+   regardless of the timing distortion.
+
+   **The `l` block is what a rung-1d capture is for.** Its four parts are the first
+   enumeration `LOOP` has ever had, and the one question they settle is map §15.4's: is
+   `DOPCFIND` large? If it is, the top of the ladder is rung 1's own hit path and `LOOP`'s
+   26 % is partly re-attributed `FETCHOP` rather than new cost. `DOPCFILL` is a second
+   number the session should bank whether or not it is large, because map §17.3's
+   physical-index study has to be judged against **the fill path's measured price** and this
+   is the first capture that has one. Check the two identities on the `l` lines before
+   reading any of it.
 
    **Sweep the corrected shares across THIS boot's `[marginal, in-bucket]` bracket** — the boot
    line prints both ends and they move ~20 % between sessions. Report the range; picking an end

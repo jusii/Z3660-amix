@@ -164,6 +164,12 @@
  * path, which is the cost class that just failed here, so it needs its own pre-registration
  * with the fill-path price measured rather than assumed.
  *
+ * AND THAT PRICE IS NOW MEASURABLE. C2 rung 1d gives the fill its own profiler bucket
+ * (DOPCFILL, id 15) and the lookup its own (DOPCFIND, id 14), so "what the fill path costs"
+ * stopped being an argument from ARM instruction counts and became a share of the
+ * interpreter, with tcnt[DOPCFILL] == DOPC_MISS as an exact identity the dump checks. Write
+ * the physical index's pre-registration against a capture, not against this comment.
+ *
  * WHAT IS DELIBERATELY LEFT WHOLE-CACHE: MOVEC to URP/SRP, MOVEC to TC, PFLUSHA,
  * build_cpufunctbl() and map_banks(). Root and table changes are genuinely global and
  * genuinely rare, and a narrowing there would buy a rounding error at real risk.

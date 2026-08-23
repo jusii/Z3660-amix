@@ -5386,6 +5386,33 @@ static int z3660_blk_run(uae_u16 op, int *cycp, int *shapep)
    }
 }
 
+/* CYBERSTORM C2 rung 1d: the recognizer's own bucket, spelled as a wrapper rather than as
+ * an ENTER/EXIT pair around the call site, because the call site is the right operand of
+ * an `&&`. Restructuring that into an `if` to make room for two statements would change
+ * the LEAN source -- and the whole macro idiom in z3660_prof.h exists so the non-profiling
+ * expansion is textually the original code. Here it is exactly `z3660_blk_run(...)`.
+ *
+ * WHAT LANDS IN THE BUCKET. On a DECLINE -- map SS19.4's "recognizer's residual test", and
+ * the overwhelmingly common case -- it is the three masked head compares and the return.
+ * On a FIRE it is the whole serviced chunk, because a bracket cannot know which it will be
+ * until the call returns. BLK_HIT and BLK_INSNS separate the two in the same dump, and
+ * z3660_blk.h's objection to bucketing the fast path is answered by where the bracket
+ * sits: it is per CALL, so a chunk of 256 guest instructions pays two transitions in
+ * total, not 512. */
+#if Z3660_EMU_PROF
+static __inline__ int z3660_prof_blk_run(uae_u16 op, int *cycp, int *shapep)
+{
+   int r;
+   z3660_prof_enter(Z3660_PROF_B_BLKREC);
+   r = z3660_blk_run(op, cycp, shapep);
+   z3660_prof_exit();
+   return r;
+}
+#define Z3660_PROF_BLK_RUN(op, cycp, shapep) z3660_prof_blk_run((op), (cycp), (shapep))
+#else
+#define Z3660_PROF_BLK_RUN(op, cycp, shapep) z3660_blk_run((op), (cycp), (shapep))
+#endif
+
 /* ====================================================================================
  * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
  *
@@ -5829,12 +5856,32 @@ void m68k_run_mmu040(void)
              * choice about paying for the fetch. A hit supplies the opcode word, the
              * resolved handler, rung 0's idiom verdict and one extension word; a miss is
              * byte-for-byte the fetch this loop has always done, plus one lookahead read
-             * to fill the extension slot. See the long comment above the table. */
+             * to fill the extension slot. See the long comment above the table.
+             *
+             * C2 rung 1d: the lookup carries its OWN bucket (DOPCFIND) rather than falling
+             * to LOOP, because map v3 SS15.4's re-attribution hypothesis -- that LOOP's
+             * 26.4 % now CONTAINS the hit path rung 1 added -- is exactly the claim this
+             * bracket settles. It closes on BOTH arms before anything else runs: on the
+             * miss arm before x_prefetch(), so the opcode fetch stays in FETCHOP where
+             * every earlier capture has it, and so the bucket measures the LOOKUP rather
+             * than the lookup-plus-whatever-the-miss-costs.
+             *
+             * THE ONE PLACE RUNG 1d MOVED LEAN SOURCE, and it is declared rather than
+             * hoped over. z3660_prof.h's idiom is that the non-profiling expansion is
+             * TEXTUALLY the original code; the two extension-slot locals below used to be
+             * declared AFTER the lookup, and bracketing the lookup would have put their
+             * two zero-stores inside DOPCFIND -- roughly a sixth of a bucket whose whole
+             * content is a generation compare and four tag compares. So they are hoisted
+             * two lines instead, and the deviation was MEASURED rather than argued:
+             * objdump of the lean newcpu.o before and against after differs by exactly
+             * those two stores changing position and by nothing else at all. Neither
+             * local is readable by z3660_dopc_find(), so the reorder cannot be observed. */
             const uaecptr z3660_dopc_pc = (uaecptr)regs.instruction_pc;
-            int z3660_dopc_way = 0;
-            struct z3660_dopc_set *z3660_dopc_e = z3660_dopc_find(z3660_dopc_pc, &z3660_dopc_way);
+            int     z3660_dopc_way    = 0;
             int     z3660_dopc_ext_ok = 0;
             uae_u16 z3660_dopc_ext0   = 0;
+            Z3660_PROF_ENTER(Z3660_PROF_B_DOPCFIND);
+            struct z3660_dopc_set *z3660_dopc_e = z3660_dopc_find(z3660_dopc_pc, &z3660_dopc_way);
             if (z3660_dopc_e) {
                mmu_opcode = regs.opcode = z3660_dopc_e->opcode[z3660_dopc_way];
                if (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_EXT0) {
@@ -5843,11 +5890,13 @@ void m68k_run_mmu040(void)
                } else {
                   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
                }
+               Z3660_PROF_EXIT();
             } else {
                /* Disarm BEFORE the fetch: the previous instruction's window must not be
                 * allowed to answer this one's opcode, and on the fill path below the
                 * lookahead read has to be a real fetch or the slot would cache itself. */
                z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+               Z3660_PROF_EXIT();
                Z3660_PROF_MARK_OPFETCH();   // C1: this fetch is the OPCODE, not an extension word
                mmu_opcode = regs.opcode = x_prefetch(0);   // MMU-translated opcode fetch
                if (z3660_dopc_on && z3660_dopc_ext_reachable(z3660_dopc_pc)) {
@@ -5986,10 +6035,16 @@ void m68k_run_mmu040(void)
              * It is deliberately NOT inside the HANDLER bucket. HANDLER's per-event cost
              * is what the map divides by an instruction count to price a single guest
              * instruction, and a chunk of 256 landing in it would corrupt exactly that
-             * figure. The fast path's own overhead falls to LOOP instead, where it is
-             * legible: LOOP is 0.51 % after probe subtraction today, so a post-change
-             * capture in which LOOP has grown is unambiguously this and nothing else. The
-             * guest stores it performs still pass through the WRITE bracket normally. */
+             * figure. The guest stores it performs still pass through the WRITE bracket
+             * normally.
+             *
+             * IT USED TO FALL TO LOOP, and the argument for that was "LOOP is 0.51 %
+             * after probe subtraction today, so a post-change capture in which LOOP has
+             * grown is unambiguously this and nothing else". Both halves of that are dead:
+             * per-bucket spans put LOOP at 26.4 % (map v3 SS15), so it is no longer a quiet
+             * place where one new arrival is unambiguous. Rung 1d gives the recognizer its
+             * own bucket (BLKREC) instead, which is the same intent implemented against a
+             * bucket that is now the largest on the page rather than the smallest. */
             {
                int z3660_blk_cyc = 0, z3660_blk_shape = 1, z3660_blk_did;
 
@@ -6001,7 +6056,7 @@ void m68k_run_mmu040(void)
                z3660_blk_did =
                   (z3660_dopc_e == NULL
                    || (z3660_dopc_e->meta[z3660_dopc_way] & Z3660_DOPC_M_IDIOM))
-                  && z3660_blk_run(z3660_dopc_op, &z3660_blk_cyc, &z3660_blk_shape);
+                  && Z3660_PROF_BLK_RUN(z3660_dopc_op, &z3660_blk_cyc, &z3660_blk_shape);
 
                /* Cache maintenance BEFORE the dispatch, so nothing here depends on state
                 * a handler may have changed -- regs.opcode is documented as fair game for
@@ -6012,12 +6067,22 @@ void m68k_run_mmu040(void)
                    * says "may be an idiom"; the first pass that CAN decide, and decides
                    * no, writes the cheaper answer back. It only ever moves toward the
                    * static truth, and only ever after the recognizer positively
-                   * established it. */
+                   * established it. Left in LOOPRES deliberately: it is one conditional
+                   * byte store, and bracketing it would charge the HIT path two more
+                   * transitions to measure something smaller than the probe. */
                   if (!z3660_blk_shape)
                      z3660_dopc_e->meta[z3660_dopc_way] &= (uae_u8)~Z3660_DOPC_M_IDIOM;
                } else {
+                  /* C2 rung 1d: the FILL gets its own bucket, and it is the one the map's
+                   * SS17.3 BAR is about -- "a physical index costs a TRANSLATION ON THE
+                   * FILL PATH ... this study must pre-register its cost site and measure
+                   * the fill-path price, not assume it". This is that price, on the
+                   * current fill, measured before anything is built on top of it. The
+                   * bracket is inside the miss arm, so a hit pays nothing for it. */
+                  Z3660_PROF_ENTER(Z3660_PROF_B_DOPCFILL);
                   z3660_dopc_fill(z3660_dopc_pc, z3660_dopc_op, z3660_blk_shape,
                                   z3660_dopc_ext_ok, z3660_dopc_ext0);
+                  Z3660_PROF_EXIT();
                }
 
                if (z3660_blk_did) {
