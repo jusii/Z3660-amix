@@ -264,6 +264,12 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
 /* ---- Entry metadata ---------------------------------------------------------------- */
 #define Z3660_DOPC_M_IDIOM  0x01u   /* rung 0's static shape verdict: MAY be an idiom head */
 #define Z3660_DOPC_M_EXT0   0x02u   /* ext0 holds the instruction word at pc + 2           */
+/* The HANDLER discriminator's static shape verdict (z3660_spec.h): this opcode is a
+ * covered MOVE/MOVEA shape AND the switch was armed when the entry was filled. It shares
+ * this byte deliberately -- the hit path already holds it in a register, so the added
+ * work on a dispatch that is not specialised is a `tst` and a not-taken branch. Because
+ * the bit records the switch state at fill time, moving the switch invalidates. */
+#define Z3660_DOPC_M_SPEC   0x04u   /* dispatch this entry through z3660_spec_move()      */
 
 /* ---- Invalidation causes ----------------------------------------------------------
  * ONE COUNTER PER CAUSE from rung 1b (Z3660_PROF_C_DOPC_IV_*, ids 28..37), because
