@@ -255,11 +255,32 @@ when they fail:
 ```
 tcnt[DOPCFIND] == DOPC_HIT + DOPC_MISS      cache ON: one lookup per dispatch
 tcnt[DOPCFIND] == INSNS + FAULTS            cache ON, via the dispatch identity below
-tcnt[DOPCFILL] == DOPC_MISS - (misses whose opcode fetch or extension lookahead faulted)
-tcnt[BLKREC]   <= tcnt[DOPCFIND] + (BLKREC's own nested spans)
+
+DOPC_MISS - FAULTS <= tcnt[DOPCFILL] <= DOPC_MISS
+                                            cache ON. NOT an equality: the fill bracket
+                                            runs SHORT of the miss count by the misses
+                                            that faulted before reaching the fill, and
+                                            no counter measures that population. What
+                                            the counters guarantee is the BOUND -- the
+                                            shortfall cannot exceed FAULTS.
+
+BLK_HIT <= DOPC_HIT + DOPC_MISS             cache ON: at most one recognizer FIRE per
+                                            dispatch. This is the call-level claim, and
+                                            BLK_HIT is the only call-level counter that
+                                            can carry it.
+
+tcnt[BLKREC] vs tcnt[DOPCFIND]              GUARANTEES NOTHING, in either direction.
+                                            Both are SPAN counts and BLKREC is impure,
+                                            so its spans exceed its calls by its nesting.
+                                            Do not check the call-level claim here.
 ```
 
-> **The third identity needed a fault term, and the reason is that a bracketed function
+**Both of the last two were previously written in a form no dump can evaluate** — an
+equality against "misses that faulted", and an inequality with "+ (BLKREC's own nested
+spans)" on the right, a term that makes the statement unfalsifiable. Each is now stated as
+the thing the counters actually bound. The reasoning behind both:
+
+> **The fill identity needed a fault term, and the reason is that a bracketed function
 > not throwing is the wrong property.** What matters is whether the **interval the identity
 > spans** can throw, and this one can. `z3660_dopc_find()` counts `DOPC_MISS` and the
 > `DOPCFIND` bracket **exits before the fetch** (`newcpu.cpp`, the exit at the end of the
@@ -274,7 +295,7 @@ tcnt[BLKREC]   <= tcnt[DOPCFIND] + (BLKREC's own nested spans)
 > with faults in it**: read the shortfall against `FAULTS`, and treat a shortfall *larger*
 > than `FAULTS` as the defect. Same class and same shape of fix as `== INSNS + FAULTS`.
 
-> **The fourth identity was stated about calls and compared over spans, and a cache-off
+> **The recognizer identity was stated about calls and compared over spans, and a cache-off
 > capture surfaced it.** `tcnt[BLKREC] <= tcnt[DOPCFIND]` reads as "at most one recognizer
 > call per dispatch", which is true — but `tcnt[]` counts **spans**, and `BLKREC` is the one
 > bracket this document already calls impure: on a fire it holds the whole serviced chunk,
