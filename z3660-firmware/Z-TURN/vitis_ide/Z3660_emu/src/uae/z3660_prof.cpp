@@ -44,7 +44,10 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    "DOPC_HIT", "DOPC_MISS", "DOPC_EXT", "DOPC_INVAL",
    /* rung 1b: one per Z3660_DOPC_INV_* cause, in cause order. */
    "IV_FLUSH", "IV_ROOT", "IV_DMA", "IV_TABLE", "IV_KNOB",
-   "IV_WRAP", "IV_MAP", "IV_PFLUSH", "IV_PFLUSHA", "IV_CACR"
+   "IV_WRAP", "IV_MAP", "IV_PFLUSH", "IV_PFLUSHA", "IV_CACR",
+   /* rung 1c: NOT a cause -- a request the CACR call site proved inert, which therefore
+    * never reached the invalidator and is absent from every counter above. */
+   "IV_CACR_SKIP"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -56,9 +59,15 @@ typedef char z3660_prof_counter_names_complete[
  * enumerations have to stay the same length and the same order. Nothing would fail
  * otherwise: a new cause would simply increment whatever counter happens to sit at the
  * end of the block, and the dump would report a plausible number under the wrong name.
- * That is the failure this line exists to make impossible. */
+ * That is the failure this line exists to make impossible.
+ *
+ * Rung 1c pinned it to the counter that FOLLOWS the block rather than to
+ * Z3660_PROF_C_COUNT, because the block is no longer last: IV_CACR_SKIP sits after it and
+ * is not a cause. Against COUNT this line would have gone on passing while a new cause
+ * aliased onto IV_CACR_SKIP -- the exact failure it exists to catch, one counter along. */
 typedef char z3660_prof_iv_block_matches_causes[
-   (Z3660_PROF_C_DOPC_IV_BASE + Z3660_DOPC_INV_COUNT == Z3660_PROF_C_COUNT) ? 1 : -1];
+   (Z3660_PROF_C_DOPC_IV_BASE + Z3660_DOPC_INV_COUNT
+    == Z3660_PROF_C_DOPC_IV_CACR_SKIP) ? 1 : -1];
 
 /* The record layout is a wire format shared with a host-side symbolizer, so pin it here
  * rather than trusting that no one ever adds a field. */
@@ -844,6 +853,7 @@ extern "C" void z3660_prof_dump_stats(void)
       uint64_t hi = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
       uint64_t mi = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
       uint64_t iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+      uint64_t sk = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_CACR_SKIP];
       uint64_t req = 0;
       unsigned ip, fp;
       int c;
@@ -865,15 +875,28 @@ extern "C" void z3660_prof_dump_stats(void)
                       z3660_prof_u64(mi / iv), (unsigned)((mi * 100u / iv) % 100u),
                       z3660_prof_u64((hi + mi) / iv), (unsigned)(((hi + mi) * 100u / iv) % 100u));
       }
-      if (req) {
-         z3660_prof_pct(req - iv, req, &ip, &fp);
-         z3660_printf("[PROF] r dopc %s invalidation requests, %s performed, %s skipped "
-                      "(%u.%02u%% narrowed away)\r\n",
-                      z3660_prof_u64(req), z3660_prof_u64(iv), z3660_prof_u64(req - iv),
+      /* THE GUEST'S OWN INVALIDATION RATE IS req + sk, NOT req. The IV_ block counts the
+       * requests that reached the invalidator; a CACR write the call site proved inert
+       * never gets there, so it is in `sk` and in neither of the two counters a reader
+       * would otherwise reach for. Printing the total the guest actually asked for -- and
+       * the narrowed share out of THAT total -- is the row the 2026-08-23 verdict had to
+       * reconstruct across two sessions because it did not exist. */
+      if (req + sk) {
+         z3660_prof_pct(sk, req + sk, &ip, &fp);
+         z3660_printf("[PROF] r dopc %s invalidation requests, %s performed, %s narrowed "
+                      "at the call site (%u.%02u%%)\r\n",
+                      z3660_prof_u64(req + sk), z3660_prof_u64(iv), z3660_prof_u64(sk),
                       ip, fp);
+         /* `req >= iv` ALWAYS: every invalidation performed was requested and counted.
+          * `req == iv` additionally holds for a capture taken entirely with the cache ON,
+          * and the gap when it does not is the requests made while the cache was OFF --
+          * which is a fact about the window, not a defect, so it is not warned about.
+          * The other direction is impossible and is. */
          if (req < iv)
-            z3660_printf("[PROF] r WARNING: more invalidations than requests -- a cause "
-                         "id is out of range or a call site bypasses the attribution\r\n");
+            z3660_printf("[PROF] r WARNING: sum(IV_*)=%s is less than DOPC_INVAL=%s -- a "
+                         "cause id is out of range or a call site bypasses the "
+                         "attribution\r\n",
+                         z3660_prof_u64(req), z3660_prof_u64(iv));
       }
    }
    z3660_printf("[PROF] === end ===\r\n");

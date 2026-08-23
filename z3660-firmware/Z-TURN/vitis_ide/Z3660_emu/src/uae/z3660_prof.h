@@ -499,18 +499,22 @@ enum {
    Z3660_PROF_C_DOPC_EXT    = 26, /* ... extension words served from the entry's slot  */
    Z3660_PROF_C_DOPC_INVAL  = 27, /* ... whole-cache invalidations that ACTUALLY ran    */
    /* CYBERSTORM C2 rung 1b -- invalidation attribution. One counter per cause, in
-    * Z3660_DOPC_INV_* order, and they count REQUESTS: every call the guest provokes,
-    * whether or not it moved the generation. So
+    * Z3660_DOPC_INV_* order. They count the requests that REACH z3660_dopc_invalidate(),
+    * which with the cache on is every request that performs one:
     *
-    *     sum(DOPC_IV_*) - DOPC_INVAL   ==  the invalidations the narrowing skipped
+    *     sum(DOPC_IV_*)  ==  DOPC_INVAL          cache ON
+    *     sum(DOPC_IV_*)  >   DOPC_INVAL == 0     cache OFF (the switch reaches the
+    *                                             invalidation path; the causes do not)
     *
-    * exactly, with no third counter to keep in step. `DOPC_INVAL` keeps its rung-1
-    * meaning ("a whole-cache invalidation happened"), which is what makes a rung-1 dump
-    * and a rung-1b dump comparable on that row.
+    * `DOPC_INVAL` keeps its rung-1 meaning ("a whole-cache invalidation happened"), which
+    * is what makes rung-1, rung-1b and rung-1c dumps comparable on that row.
     *
     * They exist because "narrow the invalidation" is not one decision: the verdict
     * measured 274-292 misses per invalidation and could not say WHICH invalidation, and
-    * a narrowing aimed at the wrong cause is a correctness risk taken for nothing. */
+    * a narrowing aimed at the wrong cause is a correctness risk taken for nothing. Their
+    * first use decided rung 1c: IV_FLUSH + IV_PFLUSHA is 82-91 % of every workload and
+    * neither is narrowable against a logical tag, while IV_PFLUSH -- the cause rung 1b's
+    * page filter was built for -- is 6-9 %. */
    Z3660_PROF_C_DOPC_IV_FLUSH   = 28, /* CPUSHL / CINV                                 */
    Z3660_PROF_C_DOPC_IV_ROOT    = 29, /* MOVEC to URP / SRP                            */
    Z3660_PROF_C_DOPC_IV_DMA     = 30, /* core0 wrote guest DRAM                        */
@@ -521,7 +525,21 @@ enum {
    Z3660_PROF_C_DOPC_IV_PFLUSH  = 35, /* PFLUSH of one page -- the narrowed cause      */
    Z3660_PROF_C_DOPC_IV_PFLUSHA = 36, /* PFLUSHA / TC write / MMU reset                */
    Z3660_PROF_C_DOPC_IV_CACR    = 37, /* MOVEC to CACR                                 */
-   Z3660_PROF_C_COUNT           = 38,
+   /* CYBERSTORM C2 rung 1c -- OUTSIDE the cause block, and deliberately.
+    *
+    * The one narrowing the 2026-08-23 verdict kept decides at its CALL SITE (MOVEC to
+    * CACR that changes no retained bit, newcpu_common.cpp), so it never reaches
+    * z3660_dopc_invalidate() and IV_CACR never sees it. That is not a request that was
+    * skipped -- it is a request that was never counted, and the verdict had to
+    * reconstruct ~41 000 of them across two sessions' captures to find out how well the
+    * narrowing worked. This counter makes it one subtraction in one dump.
+    *
+    * It is NOT a member of the IV_ block: that block is indexed arithmetically by cause
+    * and every entry in it means "reached the invalidator", which this one does not. A
+    * second call-site narrowing gets a second counter for the same reason -- one shared
+    * "skipped" counter could not attribute either of them. */
+   Z3660_PROF_C_DOPC_IV_CACR_SKIP = 38, /* MOVEC to CACR proved INERT at the call site  */
+   Z3660_PROF_C_COUNT           = 39,
    /* The block's base, so the invalidator can index it by cause. The two enumerations
     * are locked together by a compile-time tripwire in z3660_prof.cpp -- adding a cause
     * without adding its counter must not silently alias onto its neighbour. */

@@ -1518,31 +1518,24 @@ void REGPARAM2 mmu_flush_atc(uaecptr addr, bool super, bool global)
 	}	
 	flush_shortcut_cache(addr, super);
 	mmu_flush_icache_only();
-	/* CYBERSTORM C2 rung 1b -- THE ONE NARROWED CAUSE.
+	/* CYBERSTORM C2 rung 1b -- PFLUSH KEEPS ITS OWN CAUSE ID, and rung 1c is why the whole
+	 * cache still goes.
 	 *
 	 * PFLUSH is the only invalidation cause that names a guest LOGICAL page, which is the
 	 * namespace the decoded-op cache tags in; CPUSHL's operand and the DMA arm's range are
 	 * both physical and cannot be compared against a tag at all (z3660_dopc.h). So this is
-	 * where a narrowing is available, and the cache is asked whether the page it is about
-	 * to be flushed for could hold any decode. If it provably cannot, nothing happens.
+	 * the ONE call site where a narrowing by address was even available, and rung 1b built
+	 * it -- a page-presence filter, correct and mutation-tested.
 	 *
-	 * `super` and `global` are deliberately NOT passed. Narrowing by address space as well
-	 * would be architecturally defensible -- the tag carries the S bit -- but it doubles
-	 * the number of ways to be subtly wrong for a second-order gain, and `global` selects
-	 * which ATC lines survive rather than what the page means. Flushing both address
-	 * spaces' entries for the page is strictly more conservative than the architecture
-	 * requires, and costs one bit test either way.
+	 * THE COUNTER IS WHAT REVERTED IT. IV_PFLUSH measured 6.15 % of a boot's invalidation
+	 * requests, 9.14 % of dhrystone's and 6.85 % of raw disk's: the filter was aimed at a
+	 * minority cause, and it charged two hashed marks on EVERY fill to reach it. Metal
+	 * 2026-08-23 measured the trade at -2.32 % on dhrystone, and the pre-registered revert
+	 * line fired. The attribution is kept precisely so the next reader can see that the
+	 * decision rested on a measurement rather than on taste.
 	 *
-	 * The extent is the GUEST page, not the filter granule: the granule is 4 KB and a 68040
-	 * page may be 8 KB, so the size is what makes the second half of an 8 KB page get
-	 * tested. It is read from `mmu_pagesize_8k` -- the same variable the ATC index above is
-	 * built from, twelve lines up -- rather than from a cached copy elsewhere, so the flush
-	 * and the page it names cannot disagree about how big a page is. */
-	{
-		unsigned int pgsz = mmu_pagesize_8k ? 8192u : 4096u;
-		z3660_dopc_invalidate_log_range((unsigned int)(addr & ~(pgsz - 1u)), pgsz,
-		                                Z3660_DOPC_INV_PFLUSH);
-	}
+	 * Whole cache, exactly as rung 1 -- the address is not consulted at all. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSH);
 }
 
 void REGPARAM2 mmu_flush_atc_all(bool global)

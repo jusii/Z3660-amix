@@ -88,6 +88,13 @@ int m68k_move2c (int regno, uae_u32 *regp)
 				 * neither enable moved, the machine's cache configuration is bit-identical
 				 * and nothing a cached decode depends on has changed.
 				 *
+				 * THIS IS THE ARM RUNG 1c KEPT, and the only narrowing left in the
+				 * firmware. Metal 2026-08-23 reverted rung 1b's other two (the empty-cache
+				 * short-circuit and the PFLUSH page filter) because both charged the fill
+				 * path for a minority cause; this one charges one compare at one call site
+				 * and removed ~93 % of the invalidations the whole rung removed -- about
+				 * 41 000 of the 44 247 that went away on the dhrystone capture.
+				 *
 				 * Comparing the whole masked register, not just bit 15, keeps that true on
 				 * the 020/030 masks as well -- where the retained bits DO include
 				 * clear-cache bits, so any write that asks for a clear differs from the
@@ -107,9 +114,20 @@ int m68k_move2c (int regno, uae_u32 *regp)
 				 * TRIPWIRE for the one-line change that would otherwise break the
 				 * narrowing quietly: teaching movec_illg() about the 68060 without
 				 * teaching the ladder here. The host corpus has no fixture for it,
-				 * deliberately -- a test that cannot reach a branch should not claim to. */
+				 * deliberately -- a test that cannot reach a branch should not claim to.
+				 *
+				 * THE ELSE ARM IS RUNG 1c'S INSTRUMENT FIX, and it is not tidiness. This
+				 * narrowing decides HERE, before z3660_dopc_invalidate() -- so an inert
+				 * write never reaches IV_CACR and is not a "skipped request" but a request
+				 * that is never counted at all. The 2026-08-23 verdict measured a 54.8 %
+				 * fall in invalidations while `sum(IV_*) - DOPC_INVAL` could only account
+				 * for 7.3 % of it, and had to reconstruct the rest across two sessions'
+				 * captures. One increment on the path that used to cost a whole-cache
+				 * invalidation makes the yield readable from a single dump. */
 				if (cacr_mask == 0 || regs.cacr != cacr_was)
 					z3660_dopc_invalidate(Z3660_DOPC_INV_CACR);
+				else
+					z3660_dopc_cacr_skipped();
 			}
 			break;
 		/* 68040 only */
