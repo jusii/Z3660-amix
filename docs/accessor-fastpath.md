@@ -443,6 +443,18 @@ s19   4 325 817 638 / 71 116 727 spans = 60.83 cyc/dispatch
 now   5 494 477 787 / 78 203 698 spans = 70.26 cyc/dispatch      -> +15.5 %
 ```
 
+> **Both halves of this comparison are now weaker than they read, and the rung-3 session
+> found each.** *First*, **57 is a price neither capture measured**: it was s19's own
+> marginal figure, this capture's was 54, and the next session's bracket came in at
+> `[39, 50]` — a 32 % move in five hours. `cyc/dispatch` has the price as a first-order
+> term, so a pinned price charges two captures different amounts of instrument (see
+> `profiler.md`, bias note 2c: *never pin a price a capture did not measure*). *Second*,
+> **candidate (b) is DEMOTED**: rung 3 added a third always-hot table to the same L1D and
+> `DOPCFIND` moved +0.39 %, where a mechanism that charged 15.5 % for the first 2 KB should
+> have charged for the third. F6 stays **open** with neither candidate confirmed —
+> `docs/ifetch-fastpath.md`, *Measured — 2026-08-23*, has the settlement and the same-boot
+> triple (spread 0.63 %) that replaces this cross-session row.
+
 Pre-registered at ±3 % precisely so a move could not be waved through. It moved. Two candidates,
 and the 2026-08-23 session cannot separate them:
 

@@ -750,6 +750,25 @@ the hit counter beside it that was not.
    are here to show what the three passes mean and roughly where they land, not to supply a
    constant.
 
+   **How far it moves: three captures, one rig, one guest, five hours (2026-08-23).**
+
+   | capture | boot-line bracket |
+   |---|---|
+   | s19, 07:3x | `[57, 68]` |
+   | rung 2, 10:0x | `[54, 66]` |
+   | rung 3, 12:24 | **`[39, 50]`** |
+
+   A **32 %** move in the marginal price, and downward. Nothing about the workload, the guest
+   or the board changed between them. So the rule above has a second half that costs more than
+   the first: **never pin a price a capture did not measure.** A quantity of the form
+   `corrected_cyc / spans = (acc − spans × price) / spans` has the price as a first-order
+   term, so quoting one capture's `cyc/dispatch` beside another's at a price only *one* of them
+   measured charges the two captures different amounts of instrument. **Cross-session
+   `cyc/dispatch` at a pinned price is not like-for-like**; the sound comparison is
+   within-session — every arm of one boot, at that boot's own price — which is what settled
+   the `DFAST` × `IFAST` question (spread 0.63 % across three arms) where the cross-session
+   form could not.
+
    **What to price a capture at: sweep `[marginal, in-bucket]`, exactly as the C2 map swept
    50 → 59, and report the range.** Do not pick an end, and do not treat one as a correction of
    the other — the marginal figure is right for "the prof build with the probe bodies gated
@@ -789,6 +808,22 @@ the hit counter beside it that was not.
    disagree say which one you used.** A ceiling *below* the marginal figure means the price
    is wrong for this capture outright and no sweep is defensible — the existing
    "modelled probe cost exceeds its measured cycles" warning fires on the same condition.
+
+   **THE CEILING LINE DECIDES PER CAPTURE — both of its arms are live.** Every capture this
+   lane had taken printed the WARNING form, and that hardened into folklore: *the in-bucket
+   end is always arithmetically impossible.* The rung-3 session printed the OTHER form in all
+   three of its captures —
+
+   ```
+   [PROF] s ceiling: min_b(acc/spans) = 59 cyc/span, bound by TAILADV
+   [PROF] s usable sweep: [39, 50] -- the boot line's in-bucket end fits under the ceiling
+   ```
+
+   — and the reason is worth keeping: **the ceiling did not rise (59 here, 59 in the previous
+   session); the bracket DROPPED**, to `[39, 50]`. So "the in-bucket end is impossible" was a
+   fact about the bracket's historical range, not a property of the instrument. The line is
+   the arbiter, per capture, in both directions; nothing about which form it printed last
+   time may be carried into reading this one.
 
    **And one consequence that matters to the C2 map.** Even the *upper* end of the bracket,
    and even the whole armed call at 43.9, sit **below** the 50.59 at which the map's span
@@ -1145,8 +1180,11 @@ the console echo of the command that requested it.
    reading any of it.
 
    **Sweep the corrected shares across THIS boot's `[marginal, in-bucket]` bracket** — the boot
-   line prints both ends and they move ~20 % between sessions. Report the range; picking an end
-   is the error the third calibration pass exists to prevent. And take each bucket's transition
+   line prints both ends and they have moved 32 % across three sessions in one day
+   (`[57, 68]` → `[54, 66]` → `[39, 50]`; bias note 2c). Report the range; picking an end is the
+   error the third calibration pass exists to prevent, and **pinning another capture's price is
+   the error that makes two captures' `cyc/dispatch` incomparable.** Check the ceiling line
+   before the shares — it decides per capture, both ways. And take each bucket's transition
    count from the `s` block: deriving it from a correlated counter is what the `2 ×
    IFETCH_CALLS` method did, and it was wrong by 1.97×.
 4. **Install-workload profile** (optional, and the one most likely to surprise): repeat 2
