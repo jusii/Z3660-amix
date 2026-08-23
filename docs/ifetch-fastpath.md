@@ -133,6 +133,16 @@ contains **no `bl`, no `blx`, and no indirect branch**.
 | new `.bss` | — | **1 KB** (`z3660_ifv`) |
 | `BOOT-lean.BIN` | 12 795 204 B | 12 795 204 B (unchanged; `crc32 DEC21748 → 86C0BC18`) |
 
+> **This table prices NO SECOND-ORDER COST.** Every row is a static footprint — bytes of
+> text, bytes of `.bss`, instructions on a path — and none of it says what those bytes cost
+> the machine *while it runs*. This rung's 1 KB of always-hot `.bss` sits beside rung 2's
+> 2 KB and competes with a 64 KB decoded-op cache for L1D; **rung 2's finding F6 is exactly
+> such a cost and is still unattributed.** The `DOPCFIND` triple below DEMOTED the D-cache
+> candidate — a third always-hot table moved it +0.39 % where the first two allegedly cost
+> 15.5 % — but demoting a candidate is not pricing the mechanism. The honest statement is
+> that this column is unmeasured, not zero. Map v3.2 §34.5 records the same gap for both
+> fast-path docs.
+
 **The run loop did not grow at all**, which is the specific I-cache regression the map warns
 about. The growth is confined to three out-of-line accessor copies, because the resolver is
 inlined *there* and not at the ~3000 handler call sites. Rung 2 grew `.text` by 4 792 B for

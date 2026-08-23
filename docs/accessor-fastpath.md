@@ -236,6 +236,16 @@ already overlapping with guest-DRAM latency"* — is the one to watch.
 | `uae_mmu040_put_byte` | 79 | 126 |
 | new `.bss` | — | 2 KB (`z3660_dfv_r` + `z3660_dfv_w`) |
 
+> **This table prices NO SECOND-ORDER COST, and one of them is open on this very rung.**
+> Every row above is a static footprint: bytes of text, bytes of `.bss`, instructions on a
+> path. None of it says what those bytes cost the machine *while it runs* — and 2 KB of
+> always-hot `.bss` touched on every data access competes for L1D with a 64 KB decoded-op
+> cache. **Finding F6 is exactly such a cost and is still unattributed** (open item below;
+> rung 3 demoted the D-cache candidate but did not close it). A rung that grows an
+> always-hot structure has a cost this table cannot show, and the honest statement is that
+> it is unmeasured rather than zero. Map v3.2 §34.5 records the same gap for both fast-path
+> docs.
+
 **The run loop did not grow at all**, which is the specific I-cache regression the map warned
 about. The growth is confined to the ~10 out-of-line accessor copies (one set per translation
 unit), because the resolver is inlined *there* and not at the ~3000 handler call sites.
