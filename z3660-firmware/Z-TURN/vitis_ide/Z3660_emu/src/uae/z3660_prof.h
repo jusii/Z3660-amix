@@ -714,22 +714,7 @@ enum {
    Z3660_PROF_C_DFAST_HIT       = 44, /* data accesses served by the accessor fast path */
    Z3660_PROF_C_DFAST_XPAR      = 45, /* ... of those, via a TTR match rather than the
                                        *     page cache                                 */
-   /* CYBERSTORM C2 rung 3 -- the same two questions, asked of the INSTRUCTION side.
-    *
-    * The shapes are the same as rung 2's and the readings are not. `IFAST_HIT / FETCH`
-    * is coverage; `IFAST_XPAR / IFAST_HIT` is the transparent share -- and where the data
-    * side splits roughly a quarter/three-quarters (measured 22.6-24.1 % XPAR), ITT0
-    * covers 0-1 GB for BOTH privilege levels, so the fetch side is predicted to be
-    * XPAR-dominated at ~87 %. That prediction is the rung's premise, so the counter that
-    * settles it ships with the rung rather than after it.
-    *
-    * They are separate ids from DFAST's, not a shared pair, because the two paths are
-    * independently switchable: a capture with IFAST on and DFAST off has to be readable,
-    * and one pair of counters could not say which path served what. */
-   Z3660_PROF_C_IFAST_HIT       = 46, /* instruction fetches served by the fetch fast path */
-   Z3660_PROF_C_IFAST_XPAR      = 47, /* ... of those, via an ITT match rather than the
-                                       *     one-entry instruction page cache            */
-   Z3660_PROF_C_COUNT           = 48,
+   Z3660_PROF_C_COUNT           = 46,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

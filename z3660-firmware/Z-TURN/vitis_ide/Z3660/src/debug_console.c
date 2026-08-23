@@ -106,8 +106,6 @@ typedef enum {
    DOPC,    DECODED_OP_CACHE,
    /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
    DFAST,   ACCESSOR_FAST_PATH,
-   /* CYBERSTORM C2 rung 3: the instruction-fetch fast path. APPEND-ONLY. */
-   IFAST,   IFETCH_FAST_PATH,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -172,7 +170,6 @@ const char *command_names[] = {
       "BLK",     "BLOCK IDIOM",
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
-      "IFAST",   "IFETCH FAST PATH",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -700,30 +697,6 @@ int debug_thread(struct pt *pt)
                            xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
                         else
                            xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
-                     }
-                     debug_console.subcmd=0;
-                     break;
-                  case IFAST:
-                  case IFETCH_FAST_PATH:
-                     {  /* CYBERSTORM C2 rung 3. Toggle the INSTRUCTION-fetch fast path,
-                        * independently of DFAST. Two knobs rather than one is a
-                        * measurement decision, not an oversight: a shared switch would
-                        * A/B rungs 2 and 3 together, and rung 2's number is already
-                        * banked -- the question this one has to answer is what the fetch
-                        * side buys ON TOP of the shipped data side. Two knobs also put
-                        * the DFAST x IFAST 2x2 inside a single boot, which is the cheap
-                        * test for the two verdict tables competing for L1D against the
-                        * decoded-op cache. Nothing is invalidated on the way through:
-                        * the fast path holds no state of its own. The rule that turns
-                        * this word into a state is z3660_dfast.h's z3660_ifast_resolve()
-                        * and nothing else re-implements it. */
-                        uint32_t c=shared->ifast_on;
-                        c = (z3660_ifast_resolve(c)!=0u) ? Z3660_IFAST_OFF : Z3660_IFAST_DEFAULT;
-                        shared->ifast_on=c;
-                        if(c==Z3660_IFAST_OFF)
-                           xil_printf("IFETCH FAST PATH OFF (every guest instruction fetch takes the original out-of-line accessor -- this is the reference arm)\r\n");
-                        else
-                           xil_printf("IFETCH FAST PATH ON (ITT verdict + instruction page-cache resolve + direct RAM fetch, inline, no calls)\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1472,7 +1445,6 @@ void debug_console_help(void)
    xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
    xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
    xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
-   xil_printf("'IFAST'   or 'IFETCH FAST PATH' toggles the C2 instruction-fetch fast path ON/OFF (EMU); independent of DFAST, so the 2x2 fits in one boot\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

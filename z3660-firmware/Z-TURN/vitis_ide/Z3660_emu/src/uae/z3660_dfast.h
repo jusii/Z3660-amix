@@ -1,12 +1,4 @@
-/* z3660_dfast.h -- CYBERSTORM C2 rungs 2 and 3: the accessor fast paths.
- *
- * The file is named for rung 2, which built it. It now carries BOTH directions -- the
- * data accessors (rung 2, `z3660_dfv_r` / `_w`, switch DFAST) and the instruction-fetch
- * accessors (rung 3, `z3660_ifv`, switch IFAST). They share one verdict vocabulary, one
- * table-build replay and one set of rebuild sites, which is the whole reason they are not
- * two files: two copies of "what does a TTR match mean" is the divergence this fork has
- * paid for elsewhere. Renaming the file would churn core0's console include for nothing.
- * Rung 3's own design note is the second banner, below the fallback section.
+/* z3660_dfast.h -- CYBERSTORM C2 rung 2: the data-accessor fast path.
  *
  * ==========================================================================
  * WHAT THIS REMOVES, AND WHY IT IS NOT TRANSLATION
@@ -127,80 +119,10 @@
  * ==========================================================================
  *
  * `z3660_dfast_arm(0)` rebuilds the tables all-SLOW, so every access falls through to
- * the original path. It gives the host harness a genuine reference to run the equivalence
- * corpus against, and metal a `PROFZ`-fenced same-boot A/B without a second flash.
- *
- * IT IS NOT FREE, AND THE FIRST VERSION OF THIS PARAGRAPH SAID IT WAS. Measured across
- * two flashes on 2026-08-23: lean cadence 4, DFAST off, 6294.5 dhrystones against the
- * pre-rung-2 build's 6539.0 -- **-3.74 %**. The claim is true of the ARMED table and
- * false of the disarmed one: with every verdict SLOW an access still pays the table load
- * and the branch and THEN runs the unmodified accessor. So the same-boot switch OVERSTATES
- * the shipping gain, exactly and arithmetically:
- *
- *     shipping (cross-build)  8184.7 / 6539.0 = 1.2517
- *     disarm penalty          6539.0 / 6294.5 = 1.0388
- *     product                                   1.3003 = the same-boot A/B, to 4 digits
- *
- * Both numbers are honest and they answer different questions. "What does the switch do
- * on this boot" is +30.03 %; "what did shipping this rung buy" is +25.17 %, and the second
- * is the one to quote. THE SAME CAVEAT APPLIES TO IFAST and is priced in its own banner.
- *
- * ==========================================================================
- * CYBERSTORM C2 RUNG 3 -- THE SAME RUNG, ON THE INSTRUCTION SIDE
- * ==========================================================================
- *
- * Rung 2 removed the out-of-line `mmu_match_ttr()` call from the data accessors. The
- * INSTRUCTION accessors carry the same call -- `mmu_match_ttr_ins()` -- and pay it on
- * every fetch, and after rung 2 landed, `FETCHOP`+`FETCHEX` is the largest attackable
- * group left on the C2 ladder (18.06-19.98 % of cadence-4 against READ+WRITE's now
- * 14.58-15.87 %). The s19 capture priced the population: 53.3 M of 61.3 M instruction
- * fetches -- 87 % -- are ITT-matched, because AMIX-040's `pstart040.s` sets
- *
- *     ITT0 = 0x003fc000   0-1 GB code, BOTH privilege levels
- *
- * and the kernel's text lives under 1 GB. So the fetch side is the MIRROR of the data
- * side, with the arms weighted the other way round: where data accesses mostly fall
- * through to the page cache (PAGE) and take the transparent arm about a quarter of the
- * time, fetches take the transparent arm ~87 % of the time. `likely()` points the other
- * way here, deliberately, and that is the only structural difference in the resolver.
- *
- * ONE VERDICT DIFFERENCE, AND IT IS REAL. On the data side a write-protected window
- * (`TTR_NO_WRITE`) means "reads transparent, writes take the original path". A fetch is
- * a read, and `mmu_get_iword()`'s guard tests `== TTR_NO_MATCH` -- so `TTR_NO_WRITE` is
- * transparent for a fetch, with the window's own cache state installed, exactly as
- * `TTR_OK_MATCH` is. The instruction table therefore maps BOTH match results to `XPAR`.
- * (`W` in an ITTR is architecturally meaningless anyway; the table replays what this
- * emulator does, not what the manual implies.)
- *
- * THE PAGE ARM IS THE *INSTRUCTION* PAGE CACHE, WHICH IS ONE ENTRY, NOT 256. Rung 2's
- * PAGE arm indexes a 256-entry array; `MMU_IPAGECACHE` is a single
- * `atc_last_ins_laddr`/`_paddr`/`_cache` triple. The fast path uses those three variables
- * with the tag expression copied from `mmu_get_iword()` byte for byte -- so `IPAGE_HIT`
- * and `IPAGE_MISS` keep counting the same events, and the pre-registration that the fetch
- * hit rates must not move is satisfied by construction rather than by hope. An
- * invalidation needs no hook for the same reason: `flush_shortcut_cache()` writes
- * `atc_last_ins_laddr = mmu_pagemask` (an impossible tag) and the fast path reads that
- * variable, so it goes stale in exactly the same instant the original does.
- *
- * ALIGNMENT IS GATED AT THE CALL SITE, and this is the one place rung 3 needs a test that
- * rung 2 got for free. `uae_mmu040_get_ilong()` already tests `is_unaligned_bus(addr, 4)`
- * above the fast path (ISSUE-52), so everything reaching the resolver from there is
- * aligned. `uae_mmu040_get_iword()` has NEVER had such a test -- an odd instruction
- * address is an address error the 68040 raises elsewhere -- so the fast path gates itself
- * on `!(addr & 1)` there. Not to re-route the access (the original path for an odd fetch
- * must stay exactly what it was) but so that "an access served by the fast path cannot
- * cross a page or a bank window" stays STRUCTURAL rather than probabilistic. A word at
- * `page_end - 1` is the whole reason: served, it would read one byte out of an unrelated
- * physical frame -- the cdfs page-crossing DMA, again, in a hotter loop.
- *
- * WHAT RUNG 3 DOES NOT TOUCH. The decoded-op cache's extension-word window sits ABOVE the
- * fetch bracket in `uae_mmu040_get_iword()` and is untouched: a word served from it costs
- * no fetch at all and must not be charged to one. Rung 3 serves what the window and the
- * dopc lookup DO NOT -- dopc misses, and the extension words of a hit whose window has
- * already been consumed. `Z3660_PROF_ENTER_IFETCH()` and the `FETCH` counter stay exactly
- * where they are, above the fast path, so `FETCHOP`/`FETCHEX` still bracket every fetch
- * and the profile stays comparable across the rung. The bucket gets cheaper; it does not
- * get emptier.
+ * the original path. That costs NOTHING on the hot path -- the disarm lives in the table
+ * the hot path was going to read anyway -- and it gives the host harness a genuine
+ * reference to run the equivalence corpus against, and metal a `PROFZ`-fenced same-boot
+ * A/B without a second flash.
  */
 
 #ifndef Z3660_DFAST_H
@@ -255,20 +177,12 @@
 #ifdef HOST_TEST_HARNESS
 #ifdef __cplusplus
 extern "C" unsigned long z3660_dfast_serves;
-extern "C" unsigned long z3660_ifast_serves;
 #else
 extern unsigned long z3660_dfast_serves;
-extern unsigned long z3660_ifast_serves;
 #endif
 #define Z3660_DFAST_SERVED() (z3660_dfast_serves++)
-/* Rung 3 gets its OWN counter rather than sharing rung 2's. The two paths are separately
- * switchable, so a corpus case that pins "the FETCH fast path served this and the data
- * one did not" is only expressible with two counters -- and that case is most of rung 3's
- * engagement evidence, because the interpreted tests necessarily do both at once. */
-#define Z3660_IFAST_SERVED() (z3660_ifast_serves++)
 #else
 #define Z3660_DFAST_SERVED() do { } while (0)
-#define Z3660_IFAST_SERVED() do { } while (0)
 #endif
 
 #ifdef __cplusplus
@@ -282,22 +196,14 @@ extern "C" {
 extern unsigned short z3660_dfv_r[2][256];
 extern unsigned short z3660_dfv_w[2][256];
 
-/* Rung 3's, indexed the same way, built from regs.itt0/itt1 by the same replay. ONE
- * direction, because a fetch is always a read -- 1 KB, not 2. */
-extern unsigned short z3660_ifv[2][256];
-
-/* Rebuild ALL THREE tables from regs.dtt0/dtt1, regs.itt0/itt1, regs.mmu_enabled and the
- * two arm switches. Called from mmu_tt_modified() and mmu_set_tc(); safe to call at any
- * time. One function because the four TT registers are recomputed at exactly the same two
- * sites -- splitting it would create a second place for a rebuild site to be forgotten. */
+/* Rebuild both tables from regs.dtt0/dtt1, regs.mmu_enabled and the arm switch. Called
+ * from mmu_tt_modified() and mmu_set_tc(); safe to call at any time. */
 void z3660_dfast_rebuild(void);
 
 /* Arm (1) or disarm (0) the fast path and rebuild. Returns the previous state. Disarmed
  * is the reference machine: every access takes the original path. */
 int  z3660_dfast_arm(int on);
 int  z3660_dfast_armed(void);
-int  z3660_ifast_arm(int on);
-int  z3660_ifast_armed(void);
 
 /* THE CROSS-CORE KNOB, and the one rule that turns a mailbox word into a state.
  *
@@ -313,39 +219,9 @@ static __inline__ unsigned z3660_dfast_resolve(unsigned requested)
    return (requested == Z3660_DFAST_OFF) ? 0u : 1u;
 }
 
-/* THE SECOND KNOB, AND WHY IT IS A SECOND KNOB.
- *
- * Rung 3 could have folded into DFAST -- one field, one command, one thing to explain.
- * It does not, for a measurement reason that outranks the tidiness:
- *
- *  1. A SHARED switch cannot price rung 3. Toggling it would A/B (rung 2 + rung 3)
- *     against neither, and rung 2's number is already banked. The question this rung has
- *     to answer is what the FETCH side buys ON TOP of the shipped data side, which is
- *     exactly what a second switch measures and a shared one cannot.
- *  2. It makes the 2x2 available in ONE boot. DFAST x IFAST, four arms, one PROFZ fence
- *     each: that is the only cheap way to see whether the two rungs INTERACT -- and there
- *     is a live hypothesis that they might. The 2026-08-23 verdict found DOPCFIND costing
- *     15.5 % more per dispatch after rung 2, with D-cache pressure from rung 2's new
- *     always-hot 2 KB as one of two candidate causes. Rung 3 adds 1 KB more of the same
- *     kind. A shared switch would make that question unaskable without a reflash.
- *  3. Bisection. If the fetch path is ever suspected of a correctness fault on metal, a
- *     separate knob turns off exactly the suspect and leaves the machine otherwise
- *     shipped.
- *
- * Same encoding and the same rule as DFAST, for the same reason: UNSET (0) MEANS ON, so a
- * core0 built before the field existed publishes a zeroed struct and still runs the
- * shipped behaviour instead of silently disarming the rung. */
-#define Z3660_IFAST_OFF     0xFFFFFFFFu
-#define Z3660_IFAST_DEFAULT 1u
-static __inline__ unsigned z3660_ifast_resolve(unsigned requested)
-{
-   return (requested == Z3660_IFAST_OFF) ? 0u : 1u;
-}
-
-/* Harness/console: how many accesses each fast path has served. Prof build only; 0
+/* Harness/console: how many accesses the fast path has served. Prof build only; 0
  * elsewhere. Reads the profiler's own counters, so it cannot disagree with a dump. */
 unsigned long long z3660_dfast_served(void);
-unsigned long long z3660_ifast_served(void);
 
 #ifdef __cplusplus
 }
