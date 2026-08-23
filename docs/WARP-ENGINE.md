@@ -4,10 +4,12 @@
 card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 185 dhrystones
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
-**Status:** `M0 DONE` — the grill ran on **2026-08-23** and every question in §7 is answered; the
-metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with the §1.5 base re-taken
-at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1 pre-registration**, the last of M0's
-seven items. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
+**Status:** `M0 DONE`, **`M1 round 1 DONE`** — the grill ran on **2026-08-23** and every question
+in §7 is answered; the metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with
+the §1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1
+pre-registration**, the last of M0's seven items. **M1's first round shipped on 2026-08-24**: the
+engine's skeleton end to end with **no code generation at all** — §0.6 pre-registers it and §0.7
+scores it, and its one number is a *cost*, not a speed. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
 disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place with the
 correction marked. **There is still no engine code, and that is the point: M0's deliverable —
 this document plus §0.5 — is complete, and it is complete *before* the first line of it.**
@@ -43,6 +45,7 @@ Everything in this plan traces to these. Where a claim traces to none of them, i
 | `docs/block-idiom-fastpath.md` | rung 0 — the chunked-execution pattern, the page-bounded validity gate, the yield contract |
 | `docs/profiler.md` | the 17-bucket phase machine, band comparability, price artefacts |
 | `docs/AMIX.md` | the service-cadence contract and its measured couplings |
+| `docs/warp-objdiff.py` | the function-granularity object diff §0.7's disarmed-equivalence number is read from |
 | `docs/core0-loop-blocking-audit.md`, `docs/piscsi-service-path.md` | core0's cooperative loop, its blocking paths, and the latency budget |
 | `CHANGES.md` + `0a4c064`, `e37bb43`, `8be8949` | the AMP coherence history and the JIT's own I-cache lesson |
 | the 68040 port lane's `docs/C2-ATTACK-MAP.md` §§30–47 | the pricing law, the ladder, and **row J** |
@@ -1354,6 +1357,131 @@ and it is written down here rather than after the row arrives.**
 5. **Anything about faults or demand paging.** No block can fault, because no block does
    anything.
 
+## 0.7 M1 round 1 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.6 was committed at 23:43:16 on 2026-08-23; the first
+implementation commit landed at 00:15:34 on 2026-08-24, 32 minutes later. The order is a
+fact in this repository's log, which is what §3.4 asks of it** — the SPEC round's
+pre-registration preceded its code by 26 minutes and the `f` round's by 29. Every prediction in §0.6 is left
+byte-untouched below and scored beside itself, `ifetch-fastpath.md`'s standard.
+
+### 0.7.1 What was built
+
+| piece | where |
+|---|---|
+| the contract — switch rule, block key, geometry, the no-empty-pass invariant | `Z3660_emu/src/uae/z3660_warp.h` |
+| the engine — block cache, discovery, the null-block emitter, publish, invalidation, eviction, the lockstep oracle | `Z3660_emu/src/uae/z3660_warp.cpp` |
+| the run-loop hook, the knob resync + banner, the cadence feed, the invalidation join | `Z3660_emu/src/uae/newcpu.cpp` |
+| the code cache's arena accessor | `Z3660_emu/src/uae/jit/compemu_support_arm.cpp` |
+| counters 47 – 59, id 46 retired behind a placeholder, `Z3660_PROF_C_COUNT` 46 → 60 | `z3660_prof.h`, `z3660_prof.cpp` |
+| `SHARED.warp_on` at `0xFFFF00F0`, both copies | `Z3660/src/main.h`, `Z3660_emu/src/main.h` |
+| the `WARP` console command; the unconditional per-boot republish, both config paths | `Z3660/src/debug_console.c`, `Z3660/src/config_file.c` |
+| the corpus, the five mutation arms, the lockstep run | `Z3660_emu/test/host/harness_main.cpp` |
+| the object-equivalence tool | `docs/warp-objdiff.py` |
+
+### 0.7.2 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R1.1** harness | green all three variants; **+150 … +320** checks in default, the same in lean, lean+prof a further **+10 … +40** | green, `0 failed`: **3 250 / 3 246 / 3 473** against 3 186 / 3 182 / 3 390 — **+64 / +64 / +83**; default and lean gained the same number, prof a further +19 | green; **count MISSED, low** |
+| **G-R1.2** disarmed object equivalence | **≤ 12 functions changed**; every one on the WARP path or `m68k_run_mmu040` / `z3660_knobs_sync` / `z3660_dopc_invalidate`; `m68k_run_mmu040` **+8 … +40 bytes** | **12 changed of 25 125 common** (lean; 13 in each of default and prof), +11 new symbols and −1; `m68k_run_mmu040` `0x8f0` → `0x914` = **2 288 → 2 324 B, +36** | **HIT**, with one honest qualification below |
+| **G-R1.3** lockstep identity | `WARP_DIVERGE == 0` over `≥ 10⁷`; final registers and guest memory byte-identical | `WARP_DIVERGE = 0` over **10 000 000** compared boundaries; final register file, pc, restart pc and data page byte-identical; the armed arm executed **10 000 000** blocks (the anti-vacuity check) | **HIT** |
+| **G-R1.4** counter identities | `DOPC_HIT + DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS` exact both arms with `WARP_ENTER == 0`; `FAULTS` equal; `sum(IV_*) − IV_WRAP == DOPC_INVAL`; `WARP_DISC` reconciles; `BLK_*` identical | all exact, in the profiling variant, on a 20 000-instruction window: `INSNS`, `DOPC_HIT+DOPC_MISS`, `FAULTS`, `DOPC_INVAL` and all three `BLK_*` **identical between the arms**; `WARP_ENTER = 0`, `WARP_INSNS = 0`, `WARP_BAIL == WARP_BLK`, `WARP_CBYTES == 8 × WARP_COMPILE`, `WARP_CFETCH = 0` | **HIT** |
+| **G-R1.5** mutation arms | each caught, and shown to be caught | **M-5** supervisor lookup of a user block: hits 0 clean / 1 mutated. **M-7** 41 retired instructions at cadence 4: 10 polls clean / 0 mutated. **M-ICACHE** unpublished entries: 0 clean / 200 mutated. **M-ARM** 196 608 swept words arm nothing, and no value any neighbouring field can hold arms it. **M-REPUB** a resync that finds the same word leaves it armed; the boot publish disarms it | **HIT**, all five printed as well as asserted |
+| **G-R1.6** images | three rebuilt, CRCs recorded, archive fires; `q2probe` not rebuilt | `BOOT.BIN` **`9C7A2AD3`** (was `BF56576A`), `BOOT-lean.BIN` **`E80D04EE`** (was `F294E75A`), `BOOT-prof.BIN` **`423CB391`** (was `5225BD9C`); all three archived CRC-stamped, the outgoing three still in the archive; `BOOT-q2probe.BIN` untouched at `FCC0CB3F` | **HIT** |
+| **G-R1.7** entry cost | disarmed gate **3 … 6** ARM instructions; armed null-block path **24 … 40** per user-mode guest instruction | disarmed **5**; armed **60** | disarmed **HIT**; armed **MISSED, high** |
+
+**G-R1.2's qualification, stated rather than buried.** The build is `-flto`, so adding a
+translation unit re-runs whole-program optimisation and a handful of functions change for
+reasons that have nothing to do with WARP. Of the twelve: `z3660_dopc_invalidate`
+(1 → 27 instructions — `z3660_dopc_do_invalidate` got inlined into it and the WARP hook
+added), `z3660_knobs_sync` (42 → 67 — the WARP resync block) and `m68k_run_mmu040`
+(572 → 581 — the hook) are the change; `z3660_dopc_invalidate_dma` (1 → 2, a tail call that
+stopped being one because its callee grew) and seven others — `build_cpufunctbl`,
+`fill_prefetch`, `flush.part.0`, `op_d188_5_ff`, `op_53f0_14_ff`, `op_54c0_14_ff`,
+`floatx80_tentox`, `floatx80_twotox` — are LTO churn, each ±1 instruction or a reordering.
+**Under `-flto` there is no such thing as a perfectly confined object-level change, and a
+method that claimed one would be hiding the compiler rather than measuring it.**
+
+The method is `docs/warp-objdiff.py`, committed beside this document so the number can be
+re-derived: per-function disassembly with addresses, branch targets and `movw`/`movt`
+address immediates normalised away. **Whole-image byte identity — the right test after a
+revert, and used as one here twice — is the wrong test after an addition**: a new
+translation unit moves every later symbol, and on this target (`-DARMV6T2`, no literal
+pool) every global's address is baked into the instruction stream, so a byte compare
+reports 21 430 changed functions and tells you nothing. The relaxed mode canonicalises
+`movw`/`movt` immediates outright, which removes relocation entirely at the price of making
+a changed *constant* invisible; what it proves is that the instruction stream's shape and
+every branch target are unchanged, and the harness proves the behaviour.
+
+### 0.7.3 The entry cost, read off the lean disassembly — and the prediction it missed
+
+**Pre-registered 24 – 40 ARM instructions on the armed path. Measured 60. MISSED, high.**
+The prediction is left where it was written; here is what the disassembly actually shows,
+counted instruction by instruction along the steady-state path (block already cached,
+`build-lean/Z3660_emu.elf`, `E80D04EE`):
+
+| segment | instructions |
+|---|---|
+| the hook in `m68k_run_mmu040` — flag load, test, branch, the two argument loads, `bl` | 9 |
+| `z3660_warp_dispatch` prologue, trace gate, odd-pc/supervisor gate | 9 |
+| the lazy `warp_inited` check | 4 |
+| the lookup — index, key, stamp compare, tag compare | 13 |
+| the 64-bit arm-attestation increment | 8 |
+| the indirect call and the null block itself (`mov r0,#0` / `bx lr`) | 4 |
+| `z3660_warp_cadence_feed(0)` — call, prologue, early-out, return | 10 |
+| epilogue | 3 |
+| **total, armed, per user-mode guest instruction** | **60** |
+| **total, disarmed** — flag load, argument load, flag test, branch taken | **5** |
+
+**Four of the eight rows are not the engine; they are the shape of the code around it, and
+naming them now is what makes the next round's work a measurement rather than a taste.**
+The lazy init check (4) belongs at arm time, not on the dispatch path. The cadence feed's
+call and prologue (10) are a function call to do nothing — its `n <= 1` early-out belongs at
+the call site. The 64-bit attestation (8) is eight instructions for one increment. And
+`z3660_warp_dispatch` is out of line, so the hit path pays a full AAPCS prologue and
+epilogue for a lookup — the decoded-op cache's `always_inline` on `z3660_dopc_find()` exists
+for exactly this reason, and its comment says why: at `-Os` gcc will happily move a hot
+lookup out of line to save space, *"which is the exact trade this rung exists to refuse"*.
+**Together those are ~22 of the 60.** They are recorded here and **not fixed in this round**:
+tuning a number after seeing it, against the pre-registration it was scored on, is the
+re-scoping §0.2's kill line strikes outright. They are round 2's first work, and round 2
+re-registers its own band.
+
+**The metal expectation, re-derived from the measurement.** §0.6.5's band was derived from
+24 – 40 instructions and is left as written; at 60 the same arithmetic gives:
+
+```
+   armed:     60 x 0.8391 user-mode share  =  50 cycles on ~210      ->  -19.2 % at IPC 1
+                                              33 cycles at IPC 1.5   ->  -13.6 %
+   disarmed:   5 instructions               =   5 cycles on ~210     ->   -2.3 % at IPC 1
+```
+
+| row | §0.6.5 as pre-registered | re-derived from the measured counts |
+|---|---|---|
+| disarm penalty vs the `F294E75A` cross-build row (8 151) | −0.5 % … −2.9 %, dhry 7 915 … 8 110 | **−1.6 % … −2.3 %, dhry 7 963 … 8 021** |
+| same-boot switch, armed vs disarmed | −5 % … −16 %, armed dhry ≈ 6 700 … 7 700 | **−13.6 % … −19.2 %, armed dhry ≈ 6 450 … 6 900** |
+
+The reading rules are §0.6.5's, unchanged: **this is a cost, not a verdict**, the kill line
+cannot fire on a round whose coverage is 0 by construction, and the identity
+`cross-build × disarm-penalty = same-boot switch` must close or the session is a measurement
+error rather than a result.
+
+### 0.7.4 Three things worth recording that were not gates
+
+- **The null block's two words are emitted as one NEON store.** `-Os` turned the emitter's
+  two 32-bit stores into `vldr d16, [pc, #152]` + `vst1.32 {d16}, [r3]!` — the two words
+  `e3a00000` / `e12fff1e` sit in the function's own literal pool. The emitted bytes are
+  exactly the two the harness asserts; only the way they get written changed.
+- **G3 — zero `throw` sites reachable from generated code — is trivially met in round 1**,
+  and is recorded rather than skipped: generated code is two instructions and calls nothing,
+  so the reachable call graph from it is empty. The audit becomes real work in round 2, when
+  the emitted sequence starts calling helpers.
+- **The engine refuses the arena if the classic JIT owns it.** `z3660_warp_cache_arena()`
+  returns NULL when `compiled_code != NULL`, which is the `UAEJIT_*` bootmodes. Two engines
+  bump-allocating one 32 MB arena is a wild-write generator; refusing makes it impossible
+  rather than unlikely, and WARP then declines every block and reports it in `WARP_DECLINE`.
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
@@ -1667,6 +1795,29 @@ generation because reading it *"cannot be read from a per-**set** stamp... so it
 stamp and three more compares on the hit path"*, on a path that runs every dispatch. **For a JIT
 the arithmetic reverses**: the lookup runs once per *block*, so three more compares are amortised
 over the block's length. That is an argued reversal of a documented decision and it is **Q5**.
+
+> ### As built at M1 round 1 (2026-08-24) — the keying, and what replaced the refuted table
+>
+> `Z3660_WARP_KEY(pc, super) = (pc & ~1) | (super ? 1 : 0)`, indexed
+> `Z3660_WARP_INDEX(pc) = (pc >> 1) & (SETS-1)` over **1024 sets, direct-mapped**, one block
+> per set, 16 bytes per entry on the target — tag, generation stamp, a 32-bit code pointer
+> and the retired count, i.e. **half a Cortex-A9 line**, guarded by a compile-time tripwire
+> on 32-bit pointers exactly as the dopc's set is. `cache_tags[65536]` and its
+> `cacheline(regs.pc_p)` keying are **not used and not adapted**: §0.3(c) refuted the keying
+> and there is no `pc_p` under the MMU.
+>
+> **Direct-mapped, and the reason is not thrift.** The dopc needs four ways because it is
+> consulted once per *instruction*; a block table is consulted once per *block head*, and a
+> way count is a decision to take against a measured head distribution rather than by
+> analogy. Associativity is a round-2 question with `WARP_DISC` and a measured hit rate to
+> answer it.
+>
+> **The set-relative empty marker is inherited whole** — `TAG_EMPTY(idx) = (idx ^ 1) << 1` —
+> and the corpus asserts the property rather than the constant: for all 1024 sets, the
+> marker indexes a *different* set, so no legitimate key can match it. Validity is the
+> per-set generation stamp, so a discard stays O(1); the marker is what keeps the encoding
+> honest when round 2 adds ways and supervisor blocks. Mutation **M-5** (the key drops the
+> supervisor bit) is the arm that keeps it load-bearing, and it is caught. §0.7.
 
 ### What the physical-index strike does and does not transfer
 
@@ -2469,7 +2620,23 @@ Five cheap things, all before any codegen. Only the first needs the card.
 M1 — its band, its coverage bar, its counter directions checked against call topology, and its
 revert line — **before** the first line of code.
 
-### M1 — Straight-line user-mode blocks `PRE-REGISTERED, READY`
+### M1 — Straight-line user-mode blocks `IN PROGRESS — round 1 DONE`
+
+> **Round 1, the plumbing slice, is `DONE` (2026-08-24).** Blocks are discovered, keyed,
+> cached, invalidated, evicted, entered and bailed — and every block is a null block, so no
+> code is generated and **no performance claim is made or is admissible**. Its
+> pre-registration is §0.6 and its scored gates are §0.7: the harness is green in all three
+> variants, the armed and disarmed arms are byte-identical over **10⁷** compared instruction
+> boundaries with `WARP_DIVERGE = 0`, all five mutation arms are caught, and the three
+> shipping images carry the switch (`9C7A2AD3` / `E80D04EE` / `423CB391`).
+>
+> **The one number it produced is a cost: 60 ARM instructions on the armed path against a
+> pre-registered 24 – 40, and 5 on the disarmed one against 3 – 6.** The armed figure is
+> `MISSED, high`, ~22 of it is named and none of it is fixed in the round it was measured
+> in, and the re-derived metal expectation is a same-boot switch of **−13.6 % … −19.2 %**.
+> That is §30's pricing law taking its first bite, exactly where R7 said it would.
+>
+> **Round 2 is the first per-opcode compiler**, and it re-registers its own band.
 
 Compile only: register-to-register ALU, `MOVE`/`MOVEA` in the covered EA shapes, and the
 conditional branches that end blocks. No FPU, no privileged instruction, no write-back family, no
