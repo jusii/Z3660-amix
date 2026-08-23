@@ -15,6 +15,7 @@
 #include "memory.h"
 #include "newcpu.h"
 #include "harness.h"
+#include "uae/z3660_warp.h"   /* the WARP OFF sentinel core0 publishes every boot */
 #include "main.h"      /* SHARED struct (harness-safe; newcpu.cpp pulls it via ../main.h) */
 
 #include <cstdio>
@@ -172,6 +173,13 @@ void harness_shared_defaults(void)
 	_harness_shared.perf_stats      = 1;   /* per-instruction perf accounting ON */
 	_harness_shared.emu_probes      = 1;   /* run-loop diagnostic probes ON */
 	_harness_shared.perf_report     = 0;   /* [PERF] serial line OFF (as debug_console_init) */
+	/* WARP ENGINE: core0's UNCONDITIONAL per-boot publish, reproduced here because that is
+	 * what this function is for -- it is the boot state, not a convenience. The mailbox is
+	 * DDR that survives a warm reset, so an arm written by the console in one boot is still
+	 * sitting there in the next one; config_file.c therefore writes the OFF sentinel every
+	 * boot from both config-resolve paths, and the corpus's anti-vacuity check shows what
+	 * deleting that publish would cost. */
+	_harness_shared.warp_on         = Z3660_WARP_OFF;
 }
 
 void harness_mem_init(void)

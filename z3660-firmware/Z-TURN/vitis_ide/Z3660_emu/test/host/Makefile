@@ -56,8 +56,13 @@ INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) 
 # Defined ABOVE CXXFLAGS because CXXFLAGS is `:=` and expands it on the spot.
 PROF_SRC := $(abspath $(UAE)/z3660_prof.cpp)
 
+# Z3660_WARP_LOCKSTEP arms the block engine's differential oracle: the same guest span run
+# disarmed and then armed, compared after EVERY guest instruction across the whole set S3.1
+# defines. It is a GATED BUILD and it is defined HERE and nowhere else -- the firmware
+# Makefile never passes it, so WARP_LS_INSNS and WARP_DIVERGE are compiled out of every
+# shipping image, which is what docs/WARP-ENGINE.md S0.5.5 requires of it.
 CXXFLAGS := -O0 -g -std=c++11 -fno-strict-aliasing -fexceptions -MMD -MP \
-            -DSDL_strcasecmp=strcasecmp -DHOST_TEST_HARNESS \
+            -DSDL_strcasecmp=strcasecmp -DHOST_TEST_HARNESS -DZ3660_WARP_LOCKSTEP=1 \
             -Wno-write-strings -Wno-narrowing $(VARIANT_DEFS) $(INCLUDES) \
             -DZ3660_PROF_SRC_PATH='"$(PROF_SRC)"'
 
@@ -68,7 +73,8 @@ UAE_SRCS := newcpu.cpp newcpu_common.cpp readcpu.cpp cpudefs.cpp cpustbl.cpp \
             cpuemu_0.cpp cpuemu_4.cpp cpuemu_11.cpp cpuemu_13.cpp \
             cpuemu_40.cpp cpuemu_44.cpp cpuemu_32.cpp cpuemu_31.cpp \
             cpustbl_mmu030.cpp cpustbl_mmu040.cpp \
-            cpummu030.cpp cpummu.cpp newcpu_mmu_glue.cpp z3660_prof.cpp
+            cpummu030.cpp cpummu.cpp newcpu_mmu_glue.cpp z3660_prof.cpp \
+            z3660_warp.cpp
 
 HOST_SRCS := board_stubs.cpp harness_main.cpp
 
