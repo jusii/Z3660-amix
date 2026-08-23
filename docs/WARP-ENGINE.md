@@ -4,8 +4,11 @@
 card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 185 dhrystones
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
-**Status:** `TODO` — plan only. Nothing here is built. **No code, no harness change, and no
-metal time until the design freeze (M0) closes.**
+**Status:** `M0 IN PROGRESS` — the grill ran on **2026-08-23** and every question in §7 is
+answered. §0 is the freeze: it is the authority for everything below it, and where a §2
+claim disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place
+with the correction marked. **Still no engine code: M1 opens when M0's deliverable —
+this document plus the committed M1 pre-registration — is complete.**
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -42,6 +45,446 @@ Everything in this plan traces to these. Where a claim traces to none of them, i
 | `CHANGES.md` + `0a4c064`, `e37bb43`, `8be8949` | the AMP coherence history and the JIT's own I-cache lesson |
 | the 68040 port lane's `docs/C2-ATTACK-MAP.md` §§30–47 | the pricing law, the ladder, and **row J** |
 | `Z3660_emu/src/uae/` (`newcpu.cpp`, `cpummu.cpp`, `z3660_dopc.h`, `z3660_dfast.h`, `jit/`) | what exists today |
+
+---
+
+# 0. Grill decisions — design freeze (2026-08-23)
+
+The grill ran on **2026-08-23** against §7's thirteen questions. All thirteen are answered.
+Each §7 entry now carries a `RESOLVED` line pointing here, with its original recommendation
+and cheapest-experiment text left **byte-untouched** beside it — a recommendation rewritten
+to match its own outcome is not a recommendation, and §3.4 makes that a rule rather than a
+preference.
+
+**This section is the authority.** §§1–6 keep their reasoning; where one of their claims is
+refuted by the censuses in §0.3 it has been corrected in place and the correction marked
+`(corrected at M0)`. Nothing pre-registered has been rewritten.
+
+## 0.1 The decisions
+
+### Q1 — route: **C, the hybrid** `DECIDED`
+
+Keep the plumbing that is already proven on this silicon: the raw ARMv7 emitters
+(`jit/codegen_arm.h`), the block manager, the code-cache allocator, `flush_cpu_icache`, the
+flags machinery, and the register-allocator core. **Replace the `jnf_MEM_*` midfunc helpers**
+with the MMU verdict-table fast path plus bail-to-interpreter, and impose a state-sync
+discipline at faultable sites. Per-opcode compilers are inherited **family by family, and
+only where a family survives the bail contract** — never wholesale.
+
+> **The contract that comes with the route, and it is a pre-registration, not an aspiration:**
+> the **state-sync overhead per faultable access is a pre-registered M1 measurement**. The
+> allocator gets redesigned toward Route B's shape **only if the numbers say that is the
+> ceiling** — not because a redesign looks tidier from the outside.
+
+The census that motivated the choice is §0.3(a). The grill recorded its finding as *"the memory
+model is confined to the `jnf_MEM_*` layer, all emitting via `R_MEMSTART`"*, and that
+confinement is what makes "replace the layer" a route rather than a wish — inheriting a
+per-opcode compiler means inheriting whatever memory model it emits, and the whole bet is that
+there is only one such model and it lives in one place.
+
+**The exact version is slightly less tidy than the note, and the untidiness is named here rather
+than discovered during codegen.** §0.3(a): **16 `jnf_MEM_*` helpers, 14 of them emitting through
+`R_MEMSTART`** — the other two are the `special_mem` arm and dispatch through the memory-bank
+function-pointer table instead — plus **three sites that reach `R_MEMSTART` from outside the
+layer**: `jnf_MOVE16`, the five FPU emitters in `codegen_arm.cpp`, and the one line that loads
+the base register at block entry. All three are closed by exclusion rather than by porting
+(`MOVE16` is a bail family; the FPU is interpreter-only by Q13; the base load is the line Route C
+deletes), so the confinement holds where it has to.
+
+### Q2 — exceptions: **design as if a throw cannot cross generated code** `DECIDED`
+
+The posture is assumed-terminates: **bail before the fault, everywhere** (§2e option 2), so no
+`throw` is ever raised on a stack that has a generated frame on it. Every fault-visible
+decision in §2e follows from this and none of them is contingent on the probe's answer.
+
+**The probe confirms or kills the posture; it does not choose it.** `make q2probe` builds
+`BOOT-q2probe.BIN`, a fourth image that exists only for this question: it emits a
+four-instruction ARM stub into the heap, calls it, has it `bl` into C++, and provokes an
+unwind across it — once with the throw contained inside the helper and once with it crossing.
+It prints its verdict on serial before emulation starts, so one boot's capture is the whole
+result. See §0.4 and `Z3660_emu/src/warp_q2probe.cpp`. A negative answer here ends the project
+for the price of that boot, which is exactly why it is M0's first item.
+
+### Q3 — cache maintenance: **add ISB and a branch-predictor invalidate before JIT volumes** `DECIDED`
+
+The `ISB` and the branch-predictor invalidate are added to the I-cache sequence **before** the
+engine raises flush volume, not after a symptom appears. The **`UAEJIT` bootmode A/B is the
+settling experiment** — it already runs generated code today — and it is a metal session, later.
+The standing platform caveat rides with it unchanged: *adding barriers is not evidence of a fix;
+only a soak on metal is.*
+
+### Q4 — where compilation runs: **core1, inline, in bounded units** `DECIDED`
+
+Compilation runs on core1 inline, in units bounded by rung 0's measured **~42 µs** budget.
+**Core0 offload stays gated behind the unexplained 118-second core0 gap** — that investigation
+closes first, or the offload does not happen.
+
+### Q5 / Q6 — **deferred to their own pre-registered M1 counters** `DEFERRED`
+
+Q5 (a per-address-space generation) is settled by the **`IV_ROOT` blocks-discarded ratio**; Q6
+(resurrecting rung 3's `ifetch` table on the compile path) by a **compile-path fetch counter**.
+Both counters are pre-registered at M1. **Neither is built early.** Re-funding either from a
+bucket share before its counter exists is the one thing §30's law strikes outright.
+
+### Q7 — generation-one families: **MOVE/MOVEA covered shapes + register-register ALU + Bcc/DBcc** `DECIDED`
+
+Chosen **on the dhrystone window**, following Q11. The kernel-window `(xxx).L` shape — 37 % of
+the `MOVE` family where the family's covered share falls to 57.6 % — is a **named M4 ladder
+candidate, contingent on the boot rows**, not a generation-one family.
+
+### Q8 — rung 0: **stays untouched through M3** `DECIDED`
+
+The block-idiom fast path is not modified, not subsumed and not retired. **The JIT declines its
+PCs.** Revisit at M4 with its own gate, and read the campaign's rule out loud first.
+
+### Q9 — switch polarity: **`WARP` unset = OFF through M4** `DECIDED`
+
+A deliberate inversion of the house rule, and the reason is recorded: the house rule exists so a
+zeroed `SHARED` struct from an older core0 still runs *shipped behaviour*, and an unshipped
+engine's shipped behaviour is "off". **Flip to unset = ON only at M5, on the user's word.**
+**Arm attestation rides every capture** — arm state is read from a counter, never from a banner.
+
+### Q10 — the cadence contract: **blocks feed the counter with retired guest instructions** `FROZEN`
+
+**The timebase contract is FROZEN.** A block feeds the cadence counter with the number of guest
+instructions it retired, so one pump tick stays `256 × service_cadence` *guest* instructions.
+This is the item with **cross-repo reach** (§6.2), and the **PSTAT gap fingerprint is a proof
+obligation on every metal verdict** — not a check to run if there is time.
+
+### Q11 — the perf gate: **dhrystone, with a boot row beside it** `DECIDED`
+
+**Dhrystone stays THE gate.** Every verdict capture additionally records **a boot-window row and
+`INSNS_SUPER` beside it**. The kernel-heavy story accumulates evidence from M1 onward and
+**gates nothing before M4**.
+
+### Q13 — model-agnostic engine, interpreter-only FPU `DECIDED`
+
+The engine is written **68k-model-agnostic**; the code-organisation review that keeps it so
+happens when implementation starts. **The FPU is interpreter-only permanently** — the
+vector-11 / FPSP contract of R6 is a correctness decision, not a scheduling one, and it does
+not expire at M5.
+
+### Schedule
+
+**M0 now, and WARP runs solo** — no parallel projects until the user says otherwise.
+
+## 0.2 The kill line — agreed, binding, and written before any code
+
+> **At M1, with coverage in band (≥ 60 %) and no named defect: cross-build dhry ≤ 8 185 + rig
+> spread (≈ 8 242) → the project STOPS and the code reverts same-day; rung-3 precedent binding;
+> no re-scoping. Positive but far under the 1.25–1.55× band → continue ONLY with a named
+> measured mechanism + a re-registered M1b.**
+
+That is the whole line, quoted as agreed. Three things about it are worth saying once, here:
+
+- **"No re-scoping" is the operative clause.** The failure mode a kill criterion exists to
+  prevent is not a bad number; it is a bad number followed by a redefinition of what was being
+  measured. Row J's 2.11–2.35× ceiling and §1.5's 1.25–1.55× band are both *already* written
+  down and neither may be re-derived after a result.
+- **"Coverage in band and no named defect" is the guard on the other side.** A miss at 20 %
+  coverage is a bug report, not a verdict, and it does not trigger the kill line — but "we think
+  there might be something wrong" is not a named defect either. The defect has to be named.
+- **The rung-3 precedent is binding by name.** Rung 3 engaged at 91.10 % coverage, made its
+  bucket 23 % cheaper per instruction, hit or beat every premise it declared, moved the wall
+  clock −0.05 %, and came out **the same day**. A JIT that does the same is the same finding.
+
+## 0.3 M0 evidence — the zero-build censuses (2026-08-23)
+
+All three censuses read source only: no build, no toolchain, no card. Censuses (a) and (b) are
+reproduced by `docs/warp-m0-census.py`, committed beside this document so the numbers can be
+re-derived by whoever doubts them — including after the code they count has moved. Every number
+below is **measured** unless it says otherwise, and every one carries its `file:line`.
+
+### (a) The `jnf_MEM` census, and the family-inheritance survey Route C needs
+
+**The layer itself.** There are **16** `jnf_MEM_*` midfuncs, all in
+`Z3660_emu/src/uae/jit/compemu_midfunc_arm2.cpp` (`:7899`–`:8141`). **14 of the 16 emit through
+`R_MEMSTART`**; the two that do not — `jnf_MEM_READMEMBANK` (`:8090`) and `jnf_MEM_WRITEMEMBANK`
+(`:8122`) — are the `special_mem` arm and dispatch through the memory-bank function-pointer
+table instead. **(measured)**
+
+**Three leaks out of the layer, and Route C owns all three.** `R_MEMSTART` is also emitted by:
+
+| site | what it is | consequence for Route C |
+|---|---|---|
+| `jnf_MOVE16` (`compemu_midfunc_arm2.cpp:4872`) | a per-opcode midfunc that computes its own addresses and does **not** go through the accessor API | `MOVE16` is a bail family regardless — its 68040 fault semantics need `MMU_FSLW_TT_16` — so this leak is closed by exclusion, not by porting |
+| 5 sites in `codegen_arm.cpp` (`:979`, `:1012`, `:1038`, `:1099`, `:1117`) | `raw_fp_from_exten_mr` / `raw_fp_to_exten_rm` / `raw_fp_from_double_mr` / `raw_fp_to_double_rm` — the FPU's own memory path | closed by **Q13**: the FPU is interpreter-only permanently, so `compemu_fpp_arm.cpp` stays unreachable under the MMU |
+| `codegen_arm.cpp:535` | the one *definition* site: `LDR_rRI(R_MEMSTART, R_REGSTRUCT, offsmem)` loads `regs.natmem_offset` into the base register at block entry | this is the line Route C deletes; §0.3(c) says what replaces it |
+
+**So the memory model really is one layer, two named exclusions, and one line to delete** —
+which is the finding that makes Route C a retrofit rather than a rewrite, and it is worth
+saying out loud that the finding could have gone the other way. A memory model smeared across
+the 3 054 per-opcode compilers would have made Route B the only honest answer. **(measured)**
+
+**The compile table.** `compstbl_arm.cpp` holds **two** tables, `op_smalltbl_0_comp_ff` (`:15`)
+and `op_smalltbl_0_comp_nf` (`:1884`), and they are structurally identical:
+
+```
+   entries per table              1 867
+   NULL (no compiler at all)        340   18.21 %
+   per-opcode compilers           1 527
+     ... can reach guest memory   1 213   79.44 % of the compilers
+     ... pure register ops          314   20.56 %
+```
+
+with **3 054** compiler bodies defined in `compemu_arm.cpp` (1 527 × 2). **(measured)**
+
+> **Q1's own cheapest experiment, answered: "nearly all of them" is 79.44 %.** The plan said
+> that if it were nearly all of them, *"Route A is a rewrite wearing a retrofit's clothes and
+> the grill should say so out loud"*. It is, and the grill did. **Four fifths of the existing
+> per-opcode compilers cannot be inherited without the new memory model underneath them.**
+
+**By mnemonic family** — 69 families across the 1 527 compilers, split three ways:
+
+- **21 fully register-only** (no entry reaches memory): `ANDSR ASL ASR Bcc DBcc EORSR EXG EXT
+  FBcc FPP FScc LEA LSL LSR NOP ORSR ROL ROR ROXL ROXR SWAP`
+- **18 fully memory-touching** (every entry reaches memory): `ASLW ASRW BSR CMPM JMP JSR LINK
+  LSLW LSRW MOVE16 MVMEL MVMLE PEA ROLW RORW RTD RTS UNLK`
+- **30 mixed** — some shapes pure, some not: `ADD ADDA ADDX AND BCHG BCLR BFINS BSET BTST CLR
+  CMP CMPA DIVL DIVS DIVU EOR MOVE MOVEA MULL MULS MULU NEG NEGX NOT OR SUB SUBA SUBX Scc TST`
+
+**This is why Q1 says "family by family" and not "family set".** The generation-one families
+land on all three sides of that split:
+
+| family | entries | reach memory | pure | what Route C inherits |
+|---|---|---|---|---|
+| `Bcc` | 45 | **0** | 45 | inheritable as-is — no memory model involved |
+| `DBcc` | 16 | **0** | 16 | inheritable as-is |
+| `MOVE` | 281 | 272 | 9 | **not** inheritable as-is; the covered EA shapes are exactly the ones that go through the accessor API |
+| `MOVEA` | 24 | 18 | 6 | same |
+
+and register-to-register ALU lives inside the **mixed** families, so its inheritance is decided
+**per shape**, never per family. **(measured)**
+
+**The accessor API, and the faultable-site density M1's cost measurement needs.** The
+per-opcode compilers reach guest memory through exactly ten symbols in
+`compemu_support_arm.cpp` (`:1682`–`:1809`), all funnelling into the 16 midfuncs — that funnel
+*is* the choke point Route C replaces. Usage across both tables' 3 054 bodies:
+
+```
+   readword 730   writebyte 690   readlong 626   readbyte 606
+   writeword 492  writelong 432   get_n_addr 56  get_n_addr_jmp 32
+   writelong_clobber 24            writeword_clobber 0   (declared, never called)
+   jnf_MOVE16 10   (the API bypass above)
+```
+
+```
+   total guest-memory call sites   3 738
+   bodies with 0 sites               628
+              1 site               1 146
+              2 sites              1 258
+              3 sites                 12
+              4 sites                 10
+   mean per body                    1.22
+   mean per memory-touching body    1.54
+```
+
+> **The denominator for Q1's pre-registered M1 measurement.** State-sync cost is charged **per
+> faultable access**, and this says a compiled instruction has **one or two** of them in
+> essentially every case and never more than four. A design that costs *n* instructions per
+> faultable site therefore costs ~1.5*n* per memory-touching guest instruction — which is the
+> arithmetic M1 has to beat, computed from `objdump` before any metal time, in §30.3 step 3's
+> form. **(measured; the ratio is derived)**
+
+### (b) The state-discipline census — what a bail would have to sync
+
+**The virtual register file.** `VREGS 22` (`compemu_arm.h:157`), bound to home locations in
+`init_comp()` (`compemu_support_arm.cpp:1409`–`:1425`):
+
+| virtual | home | note |
+|---|---|---|
+| v0 – v15 | `regs.regs[0..15]` (`:1411`) | D0–D7, A0–A7; `INMEM` at block start |
+| v16 `PC_P` (`:197`) | `regs.pc_p` (`:1417`) | **a host pointer**, seeded `set_const(PC_P, (uintptr)comp_pc_p)` |
+| v17 `FLAGX` (`:198`) | `regs.ccrflags.x` (`:1420`) | |
+| v18 `FLAGTMP` (`:199`) | `regs.ccrflags.nzcv` (`:1423`) | |
+| v19 – v21 `S1..S3` (`:201`) | `regs.scratchregs[0..2]` (`:1414`) | the spill area §2c named |
+
+Five statuses (`compemu_arm.h:160`–`:164`): `INMEM`, `CLEAN`, `DIRTY`, `UNDEF`, `ISCONST`.
+`DIRTY` means the host register holds the truth and the home copy is stale; `ISCONST` means the
+value is known at compile time and written **nowhere**. **(measured)**
+
+**The host register budget, and it is smaller than §2c said.** `codegen_arm.cpp:83`–`:85`:
+
+```c
+#define R_MEMSTART 10
+#define R_REGSTRUCT 11
+uae_s8 always_used[]={2,3,R_MEMSTART,R_REGSTRUCT,12,-1};
+```
+
+so r2, r3, r10, r11 and r12 are locked and **8 host registers are allocatable** (r0, r1, r4–r9),
+not the 11 the nominal `N_REGS` suggests. `freescratch()` (`compemu_support_arm.cpp:1571`)
+repeats the same five by hand, which is a second, independent statement of the same fact.
+**(measured — see §0.3(c) for what this corrects.)**
+
+**The three lazinesses a bail has to undo.** The block-local discipline is lazy in exactly three
+dimensions, and each is a thing a bail must materialise:
+
+1. **Registers** — a guest register may be `DIRTY` in a host register or `ISCONST` in nothing at
+   all. `tomem()` (`:858`) and `writeback_const()` (`:871`) are the two writebacks; `evict()`
+   (`:881`) is the pair plus disassociation.
+2. **The PC** — `m68k_pc_offset` accumulates guest bytes and is folded into `PC_P` only by
+   `sync_m68k_pc()` (`:1320`), as `arm_ADD_l_ri(PC_P, m68k_pc_offset)`. Between folds **no PC
+   exists anywhere**, in any form.
+3. **The flags** — three-state: `live.flags_in_flags` (live in the ARM CPSR),
+   `live.flags_on_stack` (in `regs.ccrflags.nzcv` via `FLAGTMP`), and `live.flags_are_important`;
+   plus `flags_carry_inverted`, because ARM's carry is inverted on subtract and compare
+   (`:236`–`:260`). `flags_to_stack()` (`:799`), `clobber_flags()` (`:820`),
+   `flush_flags()` (`:828`).
+
+`flush(save_regs)` (`:1466`) is the composite the engine already has: `flush_flags()`, then
+`sync_m68k_pc()`, then a walk of v0…v18 writing back `CLEAN`/`DIRTY` via `tomem()` and `ISCONST`
+via `writeback_const()` (`PC_P` excepted). `prepare_for_call_1/2` (`:1602`, `:1609`) add the
+disassociation a C call needs. **(measured)**
+
+**And here is the census's actual result.** Comparing what `flush(1)` writes against the
+checkpoint the interpreter maintains at a guest-instruction boundary (§2e, `newcpu.cpp:5851`–
+`:5853` and the `CATCH` recovery):
+
+| the interpreter's boundary state | does `flush(1)` produce it? |
+|---|---|
+| the 16 data/address registers | **yes** — the v0…v15 walk |
+| `regs.ccrflags.nzcv` | **yes** — `flush_flags()` |
+| `regs.ccrflags.x` | **yes** — v17 in the same walk |
+| `regs.pc` (the guest **logical** PC) | **no** — and see the refinement below, which is the most useful thing this census found |
+| `regs.instruction_pc` (the restart PC) | **no** |
+| `mmu_restart` | **no** |
+| `mmufixup[0..1]` | **no** |
+
+> **Three of the four are not "not written yet": the strings `instruction_pc`, `mmu_restart` and
+> `mmufixup` do not occur anywhere in `jit/` — in any of its thirteen files, at all.** The
+> engine has no notion of the interpreter's restart checkpoint, which is exactly what a JIT
+> without an MMU is entitled to. **(measured; `docs/warp-m0-census.py` census (b5))**
+
+> **⚠ `regs.pc` is the fourth, and the first pass of this census got it wrong — so it is
+> recorded here with the correction rather than the tidy version.** A first count keyed on
+> `regs.pc` with a trailing space returned zero and the draft concluded *"the existing JIT has
+> no concept of a guest logical PC"*. Tightened to `\bregs\.pc\b(?!_)`, the count is **32**:
+> `mov_l_mr((uintptr)&regs.pc, srca)`, in exactly **16 compiler bodies per table** — **7 `JMP`
+> shapes, 7 `JSR` shapes, `RTS` and `RTD`** — one store each
+> (`compemu_arm.cpp:13306`–`:13569` and the `nf` twins at `:38888`–`:39151`).
+>
+> **Every one of them is a block terminator whose target is not a compile-time constant, and no
+> intra-block instruction boundary writes it.** That is a better finding than the one it
+> replaces, and it points the same way: **the primitive exists and is exercised; what is missing
+> is the discipline of holding a guest PC at arbitrary boundaries.** It also makes shape (ii)
+> below cheaper than it looked — at a block head the guest PC *is* a compile-time constant, so
+> the bail arm's materialisation is the immediate-store form of a store the emitter set already
+> has. **(measured; `docs/warp-m0-census.py` census (b6))**
+
+**What that hands M1, stated as design input and not as a design.** Three of the four are cheap
+*because generation one already excludes the instructions that use them*:
+
+- **`mmufixup[0..1]`** are the predecrement/postincrement address-register fixups. §2e's
+  write-back-family exclusion already keeps every instruction that arms them in the interpreter,
+  so the engine's obligation reduces to an invariant it can assert rather than maintain:
+  `mmufixup` is disarmed at every block head, because only the interpreter ever arms it.
+- **`mmu_restart`** is one bool, set to the same value the interpreter's boundary sets.
+- **`regs.instruction_pc` and a real `regs.pc`** are the one with genuine cost, and they are the
+  same cost paid twice: the engine must be able to name the **guest logical PC** of the
+  instruction it is bailing from, and laziness 2 above says it does not hold one between folds
+  — the 32 stores it does emit are all at block terminators, never at an intra-block boundary.
+
+  Two shapes are available and M1 prices them against each other, not by taste: **(i)**
+  materialise the guest PC at every faultable site — pays on the taken path, which §30's law
+  says arrives in full; **(ii)** keep the block head's guest PC plus a per-site constant delta
+  and materialise **only on the bail arm** — pays nothing on the taken path and one constant
+  materialisation on a path that is already going to cost thousands of cycles. **(ii) is the
+  obvious candidate and it is still a candidate**: it is what Q1's pre-registered state-sync
+  measurement is for, and the number that decides it is emitted-instructions-per-faultable-site
+  from `objdump`, read before any metal time.
+
+**One more input the census makes free.** The bail writeback's *ceiling* is 19 stores plus the
+flags word (v0…v18), but only the `DIRTY` and `ISCONST` entries actually emit anything. With 8
+allocatable host registers against 22 virtual ones, the interesting quantity is the *emitted*
+count, not the ceiling — so **M1's counter counts emitted stores per bail**, and pre-registering
+the ceiling instead would be pre-registering a number that cannot move.
+
+### (c) §2's claims, checked against the code
+
+Cheap checks only, and the two that failed are corrected in place in §2 with the correction
+marked. `Z3660_emu/src/` paths are relative to `z3660-firmware/Z-TURN/vitis_ide/`.
+
+| §2 claim | verdict | evidence |
+|---|---|---|
+| `blockinfo` / `cache_tags` structures exist and are reusable | **confirmed, with the keying refuted** — see below | `compemu_arm.h:54`–`:57`, `:63`–`:66`; `compemu_support_arm.cpp:162` |
+| the code cache is 32 MB from `malloc()` | **confirmed, and stronger than stated** — see below | `include/newcpu.h:42`; `compemu_support_arm.cpp:182`–`:215`, `:2094` |
+| the guest's N/Z/C/V live in one word in native ARM CPSR bit positions | **confirmed** | `machdep/m68k.h:477` is the live `flag_struct` for `CPU_arm`; `FLAGBIT_N 31` at `:487`, `Z 30`, `C 29`, `V 28`, `X 0` |
+| no literal pool is used on this target | **confirmed, and upgraded from `derived` to `measured`** | the data-buffer machinery is inside `#if defined(CPU_arm) && !defined(ARMV6T2) && !defined(CPU_AARCH64)` (`compemu_support_arm.cpp:697`) and `Z3660_emu/Makefile` passes `-DARMV6T2`, so it is not compiled at all |
+| `flush_cpu_icache` at `jit/compemu_midfunc_arm.cpp:603`, four call sites | **confirmed exactly** | `:603`; called at `:636` (`write_jmp_target`), `compemu_support_arm.cpp:2189`, `:2213`, `:2739` |
+| `m68k_run_mmu040` is 2 288 B | **confirmed** | `nm -S build-lean/Z3660_emu.elf` → `T _Z15m68k_run_mmu040v` size `0x8f0` = 2 288, 2026-08-23 |
+| `m68k_run_jit()` at `newcpu.cpp:4321`; the MMU arm precedes the JIT arm in `run_func` | **confirmed** | `newcpu.cpp:4321`; `:6570`–`:6578` |
+| `enable_jit = 0` for MMU bootmodes so `cachesize` stays 0 | **confirmed** | comment at `uae_emulator.cpp:1039`–`:1042`; the assignment at `:1079` |
+| **r11 is the guest-memory base; r0–r10 are allocatable** | **REFUTED** | `codegen_arm.cpp:83`–`:85`: `R_MEMSTART` is **r10**, `R_REGSTRUCT` is **r11**, and `always_used[]` locks r2, r3, r10, r11, r12 → **8** allocatable. The `N_REGS 11` comment at `compemu_arm.h:124` is **stale**: it says *"11 holds memstart and 12 is scratch"*, and the code has said otherwise for as long as `always_used[]` has listed five registers. §2c corrected. |
+| **`cache_tags` can serve as a block-entry table under the MMU** (implied by "reusable") | **REFUTED as keying, confirmed as structure** | `cacheline(x)` is `((uintptr)x) & TAGMASK` with `TAGMASK 0x0000ffff` (`compemu_arm.h:54`–`:57`), applied to **`regs.pc_p`** — a host pointer (`compemu_support_arm.cpp:1973`, `:2061`). Under the MMU there is no `pc_p`. §2b corrected. |
+
+**Two findings worth more than the claims that produced them.**
+
+**1. The 32 MB is already allocated, in the shipping MMU firmware, today.** `create_popalls()`
+calls `cache_alloc(POPALLSPACE_SIZE + MAX_JIT_CACHE * 1024)` = `malloc(33 556 480)`
+(`compemu_support_arm.cpp:2094`; `cache_alloc` is a plain `malloc` at `:207`, its `mmap` arm
+commented out). `create_popalls()` is called from `build_comp()` (`:2370`), which
+`build_cpufunctbl()` calls **unconditionally** under `#ifdef JIT` (`newcpu.cpp:1065`) — before
+and regardless of `alloc_cache()` returning early on `cache_size == 0` (`:1886`). So every image
+that boots today, MMU modes included, already takes 32 MB of the 96 MB core1 heap for a code
+cache it never uses, and it says so on the serial: `Cache_Alloc of 33556480 at 0x........`
+(`:212`). **WARP therefore costs no new heap, and the allocation's success is already proven on
+this card every boot rather than assumed.** §2b's size budget is right for a better reason than
+it gave. **(measured)**
+
+**2. The `nf` arm doubles the inheritance surface, and generation one need not build it.**
+`op_smalltbl_0_comp_nf` is a complete second copy — same 1 867 entries, same 340 NULLs, same
+1 527 compilers, same 1 213 memory-reaching. Half of `compemu_arm.cpp`'s 1.6 MB is the
+no-flags-needed arm. Whether generation one has an `nf` arm at all is an M1 scoping question
+this census puts a number on rather than leaving to discovery. **(measured)**
+
+## 0.4 M0 status
+
+| item | state | note |
+|---|---|---|
+| 1. the unwind probe (Q2) | `BUILT, AWAITING ONE BOOT` | `make q2probe` → `BOOT-q2probe.BIN`. Excluded from all three shipping images by two independent gates; their CRCs are unchanged with it in the tree. |
+| 2. the route audit (Q1), zero build | `DONE` | §0.3(a) — 79.44 % |
+| 3. the family census (Q7), zero build | `DONE` | §0.3(a), read against the dhrystone window per Q11 |
+| 4. the block-length census, zero build | `DONE` | §0.3(a) — faultable-site density; block length is predicted, not read out, in §2a |
+| 5. the §1.5 base re-take (optional) | `TODO` | one profiling boot; worth taking if a metal session is booked anyway |
+| 6. the state-discipline census | `DONE` | §0.3(b) — added at the grill as Q1's contract input |
+| 7. the M1 pre-registration commit | `TODO` | the remaining half of M0's deliverable; must precede the first code commit, provably |
+
+**The probe image.** `make q2probe` builds `Z3660_emu/build-q2probe` and
+`Z3660_system/Alfa/sd_card/BOOT-q2probe.BIN` from `system_cli_q2probe.bif`, sharing core0, the
+FSBL and the bitstream with the other three images. `Z3660_emu/src/warp_q2probe.cpp` is filtered
+out of the other three variants' source lists **and** is empty unless `Z3660_WARP_Q2_PROBE` is
+defined, and its one call site in `main.cpp` sits inside the same `#if` — two gates, either of
+which alone would be sufficient. It runs after the abort and undefined-instruction handlers are
+registered, so a probe that fails by executing garbage reports itself instead of rebooting
+silently, and before emulation starts, so one boot's serial capture holds the whole answer.
+
+> **This is not a shipping image and it is not an instrument either.** It exists to be booted
+> once. `BOOT-lean.BIN` goes back on the card afterwards.
+
+**The image, built 2026-08-23:** `BOOT-q2probe.BIN`, CRC **`FCC0CB3F`**, archived as
+`sd_card/archive/BOOT-q2probe-FCC0CB3F.BIN`. Built in the same session as the three shipping
+images, whose CRCs are **`BF56576A` / `F294E75A` / `5225BD9C`** — unchanged from before the
+probe existed, which is the exclusion proof. `nm` finds **9** `warp_q2` symbols in
+`build-q2probe/Z3660_emu.elf` and **0** in `build/`, `build-lean/` and `build-prof/`.
+
+**What the capture decides, and how.** The probe runs experiment **A** (containment) first
+because it is the safe one, then **B** (crossing), which is the one that can end the boot. Every
+call that could kill the boot is preceded by a sentinel line that names what silence after it
+would mean, so the capture is decidable in all outcomes:
+
+| line on the serial | reading |
+|---|---|
+| `[WARP-Q2] A: RESULT = CONTAINED (status=…, prb=…)` | generated code ran, called C++, and a `throw` was caught **inside** the helper — §2e option 1 is available |
+| silence after `[WARP-Q2] A: SENTINEL` | generated code did not execute at all. **An I-cache or execute-permission failure, not an unwind one** — a different bug, and the probe says so rather than letting it masquerade |
+| `[WARP-Q2] A: RESULT = NO-CALL` / `WRONG-STATUS` | the stub ran but the call or the return value did not — probe defect, not a verdict |
+| `[WARP-Q2] B: RESULT = CROSSED (caught outside, prb=…)` | the throw unwound **through** the generated frame. §2e's derivation is wrong; option 1 is also available; **the bail-before-fault posture stands regardless** |
+| `[WARP-Q2] B: RESULT = TERMINATED` | `std::terminate` was reached — the EHABI unwinder refused the generated frame. **The predicted answer, and it confirms §2e** |
+| silence after `[WARP-Q2] B: SENTINEL` | terminated harder than `std::terminate` could report. **Read as TERMINATED, and note it was worse** |
+| `[WARP-Q2] ==== probe end ====` | both experiments completed and the boot survived |
+
+One line that arrives free in the same capture is worth reading beside them:
+`Cache_Alloc of 33556480 at 0x........`, the code cache's 32 MB, allocated on every boot of
+every image today (§0.3(c)).
 
 ---
 
@@ -95,6 +538,14 @@ the flag machinery, the block/`blockinfo`/`cache_tags` structures, the code-cach
 I-cache maintenance primitives and an ARM FPU compiler are all present, built for this exact
 silicon.** The question is not "write a JIT". It is "which of these do we keep, and what replaces
 the memory model". That fork is **Q1** and it is the first thing the grill has to settle.
+
+> **Settled 2026-08-23 — §0.1 Q1: Route C.** The plumbing is kept, the `jnf_MEM_*` layer is
+> replaced, and the per-opcode compilers are inherited family by family only where a family
+> survives the bail contract. §0.3(a) put a number on the fork: **79.44 % of the 1 527
+> per-opcode compilers in each compile table can reach guest memory**, so inheriting them
+> wholesale would have meant inheriting the old memory model wholesale. One structure in the
+> list above turned out less reusable than it reads — `cache_tags` keys on a host pointer that
+> does not exist under the MMU (§2b, corrected at M0).
 
 ## 1.3 Non-goals
 
@@ -263,6 +714,17 @@ which does not exist. **(measured, dopc doc)**
 > The dopc keeps serving the interpreter — which the JIT will still be running for every declined
 > instruction — and its measured +23.31 % is not put at risk to save a table.
 
+> **⚠ Corrected at M0 — the same decision, for a stronger reason.** The plan reached it from the
+> dopc side (a 64-byte set has 4 spare bytes and a 4-way block pointer needs sixteen). The
+> census found the harder half on the JIT side: the existing block-entry table **cannot** be
+> reused under the MMU, whatever its geometry. `cache_tags[TAGSIZE]` is a 65 536-entry direct-
+> mapped array of `union { cpuop_func* handler; blockinfo* bi; }` (`jit/compemu_arm.h:54`–`:57`,
+> `:63`–`:66`; `jit/compemu_support_arm.cpp:162`) — 256 KB, two slots per block head — and its
+> key is `cacheline(x) = ((uintptr)x) & 0xFFFF` **applied to `regs.pc_p`, a host pointer**
+> (`jit/compemu_support_arm.cpp:1973`, `:2061`). **Under the MMU there is no `pc_p`.** The
+> *structure* is reusable verbatim; the *keying* is not, and that is a fact about the JIT rather
+> than a preference about the dopc. §0.3(c). **(measured)**
+
 ### Block boundaries
 
 Generation one ends a block at, in this order:
@@ -365,6 +827,17 @@ What transfers to this plan:
 
 **(all measured)**
 
+> **Added at M0, and it makes this whole subsection cheaper than it looks: the 32 MB is
+> *already allocated*, in the shipping MMU firmware, on every boot.**
+> `create_popalls()` calls `cache_alloc(POPALLSPACE_SIZE + MAX_JIT_CACHE * 1024)` =
+> `malloc(33 556 480)` (`jit/compemu_support_arm.cpp:2094`; `cache_alloc` is a plain `malloc` at
+> `:207`, its `mmap` arm commented out), and it is reached from `build_comp()` (`:2370`) which
+> `build_cpufunctbl()` calls **unconditionally** under `#ifdef JIT` (`newcpu.cpp:1065`) — before
+> and regardless of `alloc_cache()` returning early on `cache_size == 0` (`:1886`). The serial
+> line is `Cache_Alloc of 33556480 at 0x........` (`:212`), on every boot of every image.
+> **So the engine costs no new heap, and the allocation's success is proven rather than
+> assumed.** §0.3(c). **(measured)**
+
 > **DDR capacity is not the constraint; L1I is.** `m68k_run_mmu040` is 2 288 B in a 32 KB L1
 > instruction cache — the loop's whole working set fits with room to spare, which is a large part
 > of why the interpreter runs at IPC ≈ 1 on the dispatch walk. Generated blocks will not. This is
@@ -425,10 +898,23 @@ using knowledge it already has.** **(measured, `main.cpp:349-364`)**
 ### Register mapping
 
 The existing ARM32 allocator declares `N_REGS 11` — *"really 16, but 13 to 15 are SP, LR, PC; 11
-holds memstart and 12 is scratch register"* (`jit/compemu_arm.h:124`). So r0–r10 are allocatable,
-**r11 is the guest-memory base**, r12 is scratch. **(measured)**
+holds memstart and 12 is scratch register"* (`jit/compemu_arm.h:124`).
 
-Under the MMU there is no single base, so r11's meaning must change. But the replacement is
+> **⚠ Corrected at M0 — that comment is stale, and the plan believed it.** The code says
+> `#define R_MEMSTART 10`, `#define R_REGSTRUCT 11` and
+> `always_used[]={2,3,R_MEMSTART,R_REGSTRUCT,12,-1}` (`jit/codegen_arm.cpp:83`–`:85`), repeated
+> by hand in `freescratch()` (`jit/compemu_support_arm.cpp:1571`). So **r10 is the guest-memory
+> base, r11 is the `regs` pointer, r2/r3/r12 are the work registers, and exactly 8 host
+> registers are allocatable** — r0, r1, r4–r9 — not eleven. §0.3(b)(c). **(measured)**
+>
+> **This changes the shape of the question in the engine's favour.** The plan asked what r11's
+> replacement should be; r11 already *is* the `regs` pointer, which is one of the three things
+> the plan wanted to point it at. The register that actually frees up is **r10**, and its
+> candidates are the `z3660_dfv_r` verdict table or the page cache — decided by counting.
+> **The budget is 8 allocatable registers and it does not grow**, which is a first-class input
+> to the allocator question inside Q1, not a footnote to it.
+
+Under the MMU there is no single base, so r10's meaning must change. But the replacement is
 cheaper than it sounds, because of a fact that is easy to miss:
 
 > **Guest physical address *is* host address, 1:1.** `drct_bank` carries
@@ -437,8 +923,13 @@ cheaper than it sounds, because of a fact that is easy to miss:
 > `__builtin_bswap32` of a cast pointer. **(measured)**
 
 So the *only* thing the JIT's memory path owes over the existing JIT's is the virtual→physical
-step. r11's natural successors are a pointer to `regs`, or to the `z3660_dfv_r` verdict table, or
-to the page cache — decided by counting, in M0.
+step — and on this firmware even the base add is nominal: `regs.natmem_offset` is set to **0**
+(`uae_emulator.cpp:1084`) and `R_MEMSTART` is loaded from it at block entry
+(`jit/codegen_arm.cpp:534`–`:535`), so the existing JIT's whole memory model on this card is
+"host address = guest address, plus a byteswap". **(measured, added at M0)**
+
+r10's natural successors are the `z3660_dfv_r` verdict table or the page cache — decided by
+counting. (`regs` is not a candidate: r11 already holds it.)
 
 Two more gifts already in the struct: `regstruct` (`include/newcpu.h:176-187`) already carries
 JIT-only tail fields — `scratchregs[]`, `scratchfregs[]`, `jit_exception`, `mem_banks`,
@@ -479,9 +970,15 @@ a fault can actually be taken. §2e says where those are.
 
 The build defines `-DARMV6T2`, and the code-cache data-buffer machinery
 (`DATA_BUFFER_SIZE 768`, `reset_data_buffer()`) is guarded by
-`#if defined(CPU_arm) && !defined(ARMV6T2)` — so on this target constants go through `movw`/`movt`
-immediates and no literal pool is used. **(derived, from the Makefile flag and the guards;
-confirm in the disassembly at M0.)**
+`#if defined(CPU_arm) && !defined(ARMV6T2) && !defined(CPU_AARCH64)`
+(`jit/compemu_support_arm.cpp:697`) — so on this target constants go through `movw`/`movt`
+immediates and no literal pool is used. **(measured at M0 — upgraded from `derived`: the guard
+and the `-DARMV6T2` in `Z3660_emu/Makefile`'s `CFLAGS` together settle it without a
+disassembly.)**
+
+> **One trap for whoever greps for the gate.** `USE_DATA_BUFFER` (`jit/compemu_arm.h:118`) is
+> `#define`d for every `CPU_arm` build and is **tested nowhere in the tree** — it is dead, and
+> it is not the switch. `!defined(ARMV6T2)` is. **(measured at M0)**
 
 ### The I/D-cache maintenance contract — the exact sequence, and the gap in it
 
@@ -675,6 +1172,15 @@ are confined to the flags and the fixups. **(measured, `newcpu.cpp:5841-6177`)**
 > linked object. The ARM EHABI unwinder's response to a PC it cannot find in the index is failure,
 > which becomes `std::terminate`. **(derived, from the EHABI contract and the linker script — not
 > measured. It is the single cheapest thing to settle before a line of codegen is written: Q2.)**
+
+> **M0 status: the probe is built and awaits one boot.** `make q2probe` →
+> `BOOT-q2probe.BIN`, from `Z3660_emu/src/warp_q2probe.cpp`. It runs two experiments before
+> emulation starts — a throw *contained* inside the helper (§2e option 1 in miniature) and a
+> throw *crossing* the generated frame — and prints a sentinel before each, so the outcome that
+> destroys its own reporting is still readable as silence-after-a-named-sentinel. **The design
+> posture below does not depend on the answer** (§0.1 Q2): bail-before-fault is assumed either
+> way, and a CROSSED result would only mean option 1 is available as well, not that option 2 is
+> abandoned.
 
 ### The bail-to-interpreter contract
 
@@ -1039,7 +1545,13 @@ that is why its numbers are trustworthy. Session counts are **assumed**.
 | **M4** | **Soak + the ladder inside the JIT** | durability, and where the next rungs are | long multiuser run under paging and network load + the 128 MiB memory toucher; then per-rung §30.3 pricing | per rung, not per milestone; a rung that misses its pre-registered band is reverted | 8–15 |
 | **M5** | **Ship gate** | it is finishable | ACCEPTANCE record, changelog, docs, CRC-stamped image lineage, disarm-equivalence proof, "what this does not establish" | — the **default-on decision is the user's** | 2–3 |
 
-### M0 — Design freeze `TODO`
+### M0 — Design freeze `IN PROGRESS`
+
+**State on 2026-08-23: the grill has run and §0 is the freeze. Items 2, 3 and 4 are `DONE`
+(§0.3), item 1 is `BUILT, AWAITING ONE BOOT`, item 5 is `TODO` and optional, and the M1
+pre-registration — the other half of the deliverable below — is `TODO`. The per-item ledger is
+§0.4.** One census was added at the grill and is not in the list of five: the state-discipline
+census (§0.3(b)), which is the input to Q1's pre-registered state-sync measurement.
 
 Five cheap things, all before any codegen. Only the first needs the card.
 
@@ -1049,6 +1561,11 @@ Five cheap things, all before any codegen. Only the first needs the card.
 2. **The route audit (Q1), zero build.** Count how many of `compemu_arm.cpp`'s per-opcode compilers
    reach `readmem_real` / `writemem_real` / `get_n_addr_real`. If it is nearly all of them, Route A
    is a rewrite wearing a retrofit's clothes, and the grill should know that before choosing.
+   *(Corrected at M0: those three are `STATIC_INLINE` and a per-opcode compiler never names them.
+   The symbols to count are the ten public accessors they sit behind —
+   `readbyte`/`readword`/`readlong`, `writebyte`/`writeword`/`writelong`, the two `_clobber`
+   twins, and `get_n_addr`/`get_n_addr_jmp` — plus the one bypass, `jnf_MOVE16`. Answer: 79.44 %,
+   §0.3(a).)*
 3. **The family census (Q7), zero build.** Re-read the banked sampler rings for the time-weighted
    opcode histogram — it already exists. `MOVE`/`MOVEA` is 27.5 – 31.5 % of dispatch time with
    covered EA shapes at 22.9 – 26.4 %. Pick the ring whose `INSNS_SUPER` matches the target
@@ -1181,12 +1698,26 @@ GPL-3.0, full credit to sHaNsHe.
 
 ---
 
-# 7. Open questions for the grill
+# 7. Open questions for the grill  —  ALL RESOLVED 2026-08-23
 
 Each has a recommendation and the cheapest experiment that would settle it. Nothing below is
 decided.
 
+> **All thirteen were resolved by the grill of 2026-08-23. Each carries a `RESOLVED` line
+> pointing at the decision in §0.1, and the recommendation and cheapest-experiment text below it
+> is left byte-untouched — including where the outcome differed from the recommendation, and
+> including where a stated fact turned out wrong.** §3.4's rule is that a pre-registration which
+> gets rewritten is not one, and a recommendation is a prediction like any other. Read §0.1 for
+> what was decided; read this section for what was predicted before it was.
+
 ### Q1 — Route A (retrofit the in-tree UAE ARM JIT), Route B (a new MMU-native engine on its primitives), or Route C (hybrid)?
+
+> **RESOLVED 2026-08-23 → §0.1 Q1: Route C, as recommended.** The cheapest experiment was run
+> as census (a) (§0.3(a)) and answered **79.44 %** — nearly all of them, so Route A is a rewrite
+> wearing a retrofit's clothes and the grill said so. The route carries one explicit
+> pre-registration: the **state-sync overhead per faultable access is an M1 measurement**, and
+> the allocator is redesigned toward Route B's shape only if that number says it is the ceiling.
+> *One factual correction below: the memory model is `r10 = memstart`, not `r11` — §2c.*
 
 **Recommendation: C.** Take Route B's block manager, keying and bail contract; reuse
 `codegen_arm.h`'s raw emitters, the `blockinfo` / `cache_tags` structures, `flush_cpu_icache`, the
@@ -1200,6 +1731,11 @@ out loud.
 
 ### Q2 — Can a C++ `throw` cross a frame of generated code on this toolchain, or does it terminate?
 
+> **RESOLVED 2026-08-23 → §0.1 Q2: the recommendation is adopted as the design posture.**
+> Bail-before-fault everywhere; nothing in §2e is contingent on the probe. The probe itself is
+> built (`make q2probe` → `BOOT-q2probe.BIN`, `Z3660_emu/src/warp_q2probe.cpp`) and awaits one
+> boot; it confirms or kills the posture, it does not choose it.
+
 **Recommendation: assume it terminates, and design so no throw ever crosses** — bail-before-fault
 (§2e option 2). Everything else in the fault chapter follows from this answer.
 
@@ -1209,6 +1745,11 @@ because a negative answer that arrives after codegen exists is expensive and the
 arriving now is nearly free.**
 
 ### Q3 — Is the existing `flush_cpu_icache` sequence sufficient for ARMv7-A self-modifying code on this A9 + PL310?
+
+> **RESOLVED 2026-08-23 → §0.1 Q3: as recommended.** `ISB` + branch-predictor invalidate are
+> added to the sequence **before** the engine raises flush volume. The `UAEJIT`-bootmode A/B is
+> the settling experiment, on metal, later. The probe image exercises the shipped sequence on
+> one stub and the augmented sequence on the other — a data point, not the experiment.
 
 **Recommendation: add `ISB` and a branch-predictor invalidate before trusting it at JIT volumes,
 and price the addition** — it is per-block, not per-instruction, so it is almost certainly
@@ -1223,6 +1764,10 @@ symptom is not a proof; only a soak is.**
 
 ### Q4 — Where does compilation run: core1 inline, or core0 offload?
 
+> **RESOLVED 2026-08-23 → §0.1 Q4: as recommended.** Core1 inline, units bounded by rung 0's
+> ~42 µs budget, for M1–M4. Core0 offload stays gated, and its gate includes the unexplained
+> 118-second core0 gap closing first.
+
 **Recommendation: core1 inline for M1–M4**, in units bounded by rung 0's ~42 µs budget. Core0
 offload stays a named option behind its own gate, and that gate includes the unexplained
 118-second core0 gap being closed first.
@@ -1231,6 +1776,9 @@ offload stays a named option behind its own gate, and that gate includes the une
 before any integration. If it is far inside 42 µs, the question is settled for generation one.
 
 ### Q5 — Does the block cache need a per-address-space generation (`URP`/`SRP`), which the dopc declined to fund?
+
+> **RESOLVED 2026-08-23 → §0.1 Q5: deferred to its pre-registered M1 counter** — the `IV_ROOT`
+> blocks-discarded ratio. **Not built early.**
 
 **Recommendation: probably yes** — and it is an argued *reversal* of a documented decision, so it
 must be argued in the open. The dopc declined because a per-entry stamp costs three more compares
@@ -1243,6 +1791,10 @@ counter.
 
 ### Q6 — Should rung 3's struck `ifetch` verdict table (`3087af9`) be resurrected for the *compile* path?
 
+> **RESOLVED 2026-08-23 → §0.1 Q6: deferred to its pre-registered M1 counter** — a compile-path
+> fetch counter. **Not built early**, and not re-funded from a bucket share before that counter
+> exists.
+
 **Recommendation: yes as a hypothesis, no as a claim.** The law struck it on the execution path
 because the dopc was hiding the fetch it sat beside. On the compile path nothing is hiding that
 fetch, and the compiler reads several words back to back — which is a different classification
@@ -1253,6 +1805,13 @@ path, not a build. **Do not resurrect it before that counter exists** — re-fun
 ifetch-side rung from a bucket share is the one thing §30 strikes outright.
 
 ### Q7 — Which opcode families does generation one compile?
+
+> **RESOLVED 2026-08-23 → §0.1 Q7: as recommended, and pinned to the dhrystone window** per
+> Q11. Generation one is `MOVE`/`MOVEA` in the covered EA shapes, register-register ALU, and the
+> `Bcc`/`DBcc` that terminate blocks. The kernel-window `(xxx).L` shape is a **named M4 ladder
+> candidate contingent on the boot rows**, not a generation-one family. §0.3(a) adds the
+> inheritance detail the family choice needs: `Bcc` and `DBcc` are 45/45 and 16/16 pure and
+> inheritable as-is, while `MOVE` is 272 of 281 memory-touching and is not.
 
 **Recommendation:** start from the measurement that already exists rather than from taste.
 Time-weighted sampler-ring histograms put `MOVE`/`MOVEA` at **27.5 – 31.5 %** of dispatch time —
@@ -1267,6 +1826,9 @@ whose `INSNS_SUPER` matches the workload the engine is meant to serve.**
 
 ### Q8 — Does rung 0's block-idiom fast path stay, get subsumed, or get retired?
 
+> **RESOLVED 2026-08-23 → §0.1 Q8: as recommended.** Rung 0 stays untouched through M3 and the
+> JIT declines its PCs.
+
 **Recommendation: stays, untouched, through M3.** The JIT declines those PCs. It is worth −43.6 %
 of a boot, measured, and it protects rung 1 by collapsing the `CPUSHL` invalidation storm 18×.
 
@@ -1275,6 +1837,10 @@ campaign's rule read out loud first: *a cost measured with another rung switched
 the shipping firmware pays.*
 
 ### Q9 — What is the `WARP` switch's default polarity?
+
+> **RESOLVED 2026-08-23 → §0.1 Q9: as recommended — `unset = OFF` through M4**, a deliberate
+> inversion of the house rule with the reason recorded. The flip to `unset = ON` happens at M5
+> on the user's word and not before. **Arm attestation rides every capture.**
 
 **Recommendation: `unset = OFF` until M5**, deliberately inverting the house rule, then flip at the
 ship gate if the user says so. The house rule exists so a zeroed `SHARED` struct from an older
@@ -1285,6 +1851,11 @@ push on it rather than inherit it.
 
 ### Q10 — Does a block feed the cadence counter with its retired instruction count, or does the cadence contract change?
 
+> **RESOLVED 2026-08-23 → §0.1 Q10: as recommended, and the timebase contract is FROZEN.**
+> Blocks feed the cadence counter with retired guest instructions. This is the one item with
+> cross-repo reach, and the **PSTAT gap fingerprint is a proof obligation on every metal
+> verdict** rather than a check to run if there is time.
+
 **Recommendation: it feeds it.** One pump tick must stay `256 × service_cadence` *guest*
 instructions, or every latency statement in `docs/AMIX.md` silently changes meaning and the failure
 mode is a missed interrupt. **This is the one item in the plan with cross-repo reach.**
@@ -1294,6 +1865,10 @@ emulated-A3000 class is ~2 923 µs. If the fingerprint is unmoved with the engin
 is unmoved.
 
 ### Q11 — Is the perf gate dhrystone, or something bigger?
+
+> **RESOLVED 2026-08-23 → §0.1 Q11: as recommended. Dhrystone stays THE gate.** Every verdict
+> capture records a boot-window row and `INSNS_SUPER` beside it; the kernel-heavy story
+> accumulates evidence and **gates nothing before M4**.
 
 **Recommendation: dhrystone stays the scoring workload** — map v3.4 ratified the pinned-dhrystone
 window as the right pricing basis, and it is what every number in this document is comparable to.
@@ -1306,6 +1881,10 @@ window discriminator.
 
 ### Q12 — What kills the project, and do we agree to that now?
 
+> **RESOLVED 2026-08-23 → §0.2, and the number is written down.** The kill line is agreed and
+> **binding**, the rung-3 precedent binds by name, and **there is no re-scoping**. It is quoted
+> verbatim in §0.2; it is not paraphrased anywhere in this document.
+
 **Recommendation: pre-register M1's kill line in this document, before any code, and treat rung 3's
 precedent as binding.** Rung 3 engaged at 91.10 % coverage, made its bucket 23 % cheaper per
 instruction, hit or beat every premise it declared, moved the wall clock **−0.05 %**, and the code
@@ -1315,6 +1894,12 @@ rests on being able to say so.
 **Cheapest experiment:** write the number down at M0.
 
 ### Q13 — Is the engine written 68k-model-agnostic, and does the FPU ever get compiled?
+
+> **RESOLVED 2026-08-23 → §0.1 Q13: as recommended.** Model-agnostic yes — the code-organisation
+> review happens when implementation starts. **FPU permanently interpreter-only**, on the
+> vector-11 / FPSP contract, and that decision does not expire at M5. §0.3(a) notes the
+> consequence: the five `R_MEMSTART` sites in `codegen_arm.cpp` are the FPU's own memory path,
+> and Q13 is what keeps them unreachable.
 
 **Recommendation: model-agnostic yes, FPU no.** Isolating the 68040-specific assumptions costs
 almost nothing at M0 and is what lets Track E3's `UAE_060_MMU` inherit the engine instead of
