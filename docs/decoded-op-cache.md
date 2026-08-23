@@ -181,6 +181,40 @@ Function sizes, for the record — lean / default / profiling `m68k_run_mmu040`:
 of the lean figures exactly where rung 1 put them** (572 and 152), which is how "the narrowing
 costs nothing on the hit path" is checked rather than claimed.
 
+### The way histogram — four counters, and a verdict written before them
+
+The table above is why C2 v3.1 declined to *optimise* this path and asked for one measurement
+instead. `DOPCFIND` measures at **56.7–58.8 corrected ARM cycles per dispatch** against the
+**50–57 counted instructions** in that table: **about one instruction per cycle**, so there is
+no stall pool to reclaim and the reclaim is bounded by *instructions removed*. The way walk is
+the whole of what a way hint could remove and it is **7 instructions end to end** (50 → 57) —
+against a hint check of **≥ 2 instructions on every dispatch, hit or miss**.
+
+So the band turns entirely on one number nobody had measured: **how hits distribute across the
+four ways.** `DOPC_WAY0..WAY3` (ids 39–42) are that number, incremented on the hit arm where
+the way is already in a register. The miss arm gains nothing — a miss has no way.
+
+```
+DOPC_WAY0 + DOPC_WAY1 + DOPC_WAY2 + DOPC_WAY3  ==  DOPC_HIT
+```
+
+**The decision rule, pre-registered from the map before the counters existed** — and printed
+by `PROFD` as a `[PROF] r dopc way VERDICT:` line so it is applied rather than left in a
+document:
+
+| way-0 share | verdict |
+|---|---|
+| **≥ 85 %** | the walk is already short; way prediction is worth < 0.5 % and **the rung is STRUCK from the ladder** |
+| **≤ 60 %** | the walk is real, the 6.5 % ceiling is live, and the rung **earns a design round** with its cost site (the hint check, on every dispatch) pre-registered |
+| in between | it **stays at ladder #5**, behind three rungs worth 4–8 % each |
+
+The 6.5 % figure is the ceiling *if hits were uniform across ways* — mean 53.5 instructions
+falling to 50 — **before** charging the hint check, which gives most of it back. That is why
+85 % strikes the rung rather than merely deferring it.
+
+**Cost to take it: one counter block on one prof-image boot.** The same capture that scores
+the accessor rung carries it; there is no reason to spend a session on it.
+
 ## Coherence — the whole risk surface
 
 It is asymmetric. A cache that invalidates too eagerly is merely slower; one that invalidates

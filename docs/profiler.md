@@ -472,6 +472,7 @@ correctly.
 | 27 | `DOPC_INVAL` | ... whole-cache invalidations **actually performed** |
 | 28–37 | `IV_FLUSH` `IV_ROOT` `IV_DMA` `IV_TABLE` `IV_KNOB` `IV_WRAP` `IV_MAP` `IV_PFLUSH` `IV_PFLUSHA` `IV_CACR` | ... invalidation **requests**, one per cause, in `Z3660_DOPC_INV_*` order (C2 rung 1b) |
 | 38 | `IV_CACR_SKIP` | ... a `MOVEC` to CACR proved **inert at its call site** (C2 rung 1c) — **not a cause**, and not a member of the block above |
+| 39–42 | `DOPC_WAY0` `DOPC_WAY1` `DOPC_WAY2` `DOPC_WAY3` | ... **which way a hit was served from** (C2 v3.1 §25.2). Incremented on the hit arm only — a miss has no way |
 
 Two identities worth checking in any capture that has them: `IFETCH_CALLS == FETCH`
 identically (all five bracket sites increment `FETCH` exactly once), and
@@ -491,6 +492,14 @@ difference that reproduces another counter in the same dump exactly, twelve time
 
 > `IFETCH_CALLS == FETCH` says nothing about how often the ifetch **buckets** are entered — see
 > the `s`-block section above, where the measured spans refute that inference by 1.97×.
+
+And one arrives with the way block: **`DOPC_WAY0 + WAY1 + WAY2 + WAY3 == DOPC_HIT`**, exactly,
+on any capture — the four ways partition the hits because the counter rides the one arm that
+has a way. The firmware warns if they disagree, because a histogram wired to something other
+than the hit would make the way-0 share it is read for a share of nothing. `PROFD` prints the
+four figures, the way-0 share, and **the map's pre-registered verdict** on its own
+`[PROF] r dopc way VERDICT:` line — see `docs/decoded-op-cache.md`, "The way histogram", for
+the rule and the arithmetic behind its thresholds.
 
 A third arrives with the `IV_` block: on a capture taken entirely with the cache on,
 **`sum(IV_*) == DOPC_INVAL`** — every request that reaches `z3660_dopc_invalidate()` performs

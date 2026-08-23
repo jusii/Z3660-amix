@@ -2963,7 +2963,21 @@ static void test_prof_wire_format(void)
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_IV_CACR_SKIP],
 	             "IV_CACR_SKIP") == 0,
 	      "names line up with ids (IV_CACR_SKIP)\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   39, "39 counters");
+	/* C2 v3.1 SS25.2: the way histogram, appended at 39..42 and pinned by the same
+	 * argument as the cause block -- it is indexed WAY_BASE + way inside the lookup, so
+	 * an off-by-one in the base would file every hit under the wrong way and the verdict
+	 * the map pre-registered would be a verdict about the wrong number. This block IS
+	 * last, so pinning it to COUNT is correct here and is what the tripwire in
+	 * z3660_prof.cpp asserts at compile time. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_WAY0, 39, "DOPC_WAY0 at 39");
+	CHECK_EQ32((uae_u32)(Z3660_PROF_C_DOPC_WAY_BASE + Z3660_DOPC_WAYS),
+	           (uae_u32)Z3660_PROF_C_COUNT,
+	           "...and the way block runs to the end of the counter space");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_WAY0], "DOPC_WAY0") == 0,
+	      "names line up with ids (DOPC_WAY0)\n");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_WAY3], "DOPC_WAY3") == 0,
+	      "names line up with ids (DOPC_WAY3, the far end of the block)\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   43, "43 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -5288,6 +5302,48 @@ static void test_dopc_counters(void)
 	      + on.c[Z3660_PROF_C_DOPC_HIT] >= off.c[Z3660_PROF_C_FETCH],
 	      "every fetch the uncached run made is accounted for: still fetched, served "
 	      "from a slot, or supplied by a hit\n");
+
+	/* ---- THE WAY HISTOGRAM (C2 v3.1 SS25.2) -----------------------------------------
+	 *
+	 * Four counters, and the only thing the HOST can pin about them is the wiring --
+	 * where the hits land is a property of the guest's PC stream, and this fixture's is
+	 * a five-instruction loop, not dhrystone. So the assertions are the two that would
+	 * make a metal verdict meaningless if they failed: the histogram partitions the hits
+	 * exactly, and it is silent when nothing hit.
+	 *
+	 * The distribution is PRINTED rather than asserted, for the same reason the hit rate
+	 * above is: when the metal capture disagrees with expectations, a reader wants the
+	 * fixture's own numbers to compare against, and a test that only says PASS has none. */
+	{
+		uae_u64 wsum = 0;
+		int k;
+		for (k = 0; k < (int)Z3660_DOPC_WAYS; k++)
+			wsum += on.c[Z3660_PROF_C_DOPC_WAY_BASE + k];
+		printf("       dopc ways %llu / %llu / %llu / %llu\n",
+		       (unsigned long long)on.c[Z3660_PROF_C_DOPC_WAY0],
+		       (unsigned long long)on.c[Z3660_PROF_C_DOPC_WAY1],
+		       (unsigned long long)on.c[Z3660_PROF_C_DOPC_WAY2],
+		       (unsigned long long)on.c[Z3660_PROF_C_DOPC_WAY3]);
+		CHECK_EQ32((uae_u32)wsum, (uae_u32)on.c[Z3660_PROF_C_DOPC_HIT],
+		           "the four way counters partition DOPC_HIT exactly -- the identity the "
+		           "metal verdict's way-0 share is computed against");
+		/* OFF must move none of them: the lookup returns before it reads the table, so
+		 * there is no way to attribute. Same property as the three counters above, and
+		 * it is what makes the off arm a reference rather than a second implementation. */
+		{
+			uae_u64 offsum = 0;
+			for (k = 0; k < (int)Z3660_DOPC_WAYS; k++)
+				offsum += off.c[Z3660_PROF_C_DOPC_WAY_BASE + k];
+			CHECK_EQ32((uae_u32)offsum, 0, "OFF: no way is attributed");
+		}
+		/* A five-instruction loop with distinct PCs cannot collide in a 1024-set index,
+		 * so every hit here is way 0 -- which is the fixture saying what it is, not a
+		 * prediction about dhrystone. It also pins the counters to the RIGHT ways: an
+		 * off-by-one in WAY_BASE would show up as way 1 carrying the traffic. */
+		CHECK_EQ32((uae_u32)on.c[Z3660_PROF_C_DOPC_WAY0], (uae_u32)on.c[Z3660_PROF_C_DOPC_HIT],
+		           "this fixture's PCs never collide, so every hit is way 0 -- and the "
+		           "base of the counter block is therefore pinned");
+	}
 
 	/* ---- INVALIDATION ATTRIBUTION (C2 rung 1b, kept by 1c) --------------------------
 	 *

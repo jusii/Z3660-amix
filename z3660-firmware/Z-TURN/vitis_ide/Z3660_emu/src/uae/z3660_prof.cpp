@@ -54,7 +54,9 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    "IV_WRAP", "IV_MAP", "IV_PFLUSH", "IV_PFLUSHA", "IV_CACR",
    /* rung 1c: NOT a cause -- a request the CACR call site proved inert, which therefore
     * never reached the invalidator and is absent from every counter above. */
-   "IV_CACR_SKIP"
+   "IV_CACR_SKIP",
+   /* v3.1 SS25.2: the way histogram, in way order, indexed by WAY_BASE + way. */
+   "DOPC_WAY0", "DOPC_WAY1", "DOPC_WAY2", "DOPC_WAY3"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
@@ -75,6 +77,14 @@ typedef char z3660_prof_counter_names_complete[
 typedef char z3660_prof_iv_block_matches_causes[
    (Z3660_PROF_C_DOPC_IV_BASE + Z3660_DOPC_INV_COUNT
     == Z3660_PROF_C_DOPC_IV_CACR_SKIP) ? 1 : -1];
+
+/* v3.1 SS25.2. Same hazard, same shape of tripwire: the way histogram is indexed
+ * WAY_BASE + way inside the lookup, so the block must be exactly Z3660_DOPC_WAYS long and
+ * must end where the counter space ends. Pinned to COUNT because this block IS last --
+ * and if a later counter is appended after it, this line is what makes that visible
+ * rather than letting way 3 increment the newcomer. */
+typedef char z3660_prof_way_block_matches_ways[
+   (Z3660_PROF_C_DOPC_WAY_BASE + Z3660_DOPC_WAYS == Z3660_PROF_C_COUNT) ? 1 : -1];
 
 /* The record layout is a wire format shared with a host-side symbolizer, so pin it here
  * rather than trusting that no one ever adds a field. */
@@ -980,6 +990,50 @@ extern "C" void z3660_prof_dump_stats(void)
          z3660_prof_pct(hi, hi + mi, &ip, &fp);
          z3660_printf("[PROF] r dopc hit %u.%02u%% of %s dispatches\r\n",
                       ip, fp, z3660_prof_u64(hi + mi));
+      }
+      /* C2 v3.1 SS25.2 -- the way histogram, with the map's own decision rule applied in
+       * the dump rather than left for a reader to apply from a table of four numbers.
+       * The rule was pre-registered before the counters existed; printing the verdict
+       * here is the difference between a measurement and a measurement someone acts on. */
+      {
+         uint64_t w[Z3660_DOPC_WAYS];
+         uint64_t wsum = 0;
+         int k;
+         for (k = 0; k < (int)Z3660_DOPC_WAYS; k++) {
+            w[k] = z3660_prof_cnt[Z3660_PROF_C_DOPC_WAY_BASE + k];
+            wsum += w[k];
+         }
+         if (wsum) {
+            unsigned w0i, w0f;
+            z3660_prof_pct(w[0], wsum, &w0i, &w0f);
+            z3660_printf("[PROF] r dopc ways: %s / %s / %s / %s (way0 %u.%02u%% of %s hits)\r\n",
+                         z3660_prof_u64(w[0]), z3660_prof_u64(w[1]),
+                         z3660_prof_u64(w[2]), z3660_prof_u64(w[3]),
+                         w0i, w0f, z3660_prof_u64(wsum));
+            if (w0i >= 85)
+               z3660_printf("[PROF] r dopc way VERDICT: way0 >= 85%% -- the walk is already "
+                            "short, way prediction is worth < 0.5%%, and the rung is STRUCK "
+                            "from the C2 ladder\r\n");
+            else if (w0i < 60 || (w0i == 60 && w0f == 0))
+               z3660_printf("[PROF] r dopc way VERDICT: way0 <= 60%% -- the walk is real, the "
+                            "6.5%% ceiling is live, and the rung EARNS a design round with its "
+                            "cost site (the hint check, on every dispatch) pre-registered\r\n");
+            else
+               z3660_printf("[PROF] r dopc way VERDICT: way0 between 60%% and 85%% -- the rung "
+                            "STAYS at ladder #5, behind three rungs worth 4-8%% each\r\n");
+            /* The identity, warned rather than noted: the four ways partition the hits
+             * exactly, because the counter is incremented on the one arm that has a way.
+             * A disagreement means the histogram is wired to something other than the
+             * hit -- which would make the verdict above a verdict about nothing. */
+            if (wsum != hi)
+               z3660_printf("[PROF] r WARNING: dopc way histogram sums to %s but DOPC_HIT is "
+                            "%s -- the histogram is not counting hits\r\n",
+                            z3660_prof_u64(wsum), z3660_prof_u64(hi));
+         } else if (hi) {
+            z3660_printf("[PROF] r note: dopc way histogram is empty with DOPC_HIT=%s -- this "
+                         "capture predates the histogram or the counters were zeroed after "
+                         "the hits\r\n", z3660_prof_u64(hi));
+         }
       }
       if (iv) {
          /* Whole numbers only -- z3660_prof_pct is a percentage helper and these are

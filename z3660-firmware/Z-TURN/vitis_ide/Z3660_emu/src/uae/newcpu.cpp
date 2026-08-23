@@ -5712,6 +5712,16 @@ struct z3660_dopc_set *z3660_dopc_find(uaecptr pc, int *wayp)
    else if (s->tag[3] == key) *wayp = 3;
    else { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
 
+   /* C2 v3.1 SS25.2 -- the way histogram. The map declined to build way prediction and
+    * asked for the one measurement its 5-15 % reclaim band turns on instead: where the
+    * hits actually land. The decision rule is pre-registered in z3660_prof.h beside the
+    * counter ids, written before any histogram existed.
+    *
+    * It rides HERE and not on a separate arm because the way is already in a register on
+    * the only path that has one -- the hit. A miss has no way, so there is nothing to
+    * attribute and nothing is added to that arm. Lean and default expand this to
+    * nothing, exactly like every other Z3660_PROF_CNT on this path. */
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_WAY_BASE + *wayp);
    Z3660_PROF_CNT(Z3660_PROF_C_DOPC_HIT);
    return s;
 }

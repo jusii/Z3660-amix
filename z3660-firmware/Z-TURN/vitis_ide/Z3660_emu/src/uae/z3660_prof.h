@@ -644,7 +644,43 @@ enum {
     * second call-site narrowing gets a second counter for the same reason -- one shared
     * "skipped" counter could not attribute either of them. */
    Z3660_PROF_C_DOPC_IV_CACR_SKIP = 38, /* MOVEC to CACR proved INERT at the call site  */
-   Z3660_PROF_C_COUNT           = 39,
+   /* CYBERSTORM C2 v3.1 SS25.2 -- THE WAY HISTOGRAM. A COUNTER CHANGE, NOT A RUNG.
+    *
+    * v3.1 made DOPCFIND the largest NAMED thing in the dispatch loop (11.45-11.65 % of
+    * the interpreter, paid on every dispatch) and then declined to attack it, because
+    * 56.7-58.8 measured cycles against 50-57 counted ARM instructions puts the hit path
+    * at about one instruction per cycle -- there is no stall pool to reclaim, and the
+    * named candidates are worth 1-4 instructions each on a 50-instruction path.
+    *
+    * The whole band turns on ONE unmeasured quantity: how hits distribute across the four
+    * ways. Way 0 costs 50 instructions to dispatch, ways 1/2/3 cost 52/55/57 -- so the
+    * way walk is 7 instructions end to end, and if hits are already way-0-dominated a way
+    * hint buys nothing while costing >= 2 instructions on EVERY dispatch.
+    *
+    * PRE-REGISTERED DECISION RULE, quoted from the map before the histogram exists:
+    *
+    *   way-0 share >= 85 %  ->  the walk is already short, way prediction is worth
+    *                            < 0.5 %, AND THE RUNG IS STRUCK FROM THE LADDER;
+    *   way-0 share <= 60 %  ->  the walk is real, the 6.5 % ceiling is live, and the rung
+    *                            earns a design round with its cost site (the hint check,
+    *                            on every dispatch) pre-registered;
+    *   in between           ->  it stays at #5, behind three rungs worth 4-8 % each.
+    *
+    * Four counters, incremented in the existing lookup on the arm that already knows the
+    * way. Nothing is added to the miss arm. Identity:
+    *
+    *     WAY0 + WAY1 + WAY2 + WAY3  ==  DOPC_HIT
+    *
+    * Appended, like every id here, because the order is load-bearing: a reordering
+    * silently relabels every capture ever taken. */
+   Z3660_PROF_C_DOPC_WAY0       = 39, /* decoded-op cache hits served from way 0        */
+   Z3660_PROF_C_DOPC_WAY1       = 40,
+   Z3660_PROF_C_DOPC_WAY2       = 41,
+   Z3660_PROF_C_DOPC_WAY3       = 42,
+   Z3660_PROF_C_COUNT           = 43,
+   /* The way block's base, so the lookup can index it by way. Locked to the enumeration
+    * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
+   Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,
    /* The block's base, so the invalidator can index it by cause. The two enumerations
     * are locked together by a compile-time tripwire in z3660_prof.cpp -- adding a cause
     * without adding its counter must not silently alias onto its neighbour. */
