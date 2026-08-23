@@ -2816,7 +2816,8 @@ static void test_shared_mailbox_offsets(void)
 	CHECK_EQ32((uae_u32)offsetof(SHARED, blk_chunk),       0xE4, "blk_chunk       @ 0xFFFF00E4 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, dopc_on),         0xE8, "dopc_on         @ 0xFFFF00E8 (appended, never inserted)");
 	CHECK_EQ32((uae_u32)offsetof(SHARED, dfast_on),        0xEC, "dfast_on        @ 0xFFFF00EC (appended, never inserted)");
-	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xF0, "SHARED is 0xF0 bytes -- new fields go on the END");
+	CHECK_EQ32((uae_u32)offsetof(SHARED, dopc_ivsup),      0xF0, "dopc_ivsup      @ 0xFFFF00F0 (appended, never inserted)");
+	CHECK_EQ32((uae_u32)sizeof(SHARED),                    0xF4, "SHARED is 0xF4 bytes -- new fields go on the END");
 
 	/* C2 rung 2: the knob's RULE, not just its offset. UNSET must mean ON -- a core0
 	 * built before this field existed publishes a zeroed struct, and reading that as
@@ -3186,8 +3187,18 @@ static void test_prof_wire_format(void)
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_MISALIGN_I], "MISALIGN_I") == 0,
 	      "names line up with ids (MISALIGN_I)\n");
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DFAST_XPAR], "DFAST_XPAR") == 0,
-	      "names line up with ids (DFAST_XPAR, the last counter)\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   46, "46 counters");
+	      "names line up with ids (DFAST_XPAR)\n");
+	/* SS38.6's confession counter. Appended after rung 2's three, and it is NOT a member
+	 * of the IV_ cause block -- the block is indexed arithmetically by cause and every
+	 * entry in it means "reached the invalidator", which this one means the negation of.
+	 * Pinned here so a symbolizer's hard-coded 46 cannot drift onto a future neighbour. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_SUPPRESSED, 46, "IV_SUPPRESSED at 46");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_IV_SUPPRESSED], "IV_SUPPRESSED") == 0,
+	      "names line up with ids (IV_SUPPRESSED, the last counter)\n");
+	CHECK(Z3660_PROF_C_DOPC_IV_SUPPRESSED
+	          >= Z3660_PROF_C_DOPC_IV_BASE + Z3660_DOPC_INV_COUNT,
+	      "...and it sits OUTSIDE the IV_ cause block, which is indexed by cause\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   47, "47 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -5953,6 +5964,441 @@ static void test_dopc_coherence(void)
 }
 
 /* ==================================================================
+ * CYBERSTORM C2 SS38.6 -- THE `f` MEASUREMENT SWITCH
+ *
+ * docs/f-measurement.md is the pre-registration and it was committed before the switch
+ * existed. This is the corpus that holds it to what it says.
+ *
+ * WHAT IS BEING GUARDED. Armed, the switch makes CPUSHL / CINV stop invalidating the
+ * decoded-op cache -- a deliberate correctness violation, taken so that one boot's
+ * hit-rate response reads a STRICT UPPER BOUND on `f`. Two things therefore have to be
+ * true and neither is self-evident from reading the diff:
+ *
+ *   1. DISARMED IS THE REFERENCE MACHINE, and disarmed is what every other build in this
+ *      repository is. If the switch could arm itself -- from a zeroed mailbox, from a
+ *      neighbour's sentinel, from a config key, from the PREVIOUS BOOT -- then an unsound
+ *      emulator ships. Most of this test is about that and not about the measurement.
+ *   2. ARMED SUPPRESSES `IV_FLUSH` AND NOTHING ELSE. Every one of the other nine causes
+ *      is driven here, through the firmware's own call site where one exists, and each is
+ *      pinned to still perform. A switch that also swallowed PFLUSHA would read a larger
+ *      `f` than a physical index could ever deliver, which is a wrong ANSWER rather than
+ *      a wrong machine -- and the answer is what this build exists to produce.
+ *
+ * AND THE ENUMERATION HAS A MUTATION ARM. "It suppresses only FLUSH" is worth exactly as
+ * much as the test that fails when it stops being true, so the suppression can be widened
+ * by one non-target cause (z3660_dopc_ivsup_set_mutant, harness-only) and the enumeration
+ * re-run: it must CATCH it. Rung 1b's attribution test passed a mutation that bypassed
+ * the whole attribution, which is how this lane learned to write the arm rather than
+ * assume it.
+ *
+ * IT RUNS IN ALL THREE VARIANTS, deliberately, and outside the Z3660_EMU_PROF block:
+ * the wall-clock arm of the experiment is a LEAN boot, so the lean build is the one whose
+ * arm/disarm mechanism has to be correct. The counter assertions -- and only those -- are
+ * guarded, because z3660_prof_cnt[] does not exist in a lean binary.
+ * ================================================================== */
+
+/* MAP has no cheap call site: map_banks() rewrites the bank table under the fixture. It
+ * is raised directly, and it is one of the three below that are. */
+static void dopc_m_map(void) { z3660_dopc_invalidate(Z3660_DOPC_INV_MAP); }
+
+struct ivsup_row {
+	int           cause;
+	const char   *name;
+	dopc_maint_fn fire;
+	int           real_site;  /* driven through the firmware's own call site */
+	int           target;     /* the switch is SUPPOSED to suppress this one */
+};
+
+/* ALL TEN CAUSES. The list is the enumeration docs/f-measurement.md promises, and it is
+ * kept in Z3660_DOPC_INV_* order so a cause added without a row here is visible as a gap
+ * rather than as a silent omission -- the count is asserted against INV_COUNT below.
+ *
+ * `real_site` is honest rather than aspirational. WRAP has no firmware call site at all
+ * (the wrap inside z3660_dopc_do_invalidate() does not raise its own cause -- a
+ * pre-existing gap, noted and not fixed here), and MAP's is map_banks(). Both are raised
+ * directly and say so; the other eight go through flush_mmu040(), m68k_move2c(),
+ * z3660_dopc_invalidate_dma(), build_cpufunctbl(), the knob resync, mmu_flush_atc() and
+ * mmu_flush_atc_all(). */
+static const struct ivsup_row ivsup_rows[] = {
+	{ Z3660_DOPC_INV_FLUSH,   "FLUSH",   dopc_m_cpushl,       1, 1 },
+	{ Z3660_DOPC_INV_ROOT,    "ROOT",    dopc_m_urp,          1, 0 },
+	{ Z3660_DOPC_INV_DMA,     "DMA",     dopc_m_dma,          1, 0 },
+	{ Z3660_DOPC_INV_TABLE,   "TABLE",   dopc_m_tbl,          1, 0 },
+	{ Z3660_DOPC_INV_KNOB,    "KNOB",    dopc_m_knob,         1, 0 },
+	{ Z3660_DOPC_INV_WRAP,    "WRAP",    dopc_m_wrap,         0, 0 },
+	{ Z3660_DOPC_INV_MAP,     "MAP",     dopc_m_map,          0, 0 },
+	{ Z3660_DOPC_INV_PFLUSH,  "PFLUSH",  dopc_m_pflush_other, 1, 0 },
+	{ Z3660_DOPC_INV_PFLUSHA, "PFLUSHA", dopc_m_pflush_all,   1, 0 },
+	{ Z3660_DOPC_INV_CACR,    "CACR",    dopc_m_cacr,         1, 0 },
+};
+#define IVSUP_ROWS ((int)(sizeof ivsup_rows / sizeof ivsup_rows[0]))
+
+/* Drive every cause once and report what invalidated.
+ *
+ * THE GENERATION IS THE INSTRUMENT, not DOPC_INVAL, and that is not a stylistic choice:
+ * the generation stamp is the mechanism by which an invalidation reaches the entries, so
+ * a test that watches it is asserting the effect rather than a counter that correlates
+ * with it. It also works in a lean binary, where no counter exists.
+ *
+ * Returns the number of NON-TARGET causes that failed to invalidate. With `assert_each`
+ * the per-cause claims are checked as they go; the mutation arm calls it without, and
+ * asks only whether the count came back non-zero. */
+static int ivsup_enumerate(int armed, int assert_each)
+{
+	int missed = 0;
+	int i;
+
+	for (i = 0; i < IVSUP_ROWS; i++) {
+		const struct ivsup_row *r = &ivsup_rows[i];
+		uae_u32 g0 = z3660_dopc_generation();
+		unsigned long long s0 = z3660_dopc_ivsup_suppressed();
+		uae_u32 g1;
+		int invalidated, suppressed;
+
+		r->fire();
+		g1 = z3660_dopc_generation();
+		invalidated = (g1 != g0);
+		suppressed  = (z3660_dopc_ivsup_suppressed() != s0);
+
+		if (armed && r->target) {
+			if (assert_each) {
+				CHECK(!invalidated,
+				      "ARMED: %s (%s) is SUPPRESSED -- the generation did not move "
+				      "(%u -> %u)\n", r->name,
+				      r->real_site ? "real call site" : "raised directly",
+				      (unsigned)g0, (unsigned)g1);
+				CHECK(suppressed,
+				      "...and it is CONFESSED: the suppressed count moved\n");
+			}
+			continue;
+		}
+
+		if (!invalidated) missed++;
+		if (assert_each) {
+			CHECK(invalidated,
+			      "%s: %s (%s) still invalidates -- generation %u -> %u\n",
+			      armed ? "ARMED" : "disarmed", r->name,
+			      r->real_site ? "real call site" : "raised directly",
+			      (unsigned)g0, (unsigned)g1);
+			CHECK(!suppressed,
+			      "...and it is NOT counted as suppressed: only FLUSH ever is\n");
+		}
+	}
+	return missed;
+}
+
+static void test_dopc_ivsup_f_measurement(void)
+{
+	unsigned i;
+	int armed_any;
+
+	printf("[test] C2 SS38.6 the f measurement switch: DISARMED is the reference machine\n");
+
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_DEFAULT;
+	z3660_knobs_sync();
+	cpu_bringup(68040);
+	currprefs.cpu_model = 68040;
+	regs.s = 1;
+
+	/* ---- THE RESOLVE RULE, AND ITS POLARITY -------------------------------------
+	 *
+	 * The one rule that turns a mailbox word into a state, and the ONE place in this
+	 * firmware where "unset" does not mean "the optimisation is on". Every other C2
+	 * switch reads unset -> DEFAULT -> ON, because for those the shipped behaviour is
+	 * the optimisation. Here the shipped behaviour is soundness, so unset -> OFF. If
+	 * that inverts, an unsound emulator becomes the default build and nothing else in
+	 * this corpus would notice. */
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(Z3660_DOPC_IVSUP_OFF), 0u,
+	           "UNSET (0) resolves to DISARMED -- the opposite of every other C2 switch, "
+	           "because the shipped behaviour of an unsound mode is OFF");
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(1u), 0u,
+	           "1 does NOT arm: arming takes an exact magic, not a truthy word");
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(0xFFFFFFFFu), 0u,
+	           "...nor does 0xFFFFFFFF, which is the OFF sentinel of the three switches "
+	           "either side of this field in SHARED");
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(Z3660_DOPC_IVSUP_ARM), 1u,
+	           "the magic, and only the magic, arms");
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(Z3660_DOPC_IVSUP_ARM - 1u), 0u,
+	           "...one below it does not");
+	CHECK_EQ32(z3660_dopc_ivsup_resolve(Z3660_DOPC_IVSUP_ARM + 1u), 0u,
+	           "...and one above it does not");
+
+	/* The neighbours' whole vocabulary, by name rather than by value: a beta resync has
+	 * already mis-merged SHARED once (docs/piscsi-service-path.md), so the failure being
+	 * guarded is a neighbouring field's value landing in this one. */
+	CHECK(z3660_dopc_ivsup_resolve(Z3660_BLK_OFF) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_BLK_UNSET) == 0u
+	   && z3660_dopc_ivsup_resolve(64u) == 0u
+	   && z3660_dopc_ivsup_resolve(256u) == 0u
+	   && z3660_dopc_ivsup_resolve(1024u) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_DOPC_OFF) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_DOPC_UNSET) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_DOPC_DEFAULT) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_DFAST_OFF) == 0u
+	   && z3660_dopc_ivsup_resolve(Z3660_DFAST_DEFAULT) == 0u,
+	      "no value any neighbouring mailbox field can hold arms this one\n");
+
+	/* A sweep, so the claim is about the function and not about a list. 196 608 words
+	 * across the three ranges a stray write is most likely to produce -- small integers,
+	 * all-ones-high, and a value shifted into the top half. The magic is in none of
+	 * them, so the expected count is exactly zero. */
+	armed_any = 0;
+	for (i = 0; i <= 0xFFFFu; i++) {
+		if (z3660_dopc_ivsup_resolve(i))                armed_any++;
+		if (z3660_dopc_ivsup_resolve(0xFFFF0000u | i))  armed_any++;
+		if (z3660_dopc_ivsup_resolve(i << 16))          armed_any++;
+	}
+	CHECK_EQ32((uae_u32)armed_any, 0u,
+	           "196608 swept mailbox words, none of them arms the unsound path");
+
+	/* ---- DEFAULT OFF, AND THE BOOT PUBLISH THAT KEEPS IT OFF ---------------------
+	 *
+	 * harness_shared_defaults() reproduces core0's boot-time publish, which for this
+	 * field is disarm_measurement_switches(): the OFF sentinel written unconditionally,
+	 * every boot, from both config paths.
+	 *
+	 * THE ANTI-VACUITY CHECK COMES FIRST and it is the point of this block. The mailbox
+	 * is DDR that survives a warm reset, so an arm written in one boot is still sitting
+	 * there in the next one and a resync would pick it straight back up. That is shown
+	 * here rather than argued, because it is the reason the publish exists -- a future
+	 * reader who deletes the publish as redundant should fail this test. */
+	CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 0u,
+	           "at rest the switch is DISARMED, with no mailbox word ever written");
+
+	shared->dopc_ivsup = Z3660_DOPC_IVSUP_ARM;
+	z3660_knobs_sync();
+	CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 1u,
+	           "the console's word arms it -- the only way in, and it needs a human");
+	z3660_knobs_sync();
+	CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 1u,
+	           "...and a resync that finds the SAME word leaves it armed: the mailbox "
+	           "alone WOULD carry an arm across a reboot, which is why core0 publishes");
+
+	harness_shared_defaults();            /* == core0's disarm_measurement_switches() */
+	z3660_knobs_sync();
+	CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 0u,
+	           "and the unconditional boot publish disarms it: an arm lasts one boot");
+
+	/* ---- BOTH TRANSITIONS INVALIDATE --------------------------------------------
+	 *
+	 * The DISARM direction is the one that matters. After an armed window the table
+	 * holds entries whose invalidation was skipped; returning to the sound machine
+	 * without invalidating would carry stale decodes straight into the reference arm
+	 * and quietly corrupt the A/B. Cause INV_KNOB is not the suppressed cause, so it
+	 * performs even while armed -- which is exactly what makes the metal protocol's
+	 * return leg a real check. */
+	{
+		uae_u32 g;
+
+		g = z3660_dopc_generation();
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_ARM;
+		z3660_knobs_sync();
+		CHECK(z3660_dopc_generation() != g,
+		      "ARMING invalidates the whole cache (%u -> %u)\n",
+		      (unsigned)g, (unsigned)z3660_dopc_generation());
+
+		g = z3660_dopc_generation();
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_OFF;
+		z3660_knobs_sync();
+		CHECK(z3660_dopc_generation() != g,
+		      "DISARMING invalidates too, WHILE ARMED -- nothing that went stale during "
+		      "the armed window survives into the reference arm (%u -> %u)\n",
+		      (unsigned)g, (unsigned)z3660_dopc_generation());
+		CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 0u, "...and it is disarmed after");
+	}
+
+	/* ---- DISARMED: EVERY CAUSE STILL INVALIDATES --------------------------------
+	 *
+	 * The reference machine, asserted cause by cause. This is the half that says the
+	 * disarmed build is the build this repository has always had. */
+	{
+		unsigned long long s0 = z3660_dopc_ivsup_suppressed();
+		int missed;
+
+		CHECK_EQ32((uae_u32)IVSUP_ROWS, (uae_u32)Z3660_DOPC_INV_COUNT,
+		           "the enumeration covers every Z3660_DOPC_INV_* cause, not a subset");
+
+		missed = ivsup_enumerate(0, 1);
+		CHECK_EQ32((uae_u32)missed, 0u,
+		           "DISARMED: all ten causes invalidate -- byte-for-byte the pre-switch "
+		           "invalidation contract");
+		CHECK(z3660_dopc_ivsup_suppressed() == s0,
+		      "...and nothing was suppressed, so the confession counter never moved\n");
+	}
+
+	/* ---- ARMED: EXACTLY `IV_FLUSH`, AND NOTHING ELSE ----------------------------- */
+	printf("[test] C2 SS38.6 armed: CPUSHL/CINV suppressed -- and the other nine are not\n");
+	{
+		unsigned long long s0, s1;
+		int missed;
+
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_ARM;
+		z3660_knobs_sync();
+		CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 1u, "armed for the enumeration");
+
+		s0 = z3660_dopc_ivsup_suppressed();
+		missed = ivsup_enumerate(1, 1);
+		s1 = z3660_dopc_ivsup_suppressed();
+
+		CHECK_EQ32((uae_u32)missed, 0u,
+		           "ARMED: every NON-TARGET cause still invalidates -- generation "
+		           "invalidation, CACR, ROOT, DMA, TABLE, KNOB, WRAP, MAP, PFLUSH and "
+		           "PFLUSHA are untouched by the switch");
+		CHECK_EQ32((uae_u32)(s1 - s0), 1u,
+		           "...and exactly ONE request was suppressed across all ten -- the "
+		           "CPUSHL/CINV arm, which is the only one the switch names");
+	}
+
+	/* ---- THE CALL-SITE NARROWING IS NOT THE SWITCH -------------------------------
+	 *
+	 * z3660_dopc_cacr_skipped() is a different function on a different path (rung 1c
+	 * decides in newcpu_common.cpp, before the invalidator is reached at all). An
+	 * inert CACR write must still be narrowed while armed, and must NOT be confessed as
+	 * a suppression -- two narrowings that shared a counter could not attribute either,
+	 * which is the rule z3660_dopc.h states and this is the armed case of it. */
+	{
+		unsigned long long s0 = z3660_dopc_ivsup_suppressed();
+		uae_u32 g = z3660_dopc_generation();
+		uae_u32 was_cacr = regs.cacr;
+
+		dopc_m_cacr_same();
+		CHECK(z3660_dopc_generation() == g,
+		      "ARMED: an INERT CACR write is still narrowed at its call site\n");
+		CHECK(z3660_dopc_ivsup_suppressed() == s0,
+		      "...and is NOT confessed as a suppression -- the two narrowings keep "
+		      "separate counters\n");
+		regs.cacr = was_cacr;
+	}
+
+	/* ---- THE COUNTERS, AND THE IDENTITY THEY NOW SATISFY --------------------------
+	 *
+	 * Profiling build only: z3660_prof_cnt[] does not exist in a lean binary, which is
+	 * why everything above is written against the generation instead.
+	 *
+	 * Two claims. First, IV_FLUSH IS COUNTED ABOVE THE SUPPRESSION -- SS37.1's lesson used
+	 * deliberately, so the guest's own flush rate reads identically in both arms and the
+	 * armed capture keeps its own denominator. The pre-registered direction table
+	 * declares IV_FLUSH unchanged and this is what makes that true.
+	 *
+	 * Second, the identity the dump prints and warns on:
+	 *
+	 *     sum(IV_*) - IV_SUPPRESSED  ==  DOPC_INVAL       cache ON
+	 *
+	 * with the standing identity being its IV_SUPPRESSED == 0 special case. Driven from
+	 * a mix with the cache ON throughout and no KNOB in it: a knob toggle passes through
+	 * a cache-OFF moment, which breaks the identity for a documented reason that has
+	 * nothing to do with this switch. */
+#if Z3660_EMU_PROF
+	{
+		uae_u64 req = 0, iv, su, fl;
+		int c, k;
+
+		z3660_prof_zero();
+		for (k = 0; k < 3; k++) dopc_m_cpushl();        /* suppressed */
+		for (k = 0; k < 2; k++) dopc_m_pflush_other();  /* performed  */
+		dopc_m_dma();                                   /* performed  */
+		dopc_m_cacr();                                  /* performed  */
+
+		fl = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH];
+		su = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED];
+		iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
+			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
+
+		CHECK_EQ32((uae_u32)fl, 3u,
+		           "ARMED: IV_FLUSH counts all three requests -- it sits ABOVE the "
+		           "suppression, so the guest's flush rate is identical in both arms");
+		CHECK_EQ32((uae_u32)su, 3u,
+		           "...and IV_SUPPRESSED confesses all three: over an armed window "
+		           "IV_SUPPRESSED == IV_FLUSH exactly");
+		CHECK_EQ32((uae_u32)iv, 4u,
+		           "...while DOPC_INVAL counts only the four that PERFORMED");
+		CHECK(req - su == iv,
+		      "the armed identity holds: sum(IV_*) %llu - IV_SUPPRESSED %llu == "
+		      "DOPC_INVAL %llu\n",
+		      (unsigned long long)req, (unsigned long long)su, (unsigned long long)iv);
+
+		/* And the same window disarmed satisfies the STANDING identity, which is what
+		 * says the new one is a generalisation rather than a replacement. */
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_OFF;
+		z3660_knobs_sync();
+		z3660_prof_zero();
+		for (k = 0; k < 3; k++) dopc_m_cpushl();
+		for (k = 0; k < 2; k++) dopc_m_pflush_other();
+		req = 0;
+		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
+			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
+		CHECK(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED] == 0
+		   && req == z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL],
+		      "disarmed, IV_SUPPRESSED is 0 and the STANDING identity sum(IV_*) == "
+		      "DOPC_INVAL is exactly what the armed one collapses to\n");
+
+		/* The plain always-compiled counter and the profiler's must agree over a window
+		 * neither of them was zeroed in. They are two counters for one event on purpose
+		 * -- the lean arm has no profiler and still has to confess -- so a drift between
+		 * them would make one of the two dumps lie. */
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_ARM;
+		z3660_knobs_sync();
+		z3660_prof_zero();
+		{
+			unsigned long long p0 = z3660_dopc_ivsup_suppressed();
+			for (k = 0; k < 5; k++) dopc_m_cpushl();
+			CHECK(z3660_dopc_ivsup_suppressed() - p0
+			          == z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED],
+			      "the boot-scoped counter and the capture-scoped one agree: %llu\n",
+			      (unsigned long long)z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_SUPPRESSED]);
+		}
+		z3660_prof_zero();
+	}
+#endif
+
+	/* ---- THE MUTATION ARM --------------------------------------------------------
+	 *
+	 * Widen the suppression by ONE non-target cause and re-run the enumeration. It must
+	 * catch it. Without this the enumeration above is a list of assertions nobody has
+	 * shown can fail -- which is precisely how rung 1b's attribution test came to pass a
+	 * mutation that bypassed the whole attribution. */
+	printf("[test] C2 SS38.6 mutation arm: a suppression that widens must FAIL the enumeration\n");
+	{
+		int missed;
+
+		shared->dopc_ivsup = Z3660_DOPC_IVSUP_ARM;
+		z3660_knobs_sync();
+
+		z3660_dopc_ivsup_set_mutant(1);
+		missed = ivsup_enumerate(1, 0);
+		z3660_dopc_ivsup_set_mutant(0);
+
+		/* Printed, not merely asserted: a mutation arm that silently reports zero
+		 * detections looks identical in the log to one that was never compiled in. */
+		printf("       mutant on: %d of %d non-target causes swallowed (want >= 1)\n",
+		       missed, IVSUP_ROWS - 1);
+		CHECK(missed >= 1,
+		      "the enumeration CATCHES a suppression widened to a non-target cause "
+		      "(%d non-target cause(s) failed to invalidate)\n", missed);
+
+		/* ...and the guard disarms cleanly, so nothing after this runs mutated. */
+		missed = ivsup_enumerate(1, 0);
+		CHECK_EQ32((uae_u32)missed, 0u,
+		           "...and with the mutant off the enumeration passes again, so the "
+		           "detection above was the mutation and not a stuck fixture");
+	}
+
+	shared->dopc_ivsup = Z3660_DOPC_IVSUP_OFF;
+	z3660_knobs_sync();
+	CHECK_EQ32((uae_u32)z3660_dopc_ivsup_armed(), 0u,
+	           "the suite leaves the emulator SOUND -- no test after this one runs on "
+	           "the unsound path");
+
+	harness_shared_defaults();
+	shared->dopc_on = Z3660_DOPC_UNSET;
+	shared->blk_chunk = Z3660_BLK_UNSET;
+	z3660_knobs_sync();
+	cpu_bringup(68030);
+}
+
+/* ==================================================================
  * The BLK_ counters: the utilisation verdict a metal capture will be read through.
  *
  * A counter that is wired to the wrong quantity turns a working change into an
@@ -6596,6 +7042,7 @@ int main(int argc, char **argv)
 	test_blk_state_equivalence();
 	test_dopc_state_equivalence();
 	test_dopc_coherence();
+	test_dopc_ivsup_f_measurement();
 	test_prof_wire_format();
 	test_prof_u64_ring_depth();
 	test_prof_build_variant();

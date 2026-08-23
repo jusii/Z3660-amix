@@ -16,6 +16,7 @@
 #include "newcpu.h"
 #include "harness.h"
 #include "main.h"      /* SHARED struct (harness-safe; newcpu.cpp pulls it via ../main.h) */
+#include "uae/z3660_dopc.h"  /* SS38.6: the OFF sentinel core0 publishes on every boot */
 
 #include <cstdio>
 #include <cstdlib>
@@ -172,6 +173,12 @@ void harness_shared_defaults(void)
 	_harness_shared.perf_stats      = 1;   /* per-instruction perf accounting ON */
 	_harness_shared.emu_probes      = 1;   /* run-loop diagnostic probes ON */
 	_harness_shared.perf_report     = 0;   /* [PERF] serial line OFF (as debug_console_init) */
+	/* CYBERSTORM C2 SS38.6: the `f` measurement switch, and it is here for the OPPOSITE
+	 * reason to the four above. Those reproduce core0 publishing an ON default; this one
+	 * reproduces core0's disarm_measurement_switches(), which publishes the OFF sentinel
+	 * unconditionally on every boot because the mailbox is DDR that survives a warm reset.
+	 * A test that leaves this armed would arm the unsound path for every test after it. */
+	_harness_shared.dopc_ivsup      = Z3660_DOPC_IVSUP_OFF;
 }
 
 void harness_mem_init(void)

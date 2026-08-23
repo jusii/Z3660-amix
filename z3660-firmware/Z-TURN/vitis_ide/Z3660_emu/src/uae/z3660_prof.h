@@ -714,7 +714,30 @@ enum {
    Z3660_PROF_C_DFAST_HIT       = 44, /* data accesses served by the accessor fast path */
    Z3660_PROF_C_DFAST_XPAR      = 45, /* ... of those, via a TTR match rather than the
                                        *     page cache                                 */
-   Z3660_PROF_C_COUNT           = 46,
+   /* CYBERSTORM C2 SS38.6 -- THE `f` MEASUREMENT'S CONFESSION. docs/f-measurement.md.
+    *
+    * INV_FLUSH requests that the measurement switch counted and then did NOT pass to the
+    * invalidator. It is 0 in every sound build and in every disarmed capture, so a
+    * capture carrying a non-zero value here is a capture taken on a DELIBERATELY UNSOUND
+    * machine and the dump says so in a banner. This is why the counter exists at all: the
+    * banner can be scrolled past, a counter in the block cannot.
+    *
+    * It is NOT a member of the IV_ cause block above -- that block is indexed
+    * arithmetically by cause and every entry in it means "reached the invalidator", which
+    * this one means the opposite of. Same reasoning as IV_CACR_SKIP, from the other side.
+    *
+    * The identity, and it is what makes the confession self-checking:
+    *
+    *     sum(IV_*) - IV_SUPPRESSED  ==  DOPC_INVAL        cache ON
+    *
+    * with the standing identity being its IV_SUPPRESSED == 0 special case. Over a window
+    * armed throughout, IV_SUPPRESSED == IV_FLUSH exactly.
+    *
+    * Appended, like every id here, and NO WIRE BUMP: no id below it changed meaning, the
+    * binary header layout is untouched, and a symbolizer that does not know id 46 reports
+    * it uninterpreted rather than mis-labelled. */
+   Z3660_PROF_C_DOPC_IV_SUPPRESSED = 46, /* INV_FLUSH requests SKIPPED by the f switch   */
+   Z3660_PROF_C_COUNT           = 47,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,
