@@ -839,6 +839,7 @@ extern "C" void z3660_prof_dump_stats(void)
       uint64_t trans = z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS];
       uint64_t hi = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
       uint64_t mi = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
+      uint64_t flt = z3660_prof_cnt[Z3660_PROF_C_FAULTS];
       unsigned ip, fp;
 
       z3660_prof_pct(loop, total, &ip, &fp);
@@ -857,10 +858,41 @@ extern "C" void z3660_prof_dump_stats(void)
             z3660_printf("[PROF] l WARNING: DOPCFIND spans=%s but DOPC_HIT+DOPC_MISS=%s -- "
                          "the lookup bracket and the dispatch counters disagree\r\n",
                          z3660_prof_u64(find), z3660_prof_u64(hi + mi));
-         if (fill != mi)
-            z3660_printf("[PROF] l WARNING: DOPCFILL spans=%s but DOPC_MISS=%s -- the fill "
-                         "bracket and the miss counter disagree\r\n",
+         /* THE FILL IDENTITY IS A BOUND, NOT AN EQUALITY, and the severity has to follow
+          * the bound or the line is noise:
+          *
+          *     DOPC_MISS - FAULTS  <=  tcnt[DOPCFILL]  <=  DOPC_MISS
+          *
+          * z3660_dopc_find() counts DOPC_MISS and its bracket exits BEFORE the fetch; the
+          * miss arm then runs x_prefetch(0) and an extension lookahead, either of which
+          * can fault, and only after both does the miss reach z3660_dopc_fill() and this
+          * bracket. So a miss whose fetch faulted is counted as a miss and never reaches
+          * the fill, the span count runs SHORT of DOPC_MISS by that population, and no
+          * counter measures it -- FAULTS bounds it and nothing narrows it further.
+          *
+          * Warning on ANY gap therefore fired on every correct capture that has faults in
+          * it (2026-08-23: 1350 short in 15.6 M, both bucket captures), and a warning that
+          * is always present teaches the reader to skip warnings. The gap now gets a NOTE
+          * carrying its fault term; WARNING is kept for the two outcomes the bound really
+          * excludes -- more fills than misses, and a shortfall larger than FAULTS.
+          * docs/profiler.md, "Four identities a capture can check". */
+         if (fill > mi)
+            z3660_printf("[PROF] l WARNING: DOPCFILL spans=%s ABOVE DOPC_MISS=%s -- the "
+                         "fill bracket cannot be entered more often than the miss arm it "
+                         "sits on\r\n",
                          z3660_prof_u64(fill), z3660_prof_u64(mi));
+         else if (mi - fill > flt)
+            z3660_printf("[PROF] l WARNING: DOPCFILL spans=%s is %s short of DOPC_MISS=%s "
+                         "-- MORE than FAULTS=%s can explain, so the bound "
+                         "DOPC_MISS-FAULTS <= spans <= DOPC_MISS is broken\r\n",
+                         z3660_prof_u64(fill), z3660_prof_u64(mi - fill),
+                         z3660_prof_u64(mi), z3660_prof_u64(flt));
+         else if (fill != mi)
+            z3660_printf("[PROF] l note: DOPCFILL spans=%s is %s short of DOPC_MISS=%s -- "
+                         "misses that faulted before reaching the fill; bounded by "
+                         "FAULTS=%s, and EXPECTED on any capture with faults in it\r\n",
+                         z3660_prof_u64(fill), z3660_prof_u64(mi - fill),
+                         z3660_prof_u64(mi), z3660_prof_u64(flt));
       } else if (find) {
          z3660_printf("[PROF] l note: DOPCFIND spans=%s with DOPC_HIT+DOPC_MISS=0 -- the "
                       "cache was OFF for this window, so these two buckets price the two "

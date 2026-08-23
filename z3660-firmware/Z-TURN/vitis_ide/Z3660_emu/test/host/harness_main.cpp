@@ -6470,8 +6470,11 @@ static void test_prof_loop_split(void)
 
 		/* Neither z3660_dopc_find() nor z3660_dopc_fill() touches guest memory, so neither
 		 * can be abandoned by a fault unwind and both of these are EXACT -- which is what
-		 * makes them assertions rather than tolerances, and what makes the firmware's
-		 * matching warnings a defect report rather than a rounding note. */
+		 * makes them assertions rather than tolerances. THIS FIXTURE TAKES NO FAULTS, which
+		 * is why the fill row is an equality here: on a real capture the identity is the
+		 * BOUND DOPC_MISS-FAULTS <= spans <= DOPC_MISS, because a miss whose opcode fetch
+		 * faults never reaches the fill. The firmware notes that gap and warns only outside
+		 * the bound; here there is no gap to note. */
 		CHECK_EQ32((uae_u32)on.t[Z3660_PROF_B_DOPCFIND],
 		           (uae_u32)(on.c[Z3660_PROF_C_DOPC_HIT] + on.c[Z3660_PROF_C_DOPC_MISS]),
 		           "DOPCFIND spans == DOPC_HIT + DOPC_MISS: the bracket is entered exactly "

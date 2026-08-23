@@ -290,10 +290,19 @@ the thing the counters actually bound. The reasoning behind both:
 > counted as a miss and never reaches the fill**, so the fill bracket runs *short* of
 > `DOPC_MISS` by exactly that number. It is bounded by `FAULTS` and, on the 2026-08-23
 > captures, sat at 1349 against `FAULTS` 3632 (cadence 1) and 1348 against 3627 (cadence 4)
-> — a stable 37.1 % / 37.2 %, reproducing to within one count on two cadences. **The
-> firmware's warning is therefore correct in form and expected in substance on any capture
-> with faults in it**: read the shortfall against `FAULTS`, and treat a shortfall *larger*
-> than `FAULTS` as the defect. Same class and same shape of fix as `== INSNS + FAULTS`.
+> — a stable 37.1 % / 37.2 %, reproducing to within one count on two cadences. Read the
+> shortfall against `FAULTS`, and treat a shortfall *larger* than `FAULTS` as the defect.
+> Same class and same shape of fix as `== INSNS + FAULTS`.
+>
+> **The firmware's severity follows the bound (2026-08-23).** It used to print `WARNING` on
+> *any* gap, which meant it fired on every correct capture that has faults in it — and a
+> warning that is always present teaches the reader to skip warnings. The gap is now a
+> `[PROF] l note:` carrying its fault term (`spans is N short of DOPC_MISS, bounded by
+> FAULTS=F, and EXPECTED on any capture with faults in it`), and `WARNING` is kept for the
+> two outcomes the bound actually excludes: **`spans > DOPC_MISS`** (more fills than the
+> misses they sit on) and **`DOPC_MISS - spans > FAULTS`** (a shortfall faults cannot
+> explain). `FAULTS` is the bound because it is the only counter that covers the unmeasured
+> population, and nothing narrows it further.
 
 > **The recognizer identity was stated about calls and compared over spans, and a cache-off
 > capture surfaced it.** `tcnt[BLKREC] <= tcnt[DOPCFIND]` reads as "at most one recognizer

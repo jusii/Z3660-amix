@@ -904,7 +904,10 @@ tree reproduces all three pre-experiment images **byte for byte** —
 | `BOOT-prof.BIN` | 12 811 676 | `4183F88C` |
 
 `BOOT-lean.BIN` is now byte-identical to the image that produced the reference row this
-document is scored against.
+document is scored against. *(The `BOOT-prof.BIN` row is the revert commit's. The very next
+commit reworded the `DOPCFILL` gap line — a profiling-build-only change unrelated to this
+experiment — so a prof image built from a later tree reads `2841AD27`. The other two stay
+byte-identical.)*
 
 > # PARKED — `HANDLER` remains unclassified.
 >
