@@ -4,12 +4,13 @@
 card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 185 dhrystones
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
-**Status:** `M0 IN PROGRESS` — the grill ran on **2026-08-23** and every question in §7 is
-answered; the metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with the
-§1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2). §0 is the freeze: it is the authority for
-everything below it, and where a §2 claim disagrees with §0's censuses, §0 wins and the §2 text
-has been corrected in place with the correction marked. **Still no engine code: M1 opens when
-M0's deliverable — this document plus the committed M1 pre-registration — is complete.**
+**Status:** `M0 DONE` — the grill ran on **2026-08-23** and every question in §7 is answered; the
+metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with the §1.5 base re-taken
+at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1 pre-registration**, the last of M0's
+seven items. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
+disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place with the
+correction marked. **There is still no engine code, and that is the point: M0's deliverable —
+this document plus §0.5 — is complete, and it is complete *before* the first line of it.**
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -130,6 +131,9 @@ Q5 (a per-address-space generation) is settled by the **`IV_ROOT` blocks-discard
 (resurrecting rung 3's `ifetch` table on the compile path) by a **compile-path fetch counter**.
 Both counters are pre-registered at M1. **Neither is built early.** Re-funding either from a
 bucket share before its counter exists is the one thing §30's law strikes outright.
+
+> **Both are now pre-registered, with their decision rules and their thresholds: §0.5.6.**
+> Q5 is `WARP_DISC_ROOT` (id 57) against `WARP_DISC` (id 56); Q6 is `WARP_CFETCH` (id 55).
 
 ### Q7 — generation-one families: **MOVE/MOVEA covered shapes + register-register ALU + Bcc/DBcc** `DECIDED`
 
@@ -452,7 +456,9 @@ this census puts a number on rather than leaving to discovery. **(measured)**
 | 4. the block-length census, zero build | `DONE` | §0.3(a) — faultable-site density; block length is predicted, not read out, in §2a |
 | 5. the §1.5 base re-take (optional) | `DONE` | **base = 48.68 – 49.91 % on one capture**; the stitched ~50 % survives — §0.4.2 |
 | 6. the state-discipline census | `DONE` | §0.3(b) — added at the grill as Q1's contract input |
-| 7. the M1 pre-registration commit | `TODO` | the remaining half of M0's deliverable; must precede the first code commit, provably |
+| 7. the M1 pre-registration commit | `DONE` | §0.5 — scope, kill line, band, cost measurement, gates, counters, sessions. **Committed before any engine code exists.** |
+
+> ### M0 is `DONE`. All seven items are closed; M1 opens.
 
 **The probe image.** `make q2probe` builds `Z3660_emu/build-q2probe` and
 `Z3660_system/Alfa/sd_card/BOOT-q2probe.BIN` from `system_cli_q2probe.bif`, sharing core0, the
@@ -637,6 +643,551 @@ neither claimed nor available here. No panic, no bus error, no corruption, no as
 the four boots. `[PROF] l WARNING` appears nowhere in the session span; the `DOPCFILL` note
 (`6afc8f9`) printed as a `note:` with its fault term, `spans=2747114` 222 short of
 `DOPC_MISS=2747336` and bounded by `FAULTS=591`, in its first metal boot.
+
+## 0.5 The M1 pre-registration — written before the first line of engine code
+
+**This is M0 item 7 and the second half of M0's deliverable.** It is the contract M1 is scored
+against: the scope, the kill line in its operational form, M1's own band derived bottom-up, the
+one cost measurement Q1 owes, the correctness gates, the counter directions with their topology
+checks, and what M1 will not establish.
+
+Two mechanical rules from §3.4 govern it, and both are the reason it exists as a separate commit:
+
+- **The pre-registration commit precedes the code commit, provably.** The SPEC round's did by 26
+  minutes, the `f` round's by 29. This one precedes it by however long M1 takes to start.
+- **A pre-registration that gets rewritten is not one.** Everything below is scored as written.
+  Where a number here turns out wrong, it is marked `MISSED` beside the measurement and the
+  prediction is left byte-untouched — `ifetch-fastpath.md`'s standard, and this document has
+  already applied it to itself twice in §0.4.2.
+
+Nothing in this section rebuilds anything: the three shipping images are untouched and their CRCs
+remain **`BF56576A` / `F294E75A` / `5225BD9C`**.
+
+### 0.5.1 Scope — what generation one compiles, enumerated
+
+**Families, from §0.1 Q7, intersected with §2e's exclusion rule.** The intersection is narrower
+than the family names alone, and naming it now is the whole point of enumerating scope before
+code:
+
+| in scope | detail | inheritance, per §0.3(a) |
+|---|---|---|
+| `Bcc` (incl. `BRA`) | 45/45 entries pure — no entry reaches guest memory | memory model inherited; **linkage is not** — see below |
+| `DBcc` | 16/16 entries pure | same |
+| `MOVE` / `MOVEA` | **both EAs in `Dn`, `An`, `(An)`, `d16(An)`** | 272 of 281 `MOVE` entries reach memory: **built new** on the bail contract |
+| register-register ALU | destination `Dn`/`An`; source `Dn`/`An`, **plus** the quick-immediate shapes of the same families (`ADDQ`/`SUBQ` with a register destination) — see the reading note. Families: the *mixed* `ADD ADDA AND CMP CMPA EOR OR SUB SUBA TST` and the shift/rotate families the census already found fully pure | decided **per shape**, never per family |
+
+> **The two dropped EA modes, and why they are dropped.** Q7's covered shape set is six modes;
+> **`(An)+` and `-(An)` are excluded from generation one**, because §0.3(b) states the freeze's own
+> invariant — *"`mmufixup` is disarmed at every block head, because only the interpreter ever arms
+> it"* — and predecrement/postincrement EAs are exactly what arms it. §2e's write-back rule points
+> the same way: `op_20c8_31_ff` advances the destination register, sets the flags, advances the PC
+> and *then* stores, so a fault there is a write-back fault on an architecturally complete
+> instruction. **Generation one never compiles one.** The cost of the exclusion is priced in
+> §0.5.3 rather than waved at.
+>
+> Whether a predecrement/postincrement **source** can be admitted without violating §2e is a
+> **named M1 scoping question with a static answer** — read the generated handler, before any
+> metal time. If it resolves permissive the shapes are added under a re-registered **M1a**, never
+> folded back into this band.
+
+> **The reading note: Q7 says "register-register ALU", and the quick-immediate shapes are a
+> *reading* of it — made here, before the measurement, and not afterwards.** `ADDQ`/`SUBQ` with a
+> register destination touch no memory, arm no fixup and restart cleanly; they are the same
+> codegen problem as `ADD Dn,Dn` with the source folded into the encoding. They are also
+> **6.96 – 11.03 %** of dispatch time, which is why the reading is worth stating rather than
+> leaving to discovery. The **strict** reading — both operands registers — is priced beside it:
+> it takes §0.5.3's covered share from 30.86 – 54.85 % to **27.38 – 43.82 %**, coverage from
+> 0.19 – 0.62 to **0.16 – 0.49**, and the band from 1.04× – 1.33× to **1.03× – 1.25×**
+> (dhry ≈ 8 420 – 10 180). **Both are stated; the inclusive reading is the one M1 builds, and it
+> is frozen here so that it cannot be adopted after a disappointing row.** `MOVEQ` is covered by
+> *neither* reading — it is a move-immediate, not an ALU op — and it is M1a's first extension.
+
+> **"Inheritable as-is" is a statement about the memory model, and only about it.** `Bcc`/`DBcc`
+> carry no `jnf_MEM_*` call, which is why §0.3(a) calls them inheritable — but the existing
+> compilers compute branch targets and chain blocks through `regs.pc_p` and `cache_tags`, and
+> §0.3(c) refuted that keying under the MMU. **The branch bodies are inherited; the target
+> arithmetic and the block linkage are rebuilt on the guest logical PC.** Anyone reading "45/45
+> pure" as "45/45 free" will mis-estimate M1.
+
+**Everything else bails, and the list is checkable statically before any metal time:** every
+write-back family; every FPU opcode (`Q13`, permanently); every privileged or mode-changing
+instruction; `MOVE16`; every supervisor-mode instruction — **generation one is user-mode only, and
+a block is not entered with `regs.s` set**; every instruction the engine does not compile; and
+every PC rung 0 claims (`Q8` — the JIT declines those PCs and does not modify rung 0).
+
+**The switch.** `WARP` console knob, `SHARED.warp_on` at `0xFFFF00F0`, resolved by
+`z3660_warp_resolve()` in one header and nowhere else. **`unset = OFF` through M4** (`Q9`).
+
+> **Arm attestation, and it is a build requirement rather than a habit.** The `f` round's own
+> conclusion is the precedent and it is adopted verbatim in shape: *"The decision to compile the
+> confession counter into every variant is what made arm B attestable."* The profiler's counters
+> exist **only** in the profiling build (`Z3660_PROF_CNT` expands to nothing when `Z3660_EMU_PROF`
+> is unset), so a lean verdict boot has no counter to read — and a banner is not admissible,
+> because two cores share one unlocked UART and an arm banner arrives spliced. **Therefore:
+> `warp_entered` is a plain counter compiled into every variant, printed once on halt/disarm, and
+> its non-zero value is the arm attestation for every capture, lean included.** Its cost is one
+> increment per **block entry** (not per instruction), it is counted in the `objdump` budget of
+> §0.5.4, and it is a shipped cost by choice. **One increment site, not two:** the profiling
+> build's `WARP_ENTER` (id 47, §0.5.6) is the same quantity read out of the counter block, so the
+> lean confession and the profiled counter can never disagree.
+
+**The M1a extension list, frozen now, in priority order.** §0.5.3 predicts coverage below the
+60 % bar for the scope above; if the counter says so, these are added **in this order**, each
+under its own re-registered pre-registration commit, and **never** to rescue a row that has
+already been measured:
+
+1. `MOVEQ.L #<data>,Dn` — a register-only compiler already exists at `compemu_arm.cpp:17481`;
+   2.31 – 2.82 % of dispatch time.
+2. The remaining register-destination shapes of `ADD`/`SUB`/`AND`/`OR`/`CMP`/`EOR` not already in
+   scope, per shape.
+3. `MOVE`/`MOVEA` with an `(An)+` / `-(An)` **source**, *if* the static read of §2e resolves
+   permissive.
+4. `(xxx).L` `MOVE` shapes — §0.1 Q7's named M4 ladder candidate, pulled forward only if the boot
+   rows say so.
+
+### 0.5.2 The kill line, restated and operationalised
+
+The line as agreed in §0.2, quoted and not paraphrased:
+
+> **At M1, with coverage in band (≥ 60 %) and no named defect: cross-build dhry ≤ 8 185 + rig
+> spread (≈ 8 242) → the project STOPS and the code reverts same-day; rung-3 precedent binding;
+> no re-scoping. Positive but far under the 1.25–1.55× band → continue ONLY with a named
+> measured mechanism + a re-registered M1b.**
+
+**Operational form, and the primary comparison is a same-session row.** The absolute number 8 185
+was written when the standing lean was the 8 185-class image; the M1-era interpreter lineage is
+`F294E75A`, whose validated median is **8 151** with a within-arm spread of **0.43 %** (§0.4.3).
+Cross-session drift on this rig is ~9 %, so an absolute number carried across sessions is the one
+comparison this campaign has repeatedly found untrustworthy:
+
+```
+   R  = the engine-OFF cross-build reference row, taken in the SAME SESSION on the
+        then-current interpreter lean (the F294E75A lineage), n >= 5, median
+   s  = the GREATER of that session's own measured within-arm spread and the rig's
+        banked ceiling 0.70 % -- which is 0.2's own construction (8185 x 1.007 = 8242).
+        A session whose measured spread EXCEEDS 0.70 % is a measurement error and
+        produces no verdict at all.
+   KILL if   engine-on median  <=  R x (1 + s)
+```
+
+With this session's numbers (`R` = 8 151, measured spread 0.43 %, so `s` = 0.70 %) that threshold
+is **8 208**. The user-agreed absolute floor **8 242** is quoted beside every M1 row and is never
+removed — **both are stated; the same-session row governs.** A row that clears one and not the
+other is reported as exactly that, and the session that produces it is repeated before anything is
+concluded.
+
+Three riders, all inherited rather than invented:
+
+- **Every A/B is same-boot, with a cross-build reference row beside it**, and the identity
+  `cross-build × disarm-penalty = same-boot switch` must close (§3.5). It has closed to four or
+  five digits three times; a WARP verdict where it does not close is a measurement error, not a
+  result.
+- **The outgoing lean image is archived before anything is rebuilt.** A rebuild once destroyed the
+  only copy of a reference arm.
+- **Counters are read before wall clock**, and the counters come from the profiling build while
+  the wall clock comes from the lean build (§0.4.3's standing rule).
+
+**The coverage bar, and the counter it is read from.** ≥ **60 %** of retired guest instructions
+executed inside compiled blocks. The counter and its arithmetic are pre-registered here because
+the obvious ratio is wrong — rung 0 already walked into this and `z3660_prof.h` records it:
+
+```
+   coverage  =  WARP_INSNS / ( (INSNS - WARP_ENTER) + WARP_INSNS )
+```
+
+`INSNS` (id 0) counts instructions **retired through the run-loop tail** — it is incremented once
+per pass of the loop, inside `Z3660_PROF_RUNLOOP_SAMPLE`. A block that retires *n* guest
+instructions is **one** pass, so it contributes 1 to `INSNS` and *n* to `WARP_INSNS`:
+`WARP_INSNS` is **not a subset of `INSNS`** and the literal ratio is not a share of anything.
+This is `BLK_INSNS`'s reconstruction with `WARP_ENTER` in `BLK_HIT`'s place, and rung 0's metal
+boot is the warning: the literal ratio read 59.28 % where the correct one read 37.25 %, *"not
+merely inflated — outside the range in which the prediction could be judged at all."*
+
+> **Topology check on `WARP_ENTER`, and it is the one that decides whether the number means
+> anything.** `WARP_ENTER` must be incremented **only at the run-loop entry into a block** — the
+> site that costs exactly one `INSNS` — and **never** on a chained block-to-block transfer, which
+> costs none. Incrementing it on chained entries over-subtracts and reports coverage high. That is
+> the FETCH-fall error's exact shape (*"a counter reached only after the branch being deleted
+> cannot fall when it is deleted"*), so the two sites are separated by construction:
+> `WARP_ENTER` at the loop hook, `WARP_BLK` at every block execution including chained ones.
+
+**What a coverage miss is, and what it is not.** §0.2's guard is explicit: *"A miss at 20 %
+coverage is a bug report, not a verdict, and it does not trigger the kill line."* So:
+
+| measured at M1 | reading |
+|---|---|
+| coverage ≥ 60 %, dhry ≤ `R × (1+s)`, no named defect | **the kill line fires.** Revert same day, rung-3 precedent binding, no re-scoping |
+| coverage ≥ 60 %, dhry inside §0.5.3's band | on-prediction; M1 passes and M2 opens |
+| coverage ≥ 60 %, dhry positive but **under §0.5.3's band** | §0.2's second clause: continue **only** with a named measured mechanism and a re-registered **M1b** |
+| **coverage < 60 %** | **not a verdict in either direction.** The engine engaged too little to price. Extend the family set in §0.5.1's frozen order under a re-registered **M1a**, and take the verdict at the first wave whose coverage is in band |
+| coverage < 60 % **and** a named implementation defect | a bug report. Fix, re-run, and the defect is named in the record |
+
+**M1a and M1b are different things and are not interchangeable.** M1a is a *scope* wave that
+happens before any verdict exists, and it is legitimate precisely because its family list is
+frozen in §0.5.1 **now**, before the first measurement. M1b is §0.2's *continuation* clause after
+an in-band-coverage, under-band-positive result, and it requires a named measured mechanism.
+Neither may be used to reinterpret a row that has already been taken.
+
+> **The band this section's under-band rule is scored against.** §4's M1 gate already says it:
+> the verdict is taken *"with the first-generation band of §1.5 recorded beside it for
+> information, not as the bar"*. §1.5's **1.25× – 1.55×** is the **full-engine** number, derived
+> at coverage 0.70 – 0.90 which generation one does not deliver. **M1 is scored against
+> §0.5.3's band, derived below from what generation one actually covers, and §1.5's band is
+> quoted beside every M1 row.** This mapping is written before the measurement, which is the only
+> time it can honestly be written.
+
+### 0.5.3 M1's own band, derived bottom-up from what generation one covers
+
+§1.5 derived the full engine's band. This derives generation one's, from the same measured base
+and the same banked rings, with every deflator named and its direction stated.
+
+**Step A — the covered share of dispatch time.** Time-weighted family shares from the two
+sampler rings whose supervisor share is representative (`09-DHRY-BLKON` 43.31 %,
+`05-DHRY-ring-full` 54.10 %; the 87.91 % ring is excluded as kernel-dominated, as it was for the
+handler study):
+
+| component | ring range | deflator | contribution |
+|---|---|---|---|
+| `MOVE`/`MOVEA`, covered EA shapes | 22.91 – 26.36 % | `d` = 0.70 – 0.90 — removes `(An)+` / `-(An)` traffic (§0.5.1). Anchor: `MOVE.L (An)+,(An)+` alone is **10.3 %** of the family; the rest of the predec/postinc traffic is unmeasured, so the 0.70 end allows twice as much again | **16.04 – 23.72 %** |
+| `Bcc` / `BRA`, excluding `BSR` | 12.57 – 13.93 % (line total) | `b` = 0.70 – 1.00 — `BSR` is a fully memory-touching family (§0.3(a)) and bails; its share **inside** the line is unmeasured | **8.80 – 13.93 %** |
+| `DBcc` | inside the `ADDQ`/`SUBQ`/`Scc`/`DBcc` line, not separately quantified | — | **0** in the floor; inside the next row's ceiling |
+| register-only ALU, listed lines only | `ADDQ`/`SUBQ` 6.96 – 11.03 % + `CMP`/`CMPA`/`EOR` 5.08 – 6.17 % | `g` = 0.50 – 1.00 — the register-destination fraction of those lines is unmeasured | **6.02 – 17.20 %** |
+| the unlisted ALU tail | ~30 % of each ring is below the published histogram's cut and contains `ADD`/`SUB`/`AND`/`OR`/shifts | — | **charged 0** — a deliberate, stated undercount |
+
+```
+   gen-1 covered share of DISPATCH TIME   =   30.86 % .. 54.85 %      (derived)
+```
+
+Each row's range is the envelope across **both** rings *and* its deflator, taken per line rather
+than per ring — deliberately wider than either ring alone would give, because the two rings
+disagree in both directions and neither is the verdict window.
+
+**Step B — three conversions, each with its direction.** Coverage is a share of *retired
+instructions*; the rings measure a share of *time*, on a window that is not the verdict window:
+
+| factor | band | direction | why |
+|---|---|---|---|
+| `k` time-share → instruction-share | 1.00 – 1.25 `assumed` | **up** | generation-one instructions are the cheap ones: the handler study prices `MOVE.L Dn,Dn` at 123 cycles against 179.6 – 223.6 for the memory-touching shapes, so their instruction share is ≥ their time share |
+| `β` block formation | 0.60 – 0.90 `assumed` | **down** | coverage counts instructions inside **blocks**, and a block ends at the first instruction the engine declines (§2a). A lone compilable instruction between two declines yields a block not worth entering |
+| `w` window mismatch | charged **1.00** | **not taken** | the rings read 43.31 % / 54.10 % supervisor; the M1 verdict window measured **16.09 %** (§0.4.2). Across the three banked rings the `MOVE` family's covered fraction rises monotonically as the supervisor share falls (87.91 % → 57.6 % covered; 54.10 % → 83.3 %; 43.31 % → 83.7 %), so a 16 % window can only cover **more**. The correction is one-sided in our favour and is therefore **not taken** |
+
+```
+   c  =  0.3086 x 1.00 x 0.60   ..   0.5485 x 1.25 x 0.90
+```
+
+> ### Pre-registered coverage for generation one as frozen: **c = 0.19 – 0.62**. (derived, on six assumed factors — `d`, `b`, `g` in step A and `k`, `β`, `w` here, every one of them named)
+>
+> **The 60 % bar sits at the very top of that band, and that is a finding, not a hedge.** The
+> arithmetic says generation one is *more likely than not* to engage below the bar — so **M1 is
+> planned as M1 + M1a from the start** (§0.5.1's frozen extension list, §0.5.2's decision table),
+> and the perf verdict is taken at the first wave whose coverage is in band. Writing this down
+> before the code is what stops a later family extension from looking like a rescue.
+
+**Step C — the removal side, per bucket, with return fractions.** §30's law forbids converting
+counts to wall clock without asking what was hiding the work. Each of the §1.5 base rows is
+charged a return fraction `ρ`, on the M0 capture's own shares (sweep `[40, 51]`, §0.4.2):
+
+| bucket | share @40 / @51 | `ρ` | chained or hidden — the reason |
+|---|---|---|---|
+| `DOPCFIND` | 15.18 / 17.35 % | **0.80 – 1.00** | **chained.** The lookup's result *is* the handler pointer the indirect branch consumes; nothing overlaps a dependency the next step waits on. Becomes one lookup per block |
+| `LOOPRES` | 13.38 / 16.48 % | **0.50 – 0.80** | **mixed.** The PC advance and the cadence counter are on the chain; the rest is loop bookkeeping that partly overlaps |
+| `FETCHOP`+`FETCHEX` | 7.18 / 8.87 % | **0.00 – 0.50** | **measured hidden.** Rung 3 removed 42 instructions from exactly this call chain and moved the wall clock **−0.05 %**; §1.4 records the pair as partly latency-hidden. Charged at **at most half, never in full** |
+| `TAILPOLL` | 9.49 / 9.86 % | **0.00 – 0.50** | the poll **survives** — once per block instead of once per `cadence` instructions. At cadence 4 and a mean block length `L` = 4 – 8 the removable fraction is `1 − 4/L` = 0.00 – 0.50, and that is before asking how much of it overlaps |
+| `TAILSPEC` | 0.35 / 0.44 % | **1.00** | below the noise either way |
+
+> **Mean block length `L` is pre-registered at 4 – 8 guest instructions**, and it is a prediction,
+> not a readout (§2a claim 1). Basis: control transfers are 17.2 – 18.7 % of dispatch time in the
+> two rings (`Bcc`/`BRA`/`BSR` 12.57 – 13.93 % + `JSR`/`JMP` 4.66 – 4.76 %, `RTS` unlisted and
+> additional), so runs between control transfers are ~5 – 6 instructions before any other block
+> ender; declined instructions and page boundaries only shorten them. **If `L` measures above 8,
+> `TAILPOLL`'s row is re-read at the measured `L` and the band is not.**
+
+```
+   t_low  = (15.18x0.80 + 13.38x0.50 + 7.18x0.00 + 9.49x0.00 + 0.35x1.00) x 0.19
+          =  19.18 % x 0.19  =  3.65 %      ->  1/(1-0.0365)  =  1.04x
+   t_high = (17.35x1.00 + 16.48x0.80 + 8.87x0.50 + 9.86x0.50 + 0.44x1.00) x 0.62
+          =  40.34 % x 0.62  =  25.01 %     ->  1/(1-0.2501)  =  1.33x
+```
+
+> ### M1's band: **1.04× – 1.33×**, i.e. **dhry ≈ 8 460 – 10 870** against the same-session reference row (8 151 on the F294E75A lineage). (derived, on coverage's six factors plus five `ρ` and `L` — all named above)
+
+**Cross-check, in §1.5's own form and it lands in the same place.** Taking §1.5's Amdahl shape
+with the M0-measured base and generation one's coverage: `t = base × c × r` with
+base = 0.4868 – 0.4991, `c` = 0.19 – 0.62, `r` = 0.60 – 0.80 gives **1.06× – 1.33×** — the same
+top to two decimal places and a bottom 0.02× apart. Two derivations, one per-bucket and one
+aggregate, and they do not disagree.
+
+**Three things must be said beside the band or it is a target chosen after the result:**
+
+- **This is the removal side only.** It charges nothing for the block-entry lookup, the block
+  linkage, the arm-attestation increment, the I-cache pressure of generated code, or compilation.
+  §30's law is unambiguous about the first: *"work added in front of the path arrives"* — rung 3
+  measured +19 prepended instructions costing 1.58 % of wall clock, in full. **The cost side is
+  unquantified and it is subtracted from this band, not added to it.**
+- **The floor is close to the kill line.** 1.04× on the same-session reference is dhry ≈ 8 460
+  against a kill threshold of **8 208** and an absolute floor of 8 242 — **3.1 %** and 2.6 %
+  respectively. The bottom of this band lies within a couple of hundred dhrystones of the line,
+  and that is the honest shape of this experiment. Under the strict ALU reading (§0.5.1) the
+  floor is 1.03× = dhry ≈ 8 420, which is **2.6 %** above the threshold.
+- **The downside case is a null and it has a precedent on this rig.** Rung 3 engaged at 91.10 %
+  coverage, made its bucket 23 % cheaper per instruction, hit or beat every premise it declared,
+  moved the wall clock −0.05 %, and came out the same day.
+
+### 0.5.4 Q1's contract measurement — state-sync cost per faultable access
+
+§0.1 Q1 pre-registered this as a measurement, and §0.3(a)/(b) supplied its denominator and its
+inventory. Here is how it is measured, what it is predicted to read, and what would trigger the
+Route-B allocator redesign.
+
+**What is measured.** The **emitted ARM instructions per faultable site** attributable to
+maintaining the interpreter's boundary state, split into the two paths that matter:
+
+```
+   on-path cost   instructions executed at a faultable site when the access HITS
+   bail-arm cost  instructions executed when the site declines and the engine bails
+```
+
+**How, and in this order.** (1) **`objdump`, before any metal time**, in §30.3 step 3's form:
+compile a fixed corpus of one instruction per generation-one shape, disassemble, and count. This
+is a static number and it decides shape (i) vs shape (ii) on its own. (2) **A same-boot A/B on
+metal**, engine-on with the state-sync discipline against engine-on with it elided — which is
+**incorrect code** and therefore a **measurement build**, never shipped, gated exactly as the
+withdrawn `IVSUP` build was, and removed from the tree when the measurement lands. Its removal
+carries the `IVSUP` lesson with it (see §0.5.6 on counter id 46: a withdrawn measurement build
+leaves a poisoned counter id behind it, and the tools that must refuse it outlive the build).
+
+**The denominator, measured at M0.** 3 738 guest-memory call sites across 3 054 compiler bodies:
+**1.22 faultable sites per body**, **1.54 per memory-touching body**, one or two in essentially
+every case and never more than four (§0.3(a)). So a design costing *n* instructions per faultable
+site costs ~1.5*n* per memory-touching guest instruction.
+
+**The inventory a bail must materialise, measured at M0** (§0.3(b)): `flush(1)`'s ceiling is 19
+stores plus the flags word, but only `DIRTY` and `ISCONST` virtuals emit anything, and with **8**
+allocatable host registers against 22 virtuals the emitted count is what matters — **so the
+counter counts emitted stores per bail, not the ceiling.** The four boundary items `flush(1)` does
+*not* produce are `regs.pc`, `regs.instruction_pc`, `mmu_restart` and `mmufixup[0..1]`; of these,
+`mmufixup` reduces to an asserted invariant and `mmu_restart` is one bool, leaving the guest
+logical PC as the one with genuine cost.
+
+**The pre-registered numbers.** Shape (ii) — block-head PC plus a per-site constant delta,
+materialised **only on the bail arm**:
+
+| quantity | pre-registered band | how scored |
+|---|---|---|
+| on-path state-sync, per faultable site | **0 – 2 ARM instructions** | `objdump`, before metal |
+| on-path state-sync, per memory-touching guest instruction | **0 – 3.1** (= 1.54 × 2) | derived from the above |
+| bail-arm materialisation, per bail | **2 – 4 instructions** + the emitted register writebacks | `objdump` + `WARP_BAIL_ST / WARP_BAIL` |
+| emitted stores per bail, mean | **3 – 8** | counter ratio, read before any wall clock |
+| shape (i) — materialise at every site — if measured instead | **2 – 3 per site, 3.1 – 4.6 per memory-touching instruction** | `objdump`; recorded even though shape (ii) is expected to win, so the comparison is priced rather than asserted |
+
+**The decision rule for the Route-B redesign, and both conditions are measured.** §0.1 Q1's
+contract is that the allocator is redesigned *"only if the numbers say that is the ceiling — not
+because a redesign looks tidier from the outside"*. Operationally, **both** must hold:
+
+1. **The static condition:** on-path state-sync cannot be brought to ≤ 2 instructions per
+   faultable site inside the existing allocator, and the `objdump` shows *why* structurally —
+   spills forced by the 8-register budget, visible as spill/reload instructions in the emitted
+   sequence rather than as a coding choice; **and**
+2. **The dynamic condition:** the measurement-build A/B shows the state-sync discipline costs
+   **≥ 8 %** of the covered path's wall clock, on a same-boot A/B with the cross-build reference
+   row beside it and the disarm identity closing.
+
+Either alone is a finding to record and not a trigger. Neither is a licence to re-scope M1.
+
+### 0.5.5 Correctness gates — every one of them mandatory, none of them wall clock
+
+**G1 — the lockstep oracle, clean over ≥ 10⁸ retired guest instructions.** Mode: **per-block**
+(§3.2) — run a block jitted from a checkpoint, restore the checkpoint, run the same span
+interpreted, compare the whole set. The comparison set is rung 2's, unchanged, plus the JIT's four
+(§3.1): returned value, fault outcome, fault address, guest PC, write-back slots, `mmu_ssw`,
+`mmu_cache_state`, destination memory, all sixteen data and address registers, the page-cache
+counters, **and** `mmufixup[0..1]`, `mmu_restart`, `regs.instruction_pc`, retired-instruction
+count.
+
+**Where it runs, and the honest limit stated once more:** the host harness runs on x86-64 and
+**cannot execute one instruction of ARM codegen**. So the harness proves block discovery, keying,
+invalidation, bail decisions and state write-back — the *decisions* — and everything provable
+there is proven before a metal session is booked; the **emitted sequence is proven on target and
+only on target**, in a gated build whose lockstep arm is compiled out of every shipping image.
+The 10⁸ is accumulated on metal across the boot window and pinned dhrystone runs, counted by
+`WARP_LS_INSNS`, and the gate is `WARP_DIVERGE == 0` over that span. A single divergence is a
+stop, not a statistic.
+
+**G2 — the counter identities, exact.** See §0.5.6 for the table; the three that are gates:
+
+```
+   DOPC_HIT + DOPC_MISS  ==  (INSNS - WARP_ENTER) + FAULTS
+   FAULTS(on)            ==  FAULTS(off)                     +/- 1
+   sum(IV_*) - IV_WRAP   ==  DOPC_INVAL                       (unchanged, and WARP reconciles to it)
+```
+
+The first is the existing identity `DOPC_HIT + DOPC_MISS == INSNS + FAULTS` corrected for the
+engine: a jitted instruction never consults the decoded-op cache, and a block costs one `INSNS`.
+With the engine off, `WARP_ENTER` = 0 and it reduces to the identity as it stands today. The
+second is the bail contract's own check — the engine never faults inside a block by construction,
+so every fault is still the interpreter's; the SPEC round read 3 630 vs 3 629 and that is the
+resolution to expect.
+
+**G3 — zero `throw` sites reachable from generated code, proven statically before metal.** Q2
+measured the consequence of getting this wrong: not a fault, `std::terminate`. The proof is a
+closed-world audit, and it is cheap because the world *is* closed — generated code calls only the
+helper set the engine emits calls to. For every symbol in that set, `objdump` the reachable call
+graph and require that no reachable function references `__cxa_throw`, `__cxa_allocate_exception`
+or `_Unwind_RaiseException`, and that no reachable function contains a `TRY` block under the C++
+arm of `mmu_common.h`. **Unmet ⇒ the build does not go to metal** — the SPEC round's form of a
+static gate, mandatory, no exceptions.
+
+**G4 — the harness corpus for the `jnf_MEM` replacements, engagement-pinned.** Generation one
+replaces six of the ten accessors (`readbyte`/`readword`/`readlong`,
+`writebyte`/`writeword`/`writelong`); the corpus is built per accessor × per verdict class, and
+**every case declares MUST-serve or NEVER-serve and a counter checks it** — because *"'the two
+paths agree' is trivially true when the fast path silently never fired"*, and a JIT's decline
+surface is larger than any rung's:
+
+| axis | cases |
+|---|---|
+| accessor | 6 |
+| verdict class | `XPAR`, `PAGE`, `SLOW` (= decline → bail) |
+| engagement polarity | MUST serve / NEVER serve |
+| structural fences, per accessor | page-crossing refusal, bank-boundary refusal, device refusal, misalignment refusal |
+| the asymmetry that must not be copy-pasted away | `TTR_NO_WRITE` ⇒ read `XPAR`, write `SLOW` |
+
+`6 × 3 × 2 = 36` verdict cases, `6 × 3 = 18` fence cases (misalignment is one fence per accessor
+and the other three are per verdict-eligible class), plus the 2 asymmetry cases — **≈ 56 new
+cases**, each asserting byte-exactness against the interpreter on the returned value, the
+destination memory, `mmu_cache_state`, the fault outcome and the fault address. Half the corpus is
+decline cases, and without the engagement check they would all pass against a fast path that was
+never compiled in.
+
+**G5 — the mutation set, pre-registered here and grown at each milestone.** Every rung in this
+campaign injected defects and required the corpus to catch them. M1's arms:
+
+| # | mutation | must be caught by |
+|---|---|---|
+| M-1 | `TTR_NO_WRITE` asymmetry inverted (write → `XPAR`) | the asymmetry cases in G4 |
+| M-2 | the page-crossing structural fence removed | the fence cases in G4 |
+| M-3 | state-sync omitted at one faultable site (bail with a stale guest PC) | per-block lockstep, `regs.pc` compare |
+| M-4 | `mmufixup` invariant not asserted at block head | lockstep `mmufixup` compare |
+| M-5 | the block key drops the supervisor bit | the dopc's own empty-marker trap case, reused |
+| M-6 | one `IV_*` cause not wired to the code cache | the invalidation identity in G2 |
+| M-7 | the cadence counter fed 1 per block instead of retired instructions | the cadence-tick assertion, and on metal the PSTAT gap fingerprint |
+| M-8 | the bail arm writes back `DIRTY` but not `ISCONST` virtuals | lockstep register compare |
+
+### 0.5.6 The counter table, and every direction checked against call topology
+
+**The law being obeyed:** *"Check a pre-registered counter direction against the counter's
+position in the call topology. A counter reached only after the branch being deleted cannot fall
+when it is deleted — a declared direction was once arithmetically impossible."*
+
+**Existing counters, engine ON against engine OFF on the same pinned workload:**
+
+| counter (id) | direction | topology check |
+|---|---|---|
+| `INSNS` (0) | **falls** by `WARP_INSNS − WARP_ENTER` | incremented once per **run-loop pass** inside `Z3660_PROF_RUNLOOP_SAMPLE`; a block is one pass. It **cannot** stay equal, and §2e's claim 3 in its literal form ("`INSNS` identical between arms") is superseded by the reconstruction in §0.5.2 |
+| `INSNS_SUPER` (1) | **unchanged in absolute terms** | same per-pass site, gated on `regs.s`; generation one is user-mode only, so no block contributes. **The window discriminator must be computed on the reconstructed stream**, not on raw `INSNS`, or it moves with the arm |
+| `FETCH` (2) / `IFETCH_CALLS` (20) | **fall**, together, ≈ by the covered share | incremented inside the interpreter's ifetch bracket. **This direction is only possible because the compile path does not enter that bracket** — compiler reads are counted by `WARP_CFETCH`. Wire the compiler through the bracket and the declared fall becomes impossible |
+| `READ` (3) / `WRITE` (4) | **unchanged** | *requires the counting emitter*: in the profiling build the emitted access sequence increments them at the same point the accessor does. Without it they fall by the covered share and the fall is an instrument artefact, not guest behaviour. **Consequence, declared: the profiling build's generated code is not the lean build's, so code-bytes-per-instruction is read off the lean emitter's `objdump` and never the profiling one** |
+| `IPAGE_HIT`/`MISS` (5, 6) | **fall, by less than `FETCH`** | the compile path reads guest instruction words through the same instruction accessor (sharing the arithmetic is how equivalence is guaranteed), so it still consults the instruction page cache. `WARP_CFETCH` is the term that reconciles the two falls |
+| `DPAGE_*` (7 – 10), `XLATE`/`XLATE_OK` (11, 12), `ATC_MISS`/`ATC_HIT` (13, 19) | **unchanged** | reached from inside the shared translation arithmetic, which generated code calls rather than reimplements |
+| `MISALIGN_R`/`W`/`I` (14, 15, 43) | **unchanged** | generated code never fast-paths a misaligned access — it bails, and the interpreter performs it |
+| `FAULTS` (16) | **unchanged ± 1** | run-loop `CATCH` entries; the bail contract means every fault is still taken by the interpreter. A move here is a leak in the contract |
+| `TRANSITIONS` (17) | **falls** | profiling-build-only phase transitions; fewer interpreted instructions, fewer transitions |
+| `STACK_OVF` (18) | **0** | must be, in every capture, as today |
+| `BLK_HIT`/`BLK_INSNS`/`BLK_BYTES` (21 – 23) | **unchanged** | rung 0 is untouched and the JIT declines its PCs (`Q8`). **A fall here is the engine poaching rung-0 PCs**, and this counter is how that is detected rather than argued |
+| `DOPC_HIT`/`DOPC_MISS` (24, 25), `DOPC_EXT` (26), `DOPC_WAY0..3` (39 – 42) | **fall** ≈ by the covered share | consulted at the interpreter's decode site, which a jitted instruction never reaches; the compile path does **not** consult the dopc |
+| `DOPC_INVAL` (27), `IV_*` (28 – 38) | **unchanged** | the guest's invalidation demand is a guest property (91 k measured, cache-independent). WARP adds a **consumer**, not a cause |
+| `DFAST_HIT` (44) / `DFAST_XPAR` (45) | **unchanged**, share within 0.5 pp | with the counting emitter, both arms of the generated sequence increment where the accessor does. **Without it the ratio would not merely fall — it would be selection-biased**, because the interpreted remainder is enriched in exactly the accesses the engine declined. §2d's claim 2 ("stays at 99.1 %+") is therefore **conditional on the counting emitter**, and that dependency is a design requirement derived from a counter direction |
+
+**New counters — appended ids, no wire bump, no new buckets.**
+
+> **Id 46 is permanently retired and WARP's block starts at 47.** `Z3660_PROF_C_COUNT` is 46
+> today, so 46 is the next free index — but it is not free: the withdrawn `f`-measurement build
+> used it for `IV_SUPPRESSED`, and `profiler.md`'s standing reading rule is to **refuse to
+> interpret a capture carrying a non-zero id 46 as a profile of a correct machine**. A WARP
+> counter at 46 would make every legitimate capture refusable by a tool obeying that rule. So 46
+> stays retired, carries a placeholder in the name table so the indices align, and WARP occupies
+> **47 – 59**, taking `Z3660_PROF_C_COUNT` from 46 to **60**. **No existing id moves and no field
+> changes shape, so the dump version stays 2** — the same reasoning `IFETCH_CALLS` (id 20) and the
+> withdrawn id 46 were appended under. That is the `IVSUP` lesson's real cost, paid once here
+> rather than discovered in a symbolizer later.
+
+| id | counter | what it counts | topology position |
+|---|---|---|---|
+| 47 | `WARP_ENTER` | block entries **from the run loop** | the loop hook — the one site that costs exactly one `INSNS`. Never the chained-transfer site |
+| 48 | `WARP_BLK` | block executions, **including** chained entries | every block prologue |
+| 49 | `WARP_INSNS` | guest instructions retired inside blocks | block epilogue, from the block's compile-time count; this is also what feeds the **cadence** counter (`Q10`, frozen) — a different counter from `INSNS`, and the two must not be confused |
+| 50 | `WARP_BAIL` | bails to the interpreter | the bail arm, once per bail |
+| 51 | `WARP_BAIL_ST` | writeback stores executed on bail arms | added on the bail arm from the compile-time emitted-store count (§0.5.4) |
+| 52 | `WARP_COMPILE` | blocks compiled | the compiler's exit, success only |
+| 53 | `WARP_CINSNS` | guest instructions compiled | ditto — denominator for code bytes per instruction |
+| 54 | `WARP_CBYTES` | ARM code bytes emitted | ditto — R4's first-class metric |
+| 55 | `WARP_CFETCH` | guest instruction words read **by the compiler** | the compile path's fetch site, and **not** the interpreter's ifetch bracket — this is what makes `FETCH`'s declared fall possible. **This is Q6's counter** |
+| 56 | `WARP_DISC` | blocks discarded by invalidation, all causes | the code cache's hook on `mmu_flush_cache()`'s choke point, summing live blocks per invalidation |
+| 57 | `WARP_DISC_ROOT` | ... of those, at `IV_ROOT` invalidations | the same hook, on the `IV_ROOT` cause only. **This is Q5's counter** |
+| 58 | `WARP_FLUSH` | full code-cache flushes (bump allocator exhausted) | `flush_icache_hard()` |
+| 59 | `WARP_DECLINE` | block-head PCs the engine declined | the loop hook's decline arm — rung-0 PCs, trace on, unsupported head |
+
+C symbols are `Z3660_PROF_C_WARP_*`; the short names above are the table's. `WARP_LS_INSNS` and
+`WARP_DIVERGE` belong to the **gated lockstep build** and are not part of the shipping counter
+block. `warp_entered` — §0.5.1's every-variant arm confession — is the **same increment site** as
+id 47, not a second one.
+
+**No new buckets at M1, and that is deliberate.** Bracketing the compile path would charge the
+instrument into the thing being measured — rung 0's own reasoning for being counters rather than
+buckets applies here in its strongest form. **Compile cost per block is measured on target
+*before* integration** (§2g claim 3), with a direct cycle bracket in a micro-benchmark, not in a
+capture.
+
+**Q5's decision rule, pre-registered.** Fund a per-address-space generation **only if both**:
+`WARP_DISC_ROOT / WARP_DISC ≥ 0.10` **and** the recompilation attributable to it —
+`WARP_DISC_ROOT × (measured compile cycles per block)` — is ≥ **2 %** of the window's cycles. The
+dopc declined at 1.32 – 3.27 % of *requests* because a per-entry stamp cost three compares on a
+path that runs every dispatch; for the JIT the lookup runs once per block, so the arithmetic
+reverses — but it reverses on measured discard cost, not on the argument that it reverses.
+
+**Q6's decision rule, pre-registered.** Resurrect rung 3's struck `ifetch` verdict table
+(`3087af9`) on the **compile path only** if `WARP_CFETCH × 42` — 42 being the instructions the
+struck table removed from `iword` on the 87 % ITT-matched arm — is ≥ **20 %** of the measured
+compile-path cycles. The classification argument (nothing hides the compiler's fetch, because
+there is no dopc hit in front of it and the compiler reads several words back to back) is a
+hypothesis to price, not a claim to act on, and re-funding it from a bucket share before this
+counter exists is the one thing §30's law strikes outright.
+
+### 0.5.7 Sessions, and what M1 does not establish
+
+**Session estimate — `assumed`, stated so it can be wrong in public, and not a commitment.**
+§4 estimates M1 at 6 – 10. With the two-wave structure §0.5.3 predicts:
+
+| | sessions | card needed |
+|---|---|---|
+| codegen for the frozen families, block cache, linkage, bail contract | 3 – 5 | no |
+| host corpus (G4/G5), the static gates (G3), the `objdump` cost counts (§0.5.4) | 1 – 3 | no |
+| metal: engagement + coverage on the profiling build; verdict A/B on the lean build; one contingency | 2 – 3 | yes |
+| **M1** | **6 – 11** | |
+| M1a, if coverage lands below the bar — one family wave plus its own metal verdict | +2 – 4 | yes |
+
+**What M1 explicitly does not establish:**
+
+1. **That a JIT pays on this machine.** M1 prices generation one on dhrystone. §8 stands
+   unchanged and unrewritten.
+2. **Anything about faults or demand paging.** The bail contract's fault path is exercised by
+   construction at M1 but not *loaded*: dhrystone is small and resident and is *"the workload
+   least likely to trip"* the paging path. **M2 is the first honest test**, and everything known
+   about invalidation cost on this guest was measured on the same easy workload.
+3. **Anything about the supervisor-heavy story.** Generation one is user-mode only; the boot row
+   rides beside every M1 capture per `Q11` and **gates nothing before M4**.
+4. **That the cache-maintenance sequence is correct at JIT volumes.** Q2's experiment A is one
+   stub, not a volume. Q3's `UAEJIT` A/B is a separate metal session and the caveat stands: adding
+   barriers is not evidence of a fix; only a soak on metal is.
+5. **That the cadence contract is unmoved.** M1 asserts it by construction and checks it in the
+   harness (mutation M-7); the behavioural proof is M3's PSTAT gap fingerprint against the
+   card-1/piscsi class at 1 177 – 1 402 µs.
+6. **That the ~42 µs budget holds for compilation.** It is inherited from rung 0's measured chunk
+   and measured for compilation at M1 *per block*, not soaked.
+7. **That the profiling build's absolute wall clock means anything.** §0.4.3's +7.22 % is
+   unexplained; counters come from the profiling build, wall clock from the lean build, and no
+   WARP row compares wall clock across two profiling builds until that mechanism is named.
+8. **That any of these session counts are right.**
 
 ---
 
@@ -1281,6 +1832,13 @@ exception problem in §2e bites.
 2. `DFAST_HIT / (READ + WRITE)` stays at 99.1 %+, and the dpagecache hit rates are unmoved to
    within **0.04 pp** — rung 2's own guarantee, held because the tag arithmetic is shared.
 
+   > **⚠ Qualified at M0, in §0.5.6: this claim is conditional on the counting emitter.** If
+   > generated code does not increment the data counters in the profiling build, the surviving
+   > ratio describes only the *interpreted remainder* — which is selection-biased toward the
+   > accesses the engine declined, so it would fall for a reason that is not a regression. The
+   > emitter therefore increments them at the same points the accessor does, in the profiling
+   > build only, and the code-size metric is read off the lean emitter's `objdump`.
+
 ### Open questions
 
 Inline the `PAGE` probe in generated code, or call a helper? The helper is a `bl`, and removing
@@ -1410,6 +1968,14 @@ taken by the interpreter after a bail. Revisit at M4, or never.
 3. **`INSNS` (retired guest instructions) identical** between arms on a deterministic workload.
    Note the existing identity that makes this readable: `DOPC_HIT + DOPC_MISS == INSNS + FAULTS`
    — faulting instructions dispatch but never retire.
+
+   > **⚠ Corrected at M0, in §0.5.2 and §0.5.6 — this claim is right in substance and wrong as
+   > written.** `INSNS` is incremented once per *run-loop pass*, and a block is one pass, so it
+   > **falls** with the engine on. The comparable quantity is the reconstructed guest stream
+   > `(INSNS − WARP_ENTER) + WARP_INSNS` — rung 0's own correction with `WARP_ENTER` in
+   > `BLK_HIT`'s place — and the identity becomes
+   > `DOPC_HIT + DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS`, which reduces to the form above
+   > when the engine is off. **(measured topology, `z3660_prof.h`, `newcpu.cpp:4622`)**
 
 ## 2f. Invalidation contract
 
@@ -1702,13 +2268,13 @@ that is why its numbers are trustworthy. Session counts are **assumed**.
 | **M4** | **Soak + the ladder inside the JIT** | durability, and where the next rungs are | long multiuser run under paging and network load + the 128 MiB memory toucher; then per-rung §30.3 pricing | per rung, not per milestone; a rung that misses its pre-registered band is reverted | 8–15 |
 | **M5** | **Ship gate** | it is finishable | ACCEPTANCE record, changelog, docs, CRC-stamped image lineage, disarm-equivalence proof, "what this does not establish" | — the **default-on decision is the user's** | 2–3 |
 
-### M0 — Design freeze `IN PROGRESS`
+### M0 — Design freeze `DONE`
 
-**State on 2026-08-23: the grill has run, §0 is the freeze, and the metal half has run.
-Items 1 – 6 are `DONE` — the unwind probe answered `TERMINATED` on one boot (§0.4.1), the
-optional §1.5 base re-take was taken and the base survived (§0.4.2), and the four zero-build
-censuses are §0.3. The M1 pre-registration — the other half of the deliverable below — is
-`TODO`. The per-item ledger is §0.4.** One census was added at the grill and is not in the list of five: the state-discipline
+**State on 2026-08-23: the grill has run, §0 is the freeze, the metal half has run, and the M1
+pre-registration is committed. All seven items are `DONE`** — the unwind probe answered
+`TERMINATED` on one boot (§0.4.1), the optional §1.5 base re-take was taken and the base survived
+(§0.4.2), the four zero-build censuses are §0.3, and **§0.5 is the pre-registration, committed
+before the first line of engine code.** The per-item ledger is §0.4. One census was added at the grill and is not in the list of five: the state-discipline
 census (§0.3(b)), which is the input to Q1's pre-registered state-sync measurement.
 
 Five cheap things, all before any codegen. Only the first needs the card.
@@ -1738,7 +2304,7 @@ Five cheap things, all before any codegen. Only the first needs the card.
 M1 — its band, its coverage bar, its counter directions checked against call topology, and its
 revert line — **before** the first line of code.
 
-### M1 — Straight-line user-mode blocks `GATED(M0)`
+### M1 — Straight-line user-mode blocks `PRE-REGISTERED, READY`
 
 Compile only: register-to-register ALU, `MOVE`/`MOVEA` in the covered EA shapes, and the
 conditional branches that end blocks. No FPU, no privileged instruction, no write-back family, no
@@ -1749,6 +2315,13 @@ guest instructions; coverage ≥ 60 % of retired instructions; `FAULTS` and `INS
 the static gate on `throw` reachability met; **cross-build dhrystone above 8 185 by more than the
 rig's own within-arm spread (0.04 – 0.70 %)**, with the first-generation band of §1.5 recorded
 beside it for information, not as the bar.
+
+> **§0.5 is the pre-registration this line promised, and it is binding where the sketch above is
+> illustrative.** It narrows the shape set (`(An)+` / `-(An)` are excluded by §2e's own rule),
+> corrects the `INSNS` identity to the reconstruction rung 0 already needed, derives **M1's own
+> band 1.04× – 1.33×** from what generation one covers, operationalises the kill line against a
+> **same-session** reference row, and pre-registers the coverage counter, the new counter ids and
+> every declared direction's topology check. **Read §0.5 before writing a line of M1.**
 
 **Kill:** see the table. Rung 3's precedent binds — a rung that engages, works, and does not pay
 comes out the same day.
