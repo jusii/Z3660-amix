@@ -9,10 +9,12 @@ in §7 is answered; the metal half ran the same day and **Q2 came back `TERMINAT
 the §1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1
 pre-registration**, the last of M0's seven items. **M1's first round shipped on 2026-08-24**: the
 engine's skeleton end to end with **no code generation at all** — §0.6 pre-registers it and §0.7
-scores it, and its one number is a *cost*, not a speed. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
+scores it, and its one number is a *cost*, not a speed. **`M1 round 2 PRE-REGISTERED` — §0.8**,
+committed before the first line of round-2 code: the entry-cost work, the control-transfer-target
+discovery policy, the lookup-structure fix round 1's counters forced, and generation one's first
+compilers. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
 disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place with the
-correction marked. **There is still no engine code, and that is the point: M0's deliverable —
-this document plus §0.5 — is complete, and it is complete *before* the first line of it.**
+correction marked.
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -1481,6 +1483,339 @@ error rather than a result.
   returns NULL when `compiled_code != NULL`, which is the `UAEJIT_*` bootmodes. Two engines
   bump-allocating one 32 MB arena is a wild-write generator; refusing makes it impossible
   rather than unlikely, and WARP then declines every block and reports it in `WARP_DECLINE`.
+
+## 0.8 M1 round 2 — pre-registered, before the first line of round-2 code (2026-08-24)
+
+**This section is written before any round-2 engine code exists and is scored as written.**
+§3.4's two rules govern it exactly as they governed §0.5 and §0.6: the pre-registration
+commit precedes the implementation commits, provably, by commit timestamp in this
+repository; and a prediction that turns out wrong is marked `MISSED` beside the measurement
+with the prediction left **byte-untouched**. Round 1's own pre-registration preceded its code
+by 32 minutes, the SPEC round's by 26 and the `f` round's by 29.
+
+**Round 2 is the round that generates code.** Round 1 proved the plumbing with a null block
+and priced the entry; §0.7.3 named ~22 of its 60 armed instructions as *"the shape of the
+code around it"* and refused to fix them in the round they were scored in. This is that
+round, and it re-registers its own band rather than inheriting one.
+
+### 0.8.0 The measured inputs round 2 is built on
+
+Every number below is from the metal cost session of 2026-08-24 (evidence
+`2026-08-24-warp-r1-metal/MATRIX.md`) or from §0.7, and none of it is re-derived here.
+
+| input | value | what it decides in round 2 |
+|---|---|---|
+| clean reference `R`, `F294E75A` lineage, dhry c4, n = 7 | **8 174**, spread 0.55 % | the denominator of every ratio below |
+| disarm penalty, round-1 image | **7 988 = −2.276 %** of `R`, on **5** gate instructions | 5 instructions cost 4.88 cycles on 214.2 → **the disarmed gate runs at IPC ≈ 1.03** |
+| armed null-block row | **5 301 = −33.638 %** of the disarmed row | the entry sequence's arrival, in full |
+| the conversion factor, measured | **IPC 0.46** on the armed entry path (129.4 cycles for 60 instructions, per user-mode guest instruction) | **one ARM instruction on the entry path costs 2.17 cycles**, not 0.67–1.0. This is the single most important number round 1 bought |
+| `WARP_BLK` / user-mode `INSNS` | **0.999878** | zero amortisation: round 1 paid the whole entry for one guest instruction, every time |
+| `WARP_COMPILE` | 3 066 944 = 5.68 % of entries | one compile per 17.6 executions |
+| `WARP_DISC` / `WARP_FLUSH` | 146 536 / **0** | invalidation explains 4.8 %, eviction 0 → **95.2 % unexplained** |
+| `WARP_CBYTES` | 24 535 552 B = **73 %** of the 32 MiB arena in one ~34 s window | the eviction path is untested, not absent |
+| Q5 condition 1 | `WARP_DISC_ROOT / WARP_DISC` = **0.274 ≥ 0.10** ✔ | condition 2 still unmeasured |
+
+> **The kill line still cannot fire, and this is restated rather than assumed.** §0.5.2's
+> operational form needs a **same-session** engine-off reference row `R` and an engine-on
+> median taken beside it. **Round 2 takes no metal row at all** — it is a build-and-gate
+> round, exactly as round 1's implementation half was. No number in this section is a
+> verdict, none of them is admissible against §0.2, and the M1 kill line fires for the first
+> time only at the verdict session that takes its rows. **`kill-R` is the CLEAN INTERPRETER
+> LINEAGE row** — the engine-off cross-build reference on the then-current interpreter lean,
+> not a WARP image disarmed — per the ruling of 2026-08-24. A disarmed WARP image already
+> carries the switch's own shipped cost and using it as `R` would grade the engine against a
+> baseline it had already slowed down.
+
+### 0.8.1 What round 2 builds
+
+Four things, in the order their evidence demands, plus the first code generation.
+
+**1. The entry cost, against the four shapes §0.7.3 named.** The lazy `warp_inited` check
+(4 instructions) moves to arm time. The cadence feed's call-and-prologue-to-do-nothing (10)
+becomes an early-out at the call site. The 64-bit arm attestation (8) becomes a split
+32-bit counter with a wrap arm. `z3660_warp_dispatch` stops being an out-of-line call: the
+steady-state lookup-and-enter path is `always_inline` in the header, on the decoded-op
+cache's own precedent (*"at `-Os` gcc will happily move a hot lookup out of line to save
+space, which is the exact trade this rung exists to refuse"*).
+
+**2. The discovery policy: control-transfer TARGETS only.** §0.6.5 named this in advance as
+the round-2 lever and round 1 priced it: at `WARP_BLK`/`INSNS` = 0.999878 there was no
+amortisation to have. Fall-through **continues in the interpreter** until the next target.
+The target test is armed-only and costs the disarmed path nothing: it is a PC-discontinuity
+test against the previous pass's PC, held in the engine's own state, so no store is added to
+the interpreted path. It is an **over-approximation by construction** — a forward branch
+shorter than the longest instruction it could have been reads as a fall-through — and that is
+a coverage property, never a correctness one.
+
+**3. The lookup structure — THE MUST-FIX.** Diagnosed in §0.8.2 and fixed there.
+
+**4. Generation one's compilers**, per §0.5.1's frozen scope and no wider.
+
+### 0.8.2 The lookup-structure diagnosis, and the fix
+
+**The diagnosis is structural and reads off the round-1 source without a capture.**
+
+```
+   Z3660_WARP_SETS           1024          one block per set -- DIRECT MAPPED
+   Z3660_WARP_INDEX(pc)      (pc >> 1) & 1023
+```
+
+The index consumes **PC bits 1..10 and nothing else**, so the table addresses a **2 KiB
+window of guest text**. Two block heads 2 048 bytes apart share one slot, and with one way
+each arrival evicts the other. Round 1 discovered at **every dispatched PC**, so the whole of
+dhrystone's user text — tens of KiB, against a static working set of order 10³ distinct PCs —
+folded into a 2 KiB alias window with no associativity to absorb it. That is the shape the
+counters saw: a compile rate of 5.68 % of executions with `WARP_DISC` explaining 4.8 % of it
+and `WARP_FLUSH` explaining none.
+
+> **The decoded-op cache uses the same index formula and does not thrash, and the difference
+> is the whole finding.** `Z3660_DOPC_INDEX` is bit-for-bit `(pc >> 1) & 1023` — but the dopc
+> has **four ways** with a round-robin victim, and it caches a *decode*, which costs one to
+> three orders of magnitude less to rebuild than a *block*. Round 1 inherited the index and
+> not the associativity, and wrote down why (*"a way count is a decision to take against a
+> measured head distribution rather than by analogy"*). The measured head distribution is now
+> in: it says take the ways.
+
+**The fix, and every part of it is a decision with a reason:**
+
+| change | from | to | why |
+|---|---|---|---|
+| ways | 1 | **4** | the dopc's own geometry, now with a measured head distribution behind it. Round-robin victim, the dopc's `victim` field verbatim |
+| sets | 1024 | **2048** | 2048 × 4 × 16 B = **128 KiB**, and a set is **64 B = one Cortex-A9 line**, so a lookup still touches one line and never two. That is the dopc's `Z3660_DOPC_SET_BYTES 64` constraint, inherited |
+| index | `(pc >> 1) & 1023` | `((pc >> 1) ^ (pc >> 12) ^ (pc >> 23)) & 2047` | **high PC bits participate.** Two heads 2 048 (or 4 096, or 1 MiB) apart no longer collide by construction. It costs **two `eor`s on a path that runs once per BLOCK** — which is exactly the arithmetic §0.5.6 says reverses for a block table and does not for the dopc |
+| declined heads | re-attempted on every arrival | **cached as a null block** | a head the engine declines is a permanent property of that PC until an invalidation. Round 1 re-ran the whole discovery every time. A declined head compiles to round 1's two-word null block, so the fast path needs no NULL test and the decline costs one lookup |
+| the instrument | none | **`WARP_EVICT`, counter id 60** | §0.7's own words: *"A table-occupancy counter settles it in round 2."* It counts a **live** block overwritten in its set by a different key — the one term that separates conflict from invalidation and from flush |
+
+**Counter id 60 is appended and nothing moves.** `Z3660_PROF_C_COUNT` goes 60 → **61**, id 46
+stays retired behind its placeholder, no existing id changes meaning, no field changes shape,
+**the dump version stays 2** — the same reasoning ids 20, 46 and 47–59 were appended under.
+
+**The recompile budget, decomposed, and this is the form the fix is scored in:**
+
+```
+   WARP_COMPILE  =  first-compile of a head          (irreducible)
+                 +  WARP_DISC        (invalidation)  (a guest property, not ours)
+                 +  WARP_EVICT       (conflict)      (OURS -- this is the term being fixed)
+                 +  blocks lost to WARP_FLUSH        (capacity)
+```
+
+### 0.8.3 Generation one's compilers, and the design that makes the bail contract cheap
+
+**The scope is §0.5.1's, frozen, and round 2 does not widen it.** `Bcc`/`BRA`, `DBcc`,
+`MOVE`/`MOVEA` with both EAs in `Dn`/`An`/`(An)`/`d16(An)`, and register-destination ALU
+(`ADD` `SUB` `AND` `OR` `EOR` `CMP` register-to-register, `ADDQ`/`SUBQ` with a register
+destination, `ADDA`/`SUBA`/`CMPA` with a register source). `MOVEQ` is **M1a item 1 and is not
+built**; `(An)+`/`-(An)` are excluded in either operand; `BSR` is a fully memory-touching
+family and bails; every write-back family, every FPU opcode, every privileged or
+mode-changing instruction, `MOVE16`, every uncompiled opcode and every rung-0 PC bail.
+
+**The audit §0.5.1 demanded, done before the code and answered against expectation.**
+§0.3(a) calls `Bcc` (45/45) and `DBcc` (16/16) *"inheritable as-is"*, and §0.5.1 already
+narrowed that to *"a statement about the memory model, and only about it"*. Read against the
+bail contract the answer is stronger and it is recorded here as a finding rather than
+discovered in the diff: **the existing `Bcc`/`DBcc` compiler bodies are not inheritable.**
+They compute targets and chain blocks through `regs.pc_p` and `cache_tags` — the host-pointer
+keying §0.3(c) refuted under the MMU — and they operate on `compemu`'s lazy virtual register
+file, whose three lazinesses (§0.3(b): `DIRTY` registers, an unfolded `m68k_pc_offset`, a
+three-state flag machine) are exactly the state a bail would have to materialise. **What is
+inherited is the raw ARMv7 emitter layer (`jit/codegen_arm.h`) and nothing above it.**
+
+**The state discipline round 2 adopts, and it is shape (ii) taken to its limit.**
+§0.3(b) offered two shapes for the guest logical PC and §0.5.4 pre-registered shape (ii) —
+block-head PC plus a per-site constant delta, materialised **only on the bail arm**. Round 2
+takes it, and takes the same decision one level further:
+
+> **THE GUEST REGISTER FILE STAYS IN MEMORY.** Generated code loads its operands from
+> `regs.regs[]` and stores its results back within the same guest instruction. No guest
+> register is ever live in a host register across an instruction boundary, so at **every**
+> instruction boundary in a block the architectural state is already exactly what the
+> interpreter's boundary state is.
+
+The consequence is the whole reason for the choice, and it is a pre-registered measurement
+rather than a claim: **on-path state-sync per faultable site becomes 0 emitted instructions,
+and a bail materialises the PC and nothing else.** §0.5.4 pre-registered 0–2 on-path and
+3–8 emitted stores per bail; the second of those is now predicted to miss **low**, and the
+prediction is written here so the miss is scored rather than celebrated.
+
+It also costs something, and the cost is named before the measurement: a memory-resident
+register file re-loads operands the interpreter would also have re-loaded, so generation one
+buys its speed from **dispatch, fetch and decode**, not from register allocation. Route B's
+allocator remains what §0.1 Q1 said it was — a redesign to be funded by §0.5.4's two measured
+conditions, not by taste.
+
+**The `jnf_MEM_*` replacement, and one declared deviation from the round's brief.** The
+memory access emitted for `(An)` and `d16(An)` is the **DFAST verdict-table fast path plus
+bail-to-interpreter**, per Q1 — but it is emitted as a **call to one shared helper that
+contains `z3660_dfast_read()` / `z3660_dfast_write()` itself**, not as an open-coded copy of
+the verdict test, the page-cache probe and the bank test.
+
+> **The reason is equivalence by construction rather than by transcription.** The helper
+> calls the *same* `always_inline` resolver the interpreter's accessors call, so "the two
+> paths agree" is a property of there being one path, not of two transcriptions matching. An
+> open-coded sequence would be ~35 emitted instructions reproducing `mmu_pagemaski`,
+> `mmu_pageshift1m`, the ATC tag compare, `mem_banks[]` and `addrbank_is_direct_*` by hand —
+> five separate opportunities to ship a divergence under the banner of a speed change.
+> **And in this design a call is nearly free**: nothing is dirty, so there is no state to
+> flush before it. The open-coded expansion is therefore **priced, not skipped**: the
+> `objdump` cost of both shapes is read in this round and the inline expansion becomes a
+> round-3 item with a measured saving in front of it rather than an assumption behind it.
+
+The helper is where the structural fences live, all of them refusals rather than handled
+cases: misalignment bails, an access that crosses a page bails, a `SLOW` verdict bails, an
+ATC miss bails, a non-direct bank bails, and `TTR_NO_WRITE`'s asymmetry (read `XPAR`, write
+`SLOW`) is the resolver's own and is not re-implemented. **G3 is met by construction and is
+checked, not assumed:** the helper's reachable call graph must contain no `__cxa_throw`,
+`__cxa_allocate_exception`, `_Unwind_RaiseException` and no `TRY` block — which is exactly
+why it declines instead of translating.
+
+**Block shape.** A block ends at the first uncovered opcode (`WARP_DECLINE`), at a control
+transfer per the block-shape rules, at the §2e write-back-family exclusions, and at a page
+boundary. Every exit — normal or bail — stores the guest PC and returns the number of guest
+instructions **fully retired**, which is a compile-time constant at every exit site. The
+no-empty-pass invariant is unchanged and its pass-consuming arm, absent by design in round 1,
+lands here.
+
+**One behavioural property that changes, declared before it is measured.** With a block
+consuming a pass, `do_specialties()` runs once per **block** instead of once per
+**instruction**, so interrupt *recognition* is deferred by up to `L` guest instructions.
+The interrupt *pump* is not affected — the cadence feed still advances the service counter by
+retired instructions and polls once per crossing (Q10, frozen, and M-7 still bites). At the
+pre-registered `L` below, the deferral is under ten guest instructions against a pump tick of
+`256 × service_cadence`. Trace stays excluded at the entry gate, so no trace exception can be
+owed by a block.
+
+### 0.8.4 The round-2 gates, with their predictions
+
+Every one of these is a prediction made before the measurement exists.
+
+| gate | prediction |
+|---|---|
+| **G-R2.1 harness** | green (`0 failed`) in all three variants. New `CHECK`s: **+120 … +400** in the default variant, the **same** number in lean, lean+prof gaining a further **+10 … +60** counter-only checks. Baseline is 3 250 / 3 246 / 3 473 |
+| **G-R2.2 disarmed object equivalence** | per-function normalised-disassembly diff of the **lean** `Z3660_emu.elf` against `b16967d`: **≤ 25 functions changed**, and every changed function on the WARP path, `m68k_run_mmu040`, `z3660_knobs_sync` or `z3660_dopc_invalidate`, plus LTO churn named individually. `m68k_run_mmu040` grows **+40 … +160 bytes** from its round-1 2 324 |
+| **G-R2.3 lockstep identity** | `WARP_DIVERGE == 0` over `WARP_LS_INSNS ≥ 10⁸`, with the armed arm **executing the emitted ARM words** (§0.8.5), and the two arms' final register file, flags, `instruction_pc`, `mmufixup`, `mmu_restart` and guest memory byte-identical. A single divergence is a stop, not a statistic |
+| **G-R2.4 counter identities** | `DOPC_HIT + DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS` **exact** in both arms — and now with `WARP_ENTER > 0`, which is the first round in which that correction is load-bearing rather than vacuous. `FAULTS(on) == FAULTS(off)` **exact** on the deterministic host corpus. `sum(IV_*) − IV_WRAP == DOPC_INVAL` unchanged. `WARP_INSNS == WARP_CINSNS`-weighted block lengths reconcile. `BLK_*` identical between arms (Q8: the JIT declines rung-0 PCs) |
+| **G-R2.5 fault injection** | across every covered family, a fault made reachable at a mid-block faultable site must produce a **bail**, never a fault inside generated code: `FAULTS` equal between arms, and at the fault boundary all sixteen registers, the guest PC, `instruction_pc`, the CCR + X, `mmu_restart` and `mmufixup[0..1]` **byte-identical** to the interpreted arm. Predicted: **0 faults taken inside a block, in every injection case** |
+| **G-R2.6 mutation arms** | each **caught**, and each shown to be caught in the log rather than merely asserted. Round 1's five (**M-5**, **M-7**, **M-ICACHE**, **M-ARM**, **M-REPUB**) still bite, plus: **M-3** state-sync omitted at one faultable site; **M-4** the `mmufixup` invariant not asserted at block head; **M-8** the bail arm writes back one class of state and not another; **M-CONFLICT** the round-1 lookup geometry restored; **M-XFER** the discovery gate fires at every PC; **M-FENCE** the helper's misalignment/page-cross fence removed; **M-VERDICT** the verdict table's decline arm made permissive; and **one wrong-flag mutation per covered family** (`MOVE` test-flags, `ADD` carry, `SUB`/`CMP` carry-inversion, `Bcc` condition, `DBcc` counter) |
+| **G-R2.7 images** | the three shipping images rebuilt with the compiler present, CRCs recorded, the archive firing for each. `BOOT-q2probe.BIN` is **not** rebuilt |
+| **G-R2.8 entry cost, from the lean `objdump`** | the **disarmed** gate costs **3** ARM instructions per guest instruction (round 1: 5). The **armed** steady-state path costs **26 … 38** ARM instructions **per BLOCK** (round 1: 60 per *guest instruction*), and the armed non-target dispatch — the discovery gate that does not enter a block — costs **3 … 6** |
+| **G-R2.9 the state-sync contract (§0.5.4)** | on-path state-sync per faultable site: **0** emitted instructions. Bail-arm materialisation: **2 … 4** instructions. Emitted stores per bail (`WARP_BAIL_ST / WARP_BAIL`): **1 … 2** — which **misses §0.5.4's pre-registered 3 … 8 low**, and the miss is predicted here rather than explained afterwards |
+| **G-R2.10 the lookup fix** | on the host conflict corpus, `WARP_COMPILE` **== the number of distinct block heads, exactly** — zero recompiles for a head set the table can hold, across a text span ≥ 64 KiB that the round-1 geometry folds into 2 KiB. `WARP_EVICT == 0` on that corpus, and **> 0** under M-CONFLICT |
+| **G-R2.11 block length** | `WARP_INSNS / WARP_BLK` = **2.0 … 4.5** guest instructions per block on the harness corpora. §0.5.3 pre-registered `L` = 4 – 8 for a *fully covered* engine; generation one excludes `MOVEQ`, `(An)+`/`-(An)`, `BSR` and every memory-destination ALU shape, so its blocks are shorter and saying so now is what stops the shortfall from being read as a defect later |
+| **G-R2.12 cadence** | the §0.6 invariant re-verified with **multi-instruction** blocks feeding real retired counts: 41 retired instructions at cadence 4 poll exactly **10** times, whether they arrive as one block, as several, or interleaved with interpreted passes; and the counter's phase survives every boundary |
+
+### 0.8.5 The harness executes the emitted words, and what that does and does not close
+
+Round 1's honest limit (§3.2, §0.6.6 item 2) was that the host harness *"cannot execute one
+instruction of ARM codegen"*, so it proved the decisions and asserted the emitted words
+byte-exactly without running them. With real code generation that limit stops being
+acceptable: a wrong emitted word is now a wrong *result*, not a wrong constant.
+
+**Round 2 therefore builds an ARM-subset executor into the harness** — a decoder and
+interpreter for exactly the instruction forms the emitter produces, executing the **same
+bytes** the target executes, against the **same** `regs` structure and the **same** helpers.
+Generated code addresses everything through one base register pointing at a small environment
+block (the register-file base and the helper pointers), so the emitted words are
+pointer-width-independent and a 64-bit host runs the identical stream.
+
+**What this closes:** the semantics of every emitted sequence, on the real bytes, under the
+lockstep oracle, at 10⁸ boundaries, before any metal time.
+
+**What it does not close, stated in the same breath:** the executor is a *second
+implementation of ARM*, so a shared misreading of the architecture is invisible to it — which
+is why each form is additionally asserted against a hand-decoded golden word. And nothing
+about the **silicon** is proven by it: I-cache publication, the Q3 barrier sequence, memory
+ordering and the behaviour of generated code at volume are proven **on target and only on
+target**, exactly as before. The platform caveat rides unchanged: adding barriers is not
+evidence of a fix; only a soak on metal is.
+
+### 0.8.6 Round 2's band, derived from the measured inputs
+
+**Coverage.** §0.5.3's pre-registered `c` = **0.19 – 0.62** stands unchanged: round 2 builds
+exactly the scope §0.5.3's six factors were derived over, and re-deriving coverage after
+seeing round 1's counters would be re-scoping. §0.5.3's own finding rides with it and is
+restated so it cannot later look like an excuse: **the 60 % bar sits at the very top of that
+band, so generation one is more likely than not to engage below it, M1 was planned as
+M1 + M1a from the start, and the perf verdict is taken at the first wave whose coverage is in
+band.** A round-2 coverage row below 60 % is **not a verdict in either direction** (§0.5.2).
+
+**Block length.** `L` = **2.0 … 4.5** (G-R2.11), against §0.5.3's 4 – 8 for a full engine.
+
+**Entry cost.** `E` = **26 … 38** ARM instructions per block (G-R2.8), at the **measured**
+IPC 0.46 → **2.17 cycles per ARM instruction** on this path.
+
+**The conversion, chained versus hidden, per §30's pricing law.** The removal side is
+§0.5.3's, unchanged and not re-derived — `t` = **3.65 % … 25.01 %** of the disarmed baseline,
+built per bucket with each bucket's return fraction `ρ` stated (`DOPCFIND` **chained** at
+0.80–1.00; `LOOPRES` **mixed** at 0.50–0.80; `FETCHOP`+`FETCHEX` **measured hidden** at
+0.00–0.50, never charged in full; `TAILPOLL` at `1 − 4/L`; `TAILSPEC` 1.00). §0.5.3 said the
+cost side *"is unquantified and it is subtracted from this band, not added to it"*. Round 1
+quantified it, so round 2 subtracts it:
+
+```
+   cost per user-mode guest instruction, in cycles
+      entry   =  c x (E / L) x 2.17
+      gate    =  (1 - c) x 4 x 2.17        the armed non-target discovery test
+   against the disarmed 214.2 cycles per guest instruction
+
+   LOW CORNER   c = 0.19, L = 2.0, E = 38   ->  entry 7.84 + gate 7.03 = 14.9 cy = 6.95 %
+                removal t = 3.65 %
+                net = 1 / (1 - 0.0365 + 0.0695)  =  0.97x
+
+   HIGH CORNER  c = 0.62, L = 4.5, E = 26   ->  entry 7.77 + gate 3.30 = 11.1 cy = 5.18 %
+                removal t = 25.01 %
+                net = 1 / (1 - 0.2501 + 0.0518) =  1.25x
+```
+
+> ### Round 2's band for armed dhry c4: **0.97× – 1.25×** of the clean reference `R`, i.e. **dhry ≈ 7 910 – 10 190** against `R` = 8 174. (derived, on §0.5.3's six coverage factors and five `ρ`, plus `L` and `E` pre-registered above and IPC 0.46 measured)
+
+**Three things must be said beside it or it is a target chosen after the result:**
+
+- **The floor is below the kill threshold, and that is the honest shape of this experiment.**
+  0.97× is dhry ≈ 7 910 against a same-session threshold that would sit near 8 231
+  (`R × 1.007`) and the standing absolute floor of 8 242. §0.5.3's floor was already *"within
+  a couple of hundred dhrystones of the line"*; subtracting the measured cost side puts the
+  bottom corner **under** it. **That does not make round 2 a kill — the kill line needs a
+  same-session pair and round 2 takes no metal row.** It makes the verdict session's outcome
+  genuinely open, which is what a pre-registration is for.
+- **§1.5's full-engine band 1.25× – 1.55× is quoted beside every M1 row and is not the bar**
+  (§0.5.2). Round 2's high corner touches its bottom.
+- **The downside case is a null and it has a precedent on this rig.** Rung 3 engaged at
+  91.10 % coverage, made its bucket 23 % cheaper per instruction, hit or beat every premise it
+  declared, moved the wall clock −0.05 %, and came out the same day.
+
+### 0.8.7 The other pre-registered targets
+
+| target | pre-registered value |
+|---|---|
+| **disarm penalty** | **−0.9 % … −2.0 %** of `R`, dhry **8 011 … 8 100** — and the falsifiable half of it is the gate's instruction count, **3** (round 1: 5, measured −2.276 % at the expensive edge of its band). Round 2's requirement is *strictly better than −2.276 %* |
+| **recompile ratio** | `WARP_COMPILE / WARP_BLK` **≤ 0.5 %** (round 1: 5.68 %) |
+| **recompile attribution** | `(WARP_COMPILE − first-compiles − WARP_DISC − WARP_EVICT − flush losses) / WARP_COMPILE` **≤ 0.05** — i.e. at least 95 % of every recompile is attributable to a **named** cause. Round 1's unattributed share was **95.2 %** |
+| **conflict term on the host corpus** | `WARP_EVICT == 0` clean, **> 0** under M-CONFLICT (G-R2.10) |
+| **coverage** | `c` = **0.19 – 0.62** (§0.5.3, unchanged), read as `WARP_INSNS / ((INSNS − WARP_ENTER) + WARP_INSNS)`, with the M1a prediction restated: **below the 60 % bar is the more likely outcome and is not a verdict** |
+| **`WARP_INSNS` / `WARP_BLK`** | **2.0 … 4.5** |
+| **eviction** | the `WARP_FLUSH` path exercised at least once in the harness, against round 1's untested 0 — a 73 %-full arena in a 34 s window is *"not yet", not "never"* |
+| **Q5 condition 2** | the compile-cycles-per-block micro-benchmark is a **cycle bracket on target, deliberately not a capture** (§0.5.6) and there is no card in this round. It is **pre-registered for the verdict session** and Q5 stays *"first condition met, second unmeasured"* |
+| **Q6** | `WARP_CFETCH` becomes non-zero for the first time — the compiler reads guest instruction words. Its decision rule (`WARP_CFETCH × 42 ≥ 20 %` of measured compile-path cycles) needs the same micro-benchmark and is likewise **deferred to the verdict session** |
+
+### 0.8.8 What round 2 explicitly does not establish
+
+1. **Anything about speed on this machine.** Round 2 takes no metal row. Every number it
+   produces is a static count, a host-harness count or a derivation.
+2. **That the emitted sequence is correct on the silicon.** The harness now executes the
+   emitted words (§0.8.5), which closes their semantics and closes nothing about I-cache
+   publication, barriers or ordering. That stays on target and only on target.
+3. **Anything about faults or demand paging under load.** G-R2.5 injects faults at faultable
+   sites and proves the bail; dhrystone and the harness corpora are *"the workload least
+   likely to trip"* the paging path. **M2 is still the first honest test.**
+4. **Anything about the supervisor-heavy story.** Generation one is user-mode only.
+5. **That the cadence contract is unmoved on metal.** G-R2.12 asserts it by construction and
+   in the harness with real retired counts; the behavioural proof remains M3's PSTAT gap
+   fingerprint against the card-1/piscsi class at 1 177 – 1 402 µs.
+6. **That the ~42 µs compile budget holds.** It is measured per block, on target, in a
+   micro-benchmark that this round does not run.
+7. **That the A2 core0 reset wedge (§ MATRIX A2) has anything to do with WARP.** It is
+   separately owned and it cost the round-1 session no row.
+
 
 ---
 
