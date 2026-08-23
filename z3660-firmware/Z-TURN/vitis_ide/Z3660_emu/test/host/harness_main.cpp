@@ -6250,9 +6250,16 @@ static void test_dopc_counters(void)
 		 * IV_WRAP COMES OUT, for the same reason z3660_prof.cpp takes it out: it is in
 		 * the block but is not a request -- the wrap arm raises it from INSIDE the
 		 * invalidation another cause asked for, so it adds to the sum without adding to
-		 * DOPC_INVAL. Written as `req - wr` rather than asserted against a wrap-free
-		 * window, because a window that happens to contain no wrap would make the
-		 * subtraction untested and the identity accidentally true. */
+		 * DOPC_INVAL.
+		 *
+		 * ONE WRAP IS DRIVEN INTO THE WINDOW ON PURPOSE, through a real call site, so
+		 * the subtraction is LOAD-BEARING. A window that happened to contain no wrap
+		 * would leave `- wr` untested and the identity accidentally true -- and an
+		 * identity nobody can make fail is not evidence. Dropping the term must break
+		 * this check, and with the wrap here it does. */
+		z3660_dopc_force_generation(0xFFFFFFFFu);
+		dopc_m_dma();
+
 		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
 			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
 		iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
