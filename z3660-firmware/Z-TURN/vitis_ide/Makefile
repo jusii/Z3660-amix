@@ -57,6 +57,27 @@ LEAN_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-lean.BIN
 PROF_BIF      := Z3660_system/Alfa/system_cli_prof.bif
 PROF_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-prof.BIN
 
+# THE ARCHIVE. Every image this Makefile produces is also copied here, CRC-stamped, e.g.
+# archive/BOOT-lean-86C0BC18.BIN. Gitignored (Z3660_system/.gitignore ignores /Alfa/*).
+#
+# Each variant is written to a FIXED filename, so building a new one DESTROYS the image it
+# is about to be judged against. 2026-08-23: the rung-3 rebuild overwrote BOOT-lean.BIN and
+# crc DEC21748 -- the reference arm of that day's A/B, still on the card -- existed nowhere
+# on the host afterwards, so the verdict session could not flash the revert it had just
+# decided. One `cp` per build removes the entire class.
+#
+# Unconditional and dumb on purpose: the CRC is the identity, so a rebuild that changes
+# nothing costs one redundant copy of the same bytes, and a rebuild that changes something
+# keeps both. Pruning is a human decision about disk, never the build's.
+ARCHIVE_DIR   := Z3660_system/Alfa/sd_card/archive
+CRC32         := python3 -c 'import sys,zlib; print("%08X" % (zlib.crc32(open(sys.argv[1],"rb").read()) & 0xffffffff))'
+
+define archive_image
+@mkdir -p $(ARCHIVE_DIR)
+@crc=`$(CRC32) $(1)`; dst=$(ARCHIVE_DIR)/`basename $(1) .BIN`-$$crc.BIN; \
+ cp -p $(1) $$dst; echo "archived -> $$dst"
+endef
+
 # Component directories
 FSBL_DIR      := design_1_wrapper/zynq_fsbl
 Z3660_DIR     := Z3660
@@ -134,6 +155,7 @@ bootbin: bootbin_prepare
 	@echo "Generating BOOT.BIN (DDR $(DDR_SPEED)MHz)"
 	$(BOOTGEN_EXE_HOST) $(BIF) $(BOOTBIN)
 	@echo "BOOT.BIN -> $(BOOTBIN)"
+	$(call archive_image,$(BOOTBIN))
 
 # `make lean` -> sd_card/BOOT-lean.BIN, the production image. Core0 and the FSBL are the
 # same binaries the default image uses; only core1 differs. Does NOT touch BOOT.BIN.
@@ -145,6 +167,7 @@ lean: lean_prepare
 	@echo "Generating BOOT-lean.BIN (DDR $(DDR_SPEED)MHz, run-loop diagnostics compiled out)"
 	$(BOOTGEN_EXE_HOST) $(LEAN_BIF) $(LEAN_BOOTBIN)
 	@echo "BOOT-lean.BIN -> $(LEAN_BOOTBIN)"
+	$(call archive_image,$(LEAN_BOOTBIN))
 
 # `make profile` -> sd_card/BOOT-prof.BIN. Core0 and the FSBL are the same binaries the
 # other two images use; only core1 differs. Does NOT touch BOOT.BIN or BOOT-lean.BIN.
@@ -156,6 +179,7 @@ profile: profile_prepare
 	@echo "Generating BOOT-prof.BIN (DDR $(DDR_SPEED)MHz, lean loop + interpreter profiler)"
 	$(BOOTGEN_EXE_HOST) $(PROF_BIF) $(PROF_BOOTBIN)
 	@echo "BOOT-prof.BIN -> $(PROF_BOOTBIN)"
+	$(call archive_image,$(PROF_BOOTBIN))
 
 version:
 	python3 Z3660_system/make_version_alfa.py

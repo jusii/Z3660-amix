@@ -37,7 +37,9 @@
 > predicates — compiled out; and `make profile` gives **`BOOT-prof.BIN`**, the lean image plus an
 > interpreter profiler (a wall-clock guest-PC sampler and per-stage ARM cycle attribution). The
 > profiling image is a measuring instrument, not a production one — it costs measured time to run.
-> Details in **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
+> Every build also drops a CRC-stamped copy of its image in `sd_card/archive/` (untracked), so a
+> rebuild never destroys the image you are comparing against. Details in
+> **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
 >
 > ### Running AMIX
 > Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image** placed

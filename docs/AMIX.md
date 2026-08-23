@@ -412,6 +412,22 @@ Three operating rules, all learned from that session and all in `docs/profiler.m
   three C1 workload captures wrapped and profiled the idle loop that followed the benchmark.
 - **`PSTAT` off before any long dump** — see the runtime-toggle section below.
 
+#### Every build archives its image — `sd_card/archive/`
+
+Each variant is written to a **fixed** filename, so building the next one overwrites the last.
+That is a trap whenever a build is being *judged*: on 2026-08-23 a rebuild overwrote
+`BOOT-lean.BIN`, and `crc32 DEC21748` — the reference arm the day's A/B was measured against,
+still live on the card — existed nowhere on the host afterwards, so the session could not flash
+the revert it had just decided.
+
+So `make bootbin`, `make lean` and `make profile` each end by copying their image, CRC-stamped,
+into **`Z3660_system/Alfa/sd_card/archive/`** (`BOOT-lean-86C0BC18.BIN` and so on). The step is
+unconditional and needs `python3` on the build host (the docker image has it); the CRC is
+`zlib crc32`, the same one the boot menu's `CRC` command prints, so an archived name can be
+matched against a card without recomputing anything. The directory is untracked — everything
+under `Alfa/` except the three `.bif` descriptors is a build artefact — and is never pruned by
+the build: deleting old images is a human decision about disk.
+
 ### `isoN <file>` — CD-ROM images (upstream's key, with a trap)
 
 `isoN` is upstream's, not this fork's, and it replaced the fork's own `cdrom_units` key during the
