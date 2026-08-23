@@ -320,3 +320,189 @@ the card, and it must never be the production image.
 5. **It does not license the mode for anything but this measurement.** A clean dhrystone row
    says the small resident workload survived. It says nothing about paging, and nothing about
    the disk.
+
+---
+
+# THE METAL VERDICT — 2026-08-23: **`f` = 0.0787, NOT FUNDED, STRUCK**
+
+> Everything above this line is the pre-registration. **Nothing above it has been edited**,
+> which is the only reason the scorecard below is worth reading. This section is the row.
+
+Session 2026-08-23 17:27–18:37 EEST, A4000 + Z3660 metal, preset 7 (`amix_ram 128`,
+`service_cadence 4`), armed arms on a **work copy** of the installed 040 root. Four boots,
+three flashes (prof `2530C3F4`, lean `E663B44A`, close-out back to `DEC21748`), six CRC
+gates passed, serial span 290 079 bytes captured with **zero drops**.
+
+> ## `f` = **0.0787** · wall clock = **+0.00 %** median / **+0.15 %** mean
+> ## → **NOT FUNDED.** The physical-index decoded-op cache design round is **STRUCK**.
+
+| clause | required | measured | verdict |
+|---|---|---|---|
+| `f` ≥ 0.35 | 0.35 | **0.0787** | **MISS by 4.4×** |
+| wall clock ≥ ~1.5 % → dhry ≥ 8308 | 8308 | **8173** | **MISS**; the gate needed +135, it moved **+0** |
+
+## `f`, from the two arms it is defined on
+
+Arms **C1** (prof, unarmed) and **D1** (prof, armed), **same boot**, same instrument state
+(stage buckets off in both), each `PROFZ`-fenced around one dhrystone run at a **pinned
+100 000 count**:
+
+```
+   C1 disarmed   DOPC_HIT 61 996 672   DOPC_MISS 2 341 153   miss_rate = 0.03638844
+   D1 ARMED      DOPC_HIT 62 174 023   DOPC_MISS 2 156 677   miss_rate = 0.03352485
+
+   f = (0.03638844 - 0.03352485) / 0.03638844  =  0.0787
+```
+
+`T*` **re-derived at the measured `f`**, as this document requires rather than quoted from
+the table above:
+
+```
+   T* = f/(1-f) x S = 0.0854 x (166.6 .. 178.7) = 14.2 .. 15.3 cyc
+```
+
+against the standing bar of **93 – 99 cyc** at the calibrated `f` = 0.357. **And it is an
+upper bound**, exactly as pre-registered: a no-op invalidates a superset of what a physical
+index would, so a real index achieves `f' ≤ 0.0787` and inherits `T*' ≤ 15.3 cyc`. A design
+that prepends a translation to every fill starts an order of magnitude above its own budget.
+
+## Which reading rule fires
+
+**Row 2 — `f` < 0.35 → NULL, and it is a STRIKE-shaped null.** Record `f`, strike the study
+from the ladder, and **do not re-measure at a different band**: `f` is a ratio of two hit
+rates in one boot and carries no band.
+
+Row 4 (`wall clock ≥ 1.5 % but f < 0.35 → INVALID`) **did not fire** — the wall clock missed
+too. Row 3 did not fire either. The two instruments are different (hit-rate counters on the
+prof image, dhrystone wall clock on the lean one, different boots) and they agree on both the
+sign and the size of the null, which is the strongest form this negative could take. The
+"too good to be true" guard also stayed silent: the armed row is 8173, nowhere near the 8563
+this document named in advance as equally suspicious.
+
+## The rows
+
+| arm | image | median | mean | spread | n |
+|---|---|---|---|---|---|
+| **R0** rig continuity | `DEC21748`, installed root | 8163 | 8164.8 | 0.28 % | 5 |
+| **R** reference | `DEC21748`, work copy | **8185** | 8178.4 | 0.56 % | 5 |
+| **A** lean disarmed | `E663B44A` | 8173 | 8157.8 | 0.70 % | 5 |
+| **B** lean **ARMED** | `E663B44A` | **8173** | 8169.6 | 0.13 % | 5 |
+| **A′** return leg | `E663B44A` | 8174 | 8174.3 | 0.04 % | 3 |
+
+```
+   disarm penalty       A / R  - 1 = -0.147 %  median   (-0.252 % mean)
+   SAME-BOOT RESPONSE   B / A  - 1 = +0.000 %  median   (+0.145 % mean)   <<< THE GATE
+   return leg          A' / A  - 1 = +0.012 %  median
+```
+
+The §30.3 step-3 prediction is **checked, not assumed**: the disarm penalty was priced in
+advance at < 0.01 % of wall clock and measured −0.147 %, inside the ±0.5 % band — so the
+same-boot B/A number is usable directly and no fallback to reporting B against R was needed.
+R lands on **8185 exactly**, so this session's live reference and the pre-registered 8308
+gate line coincide. The return leg reproduces arm A to +0.012 %, so the disarm did invalidate
+and step 6's "the whole session is suspect" condition did not fire.
+
+## The expected-direction table — **15 PASS, 2 NOTE, 0 MISS**
+
+Every **gated** row moved the way it was written to move, months of reasoning ago. The
+identity rows are exact rather than approximate:
+
+```
+   sum(IV_*) - IV_SUPPRESSED == DOPC_INVAL
+       disarmed   5741 -    0 = 5741 == 5741      the standing identity's special case
+       ARMED      5738 - 2676 = 3062 == 3062      the standing identity, broken by design
+   IV_SUPPRESSED == IV_FLUSH        2676 == 2676  exact, window armed throughout
+   DOPC_HIT + DOPC_MISS == INSNS + FAULTS         exact, BOTH arms
+   DOPCFIND spans == DOPC_HIT + DOPC_MISS         exact, BOTH arms
+   DOPCFILL spans -6.55 % vs DOPC_MISS -6.55 %    the independent cross-check, 2 dp
+```
+
+`IV_FLUSH` moved **+0.04 %** — §37.1's refuting form, used deliberately: a counter above the
+skipped branch cannot move, and did not. `DOPC_MISS` fell **7.88 %**; that is the
+measurement. The two NOTE rows were both declared not-gates in advance:
+
+* **D11**, and it is the one pre-registered direction metal refutes — the **unbanded half**.
+  `FETCH` fell 3.25 % while `IPAGE_HIT`/`IPAGE_MISS` did not move (+0.011 % / +0.013 %). The
+  mechanism is in the ratio: `IPAGE_HIT+MISS` is 6.98 M against 13.80 M fetches, **one lookup
+  per two fetches**, so the ipage cache is not consulted per fetch on this path and the
+  fetches the suppression removed were the ones reusing an already-resolved page. The
+  **ratio** — the half this document put a ±0.2 pp band on — moved −0.0001 pp and is inside
+  it. Scored as the document scores it: a note, not a failure.
+* **D14**, `TRANSITIONS` −0.41 %, direction right.
+
+**D9 is a PASS with a recorded overshoot.** §37.1 prices a miss at exactly two real fetches a
+hit does not pay; metal says **2.43**, 21 % above prediction. Recorded rather than rounded
+away — it is a small upward correction to the prize side of any future dopc sizing, and it
+makes this null slightly *worse* for the design, not better: each removed miss is worth a
+little more than assumed and there are still far too few of them.
+
+**D5 was first scored MISS by the session's own scorer, and the scorer was the artefact.** A
+bare >2 % rule flagged `IV_DMA` 6 → 4 — two DMA invalidations on a base of six, a count at
+which "unchanged" is not a measurable claim. Rescored on a rule *stated* rather than tuned
+(|Δ| ≤ 1 % **or** |Δ| ≤ 5 counts): all nine causes unchanged. The row's other half — "each
+still **performs**" — is directly checkable and checks out: in the armed arm the non-flush
+causes sum to **3062** and `DOPC_INVAL` is **3062**.
+
+## The correctness gate — **PASSED, and not degraded**
+
+Every measurement window ran `dhry` directly at a pinned 100 000 runs, because one checked
+variable's correct value *is* `Number_Of_Runs + 10` and a differential diff is meaningless at
+a varying count.
+
+| capture | absolute check | differential |
+|---|---|---|
+| C1 / C2 prof disarmed | 20 checked, **0 wrong** | C2 == C1, byte-identical |
+| **D1 / D2 prof ARMED** | 20 checked, **0 wrong** | **== C1 / C2, byte-identical** |
+| A lean disarmed | 20 checked, **0 wrong** | — |
+| **B lean ARMED** | 20 checked, **0 wrong** | **== A, byte-identical** |
+| A′ return leg | 20 checked, **0 wrong** | == A, byte-identical |
+
+All seven are additionally **byte-identical to the `DEC21748` reference block** taken on boot
+0, before any IVSUP image existed. No wrong value, no wild branch, no wild write, no
+filesystem error, no panic, no bus error in either armed window.
+
+**Armedness is attested, not assumed.** Every prof capture carries the profiler's own banner
+and a non-zero `IV_SUPPRESSED`; the lean image has no profiler at all and is attested by
+core1's per-boot confession on disarm — **122 823 invalidation(s) suppressed** in the lean
+armed window (13 382 on the prof boot). The decision to compile the confession counter into
+*every* variant is what made arm B attestable.
+
+**And that licenses nothing.** §38.6 pre-empted the wrong conclusion and it stands: dhrystone
+is small and resident and is the workload least likely to trip the mode. The highest-risk
+guest path is demand paging and nothing paging-heavy was run armed, deliberately. A clean row
+here says the measurement is valid; it says nothing about the mode. The build must never
+ship, and it is off the card. It also means the session bought **no** bound on how much of
+`IV_FLUSH` is genuinely load-bearing — this document offers that as the consolation reading
+if the guest misbehaves, and the guest did not.
+
+## The error chain, recorded rather than smoothed over
+
+| carried at | by | value |
+|---|---|---|
+| §24.4 | `IV_FLUSH`'s share of invalidation traffic, i.e. an assumed response slope of 1.0 | **0.5096** |
+| §38.4 | that row's *own* calibration point (0.70 misses removed per invalidation removed) | **0.357** |
+| **metal** | measured, upper-bounded, two agreeing instruments | **0.0787** |
+
+The response slope is not 1.0 and not 0.70: it is **0.154**. This document opened by saying
+*"that is the same shape of error the `HANDLER` round just paid a full metal session for"* —
+which was correct, and understated. §38.4's three named reasons the 0.70 might be generous (a
+physical index *narrows* rather than removes; `IV_FLUSH`'s locality need not resemble
+`IV_CACR_SKIP`'s; one calibration point is one point) all bit in the same direction, exactly
+as pre-registered.
+
+**The instrument is not what failed. The prize is not there.** That distinction is the whole
+value of having written the direction table down in advance — a null with a broken instrument
+and a null with a working one are different findings, and this one is provably the second.
+
+## What this closes, and what it does not
+
+**Closes:** §38.6 item 1. `f` is measured, it is an upper bound, and the physical-index
+design round is struck from the ladder.
+
+**Does not close, and must not be read as closing:** the design's **cost site** (`T` was
+charged at zero by construction; §38.6 item 2 — the cost site must pay only on a miss that
+was going to walk anyway, *shown in the disassembly* — is the gate any successor design
+inherits); §38.2's inherited assumption that a decoded-op hit pays no opcode fetch (with `f`
+this small the wall clock had no signal to carry either way); §38.5's miss-rate confound (`f`
+is immune, the ceiling in *percent* derived from it is not, and is not quoted here); and any
+licence whatsoever for the IVSUP mode.
