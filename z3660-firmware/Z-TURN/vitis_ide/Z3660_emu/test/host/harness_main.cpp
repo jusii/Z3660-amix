@@ -2912,7 +2912,27 @@ static void test_prof_wire_format(void)
 	      "names line up with ids (DOPC_HIT, the C2 rung-1 append)\n");
 	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_INVAL], "DOPC_INVAL") == 0,
 	      "names line up with ids (DOPC_INVAL)\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   28, "28 counters");
+
+	/* C2 rung 1b: the invalidation-attribution block, ids 28..37, one per
+	 * Z3660_DOPC_INV_* cause. Both ends are pinned and so is the ORDER, because
+	 * z3660_dopc_count_cause() indexes this block arithmetically -- BASE + cause -- so an
+	 * id that drifts out of cause order would file every invalidation under its
+	 * neighbour's name and nothing would fail. */
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_BASE,    28, "IV block starts at 28");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_FLUSH,   28 + Z3660_DOPC_INV_FLUSH,   "IV_FLUSH at BASE+FLUSH");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_ROOT,    28 + Z3660_DOPC_INV_ROOT,    "IV_ROOT at BASE+ROOT");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_DMA,     28 + Z3660_DOPC_INV_DMA,     "IV_DMA at BASE+DMA");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_TABLE,   28 + Z3660_DOPC_INV_TABLE,   "IV_TABLE at BASE+TABLE");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_KNOB,    28 + Z3660_DOPC_INV_KNOB,    "IV_KNOB at BASE+KNOB");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_WRAP,    28 + Z3660_DOPC_INV_WRAP,    "IV_WRAP at BASE+WRAP");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_MAP,     28 + Z3660_DOPC_INV_MAP,     "IV_MAP at BASE+MAP");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_PFLUSH,  28 + Z3660_DOPC_INV_PFLUSH,  "IV_PFLUSH at BASE+PFLUSH");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_PFLUSHA, 28 + Z3660_DOPC_INV_PFLUSHA, "IV_PFLUSHA at BASE+PFLUSHA");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_DOPC_IV_CACR,    28 + Z3660_DOPC_INV_CACR,    "IV_CACR at BASE+CACR");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_DOPC_IV_PFLUSH], "IV_PFLUSH") == 0,
+	      "names line up with ids (IV_PFLUSH, the one narrowed cause)\n");
+	CHECK_EQ32((uae_u32)Z3660_DOPC_INV_COUNT, 10, "ten invalidation causes");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   38, "38 counters");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -3032,6 +3052,35 @@ static void test_prof_bucket_arithmetic(void)
 	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 6,
 	           "every transition is counted, so probe overhead is subtractable");
 
+	/* CYBERSTORM C2 rung 1b -- PER-BUCKET TRANSITION SPANS.
+	 *
+	 * The aggregate above makes the probe subtractable from the TOTAL; it has never been
+	 * subtractable per bucket, and the 2026-08-23 verdict paid for that by having to
+	 * report LOOP -- the largest bucket in the capture, at 23.78 % raw -- as an interval
+	 * rather than a number. The right divisor for a bucket is the number of SPANS charged
+	 * to it, which is what this array counts, and this fixture is where that is pinned
+	 * against literal values instead of against a running clock.
+	 *
+	 * Read the fixture above and the counts fall out: LOOP is left twice (at 1010 and at
+	 * 1115), HANDLER is left twice (once to enter READ, once to exit), READ once and TAIL
+	 * once. Six charges for six transitions -- the identity, and the reason the per-bucket
+	 * correction and the global one cannot disagree. */
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_LOOP],    2, "LOOP was charged twice");
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_HANDLER], 2,
+	           "HANDLER twice -- entering a nested stage closes a span just as exiting does, "
+	           "which is exactly why one probe per CALL would be the wrong divisor");
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_READ],    1, "READ once");
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_TAIL],    1, "TAIL once");
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_XLATE],   0,
+	           "a bucket that never ran is charged nothing");
+	{
+		uae_u64 spans = 0; int i;
+		for (i = 0; i < Z3660_PROF_B_COUNT; i++) spans += z3660_prof_tcnt[i];
+		CHECK_EQ32((uae_u32)spans, (uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS],
+		           "THE IDENTITY: sum(per-bucket spans) == TRANSITIONS, so the per-bucket "
+		           "subtraction decomposes the global one exactly");
+	}
+
 	/* The 32-bit cycle counter wraps every ~6.4 s at 666 MHz. Modular subtraction has to
 	 * make that a non-event, or every bucket total is garbage a few seconds into a run. */
 	z3660_prof_zero();
@@ -3050,6 +3099,13 @@ static void test_prof_bucket_arithmetic(void)
 	prof_clock(600); z3660_prof_unwound();
 	CHECK_EQ32((uae_u32)z3660_prof_acc[Z3660_PROF_B_FAULT], 100,
 	           "the abandoned span is charged to FAULT, not silently lost");
+	/* C2 rung 1b: cycles, but NO span. An unwind is not a probe transition and has never
+	 * been in TRANSITIONS, so counting it per bucket would make the two corrections
+	 * disagree. The consequence is that FAULT is reported uncorrected; asserted here so
+	 * that it is a documented property rather than a discovered one. */
+	CHECK_EQ32((uae_u32)z3660_prof_tcnt[Z3660_PROF_B_FAULT], 0,
+	           "...and charged NO span, so FAULT reads uncorrected and the sum identity "
+	           "with TRANSITIONS survives an unwind");
 	CHECK_EQ32((uae_u32)z3660_prof_sp, 0, "and the stack is back at the floor");
 	CHECK_EQ32((uae_u32)z3660_prof_cur, (uae_u32)Z3660_PROF_B_LOOP, "...running LOOP again");
 
@@ -4786,6 +4842,7 @@ static void test_dopc_coherence(void)
 	dopc_coh_one(dopc_m_cpushl,    2u, "CPUSHL / CINV (flush_mmu040) invalidates");
 	dopc_coh_one(dopc_m_pflush_pg, 2u, "PFLUSH of one page invalidates");
 	dopc_coh_one(dopc_m_pflush_all,2u, "PFLUSHA invalidates");
+
 	dopc_coh_one(dopc_m_settc,     2u, "a TC write (MOVEC to TC -> mmu_set_tc) invalidates");
 	dopc_coh_one(dopc_m_urp,       2u, "MOVEC to URP -- an MMU ROOT change -- invalidates");
 	dopc_coh_one(dopc_m_srp,       2u, "MOVEC to SRP invalidates");
@@ -5061,14 +5118,48 @@ static void test_dopc_counters(void)
 	      "every fetch the uncached run made is accounted for: still fetched, served "
 	      "from a slot, or supplied by a hit\n");
 
-	/* Invalidation is counted, and the count is what decides whether the conservative
-	 * whole-cache policy is worth narrowing. */
+	/* ---- INVALIDATION ATTRIBUTION (C2 rung 1b) --------------------------------------
+	 *
+	 * DOPC_INVAL says how high the invalidation rate is; it has never said WHAT is driving
+	 * it, and the 2026-08-23 verdict needed exactly that -- it could establish that the
+	 * misses were invalidation re-warm but not which flush was causing them, so it could
+	 * not say which narrowing was worth the correctness risk. One counter per cause.
+	 *
+	 * The block is indexed arithmetically (BASE + cause), so what is pinned here is that
+	 * each cause lands in ITS OWN counter and that the block totals the aggregate. A cause
+	 * filed under its neighbour's name would fail nothing otherwise. */
 	{
-		uae_u64 n0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		uae_u64 v0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		uae_u64 f0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH];
+		uae_u64 d0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA];
+		uae_u64 p0 = z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_PFLUSH];
+		uae_u64 req = 0, iv;
+		int c;
+
 		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
 		z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
-		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - n0), 2u,
-		           "DOPC_INVAL counts invalidations, whatever the cause");
+		z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSH);
+
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_FLUSH] - f0), 1u,
+		           "IV_FLUSH counts the CPUSHL arm and only that");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_DMA] - d0), 1u,
+		           "IV_DMA counts the DMA arm and only that");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_PFLUSH] - p0), 1u,
+		           "IV_PFLUSH counts the per-page flush -- the cause that was summed into "
+		           "the aggregate FLUSH before and could not be seen");
+		CHECK_EQ32((uae_u32)(z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL] - v0), 3u,
+		           "DOPC_INVAL still counts invalidations, whatever the cause");
+
+		/* THE SUM IDENTITY. Every invalidation performed is attributed to exactly one
+		 * cause, so the block sums to the aggregate. It is the check that would catch a
+		 * call site bypassing the attribution, or a cause id out of range landing outside
+		 * the block and silently incrementing a neighbour. */
+		for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
+			req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
+		iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+		CHECK(req == iv,
+		      "sum(IV_*) == DOPC_INVAL: every invalidation is attributed to exactly one "
+		      "cause (%llu vs %llu)\n", (unsigned long long)req, (unsigned long long)iv);
 	}
 
 	z3660_prof_zero();

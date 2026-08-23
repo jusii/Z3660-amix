@@ -1489,6 +1489,12 @@ void REGPARAM2 mmu_op_real(uae_u32 opcode, uae_u16 extra)
 	}
 }
 
+/* CYBERSTORM C2 rung 1b: the upstream half of mmu_flush_cache(), which the two ATC
+ * flushes below keep while attaching their own decoded-op-cache policy. Defined with
+ * mmu_flush_cache() further down, where it belongs; declared here because the callers
+ * come first in this file. */
+static void mmu_flush_icache_only(void);
+
 // fixme : global parameter?
 void REGPARAM2 mmu_flush_atc(uaecptr addr, bool super, bool global)
 {
@@ -1511,7 +1517,13 @@ void REGPARAM2 mmu_flush_atc(uaecptr addr, bool super, bool global)
 		}
 	}	
 	flush_shortcut_cache(addr, super);
-	mmu_flush_cache();
+	mmu_flush_icache_only();
+	/* CYBERSTORM C2 rung 1b. PFLUSH of one page gets its OWN cause id, split out of the
+	 * aggregate FLUSH: it is the only invalidation cause that names a guest LOGICAL page --
+	 * the namespace this cache tags in -- and therefore the only one that could ever be
+	 * narrowed by address. Whether that is worth doing is what the counter is for. Whole
+	 * cache for now, exactly as before. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSH);
 }
 
 void REGPARAM2 mmu_flush_atc_all(bool global)
@@ -1528,7 +1540,14 @@ void REGPARAM2 mmu_flush_atc_all(bool global)
 		}
 	}
 	flush_shortcut_cache(0xffffffff, 0);
-	mmu_flush_cache();
+	mmu_flush_icache_only();
+	/* CYBERSTORM C2 rung 1b. PFLUSHA names no page, so there is nothing to narrow by --
+	 * whole cache, exactly as before. It gets its own cause id only so the attribution can
+	 * separate it from the per-page form, which is the row that decides whether the
+	 * narrowing above was worth making. mmu_set_tc() and mmu_reset() arrive here too, and
+	 * a TC change is genuinely global: it can change the page size under the filter's feet,
+	 * and a whole-cache invalidation clears the filter with the entries. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_PFLUSHA);
 }
 
 void REGPARAM2 mmu_set_funcs(void)
@@ -1653,12 +1672,22 @@ void REGPARAM2 mmu_set_super(bool super)
 	mmu_is_super = super ? 0x80000000 : 0;
 }
 
-void REGPARAM2 mmu_flush_cache(void)
+/* CYBERSTORM C2 rung 1b. The upstream half of mmu_flush_cache(), factored out so the
+ * three callers below can keep it while attaching DIFFERENT decoded-op-cache policies --
+ * PFLUSH names a logical page and is narrowable, CPUSHL and PFLUSHA are not. Upstream's
+ * body is reproduced here verbatim rather than restructured, so an upstream resync
+ * touching the icache clear lands in one obvious place. */
+static void mmu_flush_icache_only(void)
 {
 #if MMU_ICACHE
 	int len = sizeof(mmu_icache_data);
 	memset(&mmu_icache_data, 0xff, sizeof(mmu_icache_data));
 #endif
+}
+
+void REGPARAM2 mmu_flush_cache(void)
+{
+	mmu_flush_icache_only();
 	/* CYBERSTORM C2 rung 1. THIS is the 68040 core's instruction-cache flush point, and
 	 * it always was -- upstream clears its own (compiled-out) icache right here. So the
 	 * decoded-op cache joins it, and by doing so it inherits the architecture's own
@@ -1675,7 +1704,13 @@ void REGPARAM2 mmu_flush_cache(void)
 	 *
 	 * Note the rung 0 interaction the map calls out: the block-idiom fast path collapses
 	 * that whole CPUSHL loop into ONE flush_mmu040(), and one is all that has to arrive
-	 * here, because the flush is idempotent and the cache invalidation is whole-cache. */
+	 * here, because the flush is idempotent and the cache invalidation is whole-cache.
+	 *
+	 * RUNG 1b gave the two ATC callers their own causes and their own policy, so what
+	 * still arrives HERE is CPUSHL / CINV -- plus anything upstream adds later, which is
+	 * the property worth keeping. A new upstream caller of mmu_flush_cache() inherits the
+	 * whole-cache invalidation automatically; it has to be opted OUT of, never into. That
+	 * is the safe default for the one class of bug this cache can produce. */
 	z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
 }
 

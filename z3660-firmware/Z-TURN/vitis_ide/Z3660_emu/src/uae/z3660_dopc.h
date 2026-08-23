@@ -42,8 +42,7 @@
  * eagerly is merely slower, one that invalidates too little executes instructions the
  * guest has already overwritten -- a working system that goes wrong hours later. So this
  * one INVALIDATES EVERYTHING on any event that could plausibly matter, which is O(1) here
- * because validity is a generation stamp rather than a state per entry. Narrowing it is a
- * later change, and the DOPC_INVAL counter is what will say whether it is worth making.
+ * because validity is a generation stamp rather than a state per entry.
  *
  * WHAT COUNTS AS "COULD PLAUSIBLY MATTER" is enumerated at z3660_dopc_invalidate() in
  * newcpu.cpp, and the DMA arm is the one that is specific to this board rather than to
@@ -137,15 +136,32 @@ static inline unsigned z3660_dopc_resolve(unsigned requested)
 #define Z3660_DOPC_M_EXT0   0x02u   /* ext0 holds the instruction word at pc + 2           */
 
 /* ---- Invalidation causes ----------------------------------------------------------
- * Reported as one counter today; the split exists so the narrowing step has somewhere to
- * put its evidence without renumbering anything. APPEND-ONLY. */
-#define Z3660_DOPC_INV_FLUSH  0   /* CPUSHL / CINV / PFLUSH / TC write / MMU reset      */
-#define Z3660_DOPC_INV_ROOT   1   /* MOVEC to URP / SRP / CACR: address space or caches */
-#define Z3660_DOPC_INV_DMA    2   /* core0 wrote guest DRAM (piscsi / floppy read)      */
-#define Z3660_DOPC_INV_TABLE  3   /* cpufunctbl rebuilt: every cached handler is stale   */
-#define Z3660_DOPC_INV_KNOB   4   /* the switch moved                                    */
-#define Z3660_DOPC_INV_WRAP   5   /* the generation counter wrapped (see the memset)     */
-#define Z3660_DOPC_INV_MAP    6   /* the emulator's own memory map changed               */
+ * ONE COUNTER PER CAUSE from rung 1b (Z3660_PROF_C_DOPC_IV_*, ids 28..37), because
+ * "narrow the invalidation" is not a single decision -- each cause has its own frequency,
+ * its own address namespace and its own correctness argument, and the aggregate
+ * DOPC_INVAL cannot tell them apart. Measure, then narrow.
+ *
+ * APPEND-ONLY, and ids 0..6 keep their values. Two of them have a NARROWER MEANING than
+ * they did in rung 1, which is the point of the split:
+ *   FLUSH  was CPUSHL + PFLUSH + PFLUSHA + TC;  is now CPUSHL / CINV alone.
+ *   ROOT   was URP + SRP + CACR;                is now URP / SRP alone.
+ * A capture from a rung-1 firmware therefore reports FLUSH and ROOT as sums; the names
+ * in the dump are what distinguishes the two, which is why they are compiled in. */
+#define Z3660_DOPC_INV_FLUSH   0  /* CPUSHL / CINV -- flush_mmu040/060(). PHYSICAL addr  */
+#define Z3660_DOPC_INV_ROOT    1  /* MOVEC to URP / SRP: the address space changed       */
+#define Z3660_DOPC_INV_DMA     2  /* core0 wrote guest DRAM (piscsi / floppy). PHYSICAL  */
+#define Z3660_DOPC_INV_TABLE   3  /* cpufunctbl rebuilt: every cached handler is stale   */
+#define Z3660_DOPC_INV_KNOB    4  /* the switch moved                                    */
+#define Z3660_DOPC_INV_WRAP    5  /* the generation counter wrapped (see the memset)     */
+#define Z3660_DOPC_INV_MAP     6  /* the emulator's own memory map changed               */
+#define Z3660_DOPC_INV_PFLUSH  7  /* PFLUSH of ONE page -- the ONLY cause that names a
+                                   * LOGICAL page, and therefore the only one narrowable
+                                   * against a logically-tagged cache. Split from FLUSH. */
+#define Z3660_DOPC_INV_PFLUSHA 8  /* PFLUSHA, and mmu_set_tc()/mmu_reset() through it    */
+#define Z3660_DOPC_INV_CACR    9  /* MOVEC to CACR. Split from ROOT: it is a cache-enable
+                                   * write, not an address-space change, and AMIX's rate
+                                   * of it was never separately visible.                 */
+#define Z3660_DOPC_INV_COUNT  10
 
 /* ---- The extension-word window -----------------------------------------------------
  *
@@ -177,13 +193,17 @@ extern unsigned short z3660_dopc_ext_val;
 /* Whole-cache invalidation. O(1): it bumps a generation, so "invalidate everything" is
  * affordable enough to be the default policy rather than an admission of defeat. Also
  * disarms the extension-word window. Safe to call from any core1 context, including one
- * that has never touched the 68040 run loop. */
+ * that has never touched the 68040 run loop.
+ *
+ * From rung 1b it also counts the CAUSE, so a capture can say WHICH events are driving the
+ * invalidation rate rather than only how high it is. */
 void z3660_dopc_invalidate(int cause);
 
 /* The DMA arm, called from core1's side of the cross-core mailbox once core0 has written
- * guest DRAM. Takes the range core0 wrote even though today it invalidates everything --
- * the information is what a narrowed invalidation will need, and a call site that never
- * had it cannot grow one later. */
+ * guest DRAM. Takes the range core0 wrote even though it invalidates everything: the
+ * range is a PHYSICAL address and the tags are logical, so it cannot be compared against
+ * them (top of file). The argument stays because a physical index is the natural next
+ * rung and a call site that never carried the range could not grow one later. */
 void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len);
 
 /* Read-back + direct set for the console and the host harness. The setter takes a RAW

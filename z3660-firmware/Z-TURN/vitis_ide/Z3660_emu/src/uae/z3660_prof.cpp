@@ -20,6 +20,7 @@
 #include "newcpu.h"
 #include "../main.h"      /* the cross-core SHARED mailbox (prof_ctl / prof_hz) */
 #include "z3660_prof.h"
+#include "z3660_dopc.h"   /* rung 1b: the cause ids the IV_ counter block is indexed by */
 
 #include <string.h>
 
@@ -40,12 +41,24 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    "DPAGE_WHIT", "DPAGE_WMISS", "XLATE", "XLATE_OK", "ATC_MISS",
    "MISALIGN_R", "MISALIGN_W", "FAULTS", "TRANSITIONS", "STACK_OVF",
    "ATC_HIT", "IFETCH_CALLS", "BLK_HIT", "BLK_INSNS", "BLK_BYTES",
-   "DOPC_HIT", "DOPC_MISS", "DOPC_EXT", "DOPC_INVAL"
+   "DOPC_HIT", "DOPC_MISS", "DOPC_EXT", "DOPC_INVAL",
+   /* rung 1b: one per Z3660_DOPC_INV_* cause, in cause order. */
+   "IV_FLUSH", "IV_ROOT", "IV_DMA", "IV_TABLE", "IV_KNOB",
+   "IV_WRAP", "IV_MAP", "IV_PFLUSH", "IV_PFLUSHA", "IV_CACR"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
 typedef char z3660_prof_counter_names_complete[
    (sizeof(z3660_prof_counter_names)/sizeof(z3660_prof_counter_names[0]) == Z3660_PROF_C_COUNT) ? 1 : -1];
+
+/* CYBERSTORM C2 rung 1b. The invalidation attribution block is indexed BY CAUSE --
+ * z3660_dopc_count_cause() computes Z3660_PROF_C_DOPC_IV_BASE + cause -- so the two
+ * enumerations have to stay the same length and the same order. Nothing would fail
+ * otherwise: a new cause would simply increment whatever counter happens to sit at the
+ * end of the block, and the dump would report a plausible number under the wrong name.
+ * That is the failure this line exists to make impossible. */
+typedef char z3660_prof_iv_block_matches_causes[
+   (Z3660_PROF_C_DOPC_IV_BASE + Z3660_DOPC_INV_COUNT == Z3660_PROF_C_COUNT) ? 1 : -1];
 
 /* The record layout is a wire format shared with a host-side symbolizer, so pin it here
  * rather than trusting that no one ever adds a field. */
@@ -67,6 +80,7 @@ uint32_t z3660_prof_last      = 0;
 int      z3660_prof_sp        = 0;
 uint8_t  z3660_prof_stack[Z3660_PROF_STACK_DEPTH];
 uint64_t z3660_prof_acc[Z3660_PROF_B_COUNT];
+uint64_t z3660_prof_tcnt[Z3660_PROF_B_COUNT];   /* rung 1b: spans charged, per bucket */
 uint64_t z3660_prof_cnt[Z3660_PROF_C_COUNT];
 
 int      z3660_prof_sample_on = 0;
@@ -556,6 +570,7 @@ extern "C" void z3660_prof_init(void)
 extern "C" void z3660_prof_zero(void)
 {
    memset(z3660_prof_acc, 0, sizeof z3660_prof_acc);
+   memset(z3660_prof_tcnt, 0, sizeof z3660_prof_tcnt);
    memset(z3660_prof_cnt, 0, sizeof z3660_prof_cnt);
    z3660_prof_head    = 0;
    z3660_prof_samples = 0;
@@ -721,6 +736,50 @@ extern "C" void z3660_prof_dump_stats(void)
                       "The calibration or the transition count is wrong; do not subtract.\r\n");
    }
 
+   /* CYBERSTORM C2 rung 1b -- the per-bucket subtraction the line above has always asked
+    * the reader to do and never gave them the numbers for. `s` lines carry each bucket's
+    * OWN span count, so its corrected cycles are acc - spans x price exactly, and a
+    * bucket's corrected share stops being an interval. The 2026-08-23 verdict had to
+    * report LOOP as "<= 33.90 % at 32, <= 39.71 % at 43" for want of precisely this.
+    *
+    * Priced at the MARGINAL cost the boot line calibrates (z3660_prof_probecyc), which is
+    * the SAME price the aggregate line above uses -- so the two agree by construction and
+    * `sum(corrected) == corrected total`. The boot line's [marginal, in-bucket] bracket
+    * still applies and still has to be swept by hand: it is a range, and printing one end
+    * of it as if it were the answer is the error this instrument exists to stop. */
+   if (total) {
+      uint64_t spans = 0, ctotal = 0;
+      int neg = 0;
+      for (i = 0; i < Z3660_PROF_B_COUNT; i++) {
+         uint64_t p = z3660_prof_tcnt[i] * (uint64_t)(z3660_prof_probecyc > 0
+                                                      ? z3660_prof_probecyc : 0);
+         spans += z3660_prof_tcnt[i];
+         if (z3660_prof_acc[i] >= p) ctotal += z3660_prof_acc[i] - p; else neg = 1;
+      }
+      z3660_printf("[PROF] === per-bucket spans and the corrected shares "
+                   "(price %d cyc/span; sweep to the boot line's in-bucket figure) ===\r\n",
+                   z3660_prof_probecyc);
+      for (i = 0; i < Z3660_PROF_B_COUNT; i++) {
+         uint64_t p = z3660_prof_tcnt[i] * (uint64_t)(z3660_prof_probecyc > 0
+                                                      ? z3660_prof_probecyc : 0);
+         uint64_t c = (z3660_prof_acc[i] >= p) ? z3660_prof_acc[i] - p : 0;
+         unsigned ip, fp;
+         z3660_prof_pct(c, ctotal, &ip, &fp);
+         z3660_printf("[PROF] s %-2d %-8s spans=%-14s corrected_cyc=%-16s %3u.%02u%%\r\n",
+                      i, z3660_prof_bucket_names[i], z3660_prof_u64(z3660_prof_tcnt[i]),
+                      z3660_prof_u64(c), ip, fp);
+      }
+      z3660_printf("[PROF] s -- corrected_total=%s  spans=%s  (must equal TRANSITIONS "
+                   "%s -- an unwind charges FAULT cycles and no span, so FAULT reads "
+                   "uncorrected)\r\n",
+                   z3660_prof_u64(ctotal), z3660_prof_u64(spans),
+                   z3660_prof_u64(z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS]));
+      if (neg)
+         z3660_printf("[PROF] WARNING: a bucket's modelled probe cost exceeds its measured "
+                      "cycles -- it is clamped to 0 above and the price is too high for "
+                      "that bucket. Do not read the shares.\r\n");
+   }
+
    z3660_printf("[PROF] === counters ===\r\n");
    for (i = 0; i < Z3660_PROF_C_COUNT; i++)
       z3660_printf("[PROF] c %-2d %-12s %s\r\n", i, z3660_prof_counter_names[i],
@@ -773,6 +832,49 @@ extern "C" void z3660_prof_dump_stats(void)
       z3660_prof_pct(su, in, &ip, &fp);
       z3660_printf("[PROF] r supervisor instructions %u.%02u%% of %s\r\n",
                    ip, fp, z3660_prof_u64(in));
+   }
+
+   /* CYBERSTORM C2 rung 1b -- the decoded-op cache's own derived rows, computed here for
+    * the same reason as the ones above: the 2026-08-23 verdict had to work all of these
+    * out by hand from a dump, and one of them it got structurally wrong because the doc
+    * named the wrong test. The right quantity is MISSES PER INVALIDATION against the
+    * working set -- one whole-cache invalidation can cost up to 4096 refills, so
+    * DOPC_INVAL and DOPC_MISS are not commensurable and their ratio means nothing. */
+   {
+      uint64_t hi = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
+      uint64_t mi = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
+      uint64_t iv = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+      uint64_t req = 0;
+      unsigned ip, fp;
+      int c;
+
+      for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
+         req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
+
+      if (hi + mi) {
+         z3660_prof_pct(hi, hi + mi, &ip, &fp);
+         z3660_printf("[PROF] r dopc hit %u.%02u%% of %s dispatches\r\n",
+                      ip, fp, z3660_prof_u64(hi + mi));
+      }
+      if (iv) {
+         /* Whole numbers only -- z3660_prof_pct is a percentage helper and these are
+          * ratios well above 1. Printed as x100 so the fraction survives. */
+         z3660_printf("[PROF] r dopc %s.%02u misses and %s.%02u dispatches per "
+                      "invalidation -- a figure that does NOT track the workload's code "
+                      "footprint is re-warm, not capacity\r\n",
+                      z3660_prof_u64(mi / iv), (unsigned)((mi * 100u / iv) % 100u),
+                      z3660_prof_u64((hi + mi) / iv), (unsigned)(((hi + mi) * 100u / iv) % 100u));
+      }
+      if (req) {
+         z3660_prof_pct(req - iv, req, &ip, &fp);
+         z3660_printf("[PROF] r dopc %s invalidation requests, %s performed, %s skipped "
+                      "(%u.%02u%% narrowed away)\r\n",
+                      z3660_prof_u64(req), z3660_prof_u64(iv), z3660_prof_u64(req - iv),
+                      ip, fp);
+         if (req < iv)
+            z3660_printf("[PROF] r WARNING: more invalidations than requests -- a cause "
+                         "id is out of range or a call site bypasses the attribution\r\n");
+      }
    }
    z3660_printf("[PROF] === end ===\r\n");
 

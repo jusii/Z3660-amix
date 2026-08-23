@@ -76,8 +76,12 @@ int m68k_move2c (int regno, uae_u32 *regp)
 				 * 68040 it carries the instruction- and data-cache enables, and
 				 * uae_mmu040_getc_iword() consults bit 15 directly. A guest that turns
 				 * the instruction cache off has asked for its contents to stop being
-				 * authoritative, so honour that here as well. */
-				z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT);
+				 * authoritative, so honour that here as well.
+				 *
+				 * RUNG 1b gives it its OWN cause id, split out of ROOT: it is a
+				 * cache-enable write rather than an address-space change, and AMIX's
+				 * rate of it was never separately visible. */
+				z3660_dopc_invalidate(Z3660_DOPC_INV_CACR);
 			}
 			break;
 		/* 68040 only */

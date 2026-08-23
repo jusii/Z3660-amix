@@ -5540,28 +5540,50 @@ unsigned int   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
 unsigned short z3660_dopc_ext_val = 0;
 }
 
-extern "C" void z3660_dopc_invalidate(int cause)
+/* The work, separated from the cause counting above it. */
+static void z3660_dopc_do_invalidate(void)
 {
-   (void)cause;
    /* The window came out of an entry, so it dies with the entries. Doing this FIRST
     * matters: a handler that invalidates and then reads its own extension word must get
     * a real fetch, and the ordering here is the only thing that guarantees it. */
    z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+
    if (++z3660_dopc_gen == 0) {
       /* 2^32 invalidations later. Every stamp must be made unequal to the generation we
        * are about to resume at, and zeroing does that for generation 1 -- so this is a
        * real clear and not a wrap that silently revalidates the whole table. */
       memset(z3660_dopc_tab, 0, sizeof z3660_dopc_tab);
       z3660_dopc_gen = 1;
-      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
-      return;
    }
    Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
 }
 
+/* Count the request. Bounds-checked because the alternative to a bad `cause` is a silent
+ * increment of whatever counter follows the block, and a corrupted neighbour is a worse
+ * failure than a lost one -- an out-of-range cause lands on the aggregate instead, where
+ * the sum identity will show it. */
+static __inline__ void z3660_dopc_count_cause(int cause)
+{
+   if ((unsigned)cause < (unsigned)Z3660_DOPC_INV_COUNT)
+      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_BASE + cause);
+}
+
+extern "C" void z3660_dopc_invalidate(int cause)
+{
+   z3660_dopc_count_cause(cause);
+   z3660_dopc_do_invalidate();
+}
+
 /* The DMA arm. Takes the range core0 wrote even though it currently invalidates
  * everything: a narrowed invalidation needs that range, and a call site that never
- * carried it could not grow one later without touching main.cpp again. */
+ * carried it could not grow one later without touching main.cpp again.
+ *
+ * WORTH RECORDING WHILE THE ATTRIBUTION IS GOING IN, because it decides what a narrowing
+ * here could even look like: that range is a guest PHYSICAL address (it is a DMA
+ * descriptor) while every tag in this cache is a guest LOGICAL pc. The host corpus already
+ * shows the two are not comparable -- dopc_m_dma() flushes DOPC_PCODE for an entry tagged
+ * at DOPC_VCODE, so a range test would skip a flush that was required. IV_DMA is what says
+ * whether a physical index would be worth building. */
 extern "C" void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len)
 {
    (void)addr; (void)len;
@@ -5672,6 +5694,7 @@ void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 e
    s->ext0[w]    = ext0;
    s->meta[w]    = (uae_u8)((shape     ? Z3660_DOPC_M_IDIOM : 0u)
                           | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u));
+
    /* The tag LAST. Everything above is dead until this line makes the way findable, so
     * there is no window in which a lookup can see a half-built entry -- which matters
     * because z3660_dopc_fill() can be reached from inside a chunk the fast path is

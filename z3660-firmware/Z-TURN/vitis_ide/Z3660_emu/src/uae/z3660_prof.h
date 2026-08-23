@@ -497,8 +497,35 @@ enum {
    Z3660_PROF_C_DOPC_HIT    = 24, /* decoded-op cache: opcode+decode served from a hit */
    Z3660_PROF_C_DOPC_MISS   = 25, /* ... consulted and not found (the fetch still ran) */
    Z3660_PROF_C_DOPC_EXT    = 26, /* ... extension words served from the entry's slot  */
-   Z3660_PROF_C_DOPC_INVAL  = 27, /* ... whole-cache invalidations, all causes         */
-   Z3660_PROF_C_COUNT       = 28
+   Z3660_PROF_C_DOPC_INVAL  = 27, /* ... whole-cache invalidations that ACTUALLY ran    */
+   /* CYBERSTORM C2 rung 1b -- invalidation attribution. One counter per cause, in
+    * Z3660_DOPC_INV_* order, and they count REQUESTS: every call the guest provokes,
+    * whether or not it moved the generation. So
+    *
+    *     sum(DOPC_IV_*) - DOPC_INVAL   ==  the invalidations the narrowing skipped
+    *
+    * exactly, with no third counter to keep in step. `DOPC_INVAL` keeps its rung-1
+    * meaning ("a whole-cache invalidation happened"), which is what makes a rung-1 dump
+    * and a rung-1b dump comparable on that row.
+    *
+    * They exist because "narrow the invalidation" is not one decision: the verdict
+    * measured 274-292 misses per invalidation and could not say WHICH invalidation, and
+    * a narrowing aimed at the wrong cause is a correctness risk taken for nothing. */
+   Z3660_PROF_C_DOPC_IV_FLUSH   = 28, /* CPUSHL / CINV                                 */
+   Z3660_PROF_C_DOPC_IV_ROOT    = 29, /* MOVEC to URP / SRP                            */
+   Z3660_PROF_C_DOPC_IV_DMA     = 30, /* core0 wrote guest DRAM                        */
+   Z3660_PROF_C_DOPC_IV_TABLE   = 31, /* cpufunctbl rebuilt                            */
+   Z3660_PROF_C_DOPC_IV_KNOB    = 32, /* the switch moved                              */
+   Z3660_PROF_C_DOPC_IV_WRAP    = 33, /* the generation wrapped                        */
+   Z3660_PROF_C_DOPC_IV_MAP     = 34, /* map_banks()                                   */
+   Z3660_PROF_C_DOPC_IV_PFLUSH  = 35, /* PFLUSH of one page -- the narrowed cause      */
+   Z3660_PROF_C_DOPC_IV_PFLUSHA = 36, /* PFLUSHA / TC write / MMU reset                */
+   Z3660_PROF_C_DOPC_IV_CACR    = 37, /* MOVEC to CACR                                 */
+   Z3660_PROF_C_COUNT           = 38,
+   /* The block's base, so the invalidator can index it by cause. The two enumerations
+    * are locked together by a compile-time tripwire in z3660_prof.cpp -- adding a cause
+    * without adding its counter must not silently alias onto its neighbour. */
+   Z3660_PROF_C_DOPC_IV_BASE    = Z3660_PROF_C_DOPC_IV_FLUSH
 };
 
 /* THE THREE `BLK_` COUNTERS ARE THE UTILISATION VERDICT, and they are three rather than
@@ -741,6 +768,35 @@ extern uint8_t  z3660_prof_stack[Z3660_PROF_STACK_DEPTH];
 extern uint64_t z3660_prof_acc[Z3660_PROF_B_COUNT];
 extern uint64_t z3660_prof_cnt[Z3660_PROF_C_COUNT];
 
+/* CYBERSTORM C2 rung 1b -- PER-BUCKET TRANSITION SPANS, the successor to IFETCH_CALLS.
+ *
+ * The dump has always reported the probe's total weight and then told the reader to
+ * "subtract per bucket by its share of transitions" -- while reporting no per-bucket
+ * transition count, so that subtraction was only ever exact for the ifetch bracket, where
+ * IFETCH_CALLS supplies it. The 2026-08-23 verdict hit that wall head-on: LOOP came out
+ * the largest single bucket at 23.78 % raw and its corrected share was reported as an
+ * INTERVAL (<= 33.90 % at 32 cyc, <= 39.71 % at 43) because the number is not computable
+ * from that dump. This array is the missing number.
+ *
+ * WHAT IT COUNTS, precisely, because a probe counter wired to the wrong quantity is worse
+ * than none. Every transition ends one span and begins the next; the span that ends is
+ * charged to z3660_prof_cur, and so is one probe's worth of the probe machinery (the tail
+ * of the probe that opened the span plus the head of the probe that closed it). So the
+ * right per-bucket divisor is the number of SPANS CHARGED TO THAT BUCKET, and this array
+ * is incremented at exactly the sites that do the charging -- one line beside each
+ * z3660_prof_acc[] update, never anywhere else.
+ *
+ * Two identities follow, and both are asserted in the harness rather than hoped for:
+ *
+ *     sum(tcnt) == TRANSITIONS + (unwind recoveries)
+ *     corrected cyc for bucket b == acc[b] - tcnt[b] * probe_cyc
+ *
+ * The second is the whole point: it makes the existing GLOBAL correction (total minus
+ * TRANSITIONS x probe_cyc) decompose exactly, so a bucket's corrected share stops being
+ * an interval and becomes a number -- swept across the [32, 43] price bracket the way the
+ * boot line already instructs. */
+extern uint64_t z3660_prof_tcnt[Z3660_PROF_B_COUNT];
+
 /* Sampler state. */
 extern int      z3660_prof_sample_on;                       /* the PROFS switch          */
 extern uint32_t z3660_prof_deadline;                        /* next tick, in PMU cycles  */
@@ -765,6 +821,7 @@ static __inline__ void z3660_prof_enter(int bucket)
    {
       uint32_t now = z3660_prof_cycles();
       z3660_prof_acc[z3660_prof_cur] += (uint64_t)(uint32_t)(now - z3660_prof_last);
+      z3660_prof_tcnt[z3660_prof_cur]++;   /* rung 1b: the span just charged, per bucket */
       z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS]++;
       if (z3660_prof_sp >= Z3660_PROF_STACK_DEPTH) {
          z3660_prof_cnt[Z3660_PROF_C_STACK_OVF]++;
@@ -782,6 +839,7 @@ static __inline__ void z3660_prof_exit(void)
    {
       uint32_t now = z3660_prof_cycles();
       z3660_prof_acc[z3660_prof_cur] += (uint64_t)(uint32_t)(now - z3660_prof_last);
+      z3660_prof_tcnt[z3660_prof_cur]++;   /* rung 1b: the span just charged, per bucket */
       z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS]++;
       if (z3660_prof_sp > 0)
          z3660_prof_cur = (int)z3660_prof_stack[--z3660_prof_sp];
@@ -798,6 +856,17 @@ static __inline__ void z3660_prof_unwound(void)
    {
       uint32_t now = z3660_prof_cycles();
       z3660_prof_acc[Z3660_PROF_B_FAULT] += (uint64_t)(uint32_t)(now - z3660_prof_last);
+      /* NO tcnt increment here, on purpose. An unwind is not a probe transition and is
+       * deliberately absent from TRANSITIONS too, so counting it per-bucket would make
+       * the per-bucket correction disagree with the global one that has always been
+       * printed -- an instrument that contradicts its own older column is worse than one
+       * that shares its bias. The consequence, stated so nobody has to rediscover it:
+       * FAULT receives cycles and no spans, so it is reported UNCORRECTED. At the 0.06 %
+       * FAULT measures on this interpreter that is a rounding error, and it errs by
+       * over-reporting the bucket rather than under-reporting it.
+       *
+       * It is also why sum(tcnt) == TRANSITIONS holds EXACTLY, which is the identity the
+       * harness checks and the one a reader can check in a dump. */
       z3660_prof_sp  = 0;
       z3660_prof_cur = Z3660_PROF_B_LOOP;
       z3660_prof_last = now;
