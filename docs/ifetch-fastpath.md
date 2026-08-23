@@ -1,5 +1,16 @@
 # The instruction-fetch fast path — CYBERSTORM C2 rung 3
 
+> ## STATUS — BUILT, MEASURED, **REVERTED** (2026-08-23)
+>
+> The rung works and does not pay. On metal it engaged on **91.10 %** of instruction fetches
+> and made the fetch bucket **23 % cheaper per guest instruction**, and the cross-build
+> dhrystone moved **−0.05 %** against a pre-registered **+7.8 – +8.7 %**. The verdict rule
+> fired on both of its clauses and the code came out the same day.
+>
+> The document is kept because the *measurement* is the result. The design is unchanged in
+> git at `3087af9`; what it taught is in **Measured — 2026-08-23** below, and the one
+> transferable rule is **the pricing law** in it.
+
 **What it is.** The 68040 instruction accessors (`uae_mmu040_get_iword` and
 `uae_mmu040_get_ilong`) resolve a guest fetch to a host address inline, with no calls at
 all, and perform the fetch directly when it lands in a plain-RAM bank. Anything else falls
@@ -130,6 +141,11 @@ six accessors across ~10 translation units; rung 3 costs a fifth of that for two
 ---
 
 ## Pre-registered — judge against these
+
+> **Scored on metal 2026-08-23: the headline projection below is MISSED — by 8 pp, to a
+> null.** Everything in this section is left exactly as it was written before the flash. A
+> pre-registration that gets edited after the measurement is not one; the scorecard, the
+> mechanism and the lesson are in **Measured — 2026-08-23**.
 
 ### The projection, and the arithmetic
 
@@ -313,7 +329,168 @@ when the fast path never fired.
 | profiling | 3 384 | **3 699** |
 
 (The other three harness binaries — SCSI CDB, boot-mode and AMIX-RAM — are unaffected at
-34 / 75 / 81.)
+34 / 75 / 81. With the rung reverted the three MMU totals are back at 3 186 / 3 182 / 3 384.)
+
+---
+
+## Measured — 2026-08-23, A4000 + Z3660 metal
+
+Preset 7 (`amix_ram 128`, `service_cadence 4`), installed 040 AMIX rooted on piscsi, lean
+images, every row pre-registered before power-on and the reference row taken in the same
+session. Full scorecard and findings live in the session's `MATRIX.md` / `NOTES.txt`; what
+belongs here is the judgment on *this document's* claims.
+
+| pre-registered | measured | |
+|---|---|---|
+| cross-build lean c4 **+7.8 – +8.7 %** (8824 – 8898) | **−0.05 %** — mean 8193.0 → 8188.7, median 8197 → **8184** | **MISS — hard** |
+| *named possibility*, +13.1 – +14.6 % if rung 2's 1.68× stall recovery repeated | −0.05 % | **MISS** |
+| the `IFAST`-OFF arm sits **3.2 – 3.5 %** below the pre-rung-3 build | **−1.58 %** (8193.0 → 8063.7); switch **+1.55 %** | **MISS** — half the size, right sign, right shape |
+| `cross-build × disarm penalty = same-boot switch` | 0.99947 × 1.01604 = **1.01550**; measured switch ratio **1.01550** | **HIT — exact** |
+| `IFAST_HIT / FETCH` coverage **80 – 90 %** | **91.10 %** (44 345 843 / 48 679 431) | **MISS** — 1.10 pp *above* the band: over-, not under-delivered |
+| `IFAST_XPAR / IFAST_HIT` **85 – 90 %** | **89.23 %** | **HIT** |
+| `IPAGE` rates must not move (±0.1 pp) | **91.63 → 91.62 %** across the switch, same boot | **HIT** |
+| `DFAST_HIT` + dpagecache unmoved, engagement pinned both ways | DFAST coverage 99.10 % with `IFAST` on **and** off; `IFAST_HIT` = 0 with `IFAST` off | **HIT** |
+| the pre-registered failure mode | **it fired**, in its exact signature | — |
+
+**The verdict rule fired on both clauses.** KEEP required the new lean cross-build row to
+exceed the shipping 8185 *and* coverage in band. The row (median of three) is **8184** and
+coverage is **91.10 %**. REVERT.
+
+### The rung did not under-perform its own premises
+
+Every input the projection rests on came in at or better than assumed. That is what makes
+this a finding about the *model* and not about the build.
+
+| premise | this document assumed | measured |
+|---|---|---|
+| `FETCHOP` + `FETCHEX` share of c4 | 18.06 – 19.98 % | **17.82 – 19.78 %** (both swept `[54, 59]`) |
+| fast-pathable shape | 86.6 % | **92.20 %** |
+| the misaligned-longword splitter | 26.9 % of fetch *calls* — 13.4 % of fetches | **15.59 %** — **7.8 %** of fetches |
+| coverage | 80 – 90 % | **91.10 %** |
+| `XPAR` share of served fetches | 85 – 90 % | **89.23 %** |
+| the cut this rung takes out of the bucket | −40.1 % | **−23.0 % per guest instruction** |
+
+Price the shares carefully when checking this: at *this* capture's own calibrated band
+`[39, 50]` the fetch share reads 14.21 – 16.59 % and looks smaller than the premise; at the
+band this document quoted, `[54, 59]`, it reads 17.82 – 19.78 % and matches. The band is a
+property of the boot, not of the workload — see `profiler.md`, bias note 2c.
+
+And the bucket really did shrink. Same-boot `IFAST` switch, prof image, cadence 4, corrected
+cycles **per guest instruction** (the two ~12 s windows are not the same length, so nothing
+raw is compared):
+
+| bucket | `IFAST` on | `IFAST` off | |
+|---|---|---|---|
+| `FETCHOP` | 18.33 | 26.30 | **−30.3 %** |
+| `FETCHEX` | 54.19 | 67.87 | **−20.2 %** |
+| **the pair** | **72.51** | **94.17** | **−23.0 %** |
+| corrected TOTAL | 685.31 | 706.77 | −3.04 % |
+
+The saving is not reabsorbed elsewhere: the fetch pair gives up 21.66 cyc/INSN and the whole
+corrected profile gives up 21.46. **The target was the size assumed, the fast path served
+91 % of it, the bucket got 23 % cheaper — and the wall clock did not move.**
+
+### The null, accounted for exactly
+
+The disarm leg is the control, and it *confirms* this document's instruction counts. What the
+rung ADDS costs what an instruction count says. What it REMOVES returns nothing.
+
+| arm | instructions, `iword` XPAR path | dhry c4 lean |
+|---|---|---|
+| pre-rung-3 (`DEC21748`) | 79 | **8193.0** |
+| rung 3, `IFAST` **off** | 98 (+19) | **8063.7** — −1.58 % |
+| rung 3, `IFAST` **on** | 37 (−42) | **8188.7** — −0.05 % |
+
+The +19 leg delivers **1.60 %** of runtime. Scale that by 42/19 and the armed leg should have
+returned **+3.54 %**, i.e. 8483. It returned zero — a shortfall of 294 dhrystones, 3.6 % of
+the machine.
+
+**The mechanism, and it is the exact inverse of rung 2's finding F3.** The 42 instructions
+removed are a call chain *around* the fetch — out-of-line `mmu_match_ttr_ins`, the indirect
+call through `x_phys_get_iword`, out-of-line `memory_get_word`. Their latency overlaps the
+fetch's own guest-DRAM access, which is the very latency the decoded-op cache exists to hide
+and therefore the thing this machine already has the most slack behind. The 19 instructions
+added are a **serial dependency prepended** to the original path: load `z3660_ifv[top byte]`,
+compare, branch, and only then start the accessor that was going to run anyway. **Nothing
+overlaps a dependency you put in front.**
+
+Rung 2 banked the opposite: *removing a call chain removes stalls an instruction count never
+sees*, and told rung 3 to expect over-delivery. On the data side that held, because the chain
+sat in front of a page-cache lookup the dopc could **not** hide. On the fetch side the same
+removal is worth nothing, because it sat in front of an access the dopc **was** hiding. The
+lesson is not "instruction counts are optimistic" — it is that the same instruction count
+means different things in front of different latencies, and the ladder has now measured both
+signs of it inside one week.
+
+> ### The pricing law, for every rung after this one
+>
+> **A projection from instruction counts must model whether the removed cost was
+> latency-hidden by the surrounding machinery.** Work removed from *beside* a latency returns
+> nothing; work removed from *in front of* one returns its count and more. Work *added* in
+> front of one always costs, at its full count: a prepended serial dependency never overlaps.
+>
+> A profile cannot see the difference, so **a ranking of buckets by size is not a ranking by
+> attackability** — the fetch pair was the largest attackable group on the C2 ladder, was
+> attacked with the technique that paid 25 % on the data side, with better coverage than
+> projected, and paid nothing.
+>
+> The cheap discriminator costs one lean A/B: add the console switch, flash lean, measure both
+> arms in one boot **and take a cross-build reference row**. The switch alone would have
+> reported +1.55 % here and looked like a small win.
+
+### The `DFAST` × `IFAST` 2×2 — perfectly multiplicative, and F6's D-cache candidate is demoted
+
+Means of three dhry c4 runs per cell, one boot, every arm echo-confirmed.
+
+| | `IFAST` off | `IFAST` on | IFAST gain |
+|---|---|---|---|
+| **`DFAST` off** | A **6557.0** | B **6653.7** | **+1.47 %** |
+| **`DFAST` on** | C **8063.7** | D **8188.7** | **+1.55 %** |
+| **DFAST gain** | **+22.98 %** | **+23.07 %** | |
+
+`D×A / (B×C) = 1.00075` → **+0.07 %** interaction, against a pre-registered ±1.5 %. Cell A —
+both rungs disarmed — reads 6539 / 6566 / 6566, and its first run is rung 2's banked
+pre-rung-2 reference (6539.0) to the digit. **The two rungs compose multiplicatively; there is
+no interaction to find.**
+
+That alone does not settle rung 2's open finding F6, and it was said in advance that it would
+not: a disarmed table is still loaded and still compared, so its cache lines are resident in
+every cell. The switch varies whether the table is *believed*, not whether it is *touched*. So
+the same-boot profiler triple was taken as well —
+
+```
+DOPCFIND cyc/dispatch, one boot          @39     @50     @57
+  DFAST on,  IFAST on  (shipping)       88.53   77.53   70.53
+  DFAST on,  IFAST off                  88.83   77.83   70.83
+  DFAST off, IFAST on                   88.98   77.98   70.98     spread 0.63 %
+```
+
+— and neither switch moves it. **What decides F6 is this build's existence.** Rung 3 adds a
+*third* always-hot verdict table (+1 KB `.bss`) and +944 B of `.text` to the same L1D that the
+64 KB decoded-op cache is competing for, so candidate (b) — D-cache pressure from the verdict
+tables — predicts a further rise. At the same pinned price 57: rung 2's 2 KB of tables read
+**70.26**, rung 3's 3 KB read **70.53**, **+0.39 %**. A mechanism that allegedly charged
+15.5 % for the first 2 KB charged nothing for the third. **Candidate (b) is DEMOTED.** F6
+stays open with neither candidate confirmed — and the cross-session pinned price is itself not
+like-for-like, which is the other correction this session sent to `profiler.md`.
+
+### One instrument warning this rung paid for
+
+The corrected `FETCH` share is **inflated by the profiling build itself**, so a fetch-side rung
+sized off it is sized off the instrument. In the prof image every fetch pays
+`Z3660_PROF_ENTER_IFETCH` + `Z3660_PROF_CNT` + `Z3660_PROF_RET` — three out-of-line calls — and
+all three land *inside* `FETCHOP`/`FETCHEX`. The same-boot switch removes 3.97 – 4.52 pp of the
+corrected profile, which at constant IPC is +4.1 – +4.7 %; the lean image measured **+1.55 %**.
+A ~3× over-statement, and the fetch pair is the bucket the instrument inflates most. **Size a
+fetch-side rung with a lean A/B, never with a bucket share.**
+
+### What came out
+
+The `z3660_ifv` table and its resolver, the `IFAST` console command and its mailbox word
+(`SHARED` is 0xF0 bytes again), the two appended counters (`Z3660_PROF_C_COUNT` back to 46) and
+the rung's harness corpus. Rung 2's fast path, the F1 formatter-ring fix and its guard are
+untouched. Nothing here needs re-deriving if a later rung finds a fetch-side cost the dopc is
+*not* hiding: the design is intact at `3087af9`.
 
 ---
 
