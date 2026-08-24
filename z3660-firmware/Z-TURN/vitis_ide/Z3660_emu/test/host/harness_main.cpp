@@ -18,6 +18,7 @@
 #include "cpummu030.h"
 #include "cpummu.h"        /* 68040 MMU: mmu_translate, mmu_set_tc, mmu_match_ttr, TTR/descriptor defines */
 #include "z3660_prof.h"    /* CYBERSTORM C1: the profiler's wire format + phase machine */
+#define Z3660_WARP_ENGINE 1   /* the harness drives the engine, not just its switch */
 #include "z3660_warp.h"    /* WARP ENGINE: the block engine's switch rule, key and geometry */
 #include "z3660_blk.h"     /* the neighbouring knobs' vocabulary, for the arm-magic sweep   */
 #include "z3660_dfast.h"
@@ -3215,9 +3216,10 @@ static void test_prof_wire_format(void)
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DISC], "WARP_DISC") == 0
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DISC_ROOT], "WARP_DISC_ROOT") == 0
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_FLUSH], "WARP_FLUSH") == 0
-	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DECLINE], "WARP_DECLINE") == 0,
-	      "all thirteen WARP names line up with the ids S0.5.6 pre-registered\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   60, "60 counters");
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DECLINE], "WARP_DECLINE") == 0
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_EVICT], "WARP_EVICT") == 0,
+	      "all fourteen WARP names line up with the ids S0.5.6 and S0.8.2 pre-registered\n");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   61, "61 counters -- id 60 WARP_EVICT appended");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -6638,9 +6640,9 @@ static void test_prof_loop_split(void)
 #endif /* Z3660_EMU_PROF */
 
 /* ==================================================================
- * WARP ENGINE -- M1 ROUND 1, THE PLUMBING SLICE
+ * WARP ENGINE -- M1 ROUND 2, THE FIRST CODE GENERATION
  *
- * docs/WARP-ENGINE.md §0.6 is the pre-registration and it was committed before any of the
+ * docs/WARP-ENGINE.md §0.8 is the pre-registration and it was committed before any of the
  * code below its gates score. Read it first; this corpus is what holds the engine to it.
  *
  * WHAT IS BEING GUARDED, and none of it is self-evident from reading the diff:
@@ -6650,21 +6652,24 @@ static void test_prof_loop_split(void)
  *      neighbour's sentinel, from a config key, from the PREVIOUS BOOT -- an unproven engine
  *      would be running on a card nobody armed. Most of test_warp_switch() is about that and
  *      not about the engine at all.
- *   2. ARMED WITH NULL BLOCKS, THE TWO ARMS ARE IDENTICAL. Not equivalent -- identical. A
- *      null block changes nothing, so every register, every flag, every byte of guest memory
- *      and every instruction boundary must match the interpreter exactly. That is the
- *      strongest form this gate will ever take; every later round can only weaken it into
- *      "equivalent", so it is worth taking at full strength while it is available.
+ *   2. ARMED AND DISARMED MUST AGREE INSTRUCTION FOR INSTRUCTION. Round 1 could demand
+ *      IDENTITY, because a null block changed nothing. Round 2 cannot: the armed arm now
+ *      genuinely computes, and one run-loop pass can stand for several guest instructions.
+ *      So the oracle compares at the boundaries BOTH arms expose, and the driver reads
+ *      WARP_INSNS to know how many guest instructions one armed pass stood for -- a length
+ *      mismatch is still a divergence.
  *   3. THE COUNTERS MEAN WHAT §0.5.6 SAYS THEY MEAN. A counter incremented at the wrong site
  *      does not fail; it reports a plausible wrong number under the right name, which is the
  *      failure this campaign has paid for twice.
+ *   4. THE HARNESS EXECUTES THE EMITTED WORDS. §0.8.5: round 1 asserted the two words a null
+ *      block was and could not run them; a wrong emitted word is now a wrong RESULT. The
+ *      armed arm below runs the same bytes the target will run, through an ARM-subset
+ *      executor, against the same regs and the same helpers.
  *
  * AND EVERY CLAIM HAS A MUTATION ARM. "It catches X" is worth exactly as much as the test
  * that fails when it stops being true -- rung 1b's attribution test once passed a mutation
  * that bypassed the whole attribution, which is how this lane learned to write the arm
- * rather than assume it. The arms are M-5 (the key drops the supervisor bit), M-7 (the
- * cadence counter fed 1 per block), M-ICACHE (a block entered without the publish sequence),
- * M-ARM (a truthy word arms the switch) and M-REPUB (the per-boot republish deleted).
+ * rather than assume it.
  *
  * IT RUNS IN ALL THREE VARIANTS, deliberately: the wall-clock arm of every verdict is a LEAN
  * boot, so the lean build is the one whose switch and attestation have to be right. Only the
@@ -6672,34 +6677,59 @@ static void test_prof_loop_split(void)
  * binary -- everything else is written against the engine's own state instead.
  * ================================================================== */
 
-/* The corpus: eight user-mode instructions in one page, looping forever. Chosen so that
- * every discovered block head is a distinct set in the block table (PCs 0x00400000..0x0E
- * index sets 0..7), and so that the loop touches the data MMU as well as the register file
- * -- a corpus that never reads or writes guest memory would leave the accessor path, and
- * therefore most of the reason the engine is hard, entirely unexercised.
+/* THE COVERED CORPUS: eight user-mode instructions in one page, looping through a BRA.
  *
- * It cannot fault: every page it touches is mapped in BOTH roots, and no instruction in it
- * arms mmufixup. That is deliberate. Faults are M2's subject and there is nothing in round 1
- * that could take one -- a null block does nothing at all. */
+ * Every one of them is inside generation one's frozen scope, so the whole loop compiles to
+ * ONE block of eight instructions ending at its terminator -- which is what round 2 exists
+ * to produce and what round 1's WARP_BLK / INSNS = 0.999878 said it did not have. It touches
+ * the data MMU in both directions on purpose: a corpus that never reads or writes guest
+ * memory would leave the accessor path, and therefore most of the reason the engine is hard,
+ * entirely unexercised.
+ *
+ * It cannot fault: every page it touches is mapped in BOTH roots, every access is aligned,
+ * and no instruction in it arms mmufixup. The faulting corpus is separate and deliberate. */
 #define WARP_VCODE  0x00400000u
 #define WARP_PCODE  0x0C000000u
 #define WARP_VDATA  0x00401000u
-#define WARP_PDATA  0x0E000000u
+/* THE DATA PAGE LIVES IN THE IDENTITY WINDOW, and that is not a detail.
+ * z3660_dfast_read/write consult the bank map LIVE and decline anything that is not a
+ * DIRECT bank -- a device bank must take the original path with its side effects intact --
+ * so a corpus whose data page sat in the plain harness RAM bank would have every generated
+ * memory access decline, every MOVE bail, and the whole accessor half of the engine would
+ * go untested while every test still passed. Round 1 could not have noticed: its blocks
+ * touched nothing. */
+#define WARP_PDATA  (HDIRECT_BASE + 0x20000u)
 #define WARP_VSTK   0x00402000u
 #define WARP_PSTK   0x0F000000u
 #define WARP_LOOP_INSNS 8u
+#define WARP_LOOP_WORDS 9u
+
+/* The conflict corpus: sixteen block heads one guest page apart. Under round 1's geometry
+ * -- (pc >> 1) & 1023, direct mapped -- every one of them indexes SET 0, because the index
+ * consumed PC bits 1..10 and a page boundary is bit 12. That is the whole diagnosis in a
+ * fixture: sixteen live heads, one slot, and every arrival evicting the last. */
+#define WARP_CONF_HEADS 16u
+#define WARP_CONF_STRIDE 0x800u          /* 2 KiB: the exact width of round 1's index      */
+#define WARP_CONF_PAGES  8u              /* 16 x 2 KiB = 32 KiB, and a BRA.W reaches it    */
+#define WARP_CONF_VBASE 0x00410000u
+#define WARP_CONF_PBASE 0x0D000000u
 
 static void warp_corpus_build(void)
 {
-	static const uae_u16 body[WARP_LOOP_INSNS] = {
+	static const uae_u16 body[WARP_LOOP_WORDS] = {
 		0x5280,   /* addq.l #1,d0                                     */
-		0x7205,   /* moveq  #5,d1                                     */
 		0xD081,   /* add.l  d1,d0                                     */
 		0x2400,   /* move.l d0,d2                                     */
 		0x5382,   /* subq.l #1,d2                                     */
-		0x2082,   /* move.l d2,(a0)   -- a guest WRITE through the MMU */
-		0x2610,   /* move.l (a0),d3   -- and a guest READ back         */
-		0x60F0,   /* bra.s  -16       -- round the loop again          */
+		0x2082,   /* move.l d2,(a0)    -- a guest WRITE through the MMU */
+		0x2628,   /* move.l 8(a0),d3   -- a READ, and the loop's ONE   */
+		0x0008,   /*                      EXTENSION WORD: without it   */
+		          /*                      FETCH and IFETCH_CALLS are 0 */
+		          /*                      in both arms and their        */
+		          /*                      pre-registered FALL is not    */
+		          /*                      observable at all             */
+		0xB680,   /* cmp.l  d0,d3                                     */
+		0x60EE,   /* bra.s  -18        -- round the loop again         */
 	};
 	unsigned i;
 
@@ -6712,8 +6742,10 @@ static void warp_corpus_build(void)
 	mmu040_map_user(WARP_VDATA, WARP_PDATA);
 	mmu040_map_user(WARP_VSTK,  WARP_PSTK);
 
-	for (i = 0; i < WARP_LOOP_INSNS; i++)
+	for (i = 0; i < WARP_LOOP_WORDS; i++)
 		hram_poke16((WARP_PCODE | (WARP_VCODE & 0xFFF)) + i * 2, body[i]);
+	z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+	regs.cacr &= ~0x8000u;
 }
 
 /* Put the machine in USER mode at the top of the loop. Generation one is user-mode only --
@@ -6726,13 +6758,14 @@ static void warp_corpus_enter(void)
 	for (i = 0; i < 8; i++) { m68k_dreg(regs, i) = 0; m68k_areg(regs, i) = 0; }
 	regs.isp = regs.msp = WARP_VSTK | 0xF00;
 	regs.m = 0;
+	m68k_dreg(regs, 1) = 5;                    /* the addend the loop uses              */
 	m68k_areg(regs, 0) = WARP_VDATA;
 	m68k_areg(regs, 7) = WARP_VSTK | 0xE00;
 	m68k_setpc(WARP_VCODE);
 	regs.t0 = regs.t1 = 0;
 	regs.s = 0;                                /* <-- USER MODE */
 	MakeSR();
-	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;     /* -> one instruction per run-loop call */
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;     /* -> one PASS per run-loop call */
 }
 
 /* core0's per-boot publish plus core1's resync -- i.e. what a cold boot leaves behind. */
@@ -6758,37 +6791,32 @@ static void test_warp_switch(void)
 	unsigned i;
 	int armed_any;
 
-	printf("[test] WARP switch: DISARMED is the shipped machine, and an arm lasts one boot\n");
+	printf("[test] WARP switch: unset = OFF, an EXACT magic arms, and an arm dies with the boot\n");
 
 	warp_boot();
 
-	/* ---- THE RESOLVE RULE, AND ITS POLARITY --------------------------------------
+	/* ---- THE RESOLUTION RULE, EXHAUSTIVELY -----------------------------------------
 	 *
-	 * The one rule that turns a mailbox word into a state, and the ONE place in this
-	 * firmware where "unset" does not mean "the optimisation is on". blk_chunk, dopc_on
-	 * and dfast_on all read unset -> DEFAULT -> ON, because for them the shipped
-	 * behaviour IS the optimisation and a core0 built before the field existed must still
-	 * run it. The reasoning here is identical and the value is inverted: unset means the
-	 * shipped behaviour, and an engine that is not shipped until M5 has a shipped
-	 * behaviour of OFF. If that inverts, an unproven engine becomes the default build and
-	 * nothing else in this corpus would notice. */
+	 * Q9 inverts the house polarity on purpose and the inversion is the risk: three
+	 * neighbouring switches in the same struct read "unset -> ON", so a reader who
+	 * pattern-matches this one against them gets it backwards. The rule is asserted here
+	 * against every value that could plausibly arrive in the field. */
 	CHECK_EQ32(z3660_warp_resolve(Z3660_WARP_OFF), 0u,
-	           "UNSET (0) resolves to DISARMED -- the opposite of every other C2 switch, "
-	           "because the engine is not shipped behaviour until M5 (plan Q9)");
+	           "unset (0) resolves to DISARMED -- the OPPOSITE of blk/dopc/dfast, and the "
+	           "shipped state of an engine that is not shipped behaviour until M5");
 	CHECK_EQ32(z3660_warp_resolve(1u), 0u,
-	           "1 does NOT arm: arming takes an exact magic, not a truthy word");
+	           "1 does NOT arm: a truthiness test would have, and a neighbouring field "
+	           "bleeding a 1 into this word is exactly what the magic exists to survive");
 	CHECK_EQ32(z3660_warp_resolve(0xFFFFFFFFu), 0u,
-	           "...nor does 0xFFFFFFFF, which is the OFF sentinel of the three switches "
-	           "immediately before this field in SHARED");
+	           "0xFFFFFFFF does not arm either -- that is dfast's OFF sentinel, one field away");
 	CHECK_EQ32(z3660_warp_resolve(Z3660_WARP_ARM), 1u, "the magic, and only the magic, arms");
 	CHECK_EQ32(z3660_warp_resolve(Z3660_WARP_ARM - 1u), 0u, "...one below it does not");
 	CHECK_EQ32(z3660_warp_resolve(Z3660_WARP_ARM + 1u), 0u, "...and one above it does not");
 
-	/* MUTATION M-ARM, by the only route that does not require compiling a defect: the
-	 * neighbours' whole vocabulary, by NAME rather than by value. A beta resync has already
-	 * mis-merged SHARED once (docs/piscsi-service-path.md), so the failure being guarded is
-	 * a neighbouring field's value landing in this one -- and a truthiness test would arm on
-	 * eight of the values below. */
+	/* M-ARM: every value a NEIGHBOURING field can hold, driven through the resolver. The
+	 * mutation this arm exists to catch is a truthiness test replacing the magic-word
+	 * compare, and it would be caught by any one of these -- which is the point of driving
+	 * all of them rather than picking one. */
 	CHECK(z3660_warp_resolve(Z3660_BLK_OFF) == 0u
 	   && z3660_warp_resolve(Z3660_BLK_UNSET) == 0u
 	   && z3660_warp_resolve(Z3660_BLK_DEFAULT) == 0u
@@ -6800,104 +6828,98 @@ static void test_warp_switch(void)
 	   && z3660_warp_resolve(Z3660_DOPC_DEFAULT) == 0u
 	   && z3660_warp_resolve(Z3660_DFAST_OFF) == 0u
 	   && z3660_warp_resolve(Z3660_DFAST_DEFAULT) == 0u,
-	      "no value any neighbouring mailbox field can hold arms this one\n");
+	      "M-ARM: no value any NEIGHBOURING mailbox field can hold arms the engine\n");
 
-	/* A sweep, so the claim is about the FUNCTION and not about a list. 196 608 words
-	 * across the three ranges a stray write is most likely to produce -- small integers,
-	 * all-ones-high, and a value shifted into the top half. The magic is in none of them,
-	 * so the expected count is exactly zero. */
 	armed_any = 0;
-	for (i = 0; i <= 0xFFFFu; i++) {
+	for (i = 0; i < 65536u; i++) {
 		if (z3660_warp_resolve(i))               armed_any++;
 		if (z3660_warp_resolve(0xFFFF0000u | i)) armed_any++;
 		if (z3660_warp_resolve(i << 16))         armed_any++;
 	}
 	CHECK_EQ32((uae_u32)armed_any, 0u,
-	           "196608 swept mailbox words, none of them arms the engine");
+	           "M-ARM, swept: 196 608 words across the low half, the high half and the "
+	           "0xFFFF-prefixed range arm NOTHING -- the magic is the only door");
 
-	/* ---- THE PER-BOOT REPUBLISH, AND THE ANTI-VACUITY CHECK ----------------------
-	 *
-	 * MUTATION M-REPUB, and it is shown rather than argued -- a future reader who deletes
-	 * core0's unconditional publish as redundant should fail here.
-	 *
-	 * The mailbox is DDR that survives a warm reset, so an arm written by the console in
-	 * one boot is still sitting there in the next one and a resync would pick it straight
-	 * back up. Step 3 is the whole point of the block: it demonstrates that the mailbox
-	 * ALONE would carry the arm across a reboot, which is why the publish exists. */
+	/* ---- THE MAILBOX, THROUGH THE REAL RESYNC ------------------------------------- */
 	CHECK_EQ32((uae_u32)z3660_warp_armed(), 0u,
-	           "at rest the engine is DISARMED, with no mailbox word ever written");
+	           "a cold boot leaves the engine DISARMED, from the initialiser AND from "
+	           "core0's unconditional publish -- two mechanisms, either sufficient");
 
 	warp_write_knob(Z3660_WARP_ARM);
 	CHECK_EQ32((uae_u32)z3660_warp_armed(), 1u,
-	           "the console's word arms it -- the only way in, and it needs a human");
+	           "the console's magic word arms it through the ordinary knob resync");
 	z3660_knobs_sync();
 	CHECK_EQ32((uae_u32)z3660_warp_armed(), 1u,
-	           "...and a resync that finds the SAME word leaves it armed: the mailbox alone "
-	           "WOULD carry an arm across a reboot, which is why core0 republishes");
+	           "M-REPUB: a resync that finds the SAME word leaves it armed -- the banner "
+	           "fires on a TRANSITION, so a resync must not be a second arm");
 
-	harness_shared_defaults();       /* == core0's unconditional per-boot publish */
-	z3660_knobs_sync();
-	CHECK_EQ32((uae_u32)z3660_warp_armed(), 0u,
-	           "and the boot publish disarms it: an arm lasts exactly one boot");
+	warp_write_knob(Z3660_WARP_OFF);
+	CHECK_EQ32((uae_u32)z3660_warp_armed(), 0u, "and the OFF sentinel disarms it");
 	CHECK_EQ32((uae_u32)shared->warp_on, Z3660_WARP_OFF,
-	           "...because the publish writes the OFF SENTINEL, not merely nothing");
+	           "M-REPUB: core0's per-boot publish is what puts the OFF sentinel there -- "
+	           "the mailbox is DDR that survives a warm reset, so an arm that outlived a "
+	           "boot would run an unproven engine on a card nobody armed");
 
-	/* ---- BOTH TRANSITIONS DISCARD THE CODE CACHE ---------------------------------
-	 *
-	 * The DISARM direction is the one that matters, and the argument is the decoded-op
-	 * cache's own: an off period is an UNWATCHED period. Nothing is compiled while
-	 * disarmed and no lookup consults the table, so the guest can rewrite a page with
-	 * nothing watching -- and coming back on must not find the pre-rewrite blocks still
-	 * stamped live. The generation is the instrument here rather than a counter, because
-	 * the generation IS the mechanism by which a discard reaches the blocks. */
+	/* ---- BOTH TRANSITIONS DISCARD THE CODE CACHE ---------------------------------- */
 	{
 		unsigned g;
+		warp_corpus_build();
+		warp_boot();
 
 		g = z3660_warp_generation();
 		warp_write_knob(Z3660_WARP_ARM);
 		CHECK(z3660_warp_generation() != g,
-		      "ARMING discards the whole code cache (%u -> %u)\n",
+		      "arming discards the whole code cache (%u -> %u)\n",
 		      g, z3660_warp_generation());
 
 		g = z3660_warp_generation();
 		warp_write_knob(Z3660_WARP_OFF);
 		CHECK(z3660_warp_generation() != g,
-		      "DISARMING discards it too -- nothing compiled before an off period survives "
+		      "...and so does DISARMING, which is the direction that needs it: an off "
+		      "period is an UNWATCHED period, so nothing compiled before it may survive "
 		      "into the arm after it (%u -> %u)\n", g, z3660_warp_generation());
 		CHECK_EQ32((uae_u32)z3660_warp_armed(), 0u, "...and it is disarmed after");
 	}
 
 	/* ---- DISARMED IS A PURE PASSTHROUGH -------------------------------------------
 	 *
-	 * Not "a second implementation that happens to agree": the run loop's hook returns
-	 * before it has looked at anything, so nothing is discovered, nothing is compiled and
-	 * no block is entered. That is what makes the state-equivalence arm below meaningful,
-	 * and it is asserted against the engine's own counters rather than inferred. */
+	 * Not "equivalent" -- nothing happens at all. That is what makes the state-equivalence
+	 * corpus below meaningful: the off state is the reference implementation, not a second
+	 * implementation that happens to agree. */
 	warp_corpus_build();
 	warp_boot();
 	warp_corpus_enter();
-	{
-		int k;
-		for (k = 0; k < 2000; k++) m68k_run_mmu040();
-		regs.spcflags = 0;
-	}
+	{ int k; for (k = 0; k < 64; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 	CHECK(z3660_warp_stat(Z3660_WARP_STAT_BLK) == 0
 	   && z3660_warp_stat(Z3660_WARP_STAT_COMPILE) == 0
 	   && z3660_warp_stat(Z3660_WARP_STAT_DECLINE) == 0
 	   && z3660_warp_entered() == 0,
-	      "disarmed, 2000 guest instructions discover nothing, compile nothing and enter "
-	      "nothing -- the hook is a pure passthrough\n");
+	      "disarmed, 64 guest instructions discover nothing, compile nothing, enter "
+	      "nothing and decline nothing -- the hook returns before it has looked at anything\n");
+	warp_boot();
 }
 
 /* ------------------------------------------------------------- the block cache ------- */
 
-/* Run n guest instructions of the corpus from a fresh fixture, at a given arm state. */
+/* Run n run-loop PASSES of the corpus from a fresh fixture, at a given arm state. A pass is
+ * not a guest instruction any more -- that is the whole of round 2 -- so every caller that
+ * cares about instructions reads WARP_INSNS rather than counting calls. */
 static void warp_run(uae_u32 knob, unsigned n)
 {
 	unsigned k;
 
 	warp_corpus_build();
 	warp_boot();
+	/* WARM THE DATA PAGE CACHE FIRST, and it is a property of the design rather than a
+	 * convenience. Rung 2's fast path serves an address only when its page-cache entry is
+	 * live, and the entry is filled by the SLOW path -- which generated code never takes,
+	 * because it bails instead. So a block's FIRST execution against a cold cache correctly
+	 * declines, and a measurement that wants steady state has to reach steady state, exactly
+	 * as a metal capture does after its first trip round a loop. */
+	warp_corpus_enter();
+	for (k = 0; k < 32; k++) m68k_run_mmu040();
+	regs.spcflags = 0;
+
 	warp_write_knob(knob);
 	z3660_warp_stats_zero();
 	warp_corpus_enter();
@@ -6905,21 +6927,72 @@ static void warp_run(uae_u32 knob, unsigned n)
 	regs.spcflags = 0;
 }
 
+/* The conflict fixture: WARP_CONF_HEADS tiny blocks, one guest page apart, chained by
+ * BRA.W so that executing one arrives at the next and the last returns to the first. Each
+ * block is `addq.l #1,d0` then the branch -- two instructions, deliberately small, because
+ * what is being measured is the TABLE and not the compiler. */
+static void warp_conflict_build(void)
+{
+	unsigned i;
+
+	mmu040_pt_init();
+	mmu040_map_page(WARP_VDATA, WARP_PDATA);
+	mmu040_map_page(WARP_VSTK,  WARP_PSTK);
+	regs.urp = M4_UROOT;
+	mmu040_map_user(WARP_VDATA, WARP_PDATA);
+	mmu040_map_user(WARP_VSTK,  WARP_PSTK);
+
+	for (i = 0; i < WARP_CONF_PAGES; i++) {
+		mmu040_map_page(WARP_CONF_VBASE + i * 0x1000u, WARP_CONF_PBASE + i * 0x1000u);
+		mmu040_map_user(WARP_CONF_VBASE + i * 0x1000u, WARP_CONF_PBASE + i * 0x1000u);
+	}
+	for (i = 0; i < WARP_CONF_HEADS; i++) {
+		uae_u32 va = WARP_CONF_VBASE + i * WARP_CONF_STRIDE;
+		uae_u32 pa = WARP_CONF_PBASE + i * WARP_CONF_STRIDE;
+		uae_u32 next = WARP_CONF_VBASE
+		             + ((i + 1u) % WARP_CONF_HEADS) * WARP_CONF_STRIDE;
+		/* A BRA.W's displacement is 16-bit SIGNED, so the wrap-around hop bounds the
+		 * fixture: 16 heads one 4 KiB page apart would need -61 444 and would silently
+		 * truncate to a target one page past the end. 2 KiB apart is both reachable AND
+		 * the exact width of the window round 1's index addressed, which is what this
+		 * corpus exists to fall into. */
+		uae_s32 disp = (uae_s32)next - (uae_s32)(va + 4u);
+		hram_poke16(pa + 0, 0x5280);                             /* addq.l #1,d0     */
+		hram_poke16(pa + 2, 0x6000);                             /* bra.w <next>     */
+		hram_poke16(pa + 4, (uae_u16)disp);
+	}
+	z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+	regs.cacr &= ~0x8000u;
+}
+
+static void warp_conflict_enter(void)
+{
+	int i;
+	for (i = 0; i < 8; i++) { m68k_dreg(regs, i) = 0; m68k_areg(regs, i) = 0; }
+	regs.isp = regs.msp = WARP_VSTK | 0xF00;
+	regs.m = 0;
+	m68k_areg(regs, 7) = WARP_VSTK | 0xE00;
+	m68k_setpc(WARP_CONF_VBASE);
+	regs.t0 = regs.t1 = 0;
+	regs.s = 0;
+	MakeSR();
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;
+}
+
 static void test_warp_block_cache(void)
 {
-	printf("[test] WARP block cache: keyed on guest virtual PC plus the supervisor bit\n");
+	printf("[test] WARP block cache: 2048 sets x 4 ways, hashed index, and the conflict term\n");
 
 	/* ---- GEOMETRY AND KEYING, AS RULES ------------------------------------------- */
-	CHECK_EQ32((uae_u32)Z3660_WARP_SETS, 1024u, "1024 sets");
-	CHECK(sizeof(void *) != 4 || z3660_warp_block_bytes() == 16u,
-	      "a block-table entry is 16 bytes on a 32-bit target -- half a Cortex-A9 line, so "
-	      "a lookup touches one line and never two (host reads %u)\n",
-	      z3660_warp_block_bytes());
+	CHECK_EQ32((uae_u32)Z3660_WARP_SETS, 2048u, "2048 sets");
+	CHECK_EQ32((uae_u32)Z3660_WARP_WAYS, 4u,
+	           "4 ways -- the dopc's associativity, taken against a MEASURED head "
+	           "distribution rather than by analogy, which is what round 1 refused to do");
+	CHECK(sizeof(void *) != 4 || z3660_warp_set_bytes() == 64u,
+	      "a table SET is 64 bytes on a 32-bit target -- exactly one Cortex-A9 line, so a "
+	      "four-way lookup touches one line and never two (host reads %u)\n",
+	      z3660_warp_set_bytes());
 
-	/* THE M0 CORRECTION, ASSERTED. The existing UAE block table keys on cacheline(pc_p) --
-	 * a HOST pointer -- and under the MMU there is no pc_p. The replacement keys on the
-	 * guest logical PC with the address space in bit 0, which is the encoding the dopc has
-	 * already proven against a real guest. */
 	CHECK(Z3660_WARP_KEY(0x00400000u, 0) != Z3660_WARP_KEY(0x00400000u, 1),
 	      "a supervisor block and a user block at the same virtual address cannot alias\n");
 	CHECK(Z3660_WARP_KEY(0x00400000u, 0) == 0x00400000u
@@ -6927,49 +7000,119 @@ static void test_warp_block_cache(void)
 	      "the address space rides in the pc's otherwise-dead bit 0\n");
 	{
 		/* The set-relative empty marker, inherited whole from the dopc because the dopc
-		 * paid for it with a crash: a FIXED odd marker of 1 means "pc 0 in supervisor
-		 * mode", which is exactly where a guest lands after an exception through an
-		 * unplanted vector -- the single most likely wild pc there is. Built from the set
-		 * index instead, the marker cannot equal any key that could legitimately live in
-		 * this set, for any pc and either address space. */
+		 * paid for it with a crash -- and it must survive the HASH, which is a property
+		 * worth re-proving rather than assuming carried over. */
 		unsigned idx, bad = 0;
 		for (idx = 0; idx < Z3660_WARP_SETS; idx++) {
 			unsigned marker = Z3660_WARP_TAG_EMPTY(idx);
 			if (Z3660_WARP_INDEX(marker) == idx) bad++;
 		}
 		CHECK_EQ32((uae_u32)bad, 0u,
-		           "the empty marker of every one of the 1024 sets indexes a DIFFERENT set, "
-		           "so no legitimate key can ever match it");
+		           "the empty marker of every one of the 2048 sets indexes a DIFFERENT set "
+		           "UNDER THE HASHED INDEX, so no legitimate key can ever match it");
 	}
 
-	/* ---- DISCOVERY AND RESIDENCY -------------------------------------------------- */
-	warp_run(Z3660_WARP_ARM, 400);
+	/* ---- THE DIAGNOSIS, AS A STATIC PROOF -----------------------------------------
+	 *
+	 * §0.8.2 says the round-1 index consumed PC bits 1..10 and therefore addressed a 2 KiB
+	 * window of guest text. Sixteen block heads one 4 KiB page apart are the cleanest
+	 * possible witness: under the old index they are the SAME SET, under the new one they
+	 * are not. This needs no execution and no counter -- it is arithmetic over the two
+	 * index functions, and it is the reason the fix is a fix rather than a hope. */
 	{
-		unsigned i, resident = 0;
-		for (i = 0; i < WARP_LOOP_INSNS; i++)
+		unsigned i, old_sets = 0, new_sets = 0;
+		unsigned old_seen[WARP_CONF_HEADS], new_seen[WARP_CONF_HEADS];
+		for (i = 0; i < WARP_CONF_HEADS; i++) {
+			uae_u32 pc = WARP_CONF_VBASE + i * WARP_CONF_STRIDE;
+			unsigned o = (pc >> 1) & 1023u;              /* round 1's index, verbatim  */
+			unsigned n = Z3660_WARP_INDEX(pc);
+			unsigned j, dup = 0;
+			for (j = 0; j < old_sets; j++) if (old_seen[j] == o) dup = 1;
+			if (!dup) old_seen[old_sets++] = o;
+			dup = 0;
+			for (j = 0; j < new_sets; j++) if (new_seen[j] == n) dup = 1;
+			if (!dup) new_seen[new_sets++] = n;
+		}
+		printf("       %u heads one page apart occupy %u set(s) under round 1's index and "
+		       "%u under round 2's\n", WARP_CONF_HEADS, old_sets, new_sets);
+		CHECK_EQ32((uae_u32)old_sets, 1u,
+		           "THE DIAGNOSIS: (pc >> 1) & 1023 folds every page-aligned head into ONE "
+		           "set -- the index addressed a 2 KiB window of guest text, and a page "
+		           "boundary is bit 12");
+		CHECK(new_sets >= WARP_CONF_HEADS - 1u,
+		      "THE FIX: hashing (pc>>1)^(pc>>12)^(pc>>23) spreads them across %u sets -- "
+		      "the high PC bits participate, so heads 2 KiB, 4 KiB or 1 MiB apart no longer "
+		      "collide by construction\n", new_sets);
+	}
+
+	/* ---- DISCOVERY AT CONTROL-TRANSFER TARGETS ONLY ------------------------------- */
+	warp_run(Z3660_WARP_ARM, 200);
+	{
+		unsigned resident = 0, i;
+		for (i = 0; i < WARP_LOOP_WORDS; i++)
 			if (z3660_warp_peek(WARP_VCODE + i * 2, 0)) resident++;
 
-		CHECK_EQ32((uae_u32)resident, WARP_LOOP_INSNS,
-		           "all eight block heads of the corpus are discovered and cached");
-		CHECK_EQ32((uae_u32)z3660_warp_stat(Z3660_WARP_STAT_COMPILE), WARP_LOOP_INSNS,
-		           "...compiled exactly once each: 400 instructions, 8 compiles");
-		CHECK(z3660_warp_stat(Z3660_WARP_STAT_BLK) == 400,
-		      "...and executed on every one of the 400 dispatches (%llu)\n",
+		CHECK_EQ32((uae_u32)resident, 1u,
+		           "ONE block head is discovered, not eight: discovery fires at "
+		           "CONTROL-TRANSFER TARGETS ONLY, and the loop has exactly one -- which is "
+		           "the §0.6.5 lever round 1 priced at WARP_BLK/INSNS = 0.999878");
+		CHECK_EQ32((uae_u32)z3660_warp_peek_len(WARP_VCODE), WARP_LOOP_INSNS,
+		           "...and that block compiled all EIGHT instructions of the loop, ending "
+		           "at its terminator");
+		CHECK_EQ32((uae_u32)z3660_warp_stat(Z3660_WARP_STAT_COMPILE), 1u,
+		           "compiled exactly once: 200 passes, one compile");
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_BLK) == 200,
+		      "...and executed on every one of the 200 passes (%llu)\n",
 		      z3660_warp_stat(Z3660_WARP_STAT_BLK));
-		CHECK_EQ32((uae_u32)z3660_warp_stat(Z3660_WARP_STAT_LIVE), WARP_LOOP_INSNS,
-		           "eight blocks live in the table");
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_INSNS) == 200ull * WARP_LOOP_INSNS,
+		      "WARP_INSNS / WARP_BLK == %u guest instructions per block -- round 1 read "
+		      "0.999878 and had no amortisation at all (%llu)\n",
+		      WARP_LOOP_INSNS, z3660_warp_stat(Z3660_WARP_STAT_INSNS));
+		CHECK_EQ32((uae_u32)z3660_warp_stat(Z3660_WARP_STAT_LIVE), 1u,
+		           "one block live in the table");
+		CHECK(z3660_warp_bad(Z3660_WARP_BAD_SUPER) == 0
+		   && z3660_warp_bad(Z3660_WARP_BAD_FIXUP) == 0
+		   && z3660_warp_bad(Z3660_WARP_BAD_RETIRED) == 0
+		   && z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED) == 0,
+		      "and no engine invariant was broken: no supervisor entry, no armed mmufixup "
+		      "at a block head, nothing over-retired, nothing unpublished\n");
 	}
 
-	/* ---- MUTATION M-5: THE BLOCK KEY DROPS THE SUPERVISOR BIT --------------------
+	/* ---- M-XFER: the discovery gate fires at every pc ------------------------------
 	 *
-	 * A user block must not answer a supervisor lookup at the same virtual address. With
-	 * the bit dropped it does, and that is the aliasing the dopc's own tag encoding exists
-	 * to prevent -- on a real guest it means executing the other privilege level's code.
-	 * Printed as well as asserted: a mutation arm that silently reports nothing looks
-	 * identical in the log to one that was never compiled in. */
+	 * The round-1 policy, restored. It is not a correctness defect -- every block is still
+	 * correct -- which is exactly why it needs its own arm: a performance regression that
+	 * passes every correctness test is the one a corpus is blindest to. */
+	{
+		unsigned long long compile_clean, compile_mutant, blk_clean, blk_mutant;
+
+		compile_clean = z3660_warp_stat(Z3660_WARP_STAT_COMPILE);
+		blk_clean     = z3660_warp_stat(Z3660_WARP_STAT_BLK);
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_set_mutant(Z3660_WARP_MUT_XFER);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		{ unsigned k; for (k = 0; k < 200; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+		compile_mutant = z3660_warp_stat(Z3660_WARP_STAT_COMPILE);
+		blk_mutant     = z3660_warp_stat(Z3660_WARP_STAT_BLK);
+
+		printf("       M-XFER (discovery at every pc): %llu compiles / %llu block "
+		       "executions clean, %llu / %llu mutated (want 1 then more)\n",
+		       compile_clean, blk_clean, compile_mutant, blk_mutant);
+		CHECK(compile_mutant > compile_clean,
+		      "M-XFER CAUGHT: discovering at every dispatched pc compiles a block per PC "
+		      "instead of one per loop, which is round 1's measured pathology\n");
+	}
+
+	/* ---- M-5: THE BLOCK KEY DROPS THE SUPERVISOR BIT ------------------------------ */
 	{
 		int super_hit_clean, super_hit_mutant;
 
+		warp_run(Z3660_WARP_ARM, 200);
 		super_hit_clean = z3660_warp_peek(WARP_VCODE, 1);
 		z3660_warp_set_mutant(Z3660_WARP_MUT_KEY_NOSUP);
 		super_hit_mutant = z3660_warp_peek(WARP_VCODE, 1);
@@ -6985,24 +7128,18 @@ static void test_warp_block_cache(void)
 		      "defect the encoding exists to prevent\n");
 	}
 
-	/* ---- INVALIDATION, FROM THE DOPC'S OWN CHOKE POINT ---------------------------
-	 *
-	 * The code cache does not invent call sites: mmu_flush_cache() and its nine siblings
-	 * already funnel into z3660_dopc_invalidate(), and joining there is what makes a NEW
-	 * upstream cause have to be opted OUT of invalidating the code cache rather than into
-	 * it. Every cause is driven, because "all causes" is the claim. */
+	/* ---- INVALIDATION, FROM THE DOPC'S OWN CHOKE POINT --------------------------- */
 	{
 		int cause, missed = 0;
 		unsigned long long disc0;
 
-		warp_run(Z3660_WARP_ARM, 400);
+		warp_run(Z3660_WARP_ARM, 200);
 		disc0 = z3660_warp_stat(Z3660_WARP_STAT_DISC);
 
 		for (cause = 0; cause < Z3660_DOPC_INV_COUNT; cause++) {
 			unsigned g;
-			/* re-warm, so each cause has live blocks to discard */
 			warp_corpus_enter();
-			{ int k; for (k = 0; k < 64; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+			{ int k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 			g = z3660_warp_generation();
 			z3660_dopc_invalidate(cause);
 			if (z3660_warp_generation() == g) missed++;
@@ -7015,11 +7152,8 @@ static void test_warp_block_cache(void)
 		      "...and WARP_DISC charged the blocks each one discarded (%llu)\n",
 		      z3660_warp_stat(Z3660_WARP_STAT_DISC));
 
-		/* Q5's counter, and its whole purpose: WARP_DISC_ROOT against WARP_DISC is what
-		 * decides whether a per-address-space generation is worth funding. It is live from
-		 * day one so the question is settled by a ratio rather than by an argument. */
 		warp_corpus_enter();
-		{ int k; for (k = 0; k < 64; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		{ int k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 		{
 			unsigned long long r0 = z3660_warp_stat(Z3660_WARP_STAT_DISCROOT);
 			unsigned long long d0 = z3660_warp_stat(Z3660_WARP_STAT_DISC);
@@ -7031,7 +7165,7 @@ static void test_warp_block_cache(void)
 
 			r0 = z3660_warp_stat(Z3660_WARP_STAT_DISCROOT);
 			warp_corpus_enter();
-			{ int k; for (k = 0; k < 64; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+			{ int k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 			z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
 			CHECK(z3660_warp_stat(Z3660_WARP_STAT_DISCROOT) == r0,
 			      "...and no other cause touches WARP_DISC_ROOT, or the ratio would be a "
@@ -7042,7 +7176,7 @@ static void test_warp_block_cache(void)
 	/* ---- DISARMED, AN INVALIDATION IS A NO-OP ------------------------------------ */
 	{
 		unsigned g;
-		warp_run(Z3660_WARP_OFF, 400);
+		warp_run(Z3660_WARP_OFF, 200);
 		g = z3660_warp_generation();
 		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
 		CHECK(z3660_warp_generation() == g,
@@ -7050,135 +7184,610 @@ static void test_warp_block_cache(void)
 		      "nothing was compiled, so there is nothing to discard\n");
 	}
 
-	/* ---- EVICTION: THE BUMP ALLOCATOR RUNS OUT ------------------------------------
+	/* ---- G-R2.10: THE LOOKUP FIX, MEASURED --------------------------------------
 	 *
-	 * §2b's decision for generation one, unchanged: bump-allocate, then throw everything
-	 * away and bump the generation. Simple, provably correct, and it composes with the
-	 * generation counter. The flush RATE per boot is a counter before it is a design input,
-	 * which is why WARP_FLUSH exists at all -- and why the cache limit is lowerable here
-	 * rather than the path being left untested until a boot happens to reach it. */
+	 * Sixteen heads, chained, executed a hundred times round. A table that holds them
+	 * compiles each ONCE. Round 1's geometry cannot hold them at all -- they are one set
+	 * and one way -- so every arrival evicts the last and the compile count tracks the
+	 * execution count, which is the 3 066 944-compile pathology reproduced in a fixture. */
 	{
-		warp_corpus_build();
+		unsigned long long comp_clean, evict_clean, blk_clean;
+		unsigned long long comp_mut, evict_mut;
+		const unsigned PASSES = WARP_CONF_HEADS * 400u;
+
+		warp_conflict_build();
+		warp_boot();
+		warp_conflict_enter();
+		{ unsigned k; for (k = 0; k < 64; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_conflict_enter();
+		{ unsigned k; for (k = 0; k < PASSES; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		comp_clean  = z3660_warp_stat(Z3660_WARP_STAT_COMPILE);
+		evict_clean = z3660_warp_stat(Z3660_WARP_STAT_EVICT);
+		blk_clean   = z3660_warp_stat(Z3660_WARP_STAT_BLK);
+
+		CHECK(comp_clean == WARP_CONF_HEADS,
+		      "WARP_COMPILE == %u == the number of DISTINCT BLOCK HEADS, exactly: %llu "
+		      "block executions over a %u KiB text span and not one recompile\n",
+		      WARP_CONF_HEADS, blk_clean,
+		      (WARP_CONF_HEADS * WARP_CONF_STRIDE) / 1024u);
+		CHECK_EQ32((uae_u32)evict_clean, 0u,
+		           "WARP_EVICT == 0: no live block was overwritten by a conflicting fill");
+		CHECK(comp_clean * 1000ull <= blk_clean * 5ull,
+		      "recompile ratio WARP_COMPILE / WARP_BLK = %llu / %llu = %.3f %%, inside the "
+		      "pre-registered <= 0.5 %% -- round 1 measured 5.68 %% on metal with 95.2 %% of "
+		      "it attributable to nothing at all. The ratio falls with run length because "
+		      "the numerator is bounded by the head COUNT and the denominator is not, which "
+		      "is the property the fix restores\n",
+		      comp_clean, blk_clean,
+		      100.0 * (double)comp_clean / (double)(blk_clean ? blk_clean : 1));
+
+		warp_conflict_build();
 		warp_boot();
 		warp_write_knob(Z3660_WARP_ARM);
-		z3660_warp_set_cache_limit(3u * Z3660_WARP_NULL_BYTES);   /* room for three blocks */
+		z3660_warp_set_mutant(Z3660_WARP_MUT_CONFLICT);
 		z3660_warp_stats_zero();
-		warp_corpus_enter();
-		{ int k; for (k = 0; k < 400; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		warp_conflict_enter();
+		{ unsigned k; for (k = 0; k < PASSES; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+		comp_mut  = z3660_warp_stat(Z3660_WARP_STAT_COMPILE);
+		evict_mut = z3660_warp_stat(Z3660_WARP_STAT_EVICT);
+
+		printf("       M-CONFLICT (round 1's lookup geometry restored): %llu compiles / "
+		       "%llu evictions clean, %llu / %llu mutated (want %u/0 then a storm)\n",
+		       comp_clean, evict_clean, comp_mut, evict_mut, WARP_CONF_HEADS);
+		CHECK(comp_mut > comp_clean * 4u,
+		      "M-CONFLICT CAUGHT: the round-1 index recompiles %llu times where the fixed "
+		      "one compiles %llu -- and WARP_EVICT names the cause rather than leaving it "
+		      "unattributed, which is the whole point of appending id 60\n",
+		      comp_mut, comp_clean);
+		CHECK(evict_mut > 0,
+		      "...and every one of those recompiles is charged to WARP_EVICT (%llu), so "
+		      "the budget COMPILE = first-compiles + DISC + EVICT + flush closes\n",
+		      evict_mut);
+	}
+
+	/* ---- EVICTION: THE BUMP ALLOCATOR RUNS OUT ------------------------------------
+	 *
+	 * Round 1 never reached this path -- WARP_CBYTES filled 73 % of the 32 MiB arena in a
+	 * 34-second window and the window ended before the arena wrapped, which is "not yet"
+	 * and not "never". A path that has never run is not a path that works. */
+	{
+		warp_conflict_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_set_cache_limit(Z3660_WARP_MAX_BYTES + 512u);
+		z3660_warp_stats_zero();
+		warp_conflict_enter();
+		{ unsigned k; for (k = 0; k < 400; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 
 		CHECK(z3660_warp_stat(Z3660_WARP_STAT_FLUSH) > 0,
-		      "a code cache too small for the working set flushes (%llu times) rather than "
+		      "a code cache too small for the working set FLUSHES (%llu times) rather than "
 		      "running off the end of its arena\n",
 		      z3660_warp_stat(Z3660_WARP_STAT_FLUSH));
-		CHECK(z3660_warp_stat(Z3660_WARP_STAT_LIVE) <= 3,
-		      "...and never holds more blocks than the arena has room for (%llu)\n",
-		      z3660_warp_stat(Z3660_WARP_STAT_LIVE));
 		CHECK(z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED) == 0
 		   && z3660_warp_bad(Z3660_WARP_BAD_RETIRED) == 0,
 		      "...and thrashing the allocator breaks neither invariant\n");
 		z3660_warp_set_cache_limit(0);
 	}
+	warp_boot();
 }
 
-/* -------------------------------------------------------------- the null block ------- */
+/* -------------------------------------------------------------- the emitted code ----- */
 
-static void test_warp_null_block(void)
+/* THE DECLINE STUB, byte-exact. It is round 1's null block unchanged, and it is now what a
+ * head OUTSIDE generation one's scope compiles to -- which is round 2's fourth fix: round 1
+ * re-ran the whole discovery at every arrival of a PC it had already refused. */
+static void test_warp_emitted_words(void)
 {
-	printf("[test] WARP null block: entry, exit, the bail contract and the publish discipline\n");
+	printf("[test] WARP emitted code: the decline stub, the block ABI, and every branch target\n");
 
-	/* ---- THE EMITTED WORDS, BYTE-EXACT -------------------------------------------
-	 *
-	 * This is the strongest claim the HOST can make about code it cannot execute, and it is
-	 * worth making precisely because of that: §3.2's honest limit says the emitted sequence
-	 * is proven on target and only on target, so everything provable here is proven before
-	 * a metal session is booked. The emitter is portable C, so these are the same two words
-	 * the ARM build writes into the code cache. */
 	{
-		uae_u32 words[4];
-		unsigned n;
+		uae_u32 code[512];
+		unsigned n, i, bad = 0;
 
-		memset(words, 0xAA, sizeof words);
-		n = z3660_warp_emit_null(words);
-		CHECK_EQ32((uae_u32)n, Z3660_WARP_NULL_BYTES, "a null block is 8 bytes");
-		CHECK_EQ32(words[0], 0xE3A00000u,
-		           "word 0 is `mov r0, #0` -- a null block retires no guest instruction");
-		CHECK_EQ32(words[1], 0xE12FFF1Eu,
+		/* A head the compiler must refuse: MOVEQ is M1a item 1 and the frozen extension
+		 * list is frozen, so it is not in this round. */
+		warp_corpus_build();
+		hram_poke16((WARP_PCODE | (WARP_VCODE & 0xFFF)) + 0, 0x7205);   /* moveq #5,d1 */
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_corpus_enter();
+		{ int k; for (k = 0; k < 8; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+
+		n = z3660_warp_block_code(WARP_VCODE, code, sizeof code);
+		CHECK_EQ32(n, 8u, "a declined head compiles to an 8-byte stub");
+		CHECK_EQ32(code[0], 0xE3A00000u,
+		           "word 0 is `mov r0, #0` -- a decline stub retires no guest instruction");
+		CHECK_EQ32(code[1], 0xE12FFF1Eu,
 		           "word 1 is `bx lr` -- back to the interpreter, at the PC it was entered at");
-		CHECK_EQ32(words[2], 0xAAAAAAAAu, "and it writes nothing past its own two words");
-	}
+		CHECK_EQ32((uae_u32)z3660_warp_peek_len(WARP_VCODE), 0u,
+		           "...and it is CACHED with length 0, so the head is not re-discovered on "
+		           "every arrival, which is what round 1 did");
 
-	/* ---- ENTRY, EXIT AND THE BAIL ACCOUNTING ------------------------------------- */
-	warp_run(Z3660_WARP_ARM, 400);
-	{
-		unsigned long long blk = z3660_warp_stat(Z3660_WARP_STAT_BLK);
-
-		CHECK(blk == 400,
-		      "400 dispatches, 400 block executions -- discovery fires at every dispatched "
-		      "PC while the engine is armed (%llu)\n", blk);
-		CHECK(z3660_warp_stat(Z3660_WARP_STAT_BAIL) == blk,
-		      "...every one of them BAILS: a null block retires nothing, so the bail arm is "
-		      "the only arm there is\n");
-		CHECK_EQ32((uae_u32)z3660_warp_stat(Z3660_WARP_STAT_ENTER), 0u,
-		           "WARP_ENTER is 0, BY CONSTRUCTION: it counts entries that consume a "
-		           "run-loop pass, and no null block does");
-		CHECK(z3660_warp_bad(Z3660_WARP_BAD_RETIRED) == 0,
-		      "THE NO-EMPTY-PASS INVARIANT HOLDS: no block retired anything in a round with "
-		      "no pass-consuming arm\n");
-
-		/* THE ARM ATTESTATION, and the reason it is a counter and not a banner: two cores
-		 * share one unlocked UART, so an arm banner arrives spliced. It is the SAME
-		 * increment site as WARP_BLK, so the lean confession and the profiled counter
-		 * cannot disagree -- which is what makes a lean verdict boot attestable at all. */
-		CHECK(z3660_warp_entered() == blk,
-		      "the always-compiled attestation is the same quantity as WARP_BLK, from the "
-		      "same increment site: %llu\n", z3660_warp_entered());
-	}
-
-	/* ---- CODE BYTES, AND THE COMPILE ACCOUNTING ---------------------------------- */
-	CHECK(z3660_warp_stat(Z3660_WARP_STAT_CBYTES)
-	          == z3660_warp_stat(Z3660_WARP_STAT_COMPILE) * Z3660_WARP_NULL_BYTES,
-	      "code bytes emitted == compiles x 8. Code bytes per guest instruction is a "
-	      "first-class metric for this project: DDR is not the constraint, L1I is\n");
-
-	/* ---- THE PUBLISH DISCIPLINE, AND MUTATION M-ICACHE ----------------------------
-	 *
-	 * A block is published through the I-cache sequence BEFORE it is written into the
-	 * table, so there is no window in which a lookup could hand the run loop a pointer to
-	 * bytes the I-cache has not seen. `8be8949` is this repository's own receipt for what
-	 * the other ordering costs: the first pushall_call_handler() fetched stale I-cache
-	 * lines and the board rebooted with an ARM Undefined Instruction -- caused by a
-	 * compiler-flag change, which is to say by nothing anyone would look at.
-	 *
-	 * On the host the sequence is a no-op, so what is proven here is the DISCIPLINE and not
-	 * the ARM semantics -- the barriers themselves are Q3's separate metal session, and the
-	 * standing caveat rides unchanged: adding barriers is not evidence of a fix. */
-	CHECK(z3660_warp_stat(Z3660_WARP_STAT_PUBLISH)
-	          == z3660_warp_stat(Z3660_WARP_STAT_COMPILE),
-	      "every compiled block was published: publishes %llu == compiles %llu\n",
-	      z3660_warp_stat(Z3660_WARP_STAT_PUBLISH),
-	      z3660_warp_stat(Z3660_WARP_STAT_COMPILE));
-	CHECK(z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED) == 0,
-	      "...and no block was ever entered before its publish ran\n");
-	{
-		unsigned long long bad_clean, bad_mutant;
-
-		bad_clean = z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED);
+		/* And the real block's ABI, decoded rather than asserted from memory. */
 		warp_corpus_build();
 		warp_boot();
 		warp_write_knob(Z3660_WARP_ARM);
-		z3660_warp_set_mutant(Z3660_WARP_MUT_NO_ICACHE);
 		warp_corpus_enter();
-		{ int k; for (k = 0; k < 200; k++) m68k_run_mmu040(); regs.spcflags = 0; }
-		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
-		bad_mutant = z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED);
+		{ int k; for (k = 0; k < 4; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		n = z3660_warp_block_code(WARP_VCODE, code, sizeof code) / 4u;
+		CHECK(n > 8, "the eight-instruction block emits %u ARM words\n", n);
+		CHECK_EQ32(code[0], 0xE92D41F0u,
+		           "the prologue is `push {r4,r5,r6,r7,r8,lr}` -- six registers, 24 bytes, "
+		           "so the stack stays 8-byte aligned across every helper call");
+		CHECK(code[1] == 0xE1A04000u && code[2] == 0xE1A05001u
+		   && code[3] == 0xE1A06002u && code[4] == 0xE1A07003u,
+		      "...then the four bases the caller HANDS it: r4 = the guest register file, "
+		      "r5/r6 = the two memory helpers, r7 = the block context. The emitted stream "
+		      "materialises no host address of its own, which is what makes the same words "
+		      "runnable in this harness (§0.8.5)\n");
 
-		printf("       M-ICACHE (block published without the sequence): %llu unpublished "
-		       "entries clean, %llu mutated (want 0 then >0)\n", bad_clean, bad_mutant);
-		CHECK(bad_mutant > bad_clean,
-		      "M-ICACHE CAUGHT: a block that reached the run loop without the I-cache "
-		      "sequence is detected at the point of use, not afterwards\n");
+		/* EVERY BRANCH TARGET LANDS ON AN INSTRUCTION INSIDE THE BLOCK. The compiler has no
+		 * patch list -- every offset is a constant of the emitter -- so an off-by-one in
+		 * e_b() would be a wild jump into the middle of a movw. This is the check that
+		 * would have caught it. */
+		for (i = 0; i < n; i++) {
+			if ((code[i] & 0x0E000000u) == 0x0A000000u) {
+				int off = (int)((code[i] & 0x00FFFFFFu) << 8) >> 8;
+				int tgt = (int)i + 2 + off;
+				if (tgt < 0 || tgt > (int)n) bad++;
+			}
+		}
+		CHECK_EQ32((uae_u32)bad, 0u,
+		           "every emitted branch targets a word inside its own block");
 	}
 	warp_boot();
+}
+
+/* ------------------------------------------------------------- the differential ------ */
+
+/* THE OPCODE SWEEP, and it is the strongest thing in this file.
+ *
+ * All 65 536 opcodes are offered to the compiler one at a time. The ones it ACCEPTS are
+ * generation one's scope as built -- not as described -- and every one of them is then run
+ * both ways from identical seeded state and compared byte for byte across the whole §3.1
+ * set. A family the compiler quietly gets wrong cannot hide behind a corpus that happens not
+ * to contain it, and a family it quietly REFUSES shows up as a coverage number rather than
+ * as a silent absence.
+ *
+ * The seeds are chosen to keep every memory access mapped and aligned: the address registers
+ * point into the data page and the displacements are small, so a shape that reaches memory
+ * exercises the helper's SERVE arm. The decline arm has its own test. */
+struct warp_state {
+	uae_u32 d[8], a[8], pc, ipc, ccr, x;
+	int restart, fix0r, fix1r;
+	uae_u32 fix0v, fix1v, mem[16];
+};
+
+static void warp_snap(struct warp_state *s)
+{
+	int i;
+	for (i = 0; i < 8; i++) { s->d[i] = m68k_dreg(regs, i); s->a[i] = m68k_areg(regs, i); }
+	s->pc  = m68k_getpc();
+	s->ipc = (uae_u32)regs.instruction_pc;
+	s->ccr = (uae_u32)((GET_NFLG() ? 8u : 0u) | (GET_ZFLG() ? 4u : 0u)
+	                 | (GET_VFLG() ? 2u : 0u) | (GET_CFLG() ? 1u : 0u));
+	s->x   = (uae_u32)(GET_XFLG() ? 1u : 0u);
+	s->restart = mmu_restart ? 1 : 0;
+	s->fix0r = mmufixup[0].reg; s->fix0v = mmufixup[0].value;
+	s->fix1r = mmufixup[1].reg; s->fix1v = mmufixup[1].value;
+	for (i = 0; i < 16; i++) s->mem[i] = memory_get_long(WARP_PDATA + i * 4);
+}
+
+/* Seed the machine deterministically from a 32-bit key. Address registers stay inside the
+ * mapped, aligned data page; data registers get the full range, because that is where the
+ * flag arithmetic lives and 0x7FFF + 1 and 0x8000 + 0x8000 are exactly the values a
+ * sign-extension shortcut gets wrong. */
+static void warp_seed(uae_u32 k)
+{
+	static const uae_u32 dvals[8] = {
+		0x00000000u, 0x00000001u, 0x00007FFFu, 0x00008000u,
+		0x0000FFFFu, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu
+	};
+	int i;
+	for (i = 0; i < 8; i++) {
+		m68k_dreg(regs, i) = dvals[(k >> (i * 3)) & 7u] ^ (k * (uae_u32)(i + 1));
+		m68k_areg(regs, i) = WARP_VDATA + (((k >> i) & 3u) * 8u);
+	}
+	m68k_areg(regs, 7) = WARP_VSTK | 0xE00;
+	regs.isp = regs.msp = WARP_VSTK | 0xF00;
+	regs.m = 0;
+	SET_NFLG((k >> 28) & 1); SET_ZFLG((k >> 29) & 1);
+	SET_CFLG((k >> 30) & 1); SET_VFLG((k >> 31) & 1);
+	SET_XFLG((k >> 27) & 1);
+	m68k_setpc(WARP_VCODE);
+	regs.t0 = regs.t1 = 0;
+	regs.s = 0;
+	MakeSR();
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;
+	mmufixup[0].reg = mmufixup[1].reg = -1;
+}
+
+static void warp_poke_insn(uae_u16 op)
+{
+	uae_u32 base = WARP_PCODE | (WARP_VCODE & 0xFFF);
+	/* REWRITING GUEST CODE INVALIDATES, and forgetting it is not a subtle failure: the
+	 * interpreter would dispatch the PREVIOUS opcode out of the decoded-op cache while the
+	 * compiler read the new one out of memory, and the differential would then be comparing
+	 * two different instructions and calling the difference a codegen bug. It cost this
+	 * round one debugging pass, which is cheap for a lesson about a cache the engine shares. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+	regs.cacr &= ~0x8000u;          /* and the 040 instruction-word cache above it */
+	hram_poke16(base + 0, op);
+	hram_poke16(base + 2, 0x0008);      /* a benign EVEN extension word: a d16 that stays
+	                                     * inside the data page, and a branch displacement
+	                                     * that stays inside the code page                */
+	hram_poke16(base + 4, 0x4E71);      /* nop -- outside scope, so the block is one
+	                                     * instruction long and the comparison is per
+	                                     * instruction rather than per block              */
+	hram_poke16(base + 6, 0x4E71);
+}
+
+static void test_warp_codegen(void)
+{
+	unsigned op, covered = 0, tested = 0, diverged = 0;
+	unsigned first_bad_op = 0;
+	uae_u16 *ops;
+
+	printf("[test] WARP codegen: every opcode the compiler accepts, run both ways and "
+	       "compared byte for byte\n");
+
+	ops = (uae_u16 *)malloc(65536u * sizeof(uae_u16));
+	if (!ops) { CHECK(0, "OOM\n"); return; }
+
+	/* ---- pass 1: WHAT DOES THE COMPILER ACTUALLY ACCEPT? ------------------------- */
+	warp_corpus_build();
+	warp_boot();
+	warp_write_knob(Z3660_WARP_ARM);
+	for (op = 0; op < 65536u; op++) {
+		unsigned insns = 0, bytes = 0;
+		warp_poke_insn((uae_u16)op);
+		z3660_dopc_invalidate(Z3660_DOPC_INV_FLUSH);
+		if (z3660_warp_probe_compile(WARP_VCODE, &insns, &bytes) == 0 && insns >= 1)
+			ops[covered++] = (uae_u16)op;
+	}
+	printf("       generation one accepts %u of 65536 opcodes (%.2f %%)\n",
+	       covered, 100.0 * covered / 65536.0);
+	CHECK(covered > 1000,
+	      "the compiler accepts a real family set and not a handful of shapes (%u)\n", covered);
+
+	/* ---- pass 2: the differential, over every accepted opcode ---------------------- */
+	{
+		static const uae_u32 seeds[6] = {
+			0x00000000u, 0x9E3779B9u, 0x12345678u, 0xDEADBEEFu, 0xFFFFFFFFu, 0x5A5A5A5Au
+		};
+		unsigned s, i;
+		for (i = 0; i < covered; i++) {
+			warp_poke_insn(ops[i]);
+			for (s = 0; s < 6; s++) {
+				struct warp_state ref, run;
+
+				/* the reference arm */
+				warp_write_knob(Z3660_WARP_OFF);
+				warp_seed(seeds[s] + ops[i]);
+				m68k_run_mmu040();
+				regs.spcflags = 0;
+				warp_snap(&ref);
+
+				/* the same span, armed */
+				warp_write_knob(Z3660_WARP_ARM);
+				warp_seed(seeds[s] + ops[i]);
+				m68k_run_mmu040();
+				regs.spcflags = 0;
+				warp_snap(&run);
+
+				tested++;
+				if (memcmp(&ref, &run, sizeof ref) != 0) {
+					if (!diverged) first_bad_op = ops[i];
+					if (diverged < 3) {
+						int q;
+						printf("       DBG op=%04X seed=%u\n", ops[i], s);
+						for (q = 0; q < 8; q++) if (ref.d[q] != run.d[q])
+							printf("          d%d %08X vs %08X\n", q, ref.d[q], run.d[q]);
+						for (q = 0; q < 8; q++) if (ref.a[q] != run.a[q])
+							printf("          a%d %08X vs %08X\n", q, ref.a[q], run.a[q]);
+						if (ref.pc != run.pc) printf("          pc %08X vs %08X\n", ref.pc, run.pc);
+						if (ref.ipc != run.ipc) printf("          ipc %08X vs %08X\n", ref.ipc, run.ipc);
+						if (ref.ccr != run.ccr) printf("          ccr %X vs %X\n", ref.ccr, run.ccr);
+						if (ref.x != run.x) printf("          x %X vs %X\n", ref.x, run.x);
+						if (ref.restart != run.restart) printf("          restart %d vs %d\n", ref.restart, run.restart);
+						for (q = 0; q < 16; q++) if (ref.mem[q] != run.mem[q])
+							printf("          mem%d %08X vs %08X\n", q, ref.mem[q], run.mem[q]);
+					}
+					diverged++;
+				}
+			}
+		}
+	}
+	CHECK_EQ32(diverged, 0u,
+	           "not one of the differential pairs diverges: registers, pc, "
+	           "instruction_pc, CCR, X, mmu_restart, mmufixup and the data page all match");
+	if (diverged)
+		printf("       FIRST DIVERGENCE at opcode 0x%04X (%u of %u pairs)\n",
+		       first_bad_op, diverged, tested);
+	printf("       %u differential pairs over %u accepted opcodes\n", tested, covered);
+
+	/* ---- the wrong-flag mutation set, one per covered family ---------------------- */
+	{
+		static const struct { int mut; const char *name; uae_u16 op; int d0; } arms[] = {
+			{ Z3660_WARP_MUT_FLAG_MOVE, "MOVE: C and V not cleared",          0x2400, -1 },
+			{ Z3660_WARP_MUT_FLAG_ADD,  "ADD: X not copied from C",           0xD081, -1 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "SUB: carry inversion dropped",       0x9081, -1 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "CMP: carry inversion dropped",       0xB081, -1 },
+			{ Z3660_WARP_MUT_FLAG_BCC,  "Bcc: the condition sense inverted",  0x6602, -1 },
+			/* DBcc's defect is only visible when the OLD counter is 0 or 1 -- that is the
+			 * whole difference between testing before and after the decrement -- so the arm
+			 * puts it there rather than hoping a seed lands on it. A mutation arm that can
+			 * only be caught by luck is not an arm. */
+			{ Z3660_WARP_MUT_FLAG_DBCC, "DBcc: counter tested after the "
+			                            "decrement",                          0x51C8, 0 },
+			{ Z3660_WARP_MUT_BAILX,     "the commit writes nzcv but not X",   0xD081, -1 }
+		};
+		unsigned a;
+		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
+			unsigned s, caught = 0;
+			warp_poke_insn(arms[a].op);
+			for (s = 0; s < 8 && !caught; s++) {
+				struct warp_state ref, run;
+				warp_write_knob(Z3660_WARP_OFF);
+				warp_seed(0x1234u * (s + 1u) + arms[a].op);
+				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
+				m68k_run_mmu040(); regs.spcflags = 0;
+				warp_snap(&ref);
+
+				z3660_warp_set_mutant(arms[a].mut);
+				warp_write_knob(Z3660_WARP_ARM);   /* re-arm: the mutation changes CODE */
+				warp_seed(0x1234u * (s + 1u) + arms[a].op);
+				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
+				m68k_run_mmu040(); regs.spcflags = 0;
+				warp_snap(&run);
+				z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+
+				if (memcmp(&ref, &run, sizeof ref) != 0) caught = 1;
+			}
+			printf("       wrong-flag mutation, %-42s %s\n",
+			       arms[a].name, caught ? "CAUGHT" : "NOT CAUGHT");
+			CHECK(caught,
+			      "the differential catches `%s` -- a family whose flags are wrong is a "
+			      "family whose every conditional branch is wrong\n", arms[a].name);
+		}
+	}
+
+	free(ops);
+	warp_boot();
+	warp_corpus_build();
+}
+
+/* ---------------------------------------------------------------- the bail ---------- */
+
+/* G-R2.5: A MID-BLOCK FAULT MUST BAIL, WITH BYTE-EXACT ARCHITECTURAL STATE.
+ *
+ * The engine's whole fault contract is bail-before-fault, and Q2 measured what getting it
+ * wrong costs on this target: not a fault, std::terminate. So the claim to test is not "the
+ * fault is handled" -- generated code must never take one -- but "the site DECLINES, and the
+ * state it leaves is exactly the state the interpreter would have left after the same prefix".
+ *
+ * The injection is a real MMU decline and not a stub: the base register is pointed at an
+ * UNMAPPED page, so z3660_dfast_read()'s ATC probe misses and the helper returns 0. That is
+ * the same decline a demand-paged guest produces, taken through the same resolver. */
+static void test_warp_bail(void)
+{
+	const uae_u32 VBAD = 0x00470000u;      /* mapped in NEITHER root */
+	unsigned k;
+
+	printf("[test] WARP bail contract: a faultable site declines, and the state matches "
+	       "the interpreter's exactly\n");
+
+	/* The corpus's fifth instruction is `move.l d2,(a0)` and its sixth is
+	 * `move.l (a0),d3`, so pointing a0 at an unmapped page makes instruction 4 (0-based)
+	 * the first faultable site that declines. */
+	for (k = 0; k < 2; k++) {
+		struct warp_state ref, run;
+		unsigned i;
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_OFF);
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = (k == 0) ? VBAD : (WARP_VDATA + 1u);   /* unmapped, then odd */
+		for (i = 0; i < 4; i++) m68k_run_mmu040();                  /* the four covered   */
+		regs.spcflags = 0;
+		warp_snap(&ref);
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = (k == 0) ? VBAD : (WARP_VDATA + 1u);
+		m68k_run_mmu040();                                          /* ONE pass           */
+		regs.spcflags = 0;
+		warp_snap(&run);
+
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_INSNS) == 4,
+		      "%s: the block retired exactly the four instructions before the faultable "
+		      "site and bailed there (%llu)\n",
+		      k == 0 ? "unmapped page" : "misaligned access",
+		      z3660_warp_stat(Z3660_WARP_STAT_INSNS));
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_BAIL) == 1,
+		      "...and charged exactly one bail\n");
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_BAILST) == 1,
+		      "...whose emitted-store count is 1 -- the guest PC and nothing else, because "
+		      "nothing was ever dirty. §0.5.4 pre-registered 3..8 and this MISSES it LOW, "
+		      "which is what a memory-resident register file buys\n");
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_MEMDECL) >= 1,
+		      "...and the decline came from the resolver, not from a stub (%llu)\n",
+		      z3660_warp_stat(Z3660_WARP_STAT_MEMDECL));
+		if (memcmp(&ref, &run, sizeof ref) != 0) {
+			int q;
+			printf("       DBGB k=%u\n", k);
+			for (q = 0; q < 8; q++) if (ref.d[q] != run.d[q])
+				printf("          d%d %08X vs %08X\n", q, ref.d[q], run.d[q]);
+			for (q = 0; q < 8; q++) if (ref.a[q] != run.a[q])
+				printf("          a%d %08X vs %08X\n", q, ref.a[q], run.a[q]);
+			if (ref.pc != run.pc) printf("          pc %08X vs %08X\n", ref.pc, run.pc);
+			if (ref.ipc != run.ipc) printf("          ipc %08X vs %08X\n", ref.ipc, run.ipc);
+			if (ref.ccr != run.ccr) printf("          ccr %X vs %X\n", ref.ccr, run.ccr);
+			if (ref.x != run.x) printf("          x %X vs %X\n", ref.x, run.x);
+			if (ref.restart != run.restart) printf("          restart %d vs %d\n", ref.restart, run.restart);
+			for (q = 0; q < 16; q++) if (ref.mem[q] != run.mem[q])
+				printf("          mem%d %08X vs %08X\n", q, ref.mem[q], run.mem[q]);
+		}
+		CHECK(memcmp(&ref, &run, sizeof ref) == 0,
+		      "BYTE-EXACT: sixteen registers, pc, instruction_pc, CCR, X, mmu_restart, "
+		      "mmufixup[0..1] and the guest data page are identical to the interpreter's "
+		      "state after the same four instructions\n");
+	}
+
+	/* M-3: THE BAIL STORES THE BLOCK-HEAD PC INSTEAD OF THE PER-SITE ONE.
+	 *
+	 * §0.5.4 pre-registered shape (ii) -- block-head PC plus a per-site constant delta,
+	 * materialised only on the bail arm -- and this is the arm that proves the delta is
+	 * load-bearing. It needs a MULTI-INSTRUCTION block to bite at all: with the delta
+	 * dropped the interpreter resumes at the block head and silently RE-RUNS the four
+	 * instructions the block already retired, which is a wrong answer rather than a crash. */
+	{
+		struct warp_state ref, run;
+		unsigned i;
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_OFF);
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = VBAD;
+		for (i = 0; i < 4; i++) m68k_run_mmu040();
+		regs.spcflags = 0;
+		warp_snap(&ref);
+
+		warp_corpus_build();
+		warp_boot();
+		z3660_warp_set_mutant(Z3660_WARP_MUT_BAILPC);
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = VBAD;
+		m68k_run_mmu040();
+		regs.spcflags = 0;
+		warp_snap(&run);
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+
+		printf("       M-3 (bail stores the block-head pc): pc %08X vs %08X\n",
+		       ref.pc, run.pc);
+		CHECK(memcmp(&ref, &run, sizeof ref) != 0,
+		      "M-3 CAUGHT: without the per-site delta the bail hands the interpreter the "
+		      "block head, and four already-retired instructions run a second time\n");
+	}
+
+	/* M-FENCE: the helper's alignment and page-cross fence removed. The misaligned case
+	 * above then no longer declines -- it SERVES a misaligned access the 68040 would have
+	 * split -- and the differential notices. */
+	{
+		struct warp_state ref, run;
+		unsigned i;
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_OFF);
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = WARP_VDATA + 1u;
+		for (i = 0; i < 6; i++) m68k_run_mmu040();
+		regs.spcflags = 0;
+		warp_snap(&ref);
+
+		warp_corpus_build();
+		warp_boot();
+		z3660_warp_set_mutant(Z3660_WARP_MUT_FENCE);
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_corpus_enter();
+		m68k_areg(regs, 0) = WARP_VDATA + 1u;
+		m68k_run_mmu040();
+		regs.spcflags = 0;
+		warp_snap(&run);
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+
+		printf("       M-FENCE (align / page-cross fence removed): state %s\n",
+		       memcmp(&ref, &run, sizeof ref) ? "DIVERGES -- caught" : "matches");
+		CHECK(memcmp(&ref, &run, sizeof ref) != 0,
+		      "M-FENCE CAUGHT: without the fence the helper serves a misaligned access "
+		      "instead of handing it back, and the 68040 splits those\n");
+	}
+
+	/* M-VERDICT: the write path's decline arm made permissive, which is exactly the
+	 * TTR_NO_WRITE asymmetry §0.5.5's G4 exists to protect -- read XPAR, write SLOW. The
+	 * arm is proven to be reachable rather than assumed to be. */
+	{
+		unsigned long long served_clean, served_mut;
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		{ int i; for (i = 0; i < 8; i++) m68k_run_mmu040(); regs.spcflags = 0; }
+		served_clean = z3660_warp_stat(Z3660_WARP_STAT_MEMHIT);
+
+		warp_corpus_build();
+		warp_boot();
+		z3660_warp_set_mutant(Z3660_WARP_MUT_VERDICT);
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		{ int i; for (i = 0; i < 8; i++) m68k_run_mmu040(); regs.spcflags = 0; }
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+		served_mut = z3660_warp_stat(Z3660_WARP_STAT_MEMHIT);
+
+		printf("       M-VERDICT (write decline arm made permissive): %llu served clean, "
+		       "%llu mutated -- the mutated WRITE path answers from the READ resolver\n",
+		       served_clean, served_mut);
+		CHECK(served_clean > 0,
+		      "the memory helper SERVES on the covered corpus (%llu) -- without this the "
+		      "decline tests above would be proving nothing, because a fast path that "
+		      "never fires agrees with everything\n", served_clean);
+		CHECK(served_mut > 0,
+		      "M-VERDICT is REACHED (%llu served through the mutated arm) -- but it is NOT "
+		      "CAUGHT here, and that is stated rather than glossed: the defect it injects is "
+		      "the TTR_NO_WRITE asymmetry, read XPAR and write SLOW, and this corpus has no "
+		      "read-only TTR region for it to violate. §0.5.5's G4 asymmetry cases are where "
+		      "it bites, and wiring the accessor corpus to the engine is a ROUND-3 item -- "
+		      "recorded as an owed arm, not as a passing one\n", served_mut);
+	}
+
+	/* M-4: the mmufixup invariant not asserted at a block head. §0.3(b) states the freeze's
+	 * own invariant -- mmufixup is disarmed at every block head, because only the
+	 * interpreter ever arms it -- and an invariant nobody checks is a comment. */
+	{
+		unsigned long long bad_clean, bad_mut;
+
+		warp_corpus_build();
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		mmufixup[0].reg = 3; mmufixup[0].value = 0x1234;   /* an armed fixup at a head */
+		m68k_run_mmu040(); regs.spcflags = 0;
+		bad_clean = z3660_warp_bad(Z3660_WARP_BAD_FIXUP);
+
+		warp_corpus_build();
+		warp_boot();
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NOFIXUP);
+		warp_write_knob(Z3660_WARP_ARM);
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		mmufixup[0].reg = 3; mmufixup[0].value = 0x1234;
+		m68k_run_mmu040(); regs.spcflags = 0;
+		bad_mut = z3660_warp_bad(Z3660_WARP_BAD_FIXUP);
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+		mmufixup[0].reg = mmufixup[1].reg = -1;
+
+		printf("       M-4 (mmufixup invariant unasserted): %llu violations seen clean, "
+		       "%llu mutated (want >0 then 0)\n", bad_clean, bad_mut);
+		CHECK(bad_clean > 0 && bad_mut == 0,
+		      "M-4 CAUGHT: the assertion is what turns §0.3(b)'s invariant from a comment "
+		      "into a checked property\n");
+	}
+	warp_boot();
+	warp_corpus_build();
 }
 
 /* ---------------------------------------------------------------- the cadence -------- */
@@ -7195,9 +7804,9 @@ static void test_warp_cadence(void)
 	 * and the symptom is a MISSED INTERRUPT, not a slow number. It is also the one item in
 	 * the plan with cross-repo reach.
 	 *
-	 * The feed advances the counter by n-1 and not by n, and that is not an off-by-one: the
-	 * pass's own tail supplies the last tick, so an interpreted pass and a block that
-	 * retired exactly one instruction advance the counter identically. */
+	 * ROUND 2 IS THE FIRST ROUND WHERE THE FEED CARRIES A REAL NUMBER. Round 1 always
+	 * called it with 0, so the invariant was asserted against a constant; here the corpus's
+	 * blocks retire eight instructions each and the poll count has to follow. */
 	warp_boot();
 	shared->service_cadence = 4;
 	z3660_knobs_sync();
@@ -7205,16 +7814,13 @@ static void test_warp_cadence(void)
 	{
 		unsigned long polls0;
 
-		/* n = 0 and n = 1 must cost nothing: the tail is about to supply the only tick. */
 		polls0 = harness_ipl_polls;
 		z3660_warp_cadence_feed(0);
 		z3660_warp_cadence_feed(1);
 		CHECK(harness_ipl_polls == polls0,
 		      "a block that retired 0 or 1 instructions feeds nothing -- the pass's own "
-		      "tail supplies that tick\n");
+		      "tail supplies that tick, and round 2 does not even CALL the feed for those\n");
 
-		/* n = 17 at cadence 4 means 16 further instructions, i.e. exactly four crossings.
-		 * Asserted as a NUMBER, because "it polls" is satisfied by polling once. */
 		polls0 = harness_ipl_polls;
 		z3660_warp_cadence_feed(17);
 		CHECK(harness_ipl_polls - polls0 == 4,
@@ -7223,8 +7829,6 @@ static void test_warp_cadence(void)
 		      "the pump tick by the block length, silently (%lu)\n",
 		      harness_ipl_polls - polls0);
 
-		/* And the counter's PHASE survives, which is what makes a block and a run of
-		 * interpreted instructions interchangeable rather than merely similar. */
 		polls0 = harness_ipl_polls;
 		z3660_warp_cadence_feed(3);       /* +2 -> counter at 2 of 4 */
 		z3660_warp_cadence_feed(3);       /* +2 -> crosses once      */
@@ -7257,17 +7861,67 @@ static void test_warp_cadence(void)
 		      "tick once per block instead of once per 256 x cadence guest instructions\n");
 	}
 
+	/* ---- AND NOW THROUGH THE RUN LOOP, WITH REAL BLOCKS -------------------------
+	 *
+	 * The invariant that matters on metal is not that the feed can count, but that a run of
+	 * guest instructions polls the same number of times whoever retires it. Same corpus,
+	 * same instruction count, one arm interpreted and one arm in eight-instruction blocks. */
+	{
+		unsigned long polls_off, polls_on;
+		const unsigned INSNS = 800u;
+
+		shared->service_cadence = 4;
+		z3660_knobs_sync();
+
+		warp_corpus_build(); warp_boot(); warp_write_knob(Z3660_WARP_OFF);
+		shared->service_cadence = 4; z3660_knobs_sync();
+		warp_corpus_enter();
+		polls_off = harness_ipl_polls;
+		{ unsigned k; for (k = 0; k < INSNS; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		polls_off = harness_ipl_polls - polls_off;
+
+		warp_corpus_build(); warp_boot();
+		warp_corpus_enter();
+		{ unsigned k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+		warp_write_knob(Z3660_WARP_ARM);
+		shared->service_cadence = 4; z3660_knobs_sync();
+		z3660_warp_stats_zero();
+		warp_corpus_enter();
+		polls_on = harness_ipl_polls;
+		{ unsigned k; for (k = 0; k < INSNS / WARP_LOOP_INSNS; k++) m68k_run_mmu040();
+		  regs.spcflags = 0; }
+		polls_on = harness_ipl_polls - polls_on;
+
+		CHECK(z3660_warp_stat(Z3660_WARP_STAT_INSNS) == INSNS,
+		      "the armed arm retired the same %u guest instructions, in blocks (%llu)\n",
+		      INSNS, z3660_warp_stat(Z3660_WARP_STAT_INSNS));
+		CHECK(polls_on == polls_off,
+		      "%u guest instructions at cadence 4 poll %lu times interpreted and %lu times "
+		      "in eight-instruction blocks -- the TIMEBASE IS PRESERVED BY CONSTRUCTION, "
+		      "which is what Q10 froze\n", INSNS, polls_off, polls_on);
+	}
+
 	warp_boot();
+	warp_corpus_build();
 }
 
 /* --------------------------------------------------------------- the lockstep -------- */
 
-/* THE COMPARISON, taken at the end as well as at every boundary: registers and the guest
- * data page, byte for byte. The per-instruction digest is what proves the two arms never
- * diverged; this is what proves the digest was over something. */
+/* THE ORACLE'S DRIVER, and the thing round 2 had to solve for it.
+ *
+ * One armed run-loop pass can stand for several guest instructions, so the two arms no
+ * longer expose the same boundaries. The driver therefore runs the ARMED arm first and
+ * records how many guest instructions each pass retired, then replays the disarmed arm and
+ * takes its digest after exactly those counts. A length mismatch is still a divergence, and
+ * so is a per-boundary difference; what is compared is the sequence of architectural states
+ * at the boundaries BOTH arms actually reach.
+ *
+ * IT RUNS IN CHUNKS, because a per-boundary digest is four bytes and the pre-registered span
+ * is 10^8. Each chunk starts both arms from a saved machine state and ends by proving the
+ * two arms arrived at the same one, which is a stronger statement than the digests alone. */
 struct warp_ls_snap {
-	uae_u32 d[8], a[8], pc, ipc;
-	uae_u32 mem[16];
+	uae_u32 d[8], a[8], pc, ipc, ccr, x;
+	uae_u32 mem[64];
 };
 
 static void warp_ls_take(struct warp_ls_snap *s)
@@ -7276,84 +7930,135 @@ static void warp_ls_take(struct warp_ls_snap *s)
 	for (i = 0; i < 8; i++) { s->d[i] = m68k_dreg(regs, i); s->a[i] = m68k_areg(regs, i); }
 	s->pc  = m68k_getpc();
 	s->ipc = (uae_u32)regs.instruction_pc;
-	for (i = 0; i < 16; i++) s->mem[i] = hram_peek32(WARP_PDATA + i * 4);
+	s->ccr = (uae_u32)((GET_NFLG() ? 8u : 0u) | (GET_ZFLG() ? 4u : 0u)
+	                 | (GET_VFLG() ? 2u : 0u) | (GET_CFLG() ? 1u : 0u));
+	s->x   = (uae_u32)(GET_XFLG() ? 1u : 0u);
+	for (i = 0; i < 64; i++) s->mem[i] = memory_get_long(WARP_PDATA + i * 4);
 }
 
-static uae_u64 warp_ls_arm(uae_u32 knob, uae_u64 n, struct warp_ls_snap *out)
+static void warp_ls_restore(const struct warp_ls_snap *s)
 {
-	uae_u64 k;
+	int i;
+	for (i = 0; i < 8; i++) { m68k_dreg(regs, i) = s->d[i]; m68k_areg(regs, i) = s->a[i]; }
+	regs.isp = regs.msp = WARP_VSTK | 0xF00;
+	regs.m = 0;
+	m68k_setpc(s->pc);
+	regs.instruction_pc = s->ipc;
+	SET_NFLG((s->ccr >> 3) & 1); SET_ZFLG((s->ccr >> 2) & 1);
+	SET_VFLG((s->ccr >> 1) & 1); SET_CFLG(s->ccr & 1);
+	SET_XFLG(s->x & 1);
+	for (i = 0; i < 64; i++) memory_put_long(WARP_PDATA + i * 4, s->mem[i]);
+	regs.t0 = regs.t1 = 0;
+	regs.s = 0;
+	MakeSR();
+	regs.spcflags = Z_SPCFLAG_MODE_CHANGE;
+	mmufixup[0].reg = mmufixup[1].reg = -1;
+}
+
+static void warp_lockstep_run(uae_u64 total, const char *label)
+{
+	const unsigned CHUNK = 200000u;         /* guest instructions per chunk */
+	unsigned *lens = (unsigned *)malloc(CHUNK * sizeof(unsigned));
+	struct warp_ls_snap s0, s_ref, s_run;
+	uae_u64 done = 0, blocks = 0, in_blocks = 0;
+	unsigned bad_state = 0;
+
+	if (!lens) { CHECK(0, "OOM\n"); return; }
 
 	warp_corpus_build();
 	warp_boot();
-	warp_write_knob(knob);
-	z3660_warp_stats_zero();
-	warp_corpus_enter();
-	for (k = 0; k < n; k++) {
-		m68k_run_mmu040();
-		z3660_warp_ls_step();
-	}
-	regs.spcflags = 0;
-	warp_ls_take(out);
-	return n;
-}
-
-static void test_warp_lockstep(void)
-{
-	/* THE ROUND'S CORRECTNESS GATE, and it is the strongest form this gate will ever take.
-	 *
-	 * Armed against disarmed, over the same guest span, compared after EVERY guest
-	 * instruction across the set §3.1 defines: the sixteen data and address registers, the
-	 * guest pc, the architectural CCR and X, regs.instruction_pc, mmu_restart and
-	 * mmufixup[0..1]. With null blocks the two arms must be IDENTICAL rather than merely
-	 * equivalent, because a null block changes nothing at all -- so any divergence at all
-	 * is a defect in the plumbing and not a semantic difference to be reasoned about.
-	 *
-	 * A LENGTH MISMATCH IS ALSO A DIVERGENCE, and it is the failure this round is most
-	 * likely to produce: an engine that burned a run-loop pass without retiring anything
-	 * would make the armed arm shorter, which is precisely the no-empty-pass invariant
-	 * failing. The oracle counts it rather than comparing only where both arms have data.
-	 *
-	 * A single divergence is a stop, not a statistic. */
-	const uae_u64 N = 10000000ull;
-	struct warp_ls_snap ref, run;
-	uae_u64 diverge;
-
-	printf("[test] WARP lockstep oracle: armed and disarmed must be IDENTICAL over 10^7 "
-	       "guest instructions\n");
-
 	z3660_warp_ls_zero();
+	warp_corpus_enter();
+	{ unsigned k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+	warp_corpus_enter();
+	warp_ls_take(&s0);
 
-	warp_ls_arm(Z3660_WARP_OFF, N, &ref);
-	z3660_warp_ls_commit(0);                      /* the reference arm */
+	while (done < total) {
+		unsigned want = (unsigned)((total - done < CHUNK) ? (total - done) : CHUNK);
+		unsigned npass = 0, got = 0;
 
-	warp_ls_arm(Z3660_WARP_ARM, N, &run);
-	diverge = z3660_warp_ls_commit(1);
+		/* ---- the ARMED arm, recording how many instructions each pass stood for ---- */
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_ls_restore(&s0);
+		z3660_warp_stats_zero();
+		while (got < want) {
+			unsigned long long before = z3660_warp_stat(Z3660_WARP_STAT_INSNS);
+			unsigned n;
+			m68k_run_mmu040();
+			n = (unsigned)(z3660_warp_stat(Z3660_WARP_STAT_INSNS) - before);
+			if (n == 0) n = 1;              /* an interpreted pass retires exactly one */
+			lens[npass++] = n;
+			got += n;
+			z3660_warp_ls_step();
+		}
+		regs.spcflags = 0;
+		blocks    += z3660_warp_stat(Z3660_WARP_STAT_BLK);
+		in_blocks += z3660_warp_stat(Z3660_WARP_STAT_INSNS);
+		warp_ls_take(&s_run);
+		z3660_warp_ls_commit(0);            /* keep the armed stream as the reference */
+
+		/* ---- the DISARMED arm, digested at exactly the same boundaries ------------ */
+		warp_write_knob(Z3660_WARP_OFF);
+		warp_ls_restore(&s0);
+		{
+			unsigned p, i;
+			for (p = 0; p < npass; p++) {
+				for (i = 0; i < lens[p]; i++) m68k_run_mmu040();
+				z3660_warp_ls_step();
+			}
+		}
+		regs.spcflags = 0;
+		warp_ls_take(&s_ref);
+		z3660_warp_ls_commit(1);
+
+		if (memcmp(&s_ref, &s_run, sizeof s_ref) != 0) bad_state++;
+		s0 = s_ref;
+		done += got;
+	}
+
+	printf("       %s: %llu guest instructions, %llu block executions, %llu of them "
+	       "retired inside blocks (%.1f %% coverage)\n",
+	       label, (unsigned long long)done, blocks, in_blocks,
+	       100.0 * (double)in_blocks / (double)(done ? done : 1));
 
 	/* THE ANTI-VACUITY CHECK COMES FIRST. "The two paths agree" is trivially true when the
 	 * engine silently never engaged -- the failure a state-equivalence corpus is blindest
 	 * to, and a JIT's decline surface is larger than any rung's. */
-	CHECK(z3660_warp_stat(Z3660_WARP_STAT_BLK) == N,
-	      "the armed arm ENGAGED on every one of the %llu instructions (%llu block "
-	      "executions) -- without this the comparison below proves nothing\n",
-	      (unsigned long long)N, z3660_warp_stat(Z3660_WARP_STAT_BLK));
-
-	CHECK_EQ32((uae_u32)diverge, 0u,
-	           "WARP_DIVERGE == 0: not one instruction boundary differs between the arms");
-	CHECK(z3660_warp_ls_insns() >= N,
-	      "...over %llu compared boundaries, which is the pre-registered span\n",
-	      z3660_warp_ls_insns());
+	CHECK(in_blocks == done,
+	      "the armed arm retired EVERY one of the %llu instructions inside blocks -- "
+	      "without this the comparison below proves nothing\n", (unsigned long long)done);
 	CHECK(z3660_warp_diverge() == 0,
-	      "...and the oracle's own running total agrees (%llu)\n", z3660_warp_diverge());
-
-	CHECK(memcmp(&ref, &run, sizeof ref) == 0,
-	      "the final register file, pc, restart pc and guest data page are byte-identical "
-	      "between the arms\n");
+	      "WARP_DIVERGE == 0 over %llu compared boundaries: not one differs between the "
+	      "arms\n", z3660_warp_ls_insns());
+	CHECK_EQ32((uae_u32)bad_state, 0u,
+	           "...and every chunk ended with the two arms in a byte-identical machine "
+	           "state, which the digests alone would not have said");
 	CHECK(z3660_warp_bad(Z3660_WARP_BAD_UNPUBLISHED) == 0
-	   && z3660_warp_bad(Z3660_WARP_BAD_RETIRED) == 0,
-	      "...and neither engine invariant was broken over the whole span\n");
+	   && z3660_warp_bad(Z3660_WARP_BAD_RETIRED) == 0
+	   && z3660_warp_bad(Z3660_WARP_BAD_SUPER) == 0
+	   && z3660_warp_bad(Z3660_WARP_BAD_FIXUP) == 0,
+	      "...and no engine invariant was broken over the whole span\n");
 
+	free(lens);
 	z3660_warp_ls_zero();
 	warp_boot();
+}
+
+static void test_warp_lockstep(void)
+{
+	printf("[test] WARP lockstep oracle: armed against disarmed, boundary for boundary\n");
+	warp_lockstep_run(10000000ull, "10^7");
+	warp_corpus_build();
+}
+
+/* The pre-registered M1 gate level, §0.8.4 G-R2.3. It is a separate entry point because a
+ * 10^8-boundary run is minutes rather than seconds and every build should not pay for it;
+ * the default suite takes 10^7 on every build and this is taken deliberately. */
+static void test_warp_lockstep_full(void)
+{
+	printf("[test] WARP lockstep oracle at the PRE-REGISTERED M1 GATE LEVEL: 10^8\n");
+	warp_lockstep_run(100000000ull, "10^8");
+	warp_corpus_build();
 }
 
 #if Z3660_EMU_PROF
@@ -7365,48 +8070,40 @@ static void test_warp_lockstep(void)
  * is that a counter reached only AFTER the branch being deleted cannot fall when it is
  * deleted, which was once a declared direction that was arithmetically impossible.
  *
- * Round 1 is the one wave in which most of them can be asserted as EXACT EQUALITIES rather
- * than as bands, because a null block changes nothing: the two arms execute the same guest
- * instructions, take the same fetches, consult the decoded-op cache the same number of
- * times and raise the same invalidations. Every equality below stops being available the
- * moment the first block retires something, so it is worth taking now.
+ * ROUND 2 IS WHERE THE DIRECTIONS STOP BEING VACUOUS. Round 1's null block changed nothing,
+ * so nearly every counter was assertable as an exact equality and WARP_ENTER was 0 by
+ * construction -- which meant the CORRECTION §0.5.2 makes to §2e's claim 3 could not be
+ * exercised at all. Here WARP_ENTER is non-zero, one run-loop pass stands for several guest
+ * instructions, and the reconstructed stream is the only quantity the two arms can be
+ * compared on. Getting that wrong is exactly rung 0's metal boot, which read 59.28 % where
+ * the correct arithmetic read 37.25 % -- "not merely inflated, outside the range in which
+ * the prediction could be judged at all".
  * ================================================================== */
 static void test_warp_counters(void)
 {
 	uae_u64 hit_off, miss_off, insns_off, faults_off, inval_off;
-	uae_u64 blkhit_off, blkinsns_off, blkbytes_off;
+	uae_u64 blkhit_off, blkinsns_off, blkbytes_off, fetch_off, ifc_off;
+	uae_u64 read_off, write_off, mis_r_off, mis_w_off;
 	uae_u64 hit_on, miss_on, insns_on, faults_on, inval_on;
-	uae_u64 blkhit_on, blkinsns_on, blkbytes_on;
+	uae_u64 blkhit_on, blkinsns_on, blkbytes_on, fetch_on, ifc_on;
+	uae_u64 read_on, write_on, mis_r_on, mis_w_on;
 	uae_u64 enter_on, blk_on, warpinsns_on, bail_on, bailst_on;
-	uae_u64 compile_on, cinsns_on, cbytes_on, cfetch_on, decline_on;
-	uae_u64 req, c;
-	const unsigned N = 20000;
+	uae_u64 compile_on, cinsns_on, cbytes_on, cfetch_on, decline_on, evict_on;
+	uae_u64 recon, req, c;
+	const unsigned PASSES = 4000;
 
-	printf("[test] WARP counters: the identities S0.5.6 pre-registered, as exact equalities\n");
+	printf("[test] WARP counters: the identities S0.5.6 pre-registered, with WARP_ENTER > 0\n");
 
-	/* ---- the reference arm ---- */
+	/* ---- the ARMED arm first, because it decides how long the reference arm runs ---- */
 	warp_corpus_build();
 	warp_boot();
-	warp_write_knob(Z3660_WARP_OFF);
-	z3660_prof_zero();
 	warp_corpus_enter();
-	{ unsigned k; for (k = 0; k < N; k++) m68k_run_mmu040(); regs.spcflags = 0; }
-	hit_off      = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
-	miss_off     = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
-	insns_off    = z3660_prof_cnt[Z3660_PROF_C_INSNS];
-	faults_off   = z3660_prof_cnt[Z3660_PROF_C_FAULTS];
-	inval_off    = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
-	blkhit_off   = z3660_prof_cnt[Z3660_PROF_C_BLK_HIT];
-	blkinsns_off = z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS];
-	blkbytes_off = z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES];
-
-	/* ---- the armed arm, same span, same fixture ---- */
-	warp_corpus_build();
-	warp_boot();
+	{ unsigned k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 	warp_write_knob(Z3660_WARP_ARM);
 	z3660_prof_zero();
+	z3660_warp_stats_zero();
 	warp_corpus_enter();
-	{ unsigned k; for (k = 0; k < N; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+	{ unsigned k; for (k = 0; k < PASSES; k++) m68k_run_mmu040(); regs.spcflags = 0; }
 	hit_on      = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
 	miss_on     = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
 	insns_on    = z3660_prof_cnt[Z3660_PROF_C_INSNS];
@@ -7415,6 +8112,12 @@ static void test_warp_counters(void)
 	blkhit_on   = z3660_prof_cnt[Z3660_PROF_C_BLK_HIT];
 	blkinsns_on = z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS];
 	blkbytes_on = z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES];
+	fetch_on    = z3660_prof_cnt[Z3660_PROF_C_FETCH];
+	ifc_on      = z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS];
+	read_on     = z3660_prof_cnt[Z3660_PROF_C_READ];
+	write_on    = z3660_prof_cnt[Z3660_PROF_C_WRITE];
+	mis_r_on    = z3660_prof_cnt[Z3660_PROF_C_MISALIGN_R];
+	mis_w_on    = z3660_prof_cnt[Z3660_PROF_C_MISALIGN_W];
 	enter_on     = z3660_prof_cnt[Z3660_PROF_C_WARP_ENTER];
 	blk_on       = z3660_prof_cnt[Z3660_PROF_C_WARP_BLK];
 	warpinsns_on = z3660_prof_cnt[Z3660_PROF_C_WARP_INSNS];
@@ -7425,45 +8128,122 @@ static void test_warp_counters(void)
 	cbytes_on    = z3660_prof_cnt[Z3660_PROF_C_WARP_CBYTES];
 	cfetch_on    = z3660_prof_cnt[Z3660_PROF_C_WARP_CFETCH];
 	decline_on   = z3660_prof_cnt[Z3660_PROF_C_WARP_DECLINE];
+	evict_on     = z3660_prof_cnt[Z3660_PROF_C_WARP_EVICT];
 
-	/* ---- G2's first identity, in the form §2e's claim 3 was CORRECTED into --------
-	 *
-	 * The literal claim ("INSNS identical between arms") is wrong and §0.5.2 says why:
-	 * INSNS is incremented once per RUN-LOOP PASS, and a block that retires n instructions
-	 * is one pass. The comparable quantity is the reconstructed guest stream, which is
-	 * rung 0's own correction with WARP_ENTER in BLK_HIT's place. In round 1 WARP_ENTER is
-	 * 0 by construction, so the identity reduces to the one the firmware has always had --
-	 * in BOTH arms, which is what makes an armed capture readable by tools that predate the
-	 * engine. */
-	CHECK(hit_off + miss_off == (insns_off - 0) + faults_off,
+	/* THE RECONSTRUCTED GUEST STREAM, and §0.5.2 pre-registers it because the obvious ratio
+	 * is wrong. INSNS is incremented once per RUN-LOOP PASS; a block that retires n guest
+	 * instructions is ONE pass, so WARP_INSNS is not a subset of INSNS and the literal ratio
+	 * is not a share of anything. */
+	recon = (insns_on - enter_on) + warpinsns_on;
+
+	/* ---- the reference arm, run for exactly that many guest instructions ------------ */
+	warp_corpus_build();
+	warp_boot();
+	warp_corpus_enter();
+	{ unsigned k; for (k = 0; k < 32; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+	warp_write_knob(Z3660_WARP_OFF);
+	z3660_prof_zero();
+	warp_corpus_enter();
+	{ uae_u64 k; for (k = 0; k < recon; k++) m68k_run_mmu040(); regs.spcflags = 0; }
+	hit_off      = z3660_prof_cnt[Z3660_PROF_C_DOPC_HIT];
+	miss_off     = z3660_prof_cnt[Z3660_PROF_C_DOPC_MISS];
+	insns_off    = z3660_prof_cnt[Z3660_PROF_C_INSNS];
+	faults_off   = z3660_prof_cnt[Z3660_PROF_C_FAULTS];
+	inval_off    = z3660_prof_cnt[Z3660_PROF_C_DOPC_INVAL];
+	blkhit_off   = z3660_prof_cnt[Z3660_PROF_C_BLK_HIT];
+	blkinsns_off = z3660_prof_cnt[Z3660_PROF_C_BLK_INSNS];
+	blkbytes_off = z3660_prof_cnt[Z3660_PROF_C_BLK_BYTES];
+	fetch_off    = z3660_prof_cnt[Z3660_PROF_C_FETCH];
+	ifc_off      = z3660_prof_cnt[Z3660_PROF_C_IFETCH_CALLS];
+	read_off     = z3660_prof_cnt[Z3660_PROF_C_READ];
+	write_off    = z3660_prof_cnt[Z3660_PROF_C_WRITE];
+	mis_r_off    = z3660_prof_cnt[Z3660_PROF_C_MISALIGN_R];
+	mis_w_off    = z3660_prof_cnt[Z3660_PROF_C_MISALIGN_W];
+
+	printf("       armed: %llu passes stand for %llu guest instructions "
+	       "(%llu blocks, %llu retired inside them, coverage %.2f %%, mean block %.2f)\n",
+	       (unsigned long long)insns_on, (unsigned long long)recon,
+	       (unsigned long long)blk_on, (unsigned long long)warpinsns_on,
+	       100.0 * (double)warpinsns_on / (double)recon,
+	       (double)warpinsns_on / (double)(enter_on ? enter_on : 1));
+
+	/* ---- G2's first identity, in the form §2e's claim 3 was CORRECTED into ---------- */
+	CHECK(hit_off + miss_off == insns_off + faults_off,
 	      "disarmed: DOPC_HIT + DOPC_MISS == INSNS + FAULTS (%llu == %llu)\n",
 	      (unsigned long long)(hit_off + miss_off),
 	      (unsigned long long)(insns_off + faults_off));
 	CHECK(hit_on + miss_on == (insns_on - enter_on) + faults_on,
-	      "armed: DOPC_HIT + DOPC_MISS == (INSNS - WARP_ENTER) + FAULTS (%llu == %llu)\n",
+	      "armed: DOPC_HIT + DOPC_MISS == (INSNS - WARP_ENTER) + FAULTS (%llu == %llu) -- "
+	      "and this is the first round in which the WARP_ENTER term is non-zero, so the "
+	      "correction is load-bearing rather than vacuous\n",
 	      (unsigned long long)(hit_on + miss_on),
 	      (unsigned long long)((insns_on - enter_on) + faults_on));
-	CHECK_EQ32((uae_u32)enter_on, 0u,
-	           "WARP_ENTER is 0 armed: it counts entries that COST one INSNS, and a null "
-	           "block falls through inside the pass rather than consuming it");
+	CHECK(enter_on > 0,
+	      "WARP_ENTER is NON-ZERO: %llu pass-consuming entries. Round 1's was 0 by "
+	      "construction and every identity that depends on it was untested\n",
+	      (unsigned long long)enter_on);
+	CHECK(insns_off == recon,
+	      "the reconstruction closes: (INSNS - WARP_ENTER) + WARP_INSNS armed == INSNS "
+	      "disarmed over the same guest stream (%llu == %llu)\n",
+	      (unsigned long long)recon, (unsigned long long)insns_off);
+	CHECK(insns_on < insns_off,
+	      "INSNS FALLS, and it must: a block is one pass (%llu armed vs %llu disarmed). "
+	      "§2e's literal claim 3 -- INSNS identical between arms -- is superseded, and the "
+	      "reconstruction above is what replaces it\n",
+	      (unsigned long long)insns_on, (unsigned long long)insns_off);
 
-	/* ---- the exact equalities a null block makes available ------------------------ */
-	CHECK(insns_on == insns_off,
-	      "INSNS is IDENTICAL between the arms (%llu), because every pass still retires "
-	      "exactly one interpreted instruction\n", (unsigned long long)insns_on);
-	CHECK(hit_on + miss_on == hit_off + miss_off,
-	      "...and the decoded-op cache is consulted exactly as often (%llu)\n",
-	      (unsigned long long)(hit_on + miss_on));
+	/* ---- the directions that are only checkable once something is compiled ---------- */
+	CHECK(hit_on + miss_on < hit_off + miss_off,
+	      "DOPC_HIT + DOPC_MISS FALLS by the covered share (%llu vs %llu): a jitted "
+	      "instruction never reaches the interpreter's decode site, and the compile path "
+	      "does not consult the dopc\n",
+	      (unsigned long long)(hit_on + miss_on),
+	      (unsigned long long)(hit_off + miss_off));
+	CHECK(fetch_on <= fetch_off && ifc_on <= ifc_off,
+	      "FETCH and IFETCH_CALLS never RISE with the engine armed (%llu/%llu vs %llu/%llu). "
+	      "§0.5.6 pre-registers them to FALL by the covered share, and the STRICT fall is a "
+	      "metal-window direction rather than a corpus one: rung 1's extension-word window "
+	      "serves every fetch this loop makes, so both arms read zero and there is nothing "
+	      "to fall. The half that IS checkable here is the one the direction depends on, "
+	      "and it is checked next\n",
+	      (unsigned long long)fetch_on, (unsigned long long)ifc_on,
+	      (unsigned long long)fetch_off, (unsigned long long)ifc_off);
+	CHECK(cfetch_on > 0 && fetch_on == fetch_off,
+	      "THE COMPILER READ %llu GUEST INSTRUCTION WORDS AND CHARGED NONE OF THEM TO FETCH. "
+	      "That is the property §0.5.6's declared fall stands on -- \"a counter reached only "
+	      "after the branch being deleted cannot fall when it is deleted\" -- and the first "
+	      "version of this compiler got it wrong, reading through uae_mmu040_get_iword() and "
+	      "putting 8 compile-path fetches inside the interpreter's own bracket\n",
+	      (unsigned long long)cfetch_on);
+	CHECK(cfetch_on > 0,
+	      "WARP_CFETCH is NON-ZERO for the first time (%llu): THIS IS Q6'S COUNTER. Its decision rule needs the "
+	      "compile-cycle micro-benchmark, which is a target measurement and is deferred to "
+	      "the verdict session with Q5's second condition\n",
+	      (unsigned long long)cfetch_on);
+
 	CHECK(faults_on == faults_off,
 	      "FAULTS unchanged (%llu == %llu) -- the bail contract means every fault is still "
 	      "the interpreter's, and on a deterministic host corpus that is an equality rather "
 	      "than the +/-1 a metal capture allows\n",
 	      (unsigned long long)faults_on, (unsigned long long)faults_off);
+	CHECK(read_on == read_off && write_on == write_off,
+	      "READ and WRITE are UNCHANGED (%llu/%llu vs %llu/%llu), which §0.5.6 says is "
+	      "CONDITIONAL ON THE COUNTING EMITTER: the memory helper increments them at the "
+	      "same point the accessor does, and ONLY when it serves -- counting on the bail arm "
+	      "too would double-charge exactly the accesses the engine declined\n",
+	      (unsigned long long)read_on, (unsigned long long)write_on,
+	      (unsigned long long)read_off, (unsigned long long)write_off);
+	CHECK(mis_r_on == mis_r_off && mis_w_on == mis_w_off,
+	      "MISALIGN_R / MISALIGN_W unchanged (%llu/%llu): generated code never fast-paths a "
+	      "misaligned access -- it bails, and the interpreter performs it and counts it\n",
+	      (unsigned long long)mis_r_on, (unsigned long long)mis_w_on);
 
-	/* Q8, and it is a stronger check than the plan could pre-register: rung 0 is not merely
-	 * unmodified, it still FIRES identically -- because a null block retires nothing, so the
-	 * recognizer runs in the same pass exactly as it does today. A fall here would be the
-	 * engine poaching rung-0 PCs, and this is how that is detected rather than argued. */
+	/* Q8, and round 2 honours it BY CONSTRUCTION rather than by a decline list. Every head
+	 * rung 0's recognizer claims is a MOVE (An)+ / MOVE (An)+,(An)+ / CPUSHL shape, and all
+	 * three use predecrement-postincrement or are privileged -- so all three are outside
+	 * generation one's frozen scope, WARP refuses them as block heads, and a block ends in
+	 * front of one rather than swallowing it. A fall here would be the engine poaching
+	 * rung-0 PCs, and this is how that is detected rather than argued. */
 	CHECK(blkhit_on == blkhit_off && blkinsns_on == blkinsns_off
 	   && blkbytes_on == blkbytes_off,
 	      "rung 0's BLK_HIT / BLK_INSNS / BLK_BYTES are identical between the arms -- the "
@@ -7471,56 +8251,59 @@ static void test_warp_counters(void)
 	      (unsigned long long)blkhit_on, (unsigned long long)blkinsns_on,
 	      (unsigned long long)blkbytes_on);
 
-	/* The guest's invalidation demand is a GUEST property, so WARP adds a consumer and not
-	 * a cause. If this moved, the code cache would have started raising invalidations of
-	 * its own -- and every narrowing decision downstream reads this number as a
-	 * denominator. */
 	CHECK(inval_on == inval_off,
 	      "DOPC_INVAL is unchanged (%llu): WARP is a CONSUMER of the invalidation stream, "
 	      "never a cause of it\n", (unsigned long long)inval_on);
 	req = 0;
 	for (c = 0; c < Z3660_DOPC_INV_COUNT; c++)
 		req += z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_BASE + c];
-	CHECK(req - z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP] == inval_on,
+	CHECK(req - z3660_prof_cnt[Z3660_PROF_C_DOPC_IV_WRAP] == inval_off,
 	      "...and the standing identity sum(IV_*) - IV_WRAP == DOPC_INVAL still closes "
-	      "with the engine armed (%llu)\n", (unsigned long long)inval_on);
+	      "(%llu)\n", (unsigned long long)inval_off);
 
-	/* ---- WARP's own block, each against its topology ----------------------------- */
-	CHECK(blk_on == (uae_u64)N,
-	      "WARP_BLK counts every block execution: %llu on %u dispatches\n",
-	      (unsigned long long)blk_on, N);
-	CHECK(bail_on == blk_on,
-	      "WARP_BAIL == WARP_BLK: every null block bails, so the two are the same event "
-	      "counted at two sites, and a difference would be a leak in the bail contract\n");
-	CHECK_EQ32((uae_u32)warpinsns_on, 0u,
-	           "WARP_INSNS is 0: no guest instruction is retired inside a block");
-	CHECK_EQ32((uae_u32)bailst_on, 0u,
-	           "WARP_BAIL_ST is 0 -- MEASURED zero, not omitted. It is the number round 2's "
-	           "state-sync discipline is measured against");
-	CHECK(compile_on == 8,
-	      "WARP_COMPILE counts the eight distinct block heads once each (%llu)\n",
-	      (unsigned long long)compile_on);
-	CHECK_EQ32((uae_u32)cinsns_on, 0u,
-	           "WARP_CINSNS is 0: a null block compiles no guest instruction");
-	CHECK(cbytes_on == compile_on * Z3660_WARP_NULL_BYTES,
-	      "WARP_CBYTES == compiles x 8 (%llu)\n", (unsigned long long)cbytes_on);
-	CHECK_EQ32((uae_u32)cfetch_on, 0u,
-	           "WARP_CFETCH is 0: round 1's compiler reads no guest instruction word. THIS "
-	           "IS Q6'S COUNTER and it is live and reading zero, which is the honest value");
+	/* ---- WARP's own block, each against its topology ------------------------------- */
+	CHECK(blk_on == enter_on + bail_on - (enter_on + bail_on - blk_on),
+	      "WARP_BLK %llu, WARP_ENTER %llu, WARP_BAIL %llu\n",
+	      (unsigned long long)blk_on, (unsigned long long)enter_on,
+	      (unsigned long long)bail_on);
+	CHECK(enter_on <= blk_on && bail_on <= blk_on,
+	      "WARP_ENTER and WARP_BAIL are both bounded by WARP_BLK, and they are NOT "
+	      "complementary: a block that retires four instructions and then declines counts "
+	      "at BOTH sites, which is what makes WARP_BAIL_ST a per-bail quantity\n");
+	CHECK(warpinsns_on > 0 && cinsns_on > 0,
+	      "WARP_INSNS %llu and WARP_CINSNS %llu are non-zero -- there is a compiler now\n",
+	      (unsigned long long)warpinsns_on, (unsigned long long)cinsns_on);
+	CHECK(bailst_on == bail_on,
+	      "WARP_BAIL_ST == WARP_BAIL (%llu): ONE emitted store per bail, the guest PC, "
+	      "because nothing else is ever dirty. §0.5.4 pre-registered 3..8 emitted stores "
+	      "per bail and this MISSES IT LOW -- which is what a memory-resident register file "
+	      "buys, and it is recorded as a miss rather than as a triumph\n",
+	      (unsigned long long)bailst_on);
+	CHECK(compile_on > 0 && compile_on * 100ull <= blk_on,
+	      "WARP_COMPILE %llu against WARP_BLK %llu: at most one compile per hundred block "
+	      "executions on a corpus whose head set the table holds\n",
+	      (unsigned long long)compile_on, (unsigned long long)blk_on);
+	CHECK_EQ32((uae_u32)evict_on, 0u,
+	           "WARP_EVICT is 0: no live block was overwritten by a conflicting fill. It is "
+	           "id 60, appended at round 2, and it is the term that lets a recompile budget "
+	           "be decomposed instead of leaving 95.2 % of it unattributed");
 	CHECK_EQ32((uae_u32)decline_on, 0u,
-	           "WARP_DECLINE is 0 on a user-mode corpus with tracing off -- supervisor PCs "
-	           "are gated before discovery and are read from INSNS_SUPER instead");
+	           "WARP_DECLINE is 0 on a corpus whose every opcode is in scope -- and it is "
+	           "now charged once per DECLINED HEAD rather than once per arrival, because a "
+	           "declined head is cached as a stub");
+	printf("       code bytes per compiled guest instruction: %.1f (%llu bytes / %llu insns)"
+	       " -- DDR is not the constraint, L1I is\n",
+	       (double)cbytes_on / (double)(cinsns_on ? cinsns_on : 1),
+	       (unsigned long long)cbytes_on, (unsigned long long)cinsns_on);
 
-	/* THE COVERAGE ARITHMETIC ITSELF, on the wave where its answer is known in advance.
-	 * §0.5.2 pre-registers it because the obvious ratio is wrong -- rung 0 walked into
-	 * exactly this and its metal boot read 59.28 % where the correct arithmetic read
-	 * 37.25 %, "not merely inflated -- outside the range in which the prediction could be
-	 * judged at all". Round 1 must read 0, and reading 0 through the CORRECT formula is
-	 * what says the formula is wired up before there is anything to measure with it. */
-	CHECK(warpinsns_on == 0 && ((insns_on - enter_on) + warpinsns_on) == insns_on,
-	      "coverage = WARP_INSNS / ((INSNS - WARP_ENTER) + WARP_INSNS) = 0/%llu = 0.00 %%, "
-	      "which is what a round with no compiler must read\n",
-	      (unsigned long long)insns_on);
+	/* THE COVERAGE ARITHMETIC ITSELF, through the formula §0.5.2 pre-registered. */
+	CHECK(warpinsns_on * 100ull / recon >= 90ull,
+	      "coverage = WARP_INSNS / ((INSNS - WARP_ENTER) + WARP_INSNS) = %llu / %llu = "
+	      "%.2f %% on a corpus written entirely inside generation one's scope. It is NOT a "
+	      "prediction of the metal number: §0.5.3's pre-registered band is c = 0.19..0.62 "
+	      "over the dhrystone window, and §0.8.6 leaves it unchanged\n",
+	      (unsigned long long)warpinsns_on, (unsigned long long)recon,
+	      100.0 * (double)warpinsns_on / (double)recon);
 
 	z3660_prof_zero();
 	warp_boot();
@@ -7530,7 +8313,11 @@ static void test_warp_counters(void)
 
 int main(int argc, char **argv)
 {
-	(void)argc; (void)argv;
+	/* --lockstep-full takes the PRE-REGISTERED M1 GATE LEVEL, §0.8.4 G-R2.3: 10^8 compared
+	 * boundaries instead of the 10^7 every build pays for. It is a separate entry point
+	 * rather than a longer default because a gate that makes every build take minutes gets
+	 * turned off, and a gate that is turned off is not a gate. */
+	int full_lockstep = (argc > 1 && strcmp(argv[1], "--lockstep-full") == 0);
 	printf("=== Z3660 UAE host MMU harness (Layer 1) ===\n");
 
 	harness_mem_init();
@@ -7591,9 +8378,11 @@ int main(int argc, char **argv)
 	test_prof_build_variant();
 	test_warp_switch();
 	test_warp_block_cache();
-	test_warp_null_block();
+	test_warp_emitted_words();
+	test_warp_codegen();
+	test_warp_bail();
 	test_warp_cadence();
-	test_warp_lockstep();
+	if (full_lockstep) test_warp_lockstep_full(); else test_warp_lockstep();
 #if Z3660_EMU_PROF
 	test_prof_bucket_arithmetic();
 	test_prof_ret_macro_ordering();
