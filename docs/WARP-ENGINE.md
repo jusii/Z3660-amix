@@ -20,8 +20,10 @@ disagrees with §0's censuses, §0 wins and the §2 text has been corrected in p
 correction marked.
 
 **`docs/warp-gen2-prospectus.md`** prices the M1 fork — park generation one, or fund a generation
-two — as scenarios against the R5 metal rows. It is a paper instrument, it carries no
-recommendation, and it scores nothing here: no number in this document is moved by it.
+two — as scenarios against the R5 metal rows, now scored in full at **§0.16**. It is a paper
+instrument, it carries no recommendation, and it scores nothing here: no number in this document
+is moved by it. **The fork itself is with the user** — this document names the row and prices the
+scenarios; it decides nothing.
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -3855,7 +3857,7 @@ What the harness does settle, and it is the part that could have been wrong:
 
 1. **Every metal row.** Round 5 takes none. The ablation matrix, the bail split's shares, the
    coverage band, the armed band and the disarm penalty are all pre-registered in §0.14 and
-   all unmeasured.
+   all unmeasured. **Taken 2026-08-24 → scored in §0.16.**
 2. **The decision rule's own bar needs re-reading against A0's own row.** §0.14.1 rule 2 pins
    it at 2.128 pp = half of round 4's −4.256 %, and §0.15.2 has just established that
    −4.256 % was measured on an image round 4's source does not build. **The rule is applied to
@@ -3873,6 +3875,189 @@ What the harness does settle, and it is the part that could have been wrong:
 6. **`z3660_warp_run`'s preamble**, unchanged, still the largest row in §0.9.3's table.
 7. **Everything §0.8.8, §0.10.7, §0.11.7, §0.12.8, §0.13.6 and §0.14.9 said would not be
    established**, unchanged.
+
+## 0.16 M1a round 5 — the metal row, scored against §0.14 (2026-08-24)
+
+**The row §0.15.7 item 1 said round 5 takes none of.** The ablation matrix, the bail split's
+shares, the coverage band, the armed band and the disarm penalty — every one pre-registered in
+§0.14 and left unmeasured when §0.15 was written — were taken on **2026-08-24, 11:55 – 13:34
+EEST**, A4000 + Z3660, piscsi-root installed AMIX, preset 7 (`amix_ram 128`, `service_cadence 4`,
+`arm_frequency 1100`, `UAE_040_MMU`). Eight flashes, eight guest boots, forty-five scored
+dhrystone rows across nine arms, two `WARPTEST` gates, two `PROFZ`-fenced counter windows. Every
+number below is read off `Amix/tmp/2026-08-24-warp-r5-metal/MATRIX.md`, `MATRIX-SCORING.txt`,
+`R-VERDICT.txt` and `R5-VERDICT.txt`; the same numbers are reproduced a third time in
+`docs/warp-gen2-prospectus.md` §§1.1–1.2 and 6.1, which prices them and does not score them —
+its own words, and §0's authority stands over it. **Where the two disagree, this section follows
+the evidence directory**, and the one place they diverge in substance is noted at §0.16.2.
+
+### 0.16.1 The anchor, and the card decision it drives
+
+`R` = **8185.0** (`F294E75A`, n = 7, spread 0.42 %, `s` = 0.70 %, threshold `R×(1+s)` =
+**8242.3**, absolute floor 8242 quoted beside and never removed).
+
+| | pre-registered (§0.14.8 step 3) | measured | verdict |
+|---|---|---|---|
+| **A0 disarmed** (the blessing gate) | ≥ 7 988 (same-session `R×0.97724` = 7 998.7; doc absolute 7 988) | **7 903**, penalty **−3.445 %** | **MISSED, third consecutive round** — 96 dhry short of 7 998.7, 85 short of 7 988 |
+| A0 vs round 4's flown penalty | — | −3.445 % vs −4.256 % | **better by 0.811 pp** — but the class is absolute, not a delta |
+| Q11 boot row, A0 | 45 … 50 s | **48 s** | **HIT** |
+
+**The card does not ship `7A5EC595`.** The pre-declared rule (§0.14.1, carried from §0.12.7 step
+3) is unconditional on the class, not on the trend: round 5 flew §0.12.1's designed gate for the
+first time — one instruction, one load lighter than the image that measured −4.256 % — it is
+worth 0.811 pp, and it is still not enough. `0:/Z3660.bin` returns to the clean interpreter
+lineage, `F294E75A`, for a third consecutive round.
+
+### 0.16.2 THE ABLATION MATRIX — every edge against its §0.14.1 prediction
+
+| variant | removes | dhry (n=5) | penalty vs `R` | boot |
+|---|---|---|---|---|
+| A0 `7A5EC595` | nothing — the shipping lean | 7 903 | −3.445 % | 48 s |
+| A1 `0BAEECE1` | `L-WTST` | 7 905 | −3.421 % | 48 s |
+| A2 `161412F2` | `L-ATT` — **the floor** | 7 861 | −3.958 % | 49 s |
+| A3 `5E2592EF` | `L-HOOK` | 8 064 | −1.478 % | 47 s |
+| A4 `459E51A3` | `L-HOOK` + `L-REG` | 8 140 | −0.550 % | 46 s |
+| A5 `BBED0509` | the engine entirely | 8 163 | −0.269 % | 46 s |
+
+| edge | layer | predicted | measured | verdict |
+|---|---|---|---|---|
+| A0→A1 | `L-WTST` | 0.0 – 0.5 pp | **+0.024 pp** | **HIT** — below the floor, and that IS the prediction |
+| A0→A2 | `L-ATT` = **THE FLOOR** | 0.0 – 0.3 pp | **−0.513 pp** | **MISSED, wrong-signed** — removing 64 B of cold attestation code made the disarmed image measurably *slower*, 0.213 pp past the band's own ceiling in magnitude |
+| A0→A3 | `L-HOOK` | 0.6 – 1.4 pp | **+1.967 pp** | **MISSED, HIGH** by 0.567 pp — readable, 3.8× the floor |
+| A3→A4 | `L-REG` — the pre-registered favourite | 1.8 – 3.4 pp | **+0.929 pp** | **MISSED, LOW** by 0.871 pp — readable, 1.8× the floor, but half its own band's bottom |
+| A0→A5 | whole engine (closure) | 3.9 – 4.6 pp | **+3.177 pp** | **MISSED, LOW** by 0.723 pp |
+
+**The decision rule (§0.14.1), read in its own order:**
+
+```
+1. THE FLOOR = |penalty(A0) - penalty(A2)| = 0.513 pp.
+   No edge smaller than 0.513 pp may be read as a mechanism, in this round or any later one.
+
+2. A single edge that recovers >= HALF the measured penalty NAMES the mechanism.
+   Largest single-layer edge: A0->A3 (L-HOOK) = +1.967 pp = 57.1 % of A0's 3.445 pp.
+
+   APPLIED bar (§0.15.7 item 2 -- half of A0's OWN same-session penalty) = 1.7227 pp
+      1.967 >= 1.7227  ->  NAMES L-HOOK, the run-loop gate
+   PRE-REGISTERED bar (§0.14.1 rule 2, byte-untouched -- half of round 4's -4.256 %) = 2.128 pp
+      1.967 <  2.128, short by 0.161 pp  ->  rule 3 would read "distributed or emergent"
+
+   BOTH BARS ARE REPORTED. The applied reading governs; the pre-registered figure stands
+   beside it, unrewritten, because the naming verdict rests on a 0.161 pp margin against a
+   0.513 pp floor, and saying so is the difference between an attribution and a claim.
+
+4. A5's own penalty = -0.269 %; |0.269| <= floor 0.513  ->  WITHIN the floor of zero.
+   The four named layers SPAN the cost. The "something outside all four carries it" branch
+   does not fire.
+
+5. ADDITIVITY: (A0-A1)+(A0-A2)+(A0-A3)+(A3-A4) = 0.024 - 0.513 + 1.967 + 0.929 = +2.407 pp
+   (A0-A5) = +3.177 pp.  |difference| = 0.770 pp,  tolerance 2x floor = 1.026 pp  ->  HOLDS.
+   The layers ADD; they do not interact.
+```
+
+> **The named mechanism is `L-HOOK`, the run loop's `if (z3660_warp_on) … z3660_warp_step()` gate
+> and the restructured loop body around it — the first attribution this campaign has produced,
+> after two disassembly-guessed mechanisms were refuted on metal (§0.10.6, §0.12.1).** `L-REG`,
+> the pre-registered favourite, is refuted in public as §0.14.1 asked: it measured 0.929 pp
+> against a predicted 1.8 – 3.4 pp — real, but under half its own floor.
+
+*(One evidence-file note, not a doc-content issue: `MATRIX-SCORING.txt`'s own verdict line for
+A0→A2 reads "MISSED, LOW by 0.513 pp", which is the measured magnitude rather than the miss's
+excess over the 0.3 pp band ceiling; `MATRIX.md`'s prose gives the arithmetically consistent
+0.213 pp and is what this section follows.)*
+
+### 0.16.3 The armed row, and the coverage precondition
+
+| row | pre-registered (§0.14.8 steps 1–2) | measured | verdict |
+|---|---|---|---|
+| **coverage `c`** | 0.20 – 0.28, point 0.229 | **0.20263** | **HIT** — below 60 %, the kill line's precondition is unmet for a **third consecutive wave** |
+| armed, A0, n=5 | 0.910× – 0.976× of same-session `R` (7 448.4 – 7 988.6) | **7 563** = **0.92401×**, spread 0.42 % | **HIT** — 115 above the floor, 426 below the ceiling |
+| return leg, n=3 | must return to the A0 disarmed class | **7 897** vs 7 903 = **−0.076 %**, spread 0.11 % | **HIT** |
+| identity `(A0/R)×(armed/A0) = armed/R` | closes to ≥ 3 digits | 0.96555 × 0.95698 = **0.92401** vs **0.92401** | **HIT** — closes exactly, **5 digits** |
+| kill comparison `armed ≤ R×(1+s)` | — | 7 563 ≤ 8 242.3, satisfied by 679 dhry | **precondition unmet — not a firing** (§0.2's guard: a miss at 20 % coverage is a bug report, not a verdict) |
+
+**No verdict, in either direction, for the third wave running.** `WARPTEST` returns `PASS 17/17`
+on both images, all counter identities close exactly, the dhrystone correctness gate is
+byte-identical, `FAULTS(on)` equals `FAULTS(off)` exactly, the return leg returns to class, and
+the whole-session anomaly scan is clean (§0.16.6). The engine is correct; it engages a fifth of
+the workload; that is not a price.
+
+### 0.16.4 The six counter bands — all HIT
+
+| row | pre-registered band | point | measured | verdict |
+|---|---|---|---|---|
+| coverage `c` | 0.20 – 0.28 | 0.229 | **0.20263** | **HIT** |
+| `WARP_INSNS`/`WARP_BLK` | 0.92 – 1.32 | 1.088 | **0.94765** | **HIT** |
+| compiled length `L` | 2.30 – 3.10 | 2.651 | **2.4689** | **HIT** |
+| decline rate | 51 – 62 % | 56.8 % | **58.778 %** | **HIT** |
+| bail rate | 58 – 70 % | 64.3 % | **67.397 %** | **HIT** |
+| `WARP_DISC_EV` per M retired (`I_true`) | 75 – 110 | 90.6 | **90.358** | **HIT** — 0.24 from the point estimate |
+
+### 0.16.5 THE BAIL SPLIT — two clean misses, the falsifier that did not fire
+
+```
+WARP_BAIL 9 207 252 = STUB 9 205 768 + MEM 1 484 + OTHER 0        EXACT
+WARP_BAIL_MEM 1 484  = FENCE 0 + VERDICT 1 484                     EXACT
+WARP_BAIL_OTHER = 0                                                EXACT
+```
+
+| row | pre-registered (§0.14.2) | measured | verdict |
+|---|---|---|---|
+| `WARP_BAIL_STUB`/`WARP_BAIL` | 0.80 – 0.97, point 0.88 | **0.99984** | **MISSED, HIGH** by 0.030 |
+| `WARP_BAIL_MEM`/`WARP_BAIL` | 0.03 – 0.20, point 0.12 | **0.000161** (1 484 / 9 207 252) | **MISSED, LOW** by 0.030 |
+| `WARP_BAIL_FENCE`/`WARP_BAIL_MEM` | ≤ 0.10, point 0.02 | **0.000** | **HIT** |
+| `WARP_BAIL_OTHER` | exactly 0 | **0** | **HIT** — the tripwire held |
+
+> **THE FALSIFIER DID NOT FIRE.** §0.14.2's rule, quoted: *"if `WARP_BAIL_MEM`/`WARP_BAIL` ≥
+> 0.30, the memory-helper candidate is CONFIRMED and this prediction is marked MISSED beside
+> itself."* Measured **0.000161 — roughly 1 875× below the falsifier**. §0.13's named mechanism
+> for round 4's bail-vs-decline gap — *"round 4's auto-adjust `(An)+`/`−(An)` sources compile
+> successfully but bail at run time on the memory helper"* — is **REFUTED AT THREE DIGITS**: it
+> accounts for 1 484 bails in 9.2 million. **The prediction's direction is right, emphatically —
+> the gap IS the decline stub — and both magnitudes miss, in the same direction**: the stub
+> share is more extreme than the band's own ceiling; essentially every bail is a cached decline
+> stub.
+
+**`WARP_BAIL_FENCE` never fired on metal.** It measured exactly 0, so the `MEM == FENCE +
+VERDICT` identity above is asserted over a path that never ran on this workload; the identity is
+exact, but **silicon has not exercised the fence arm**, which §0.14.9 item 4 already named as
+M2's question rather than this round's. Flagged rather than absorbed.
+
+**Two standing correctness gates, not new §0.14 predictions but scored on this exact tranche-2
+image for the first time:**
+
+- **`FAULTS(on)` vs `FAULTS(off)`**: **591 == 591**, delta 0 — the bail contract did not leak a
+  fault (§0.5.5 G2).
+- **Budget closure**: `COMPILE` 41 776 = first-compiles 134 + `DISC` 41 642 + `EVICT` 0 +
+  `FLUSH` 0 → unattributed **0.000 %** against a ≤ 5 % gate (§0.5.6).
+
+### 0.16.6 `WARPTEST`, boot windows, and R6's corroboration of §0.15.2
+
+**`WARPTEST`, both images, each on its own boot before its own arm:**
+
+| image | families | F1 alignment sweep | range misses | verdict |
+|---|---|---|---|---|
+| A0 lean `7A5EC595` | 17/17 | 64/64 | +0 | `PASS 17/17 families, 0 mismatches` |
+| prof `6973E8B5` | 17/17 | 64/64 | +0 | `PASS 17/17 families, 0 mismatches` |
+
+All four new families — F14 `LEA`, F15 `CLR`, F16 `EXT`/`EXTB`, F17 register-count shifts —
+passed on silicon at the first attempt.
+
+**Boot windows, all eight, against the pre-registered 45 … 50 s:** `R` 45 s · A0 **48 s** ·
+A1 48 s · A2 49 s · A3 47 s · A4 46 s · A5 46 s · prof 78 s.
+
+**R6 — the compile bracket, and an independent corroboration of §0.15.2:**
+
+```
+A0 lean 7A5EC595 : 902 gtick/blk = 1805 cyc/blk = 361 cyc/compiled-insn
+prof    6973E8B5 : 912 gtick/blk = 1825 cyc/blk = 365 cyc/compiled-insn
+-> the two builds agree to 1.1 %   (round 4: 7.7 %;  round 3: 4.7 %)
+```
+
+**Round 5's lean is 6.9 % faster per block than round 4's lean, with four more emitter families
+in the decode chain — a direction that should not happen.** Round 4's *prof* (1 799 cyc/blk)
+sits within 1.4 % of round 5's *prof* (1 825), while round 4's *lean* (1 938) is the outlier of
+the four measurements. **The anomalous member of the set is the round-4 LEAN image — exactly the
+image §0.15.2's byte search proved is not what its source builds.** Recorded as corroboration,
+not proof; the byte search is the proof.
 
 
 
