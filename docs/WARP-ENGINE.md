@@ -4435,6 +4435,37 @@ mechanism rather than as a named layer is reading more out of this campaign than
 > unmeasured; if a session is ever bought, that is what it is scored against, and §0.18.7 is
 > the list of what it must re-establish first.
 
+### 0.19.5 PARK ADDENDUM — the gate met its second compiler, and one row of §0.18.5 was wrong (2026-08-24)
+
+**`make bootbin` through the Vitis docker failed G-R6.6 on the ARMED loop, and the loop was
+fine.** The gate is there and calls `z3660_warp_step` two instructions later; gcc 12.2.0
+hoists that call's argument load (`regs.instruction_pc`, displacement 88) between the flag
+load and the compare, where gcc 14.2.1 sinks it below the branch. `tools/warp-gate.sh` matched
+the gate on three FIXED lines after the handler's `blx r3`, so an instruction scheduled into
+the middle of it moved the compare to line 3, the branch to line 4, and the script reported a
+loop that plainly engages the engine as having no gate at all.
+
+**It was wrong in the dangerous direction too, which is the part worth keeping.** Pointed at a
+hooked loop through the DISARMED symbol, the old matcher on that same gcc-12.2.0 image printed
+`no gate after the handler returns -- as designed`. The build still failed — but only because
+the independent "names no `z3660_warp` symbol" test caught it. The shape half of G-R6.6 was a
+false pass, on the one variant the property matters most for.
+
+> ### **AND THE VARIABLE WAS NEVER RECORDED ANYWHERE: every ELF this campaign archived — all ten — was built by the HOST `arm-none-eabi-gcc` 14.2.1, while `CLAUDE.md` documents the Vitis docker (gcc 12.2.0) as the build path.** Not one measured row in this document is a docker build. The first one ever made was the one that failed the gate, and there was no way to see that from a manifest row, a CRC or a build log. Gate output now names the producer of every ELF it reads, and `make gate` re-reads every core1 build directory at once instead of checking a variant only at the instant it is linked.
+
+**§0.18.5's `BOOT.BIN` row is wrong in two cells.** The default variant's loops are **3 204 /
+3 284 B**, not 2 100 / 2 184 — those are lean's, transcribed. The CRC, the image size and
+`sizeof(regs)` are right, and the image is sound: a clean rebuild at `43aa971` reproduces
+`BOOT-15A7FF0C.elf` **byte-identically** and it passes the gate. **G-R6.12 is unaffected** —
+the gate did run on that link and did pass; only the two cells copied into the table are wrong.
+
+**Nothing about the engine, the loops or any measured row moves.** All three variants' core1
+ELFs rebuild byte-identical to their round-6 archive entries (`15A7FF0C`, `9AECF99D`,
+`9D07C731`), the harness is unchanged at **3 334 / 3 330 / 3 561, 0 failed**, and `M1 PARKED`
+stands. What changed is the gate's shape test, restated as the property it always meant: the
+flag must be reached in **one load off a live base**, with no address materialised first —
+which is what round 3 actually violated, and what a surplus scheduled load never was.
+
 
 ---
 
