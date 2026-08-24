@@ -3219,7 +3219,9 @@ static void test_prof_wire_format(void)
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DECLINE], "WARP_DECLINE") == 0
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_EVICT], "WARP_EVICT") == 0,
 	      "all fourteen WARP names line up with the ids S0.5.6 and S0.8.2 pre-registered\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   61, "61 counters -- id 60 WARP_EVICT appended");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   64, "64 counters -- ids 61..63 are round 4's "
+	           "churn split: DISC_EV separates EVENTS from BLOCKS, which round 3 could not do "
+	           "at all, and DISC_ATC / DISC_CPUSH name the two causes that are 87 % of them");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -7287,10 +7289,13 @@ static void test_warp_emitted_words(void)
 		uae_u32 code[512];
 		unsigned n, i, bad = 0;
 
-		/* A head the compiler must refuse: MOVEQ is M1a item 1 and the frozen extension
-		 * list is frozen, so it is not in this round. */
+		/* A head the compiler must refuse. It USED to be MOVEQ, which round 4 compiles --
+		 * §0.5.1's frozen M1a item 1 landing is exactly what makes this test's old subject
+		 * the wrong one. LINK A5,#0 is picked instead because it is refused for a reason
+		 * that cannot expire inside generation one: it pushes, so it is a memory-touching
+		 * write-back family under §2e and no tranche of M1a can reach it. */
 		warp_corpus_build();
-		hram_poke16((WARP_PCODE | (WARP_VCODE & 0xFFF)) + 0, 0x7205);   /* moveq #5,d1 */
+		hram_poke16((WARP_PCODE | (WARP_VCODE & 0xFFF)) + 0, 0x4E55);   /* link a5,#0 */
 		warp_boot();
 		warp_write_knob(Z3660_WARP_ARM);
 		warp_corpus_enter();
@@ -7453,6 +7458,31 @@ static void test_warp_codegen(void)
 	CHECK(covered > 1000,
 	      "the compiler accepts a real family set and not a handful of shapes (%u)\n", covered);
 
+	/* ---- THE ACCEPT-SET DISCRIMINATOR (§0.12.6 G-R4.2) ----------------------------------
+	 *
+	 * The round-4 corpus prediction in §0.12.3 was derived by classifying the dhrystone
+	 * binary under a HAND TRANSCRIPTION of this compiler's accept predicate, in
+	 * docs/warp-corpus.py. A transcription that has drifted predicts confidently and wrongly,
+	 * and nothing in a corpus count would show it. So the engine's OWN accept set goes out
+	 * here, one opcode per line, and `docs/warp-corpus.py --compare` reports the symmetric
+	 * difference classified by tag -- which turns "the model describes the engine" from an
+	 * assumption into a diff.
+	 *
+	 * It is written beside the binary rather than asserted against a baked-in constant on
+	 * purpose: a constant would have to be updated by the same hand that changed the emitter,
+	 * which is exactly the review this gate exists to avoid needing. */
+	{
+		FILE *f = fopen("warp-accept.txt", "w");
+		if (f) {
+			unsigned i;
+			for (i = 0; i < covered; i++)
+				fprintf(f, "%04X\n", ops[i]);
+			fclose(f);
+			printf("       accept set written to warp-accept.txt (%u opcodes) -- "
+			       "compare with `python3 docs/warp-corpus.py --compare`\n", covered);
+		}
+	}
+
 	/* ---- pass 2: the differential, over every accepted opcode ---------------------- */
 	{
 		static const uae_u32 seeds[6] = {
@@ -7511,19 +7541,61 @@ static void test_warp_codegen(void)
 
 	/* ---- the wrong-flag mutation set, one per covered family ---------------------- */
 	{
-		static const struct { int mut; const char *name; uae_u16 op; int d0; } arms[] = {
-			{ Z3660_WARP_MUT_FLAG_MOVE, "MOVE: C and V not cleared",          0x2400, -1 },
-			{ Z3660_WARP_MUT_FLAG_ADD,  "ADD: X not copied from C",           0xD081, -1 },
-			{ Z3660_WARP_MUT_FLAG_SUB,  "SUB: carry inversion dropped",       0x9081, -1 },
-			{ Z3660_WARP_MUT_FLAG_SUB,  "CMP: carry inversion dropped",       0xB081, -1 },
-			{ Z3660_WARP_MUT_FLAG_BCC,  "Bcc: the condition sense inverted",  0x6602, -1 },
+		/* THE OVERRIDES ARE 64-BIT AND THERE IS ONE FOR A7, AND BOTH WIDENINGS WERE
+		 * FORCED BY ARMS THAT DID NOT BITE. `int d0` could not express 0x80000000, so a
+		 * carry-out mutation on a left shift had nothing to lose: warp_seed()'s own D0
+		 * values never reach bit 31 for these keys, and the arm passed by construction.
+		 * And A7 seeds to WARP_VSTK, which the helper does not serve -- so the byte-step
+		 * mutation bailed in both arms and compared equal. A mutation arm that can only
+		 * be caught by luck is not an arm, and one that cannot be caught at all is worse
+		 * than none: it reports CAUGHT-shaped silence. -1 means "leave the seed alone". */
+		static const struct {
+			int mut; const char *name; uae_u16 op; uae_s64 d0; uae_s64 a7;
+		} arms[] = {
+			{ Z3660_WARP_MUT_FLAG_MOVE, "MOVE: C and V not cleared",          0x2400, -1, -1 },
+			{ Z3660_WARP_MUT_FLAG_ADD,  "ADD: X not copied from C",           0xD081, -1, -1 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "SUB: carry inversion dropped",       0x9081, -1, -1 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "CMP: carry inversion dropped",       0xB081, -1, -1 },
+			{ Z3660_WARP_MUT_FLAG_BCC,  "Bcc: the condition sense inverted",  0x6602, -1, -1 },
 			/* DBcc's defect is only visible when the OLD counter is 0 or 1 -- that is the
 			 * whole difference between testing before and after the decrement -- so the arm
 			 * puts it there rather than hoping a seed lands on it. A mutation arm that can
 			 * only be caught by luck is not an arm. */
 			{ Z3660_WARP_MUT_FLAG_DBCC, "DBcc: counter tested after the "
-			                            "decrement",                          0x51C8, 0 },
-			{ Z3660_WARP_MUT_BAILX,     "the commit writes nzcv but not X",   0xD081, -1 }
+			                            "decrement",                          0x51C8, 0, -1 },
+			{ Z3660_WARP_MUT_BAILX,     "the commit writes nzcv but not X",   0xD081, -1, -1 },
+			/* ---- ROUND 4'S ARMS, one per new family and one per new DECISION -------
+			 *
+			 * The family arms say the emitter computes the right flags. The DECISION arms
+			 * -- M-AUTO-BYTEINC and M-AUTO-ORDER -- say §0.12.2's static read was
+			 * load-bearing: the first breaks A7's two-byte step, the second puts the
+			 * auto-adjust write-back back in front of the access, which is the exact
+			 * arrangement that read exists to forbid.
+			 *
+			 * M-ALUMEM-EARLY has no arm here and that is deliberate rather than an
+			 * omission: it needs a source read that DECLINES, and this table's corpus is
+			 * a served window. It is exercised by test_warp_auto_bail() below, where a
+			 * decline can be arranged. */
+			{ Z3660_WARP_MUT_MOVEQ_FLAG,   "MOVEQ: C and V not cleared",      0x7205, -1, -1 },
+			{ Z3660_WARP_MUT_TST_FLAG,     "TST: C and V committed",          0x4A80, -1, -1 },
+			/* D0 = 0x80000000 so the left shift HAS a carry to drop, and D0 = 1 so the
+			 * right one does. Both are the seed the defect needs, stated rather than
+			 * hoped for. */
+			{ Z3660_WARP_MUT_SHIFT_C,      "LSL: the carry-out dropped",      0xE388,
+			                               0x80000000LL, -1 },
+			{ Z3660_WARP_MUT_SHIFT_C,      "ASR: the carry-out dropped",      0xE280, 1, -1 },
+			{ Z3660_WARP_MUT_SHIFT_X,      "ROL: X written, which only ROXd "
+			                               "may do",                          0xE398,
+			                               0x80000000LL, -1 },
+			{ Z3660_WARP_MUT_IMM_CARRY,    "SUBI: the carry inversion "
+			                               "dropped",                         0x0480, -1, -1 },
+			{ Z3660_WARP_MUT_IMM_CARRY,    "CMPI: the carry inversion "
+			                               "dropped",                         0x0C80, -1, -1 },
+			/* A7 into the SERVED data page: the byte-step defect only exists on a write-back
+			 * that actually happens, and on the stack page the helper declines and both arms
+			 * bail identically. §0.12.2's areg_byteinc[] rule is what this arm is about. */
+			{ Z3660_WARP_MUT_AUTO_BYTEINC, "(A7)+ at byte size steps by 1",   0x101F,
+			                               -1, (uae_s64)WARP_VDATA }
 		};
 		unsigned a;
 		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
@@ -7534,6 +7606,7 @@ static void test_warp_codegen(void)
 				warp_write_knob(Z3660_WARP_OFF);
 				warp_seed(0x1234u * (s + 1u) + arms[a].op);
 				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
+				if (arms[a].a7 >= 0) m68k_areg(regs, 7) = (uae_u32)arms[a].a7;
 				m68k_run_mmu040(); regs.spcflags = 0;
 				warp_snap(&ref);
 
@@ -7541,6 +7614,7 @@ static void test_warp_codegen(void)
 				warp_write_knob(Z3660_WARP_ARM);   /* re-arm: the mutation changes CODE */
 				warp_seed(0x1234u * (s + 1u) + arms[a].op);
 				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
+				if (arms[a].a7 >= 0) m68k_areg(regs, 7) = (uae_u32)arms[a].a7;
 				m68k_run_mmu040(); regs.spcflags = 0;
 				warp_snap(&run);
 				z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
@@ -7992,6 +8066,122 @@ static void test_warp_bail(void)
 		      "M-4 CAUGHT: the assertion is what turns §0.3(b)'s invariant from a comment "
 		      "into a checked property\n");
 	}
+
+	/* ---- ROUND 4: THE AUTO-ADJUST SOURCE'S BAIL, WHICH IS THE WHOLE TRANCHE ------------
+	 *
+	 * §0.12.2 admitted `(An)+` / `-(An)` as SOURCES on a static read of the generated
+	 * handler: the register write-back lands strictly AFTER the faultable access, so at the
+	 * instant the access can fault the register is still unmodified and `mmufixup` is a no-op
+	 * restore. That is an argument about an ordering, and an argument about an ordering is
+	 * worth exactly what the test that breaks it is worth.
+	 *
+	 * So: point A0 at a page mapped in NEITHER root and run ONE `MOVE.L (A0)+,D0` both ways.
+	 * The two arms must be BYTE-IDENTICAL, A0 above all. Then put the defect back with
+	 * M-AUTO-ORDER and require that they are not.
+	 *
+	 * THE REFERENCE ARM IS AN INTERPRETED RUN AND NOT THE PRE-STATE, and getting that wrong
+	 * cost this round one debugging pass worth recording: a run-loop pass whose block bails
+	 * with nothing retired FALLS THROUGH to the interpreter inside the same pass, so the
+	 * interpreter takes the fault and the machine is legitimately not what it was. What the
+	 * bail contract claims is not "nothing happened" -- it is "the interpreter saw exactly
+	 * what it would have seen", and only an armed-vs-disarmed pair can say that. */
+	{
+		static const struct { uae_u16 op; const char *what; } autos[] = {
+			{ 0x2018u, "MOVE.L (A0)+,D0" },
+			{ 0x2020u, "MOVE.L -(A0),D0" },
+			{ 0x1018u, "MOVE.B (A0)+,D0" },
+			{ 0xD098u, "ADD.L  (A0)+,D0" },
+			{ 0xB090u, "CMP.L  (A0),D0"  }
+		};
+		unsigned a;
+		for (a = 0; a < sizeof autos / sizeof autos[0]; a++) {
+			struct warp_state before, after, mutated;
+
+			warp_poke_insn(autos[a].op);
+
+			warp_boot();
+			warp_write_knob(Z3660_WARP_OFF);
+			warp_seed(0x51EEDu + autos[a].op);
+			m68k_areg(regs, 0) = VBAD;
+			m68k_run_mmu040(); regs.spcflags = 0;
+			warp_snap(&before);
+
+			warp_boot();
+			warp_write_knob(Z3660_WARP_ARM);
+			warp_seed(0x51EEDu + autos[a].op);
+			m68k_areg(regs, 0) = VBAD;
+			m68k_run_mmu040(); regs.spcflags = 0;
+			warp_snap(&after);
+
+			CHECK(memcmp(&before, &after, sizeof before) == 0,
+			      "%s declines with A0 UNTOUCHED: the auto-adjust write-back is emitted "
+			      "AFTER the access, so the interpreter takes the fault from exactly the "
+			      "state it would have had (a0 %08X vs %08X)\n",
+			      autos[a].what, before.a[0], after.a[0]);
+
+			/* And the arm that proves the ordering was load-bearing. Only the two
+			 * auto-adjust shapes can move a register early; (An) has nothing to move, so
+			 * it is checked clean above and skipped here rather than asserted to fail. */
+			if (autos[a].op == 0xB090u)
+				continue;
+			warp_boot();          /* NOTE: warp_boot() clears the mutant, so it is set AFTER */
+			z3660_warp_set_mutant(Z3660_WARP_MUT_AUTO_ORDER);
+			warp_write_knob(Z3660_WARP_ARM);
+			warp_seed(0x51EEDu + autos[a].op);
+			m68k_areg(regs, 0) = VBAD;
+			m68k_run_mmu040(); regs.spcflags = 0;
+			warp_snap(&mutated);
+			z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+
+			CHECK(memcmp(&before, &mutated, sizeof before) != 0,
+			      "M-AUTO-ORDER CAUGHT on %s: with the write-back moved in front of the "
+			      "access, a decline hands the interpreter an already-adjusted A0 and the "
+			      "instruction re-executes from the wrong address (a0 %08X -> %08X)\n",
+			      autos[a].what, before.a[0], mutated.a[0]);
+		}
+	}
+
+	/* ---- ROUND 4: M-ALUMEM-EARLY, the memory-source ALU's own decline arm --------------
+	 *
+	 * The mutation computes from a destination read BEFORE the source could decline, and
+	 * commits flags from it. Clean, the block must leave nothing behind; mutated, it must
+	 * leave something. This is the arm §0.12.5 said the wrong-flag table could not carry,
+	 * because that table's corpus is a window the helper always serves. */
+	{
+		struct warp_state before, after, mutated;
+
+		warp_poke_insn(0xD090u);                       /* ADD.L (A0),D0 */
+
+		warp_boot();
+		warp_write_knob(Z3660_WARP_OFF);
+		warp_seed(0xA10E1u);
+		m68k_areg(regs, 0) = VBAD;
+		m68k_run_mmu040(); regs.spcflags = 0;
+		warp_snap(&before);
+
+		warp_boot();
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_seed(0xA10E1u);
+		m68k_areg(regs, 0) = VBAD;
+		m68k_run_mmu040(); regs.spcflags = 0;
+		warp_snap(&after);
+		CHECK(memcmp(&before, &after, sizeof before) == 0,
+		      "ADD.L (A0),D0 declines with nothing committed -- the flags are computed "
+		      "after the source read, not before it\n");
+
+		warp_boot();             /* warp_boot() clears the mutant, so it is set AFTER it */
+		z3660_warp_set_mutant(Z3660_WARP_MUT_ALUMEM_EARLY);
+		warp_write_knob(Z3660_WARP_ARM);
+		warp_seed(0xA10E1u);
+		m68k_areg(regs, 0) = VBAD;
+		m68k_run_mmu040(); regs.spcflags = 0;
+		warp_snap(&mutated);
+		z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+		CHECK(memcmp(&before, &mutated, sizeof before) != 0,
+		      "M-ALUMEM-EARLY CAUGHT: a memory-source ALU that computes before its source "
+		      "can decline commits a result the interpreter never would\n");
+	}
+
 	warp_boot();
 	warp_corpus_build();
 }

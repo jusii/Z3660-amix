@@ -327,14 +327,48 @@ def bitmap(gen):
             sys.stdout.write("\n")
 
 
+def compare(path, gen):
+    """G-R4.2: the ENGINE's accept set against this model's, opcode for opcode.
+
+    The engine's set is written by the host harness (test_warp_codegen) as
+    warp-accept.txt, one hex opcode per line. Anything in one and not the other is
+    reported and classified, because "the model describes the engine" has to be a
+    diff rather than an assumption -- the round-4 corpus prediction in Sec 0.12.3
+    was derived entirely from this model.
+    """
+    engine = set()
+    for line in open(path):
+        line = line.strip()
+        if line:
+            engine.add(int(line, 16))
+    model = set(o for o in range(65536) if accept(o, gen)[0])
+    only_model = sorted(model - engine)
+    only_engine = sorted(engine - model)
+    print("engine accepts %d, model (gen %d) accepts %d" % (len(engine), gen, len(model)))
+    print("agree on %d of 65536 opcode words" % (65536 - len(only_model) - len(only_engine)))
+    for label, s in (("MODEL accepts, ENGINE refuses", only_model),
+                     ("ENGINE accepts, MODEL refuses", only_engine)):
+        print("  %s: %d" % (label, len(s)))
+        tags = collections.Counter(accept(o, gen)[1] for o in s)
+        for tag, c in tags.most_common():
+            print("      %-16s %5d" % (tag, c))
+        if s:
+            print("      first: %s" % " ".join("%04X" % o for o in s[:8]))
+    return 0 if not (only_model or only_engine) else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dis', help='objdump -d output of the corpus')
     ap.add_argument('--bitmap', type=int, help='dump the model accept bitmap for a generation')
+    ap.add_argument('--compare', help="the harness's warp-accept.txt, for gate G-R4.2")
+    ap.add_argument('--gen', type=int, default=4, help='generation to compare against')
     a = ap.parse_args()
     if a.bitmap:
         bitmap(a.bitmap)
         return
+    if a.compare:
+        sys.exit(compare(a.compare, a.gen))
     n3 = sum(1 for o in range(65536) if accept(o, 3)[0])
     n4 = sum(1 for o in range(65536) if accept(o, 4)[0])
     print("model accept over all 65536 opcode words: R3 %d, R4 %d (+%d)"
