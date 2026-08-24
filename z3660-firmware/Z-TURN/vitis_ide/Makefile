@@ -168,6 +168,25 @@ define warp_gate
 	 else echo "WARNING: $(WARP_GATE) not found -- run-loop gate NOT checked"; fi
 endef
 
+# `make gate` -- re-run the gate over EVERY core1 build directory that exists, plus the
+# matcher's own self-test, WITHOUT rebuilding anything.
+#
+# The per-variant hook above checks a variant at the moment it is linked and never again,
+# which is a check on an EVENT rather than on the tree. Round 6 built all eight variants with
+# one compiler and read them once; the next build of one variant went through a different
+# compiler and the two could not be compared, because nothing re-read the other seven and
+# nothing recorded which toolchain any of them came from. This re-reads all of them, in one
+# command, and each line now names its producer.
+.PHONY: gate
+gate:
+	@if [ ! -x "$(WARP_GATE)" ]; then \
+	   echo "$(WARP_GATE) not found"; exit 1; fi
+	@"$(WARP_GATE)" --selftest
+	@elfs=`ls -1 $(Z3660_EMU_DIR)/build*/Z3660_emu.elf 2>/dev/null`; \
+	 if [ -z "$$elfs" ]; then \
+	   echo "no core1 build directory holds a Z3660_emu.elf -- nothing to gate"; exit 1; fi; \
+	 "$(WARP_GATE)" $$elfs
+
 z3660: bsp_cortexa9_0
 	@$(MAKE) -C $(Z3660_DIR) -j 4
 
