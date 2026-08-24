@@ -23,6 +23,19 @@ The output is the number this round is scored on: how many functions changed, an
 
 Usage:
     docs/warp-objdiff.py BASE.elf NEW.elf [--list] [--relaxed]
+                         [--alias BASESYM=NEWSYM]... [--only SYM]... [--self]
+
+`--alias` pairs a function that was RENAMED between the two builds, so its bodies are
+compared instead of being reported as "only in base" plus "only in new". Round 6 needs it:
+the disarmed 68040 run loop is `m68k_run_mmu040` in every image measured up to R5 and
+`m68k_run_mmu040_nowarp` after the loop was split in two (docs/WARP-ENGINE.md §0.17.1), and
+the claim that has to be checkable is that those two bodies are the SAME CODE.
+
+`--only` restricts the comparison to the named symbols (after aliasing), which is how a
+single-function claim is scored without the whole-image census drowning it. `--self` rewrites
+a function's branches to ITSELF as `<SELF+0x..>`, which an --alias pair needs or every
+internal branch differs on the name alone; the OFFSET is kept, so a re-laid-out function
+still compares unequal.
 
 Requires arm-none-eabi-objdump on PATH.
 """
@@ -93,7 +106,7 @@ def resolve(syms, addr):
     return '<%s+0x%x>' % (name, off) if off else '<%s>' % name
 
 
-def disassemble(path, relaxed=False):
+def disassemble(path, relaxed=False, selfnorm=False):
     out = subprocess.run(['arm-none-eabi-objdump', '-d', path],
                          capture_output=True, text=True, check=True).stdout
     syms = symbol_table(path)
@@ -168,6 +181,14 @@ def disassemble(path, relaxed=False):
 
         text = TARGET_RE.sub(r'\1', text)
         text = ADDR_RE.sub('@', text)
+        if selfnorm and cur:
+            # A branch INSIDE the function names the function itself, so a RENAMED function
+            # differs from its original on every internal branch even when the code is
+            # identical. Rewrite the enclosing symbol to <SELF+...> so an --alias pair is
+            # compared on its code and not on its name. The offset is kept: two functions
+            # whose blocks are laid out differently must still compare unequal, which is
+            # exactly what §0.17.3 G-R6.7 is asking.
+            text = text.replace('<%s+' % cur, '<SELF+').replace('<%s>' % cur, '<SELF>')
         body.append(text.strip())
     if cur is not None:
         funcs[cur] = body
@@ -182,8 +203,34 @@ def main():
     show = '--list' in sys.argv
 
     relaxed = '--relaxed' in sys.argv
-    a = disassemble(base, relaxed)
-    b = disassemble(new, relaxed)
+    aliases, only = {}, []
+    argv = sys.argv[3:]
+    for i, arg in enumerate(argv):
+        if arg == '--alias' and i + 1 < len(argv) and '=' in argv[i + 1]:
+            old, newname = argv[i + 1].split('=', 1)
+            aliases[old] = newname
+        elif arg == '--only' and i + 1 < len(argv):
+            only.append(argv[i + 1])
+
+    selfnorm = '--self' in sys.argv
+    a = disassemble(base, relaxed, selfnorm)
+    b = disassemble(new, relaxed, selfnorm)
+
+    # Rename in BASE so an aliased pair compares as one function under the new name. A
+    # target that already exists is a collision rather than an alias, and it is refused
+    # rather than silently overwriting a real body.
+    for old, newname in aliases.items():
+        if old not in a:
+            print(f'alias: {old} is not in {base}')
+            return 2
+        if newname in a:
+            print(f'alias: {newname} already exists in {base} -- refusing to overwrite')
+            return 2
+        a[newname] = a.pop(old)
+
+    if only:
+        a = {k: v for k, v in a.items() if k in only}
+        b = {k: v for k, v in b.items() if k in only}
 
     only_a = sorted(set(a) - set(b))
     only_b = sorted(set(b) - set(a))

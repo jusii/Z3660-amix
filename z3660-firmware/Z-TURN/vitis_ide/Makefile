@@ -156,24 +156,40 @@ fsbl: $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
 $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf: zynq_fsbl_bsp
 	@$(MAKE) -C $(FSBL_DIR) DDR_SPEED=$(DDR_SPEED) -j 4
 
+# THE WARP RUN-LOOP GATE, ON EVERY CORE1 BUILD (docs/WARP-ENGINE.md 0.17.3 G-R6.12).
+# tools/warp-gate.sh reads both run loops off the freshly linked ELF and FAILS the build if
+# the disarmed one carries a hook or names the engine at all. It exists because 0.15.2 caught
+# an image that is not what its own source builds -- and because the dormant-tax fix's entire
+# claim is a property of generated code, which is not checkable in a source diff. A missing
+# script is a warning rather than a failure: a checkout without tools/ can still build.
+WARP_GATE := $(abspath $(CURDIR)/../../../tools/warp-gate.sh)
+define warp_gate
+	@if [ -x "$(WARP_GATE)" ]; then "$(WARP_GATE)" "$(1)"; \
+	 else echo "WARNING: $(WARP_GATE) not found -- run-loop gate NOT checked"; fi
+endef
+
 z3660: bsp_cortexa9_0
 	@$(MAKE) -C $(Z3660_DIR) -j 4
 
 z3660_emu: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) -j 4
+	$(call warp_gate,$(Z3660_EMU_DIR)/build/Z3660_emu.elf)
 
 # LEAN core1: -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0, into Z3660_emu/build-lean.
 z3660_emu_lean: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_LEAN=1 -j 4
+	$(call warp_gate,$(Z3660_EMU_DIR)/build-lean/Z3660_emu.elf)
 
 # PROFILING core1: the lean flags plus -DZ3660_EMU_PROF=1, into Z3660_emu/build-prof.
 z3660_emu_prof: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_PROF=1 -j 4
+	$(call warp_gate,$(Z3660_EMU_DIR)/build-prof/Z3660_emu.elf)
 
 # Q2-PROBE core1: the DEFAULT flags plus -DZ3660_WARP_Q2_PROBE=1 and the one extra source
 # file, into Z3660_emu/build-q2probe.
 z3660_emu_q2probe: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_Q2PROBE=1 -j 4
+	$(call warp_gate,$(Z3660_EMU_DIR)/build-q2probe/Z3660_emu.elf)
 
 # THE WARP DISARM-RESIDUAL ABLATION KIT (docs/WARP-ENGINE.md 0.14.1). Five LEAN core1 builds,
 # each with exactly one layer of the engine removed, into Z3660_emu/build-abl1..5. They are an
@@ -182,6 +198,7 @@ z3660_emu_q2probe: bsp_cortexa9_1
 # that two named mechanisms have now failed to explain.
 z3660_emu_abl%: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_WARP_ABLATE=$* -j 4
+	$(call warp_gate,$(Z3660_EMU_DIR)/build-abl$*/Z3660_emu.elf)
 
 # DDR_SPEED variable can be set to 533, 667, or 800
 DDR_SPEED ?= 533
