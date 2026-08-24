@@ -2015,6 +2015,368 @@ lowers the limit and reaches it deliberately, with both invariants intact.
 5. **Everything §0.8.8 said round 2 would not establish, it did not establish.**
 
 
+## 0.10 M1 round 3 — the BUG-REPORT round, pre-registered before the first line of round-3 code (2026-08-24)
+
+**§0.5.2's last decision row routed round 2's metal session here, by name:** *"coverage < 60 %
+**and** a named implementation defect → a bug report. Fix, re-run, and the defect is named in
+the record."* The armed round-2 engine did not survive on silicon — four arms, two images,
+four crashes, zero armed rows (`2026-08-24-warp-r2-verdict/MATRIX.md`). **This section is the
+bug report, and it is written before any round-3 code exists.** §3.4's two rules govern it as
+they governed §0.5, §0.6 and §0.8: the pre-registration commit precedes the implementation
+commits, provably, by commit timestamp in this repository; and a prediction that turns out
+wrong is marked `MISSED` beside the measurement with the prediction left **byte-untouched**.
+
+**Round 3 takes no metal row either.** Every number below is a static count, a host-harness
+count, an arithmetic derivation, or a protocol for a session that has not happened. The kill
+line cannot fire on it and `kill-R` remains the clean interpreter lineage row (the ruling of
+2026-08-24).
+
+### 0.10.1 THE ROOT CAUSE — the publish sequence does not cover the block it publishes
+
+**Named, with its arithmetic, and it is a defect of RANGE and not of sequence.** §0.8.8 item 2
+and Q3's standing caveat both said adding barriers is not evidence of a fix; the R2 session
+confirmed the Q3 sequence is *present* at `z3660_warp.cpp:1007–1018` and correctly ordered.
+It is. **The bytes it is pointed at are wrong.**
+
+`warp_publish(p, bytes)` calls the firmware's own two CP15 line loops, whose bodies are in
+`jit/compemu_midfunc_arm.cpp:566` and `:578` and whose shape is identical:
+
+```
+   length = (length + 31) & ~31;
+   while (length) { <CP15 op on `addr`>; addr += 32; length -= 32; }
+```
+
+**The length is rounded up; the ADDRESS IS NEVER ROUNDED DOWN.** With `k = ceil(L/32)`
+iterations the loop touches `A, A+32, … , A+32(k-1)`, i.e. the `k` consecutive lines starting
+at `A & ~31`. Its byte coverage is therefore `[A & ~31, (A & ~31) + 32k)` — and the block
+occupies `[A, A + L)`. So:
+
+```
+   THE BLOCK'S LAST CACHE LINE IS LEFT UNMAINTAINED  iff  (A & 31) + L  >  32 x ceil(L / 32)
+```
+
+**The D-cache half is the load-bearing half, and this is why the failure is a wrong control
+transfer rather than a wrong result.** `arm_flush_cache` is `DCCIMVAC` — clean-and-invalidate
+to PoC. A line it does not touch stays **dirty in L1D and never reaches PoC**. The Cortex-A9
+has no I/D coherency: the instruction-side linefill for that address reads **PoC**, which
+still holds what was there before the compiler wrote the block. So the CPU executes the
+block correctly up to its last line and then executes **stale memory**.
+
+**Two stale contents, two manifestations, and the four crashes are one mechanism:**
+
+| stale content | when | what happens | R2 occurrence |
+|---|---|---|---|
+| **zeros** (virgin arena — 32 MB, `cache_alloc`ed and zeroed, never yet written) | before the bump pointer has wrapped or been reset | `0x00000000` decodes as `andeq r0,r0,r0`, a NOP. Execution walks **past the block's own `pop {r4-r8,pc}`** and forward through the arena until it leaves the mapped heap → core1 prefetch abort / undefined instruction, with no handler left standing to print → **the board restarts, silently** | **1, 2, 3** |
+| **a previous block's bytes** | after `warp_flush_cache()` or `z3660_warp_arm()` has reset `warp_cp` over already-written arena | execution lands mid-block in straight-line code. **The stack is balanced** — entry went through a real prologue — so it reaches some later `pop {r4-r8,pc}` and RETURNS to `z3660_warp_run` carrying a **stray `ctx.pc`** (written by whatever `str r1,[r7,#0]` it ran through) and a **stray retired count** in r0. `z3660_warp_run` then does `regs.pc = z3660_warp_ctx.pc` → **the guest's control flow has been handed a wrong address** | **4** |
+
+Occurrence 4's capture is the mechanism's own signature and needs no interpretation:
+`[XT07] vec=2 ipc=C100F348 pc=C100F348 fa=C100F348 ssw=0542 sr=0000` — `fa == pc` is an
+instruction-fetch fault **at** the PC, in **user mode**, which is the only mode generation one
+runs in; and `a7=8080002A`, an odd stack pointer, is what a guest gets after a `MOVEA`-shaped
+exit ran with a stray immediate. The MATRIX's reading — *"a wrong control transfer out of
+generated code; guest address space → occurrence 4, host ARM address space → occurrences
+1–3"* — was correct in both halves and this is the mechanism under it.
+
+**THE DISCRIMINATOR, AND IT IS EXACT: round 1 could not hit this, and round 2 hits it 43.75 %
+of the time.** The R2 session's strongest observation was that round 1's null blocks ran a
+full armed five-row set on the same silicon. That is not luck and it is not a difference in
+"real code":
+
+| round | block length `L` | bump step | `A & 31` reachable | `(A&31) + L > 32·ceil(L/32)` |
+|---|---|---|---|---|
+| **1** | **always 8** (`Z3660_WARP_NULL_BYTES`, `mov r0,#0` + `bx lr`) | 8 | {0, 8, 16, 24} | `≤ 24 + 8 = 32` — **never**, for every reachable offset |
+| **2** | `c.n × 4`, 8 … 4096, ~50 B per compiled guest instruction | `L` | every multiple of 4 in [0,32) | **7 of every 16** publishes, by the count below |
+
+With `a = A & 31` and `r = L mod 32` both walking the eight 4-aligned residues: the defect
+fires for `r = 0, a > 0` (7 of 64 pairs) and for `r > 0, a > 32 − r` (21 of 64 pairs) —
+**28/64 = 43.75 % of all published blocks leave their last line unmaintained.** Round 1 was
+structurally immune; round 2 is a coin flip per block. An armed guest reaches its first
+user-mode control-transfer target within milliseconds, which is why occurrence 2 died in
+under a second, and why occurrence 1 survived eighteen seconds of an *idle shell* — a window
+with almost no user-mode block in it — and died one second into dhrystone.
+
+**And the mid-arm PROFD race is the positive control the R2 session bought without knowing
+what it was controlling for.** A window that was 100.00 % supervisor with all fourteen WARP
+counters at zero compiled and published **nothing**, so nothing was stale, and the guest
+survived it. The crash tracks user-mode execution because publication is what user-mode
+execution reaches.
+
+> **This is a defect the campaign has already paid for once, in this repository, and the
+> receipt is quoted in the source that carries it.** `warp_compile()`'s own comment names
+> `8be8949` — *"the first `pushall_call_handler()` fetched stale I-cache lines and the board
+> rebooted with an ARM Undefined Instruction, caused by a compiler-flag change."* The
+> ordering lesson from that receipt was learned and applied (publish before the block is
+> reachable). The **range** was not, because the range was inherited.
+
+### 0.10.2 THE FIDELITY GAP — what the harness executes versus what the silicon executes
+
+**§0.8.5 claimed the harness "runs the words the compiler emits", and §0.9.2 scored G-R2.3
+green over 10⁸ boundaries. Both statements are true and neither of them touched the defect.**
+The gap is not that the harness's ARM model is a second implementation — §0.8.5 declared that
+and §0.9.5 restated it. The gap is one line of the harness:
+
+```
+   static void warp_publish(void *p, unsigned bytes)
+   {
+   #ifndef HOST_TEST_HARNESS
+      ... the whole Q3 sequence ...
+   #else
+      (void)p; (void)bytes;                       <-- THE GAP, IN ONE LINE
+   #endif
+      WARP_STAT(Z3660_WARP_STAT_PUBLISH);
+   }
+   ```
+
+**So the harness proves the words and never the PUBLICATION of the words.** Stated as the
+four questions the round-2 dispatch asked, answered honestly:
+
+| question | round-2 answer |
+|---|---|
+| does generated ARM code actually run in the host harness? | **No — it is INTERPRETED**, by `warp_host_exec()`, a decoder for exactly the forms the emitter produces. It reads the emitted words as **DATA**, through ordinary loads. |
+| is the real entry/exit trampoline exercised? | Partly. `z3660_warp_run()` is the real function; the block's `push`/`pop` are decoded for **shape only** and the harness's stack is a token array. |
+| is the real `warp_run` preamble exercised? | Yes for the C half (ctx set-up, flag pack, commit); no for the ARM call itself. |
+| is the real address materialisation of exit stubs exercised? | Yes as **words** — `movw`/`movt` of a guest pc are decoded and executed. **The emitted stream contains no host address at all** (§0.8.5's design constraint), so there is nothing there to differ between address spaces. |
+
+**Every candidate the dispatch listed is therefore EXCLUDED by construction, and saying so is
+part of the report:** exit-stub address materialisation cannot differ between harness and
+target because no host address is ever emitted; a PC-relative branch cannot reach in one and
+not the other because every branch this compiler emits is a forward skip over a known-length
+sequence with the offset fixed at emit time, and the harness decodes every one of them and
+checks it lands on an instruction boundary inside the block; the block-exit guest-PC
+computation for Bcc/DBcc is pure arithmetic on constants, executed identically in both; the
+bail path's PC materialisation is the same two `movw`/`movt` words in both. **And the odd
+`a7` is a consequence, not a cause** — the audit is in §0.10.4 G-R3.6 and every generation-one
+family that can write `A7` (`MOVEA`, `MOVE` to `An`, `ADDQ`/`SUBQ` to `An`, `ADDA`/`SUBA`)
+writes it as the 68040 does, full width and without an alignment rule, so an odd `A7` is
+architecturally legal and is evidence of a wrong VALUE arriving, not of a wrong emitter.
+
+> **The one-sentence statement of the gap, for the record: the host harness reads the emitted
+> words through the DATA side and the silicon executes them through the INSTRUCTION side, and
+> the only thing that stands between those two sides is the publish sequence — which the
+> harness compiles out. A harness that cannot see the D-side/I-side seam cannot see any defect
+> that lives in it, and this one did.**
+
+**What now covers it** is §0.10.3 item 2 and §0.10.5: an on-target self-test whose oracle is
+*the same block, executed on the silicon and interpreted from its own words*, which is the
+D-side and the I-side compared against each other on the machine that has both.
+
+### 0.10.3 What round 3 builds
+
+**1. The fix, in two independent parts, because one of them must survive the other being
+changed.**
+
+| part | change | why both |
+|---|---|---|
+| **A — correctness** | `warp_publish()` maintains `[p & ~31, (p + bytes + 31) & ~31)` — the range rounded OUT to whole cache lines at both ends | This is correct for **any** allocation policy. It is the part a future reader must not be able to un-fix by changing where blocks land. The two CP15 loops are shared with the classic JIT and are **not** modified: the range is corrected at WARP's call site, so no behaviour outside the engine moves. |
+| **B — hardening** | the arena base is aligned up to 32, its usable size rounded down to 32, and the bump pointer advances by `(bytes + 31) & ~31` so **every block starts on a cache line and no two blocks share one** | With `A & 31 == 0` the defect cannot fire even under part A's absence, the publish range is exact rather than rounded, and a future concurrent publisher can never touch a neighbour's line. Costs ≤ 28 B per block out of 32 MB. |
+
+**2. The proof the round-2 harness could not carry — the on-target armed self-test.** Designed
+in §0.10.5, with its serial protocol. It ships in **every** variant, inert until a console verb
+runs it, and it is the gate on every future arm.
+
+**3. The regression arms**, in the harness **and** in the on-target self-test, per the round's
+brief. A publish-coverage invariant (`Z3660_WARP_BAD_PUBRANGE`), a mutation arm
+(`M-PUBRANGE`) that restores round 2's shipped range, a unit assertion of the coverage
+arithmetic against hand-computed cases **including round 1's geometry** — which is the arm
+that keeps the discriminator honest — and an on-target alignment sweep that compiles and runs
+the same block at every 4-byte offset within a line.
+
+**4. The disarm penalty.** §0.10.6.
+
+**5. The owed items that ride.** M-VERDICT's `TTR_NO_WRITE` asymmetry arm (§0.9.6 item 1) and
+the R6 compile-cycles-per-block micro-benchmark (§0.9.6 item 4, §0.8.7's Q5 condition 2 and
+Q6's decision rule), the latter folded into the self-test verb so the next metal session can
+run it without a new build.
+
+### 0.10.4 The round-3 gates, with their predictions
+
+Every one of these is a prediction made before the measurement exists.
+
+| gate | prediction |
+|---|---|
+| **G-R3.1 harness** | green (`0 failed`) in all three variants. New `CHECK`s: **+25 … +90** in the default variant, the **same** number in lean, prof gaining a further **0 … +10**. Baseline is 3 280 / 3 276 / 3 507 |
+| **G-R3.2 the defect reproduces, then goes green** | with the publish range as round 2 shipped it, the new invariant `Z3660_WARP_BAD_PUBRANGE` reads **> 0** on the existing WARP corpora; with the fix it reads **0**. The mutation `M-PUBRANGE` restores round 2's range and is **caught**. This is the failing-test-then-green the round is scored on |
+| **G-R3.3 the discriminator, asserted** | the coverage predicate, evaluated over round 1's geometry (`L = 8`, `A ≡ 0 mod 8`), reports **covered for all four reachable offsets** — and over round 2's (`L` a multiple of 4, `A` a multiple of 4) reports **exactly 28 of the 64 (a, r) pairs uncovered = 43.75 %** |
+| **G-R3.4 disarmed object equivalence** | per-function normalised-disassembly diff of the **lean** `Z3660_emu.elf` against `a392fbe`: **≤ 20 functions changed**, every changed function on the WARP path or `m68k_run_mmu040`. `m68k_run_mmu040` **shrinks** from 2 548 B to **2 330 … 2 400 B** (§0.10.6) |
+| **G-R3.5 lockstep identity, unmoved** | `WARP_DIVERGE == 0` over `WARP_LS_INSNS ≥ 10⁸` again, with byte-identical arms. Round 3 changes no emitter, so a divergence here would mean the fix moved something it had no business moving |
+| **G-R3.6 the odd-`A7` audit** | a static enumeration of every generation-one shape that can write `A7`, each shown to write it exactly as `cpuemu_31` does. Predicted: **no shape can produce an `A7` the interpreter would not have produced**, so occurrence 4's `a7=8080002A` is downstream of the wrong control transfer and not a second defect |
+| **G-R3.7 the on-target self-test exists and is inert** | it is present in all three shipping images, reachable only through the `WARPTEST` console verb, touches **no guest memory at all** (neither instruction words nor operands), leaves `regs`, the block table, the generation and the bump pointer exactly as it found them, and adds **0 bytes** to `m68k_run_mmu040` |
+| **G-R3.8 M-VERDICT, the owed arm** | a write-protected data TTR window is wired into the WARP corpus so a compiled store into it must **bail**; under `M-VERDICT` it is **served** and the arms diverge. Predicted: **caught**, closing §0.9.6 item 1 |
+| **G-R3.9 R6 is runnable** | the compile-cycle bracket exists behind the same verb, uses the ARM **global timer** (`XTime_GetTime`, always running in every variant, CPU:global fixed 2:1 per §z3660_prof.h note 5) rather than the PMU — so no counter has to be armed and the lean image measures the same way the profiling one does. It prints cycles per block, cycles per compiled guest instruction and `WARP_CFETCH` per block. **Not run this round: there is no card in it** |
+| **G-R3.10 images** | the three shipping images rebuilt, CRCs recorded, the archive firing for each. `BOOT-q2probe.BIN` is **not** rebuilt and stays at `FCC0CB3F` |
+
+### 0.10.5 The on-target self-test — design, and the protocol the metal session runs
+
+**THE RULE IT EXISTS TO ENFORCE, stated first because it is the deliverable:**
+
+> **No metal session arms the WARP engine on a live guest until `WARPTEST` reports PASS on the
+> image that is about to be armed.**
+
+**Where it lives, and the decision stated with its reason.** It **ships in every variant —
+default, lean and prof — inert until invoked.** It is not excluded from the shipping images
+and it is not a fourth build. The reason is the one this whole round is about: *the wall-clock
+arm of every verdict is a LEAN boot* (§0.5.1, §0.4.3's standing rule), so a self-test that
+existed only in a debug variant would attest a **different binary** from the one armed — which
+is exactly the class of error §0.10.2 is a report about. It is the same argument the arm
+attestation is shipped under, and it is paid the same way: cold `.text` that never executes,
+with G-R3.7 measuring that `m68k_run_mmu040` does not grow by a byte.
+
+**The oracle, and it is the whole design.** Each block is run **twice, from the same starting
+architectural state**:
+
+1. **executed on the silicon** — a real call through the real function pointer, so the words
+   arrive through the **instruction side**: I-cache, the publish sequence, the barriers;
+2. **interpreted from its own words** — by `warp_host_exec()`, the decoder §0.8.5 built,
+   promoted out of `HOST_TEST_HARNESS` so it compiles on the target too. It reads the same
+   bytes with ordinary loads, i.e. through the **data side**.
+
+Then the two results are compared: the sixteen guest registers, the block context's `pc`,
+`nzcv`, `xflg`, `ipc` and `restart`, and the retired count.
+
+> **A publish defect makes exactly those two disagree, and nothing else in the engine can.**
+> That is the sentence the round-2 harness had no way to write, because it had only arm 2.
+
+**What it does NOT do, declared here rather than discovered later.** It does not re-prove
+semantics — the harness did that at 10⁸ boundaries against the interpreter, on the real
+emitted words, and a second oracle on target would only re-run a second implementation of ARM.
+It does not compile from guest memory: the compiler's instruction fetch is fed from a
+core1-resident opcode array, so **no guest instruction page is read**. It does not execute a
+memory-touching family: `(An)` and `d16(An)` operands would need a guest data page and the
+self-test must be safe to run **on a live guest at any time**. Generation one's memory helper
+therefore stays a harness-proven path this round, and that is **re-owed explicitly** in
+§0.10.7 rather than waved at.
+
+**The families, in the order they run, and the alignment sweep is first on purpose.**
+
+| # | family | what it establishes |
+|---|---|---|
+| **F1** | **publish / coherency alignment sweep** — one register-ALU block compiled and run at every 4-byte offset in a 32-byte line, at several lengths | **the defect's own reproducer on silicon.** Under round 2's range, the cases satisfying `(A&31)+L > 32·ceil(L/32)` fail or hang; under the fix all pass |
+| **F2** | `MOVE`/`MOVEA`, register operands only | the emitter's flag and size discipline, executed |
+| **F3** | register ALU — `ADD SUB AND OR EOR CMP` | ditto, with X and the carry inversion |
+| **F4** | `ADDQ`/`SUBQ`, both `Dn` and `An` destinations | the quick-immediate reading of Q7 |
+| **F5** | `ADDA`/`SUBA`/`CMPA` | the `An`-destination shapes |
+| **F6** | `Bcc`/`BRA` — taken and not-taken | a **real control transfer out of generated code**, which is the defect class |
+| **F7** | `DBcc` — expired, taken and always-true | three exits from one block |
+| **F8** | a **multi-instruction block** ending at a terminator | the exit that is not the first one |
+| **F9** | a **declined head** — the two-word null stub | the shortest publish there is, and round 1's exact geometry |
+
+**THE SERIAL PROTOCOL, and it is designed to survive the crash class it hunts.** Every family
+prints a `>>>` sentinel **before** it runs and a result line **after**. An occurrence-1-style
+silent death therefore **names the family by the sentinel that has no result line under it** —
+which is the one diagnostic the R2 session could not get, because the machine died with
+nothing on the wire.
+
+```
+[WTST] WARP on-target self-test -- 9 families, arena 0x........ +........ B, cp +........
+[WTST] >>> F1 publish/coherency alignment sweep
+[WTST]     F1 PASS  64/64 cases   (offsets 0..28, lengths 8..264)
+[WTST] >>> F2 MOVE/MOVEA register operands
+[WTST]     F2 PASS  12/12 cases
+...
+[WTST] >>> F9 declined head (null stub)
+[WTST]     F9 PASS   1/1 cases
+[WTST] R6 compile bracket: <n> blocks, <cyc> cyc/block, <cyc> cyc/compiled-insn, CFETCH <n>/block
+[WTST] VERDICT: PASS 9/9 families, 0 mismatches -- the engine may be armed on this image.
+```
+
+A failure prints the family, the case, and the first field that differs, then **stops** —
+because a self-test that keeps going after a coherency failure is walking through a machine
+whose instruction stream it no longer trusts:
+
+```
+[WTST]     F1 FAIL  case off=12 len=52: exec pc=........ vs decode pc=........
+[WTST] VERDICT: FAIL at F1 -- DO NOT ARM. docs/WARP-ENGINE.md 0.10
+```
+
+**How it is invoked, and why it cannot arm anything.** Console verb `WARPTEST` writes the magic
+`0x57545354` (ASCII `WTST`) into the same `SHARED.warp_on` mailbox. `z3660_warp_resolve()` is
+**unchanged** and returns 0 for it — only `Z3660_WARP_ARM` arms, which is Q9's rule and the
+withdrawn IVSUP switch's precedent. Core1 notices the word at its next knob resync,
+**consumes it by writing the OFF sentinel back** — `z3660_prof.cpp:1275`'s pattern verbatim,
+*"consume before acting: a dump takes seconds"* — runs the test, prints the report, and leaves
+the engine disarmed. No SHARED field is added, no config key exists, and a self-test request
+that arrives twice runs twice.
+
+**The metal session's steps, in order:**
+
+1. Boot the image that is about to be armed. Do not arm anything.
+2. `WARPTEST` on the serial console. Capture the whole `[WTST]` block.
+3. **If the verdict is not `PASS 9/9`, or if a `>>>` sentinel has no result line under it, the
+   session takes no armed row and the family named by that sentinel is the bug report.**
+4. Only then `WARP`, and only then the armed rows.
+5. Record the `[WTST]` block in the evidence directory beside the arm — it is the attestation
+   that the arm was gated, and a session without one is unverified.
+
+### 0.10.6 The disarm penalty — the pre-registered target and its named mechanism
+
+**The measurement being attacked: −5.848 % (dhry 7 696, n = 7, spread 0.27 %) against a
+pre-registration of −0.9 % … −2.0 % and a caveat of −2.276 %. 2.57× round 1's cost, and the
+card ships it.**
+
+**The named candidate is G-R2.2's own row and §0.4.3's own mechanism:** `m68k_run_mmu040` grew
+**2 324 → 2 548 B (+224, +9.6 %)**, and §0.4.3 already recorded a +7.22 % unexplained
+wall-clock move on identical work between two builds whose only difference was code motion,
+with the mechanism named — *"an interpreter dispatch loop in a 32 KB Cortex-A9 L1I is exactly
+the workload sensitive to that."*
+
+**Where the +224 bytes came from, read off §0.9.3's own table:** `z3660_warp_step()` is
+`always_inline`, so the **armed-only** half of it is inlined into the run loop and occupies
+L1I on every disarmed pass that branches over it — the control-transfer-target test (6
+instructions), the supervisor/odd-pc/trace gates (8) and the four-way hashed lookup (18) =
+**32 ARM instructions ≈ 128 B**, plus the address materialisations gcc hoists for the table
+and the generation.
+
+**The change: `z3660_warp_step()` goes OUT OF LINE.** The run loop keeps only what it must —
+one address materialisation, one load, one test, one perfectly predicted branch — and every
+byte behind that branch leaves the loop's cache footprint. This **reverses §0.8.1 item 1's
+inlining decision on the disarmed side, deliberately and with the measurement that forces
+it**, and the cost is stated before it is paid: the armed path gains one AAPCS call, so the
+armed non-target dispatch goes from 11 to roughly 15 instructions and the armed per-block from
+≈ 108 to ≈ 114. **That trade is correct under this campaign's own rules** — the disarmed cost
+is a SHIPPED cost until the M5 gate, the armed cost is not yet a verdict of any kind, and
+§0.9.3 already found the entry cost dominated by `z3660_warp_run`'s 33-instruction preamble
+rather than by the gate.
+
+> ### The pre-registered targets
+>
+> - **static, measured this round:** `m68k_run_mmu040` = **2 330 … 2 400 B**, down from 2 548,
+>   i.e. at least 148 of the 224 bytes returned. Derivation: the 32 inlined armed-only
+>   instructions above are 128 B, and the hoisted materialisations they need are the rest.
+> - **wall clock, scored at the NEXT metal session and not here:** the disarm penalty returns
+>   to the round-1 class — **−2.276 % or better, dhry ≥ 7 988** — and the requirement is
+>   *strictly better than −5.848 %*, which is the only half of it that is not already a
+>   guess about a machine no one has run.
+> - **the boot row rides beside it** (Q11): the `DBF9A5AF` class read 51 s / 49 s against the
+>   clean lineage's 45 – 47 s. Predicted back into the **46 … 48 s** band.
+
+**Two levers are named and NOT taken, so that the one that is taken can be scored alone.**
+§0.9.6 item 3's open-coded memory fast path stays priced and unbuilt; and `z3660_warp_run`'s
+33-instruction preamble is **not** reduced this round unless the fix touches it anyway — it is
+the largest single row in §0.9.3's table, it is entirely on the **armed** path, and mixing an
+armed-path reduction into the round whose one wall-clock target is a **disarmed** number is
+how a result stops being attributable.
+
+### 0.10.7 What round 3 explicitly does not establish
+
+1. **That the fix works on silicon.** Round 3 takes no metal row. The reproducer is an
+   arithmetic predicate and a harness invariant; the on-target self-test is *built* here and
+   *run* by the next session. **Adding a range fix is not evidence of a fix; only the
+   self-test's PASS on metal is**, and that is Q3's standing caveat applied to this round's
+   own work.
+2. **Anything about speed.** No wall-clock number in §0.10.6 is measured here.
+3. **That the publish defect was the ONLY defect.** It explains all four occurrences and it is
+   the one defect this round names. A second one would show as an on-target self-test failure
+   in a family other than F1, which is precisely why the self-test is per-family.
+4. **The memory-touching families on silicon.** The self-test is guest-memory-free by design
+   (§0.10.5), so `(An)` and `d16(An)` remain harness-proven only. **Re-owed**, with the M2
+   demand-paging session as the first honest test either way.
+5. **`WARP_INSNS / WARP_BLK` against a representative stream** (§0.9.6 item 2). Still the
+   verdict session's to take, still 2.0 … 4.5 as written in §0.8.4.
+6. **Q5's second condition and Q6's decision rule.** The bracket is built and runnable; the
+   numbers need a card.
+7. **Everything §0.8.8 said round 2 would not establish**, unchanged.
+
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
