@@ -64,10 +64,12 @@ extern "C" const char * const z3660_prof_counter_names[] = {
     * profile of a correct machine". The placeholder keeps every later index aligned and
     * says out loud, in the dump itself, that nothing increments it. */
    "(retired)",
-   /* WARP ENGINE, ids 47..59, in the order docs/WARP-ENGINE.md §0.5.6 pre-registered. */
+   /* WARP ENGINE, ids 47..59, in the order docs/WARP-ENGINE.md §0.5.6 pre-registered,
+    * plus id 60 appended at round 2 (§0.8.2) -- the conflict term round 1 had no way to
+    * see, and without which a recompile budget cannot be decomposed at all. */
    "WARP_ENTER", "WARP_BLK", "WARP_INSNS", "WARP_BAIL", "WARP_BAIL_ST",
    "WARP_COMPILE", "WARP_CINSNS", "WARP_CBYTES", "WARP_CFETCH",
-   "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE"
+   "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE", "WARP_EVICT"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];

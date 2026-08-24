@@ -787,7 +787,20 @@ enum {
                                        * are gated BEFORE discovery and deliberately not
                                        * counted here -- that rate is INSNS_SUPER, and a
                                        * second copy of it would say nothing               */
-   Z3660_PROF_C_COUNT           = 60,
+   Z3660_PROF_C_WARP_EVICT      = 60, /* LIVE blocks overwritten in their set by a fill with
+                                       * a different key -- THE CONFLICT TERM. Appended at
+                                       * M1 round 2 because round 1 could not decompose its
+                                       * own recompile budget: 3 066 944 compiles with
+                                       * WARP_DISC explaining 4.8 % and WARP_FLUSH none, so
+                                       * 95.2 % was attributable to nothing at all. With
+                                       * this the budget closes:
+                                       *   COMPILE = first-compiles + DISC + EVICT + flush
+                                       * §0.7's own words: "a table-occupancy counter
+                                       * settles it in round 2". Appended, no id moves, no
+                                       * field changes shape, THE DUMP VERSION STAYS 2 --
+                                       * the same reasoning ids 20, 46 and 47..59 rode in
+                                       * under                                             */
+   Z3660_PROF_C_COUNT           = 61,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

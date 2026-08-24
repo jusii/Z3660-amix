@@ -4753,7 +4753,13 @@ static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
  * into EVERY variant, like rungs 0/1/2 and unlike the two instruments, because it is an
  * optimisation and not a diagnostic -- and switchable at runtime so a metal session can A/B
  * it on a live guest without reflashing, and so the host harness has an off state to compare
- * against. The arm flag itself lives in z3660_warp.cpp; the run loop reads it directly. */
+ * against. The arm flag itself lives in z3660_warp.cpp; the run loop reads it directly.
+ *
+ * Z3660_WARP_ENGINE opens the half of the header core0 must never see -- the block table,
+ * the context struct and the inlined fast path. core0's debug console and config parser
+ * include the same file for the sentinel values and the resolver alone, and the guard is
+ * what keeps that split a compiler-enforced fact rather than a convention. */
+#define Z3660_WARP_ENGINE 1
 #include "z3660_warp.h"
 
 #ifdef HOST_TEST_HARNESS
@@ -4856,8 +4862,8 @@ extern "C" void z3660_knobs_sync(void)
          if (w)
             z3660_printf("\r\n[WARP] ENGINE ARMED -- guest basic blocks are compiled and "
                          "executed as ARM code.\r\n"
-                         "[WARP] M1 round 1: every block is a NULL BLOCK and bails "
-                         "immediately. No speedup is expected or claimed.\r\n"
+                         "[WARP] M1 round 2: generation one compiles MOVE/MOVEA, "
+                         "register ALU, Bcc and DBcc; everything else bails.\r\n"
                          "[WARP] Read the arm state back from the counter, never from this "
                          "line. docs/WARP-ENGINE.md\r\n\r\n");
          else
@@ -6006,34 +6012,54 @@ void m68k_run_mmu040(void)
             do_cycles(cpu_cycles);
 
             /* ================================================================= WARP =====
-             * THE BLOCK ENGINE'S DISCOVERY HOOK, and it sits here for the same reason the
-             * decoded-op cache's lookup sits twelve lines below: this is the last moment at
-             * which the loop still has a choice about paying for the fetch and the dispatch.
+             * THE BLOCK ENGINE'S HOOK, and it sits here for the same reason the decoded-op
+             * cache's lookup sits twelve lines below: this is the last moment at which the
+             * loop still has a choice about paying for the fetch and the dispatch.
              *
-             * DISARMED IT IS ONE LOAD, ONE TEST AND A PERFECTLY PREDICTED BRANCH, and that
-             * is a SHIPPED cost until the M5 gate rather than a free one. It is
-             * pre-registered at 3..6 ARM instructions per guest instruction (§0.6.4 G-R1.7)
-             * and read off the lean objdump, never estimated -- because §30's pricing law
-             * says work prepended to the path arrives in full, and the one thing this round
-             * must not do is charge itself nothing.
+             * DISARMED IT IS ONE LOAD, ONE TEST AND A PERFECTLY PREDICTED BRANCH -- three
+             * ARM instructions, pre-registered in §0.8.4 G-R2.8 and read off the lean
+             * objdump, never estimated. Round 1 measured FIVE, because the two argument
+             * loads for an out-of-line call were hoisted above the test; the fast path is
+             * inlined now, so nothing is loaded until the arm is known to be live. It is a
+             * SHIPPED cost until the M5 gate rather than a free one, because §30's pricing
+             * law says work prepended to the path arrives in full and the one thing this
+             * round must not do is charge itself nothing.
              *
-             * ROUND 1 IGNORES THE RETURN VALUE, AND THAT IS THE NO-EMPTY-PASS INVARIANT
-             * SHOWING ITS OTHER HALF. A block entry either retires >= 1 guest instruction
-             * and consumes this pass, or retires 0 and falls through to the interpreter
-             * inside it. Every block in round 1 is a NULL BLOCK -- it retires nothing -- so
-             * the fall-through arm is the only one that exists, the loop below runs exactly
-             * as it always has, and the pass still retires exactly one instruction. The
-             * pass-consuming arm arrives in round 2 with the first block that retires
-             * something, priced by what this round measures.
+             * THE PASS-CONSUMING ARM LANDS HERE, and it is the other half of the
+             * no-empty-pass invariant. A block entry either retires >= 1 guest instruction
+             * and CONSUMES this pass -- the interpreter body below is skipped entirely and
+             * the tail runs once -- or retires 0 and falls through inside the same pass, in
+             * which case the loop runs exactly as it always has. There is no third outcome
+             * and therefore no re-entry guard: progress is guaranteed by construction.
              *
-             * Consequence, and it is what makes an armed capture readable by tools that
-             * predate the engine: WARP_ENTER is 0 in round 1, so
-             * DOPC_HIT + DOPC_MISS == (INSNS - WARP_ENTER) + FAULTS holds exactly, in both
-             * arms, and reduces to the identity the firmware has always had.
+             * CYCLES ARE PRESERVED BY CONSTRUCTION, not by approximation. Every handler in
+             * the cpuemu_31 table this loop dispatches returns the same constant, so a
+             * block that retired n instructions is worth exactly n of them and the harness
+             * pins that constant against a real handler's return value.
+             *
+             * THE CADENCE FEED IS CALLED FROM THE CALL SITE AND ONLY WHEN IT HAS WORK.
+             * Round 1 called it unconditionally with 0 and paid ten ARM instructions -- a
+             * call, a prologue, an early-out and a return -- to do nothing; §0.7.3 named
+             * that as one of the four shapes that were "not the engine". n <= 1 needs no
+             * feed at all, because the pass's own tail supplies that one tick (Q10, frozen).
              * =========================================================================== */
+            unsigned z3660_warp_n = 0;
+#if Z3660_EMU_PROF
+            /* Hoisted above the WARP arm because the tail's sampler reads it and a block
+             * pass skips the fetch that would otherwise set it. A block pass therefore
+             * samples opcode 0, which is declared rather than discovered: the WARP verdict
+             * rows are read from COUNTERS, and the family histogram of an armed profiling
+             * capture is not one of them. */
+            uae_u16 z3660_prof_op = 0;
+#endif
             if (z3660_warp_on)
-               z3660_warp_dispatch((unsigned)regs.instruction_pc, regs.s ? 1 : 0);
+               z3660_warp_n = z3660_warp_step((unsigned)regs.instruction_pc);
 
+            if (z3660_warp_n != 0) {
+               cpu_cycles = (int)(z3660_warp_n * (unsigned)Z3660_WARP_CYC_PER_INSN);
+               if (z3660_warp_n > 1u)
+                  z3660_warp_cadence_feed(z3660_warp_n);
+            } else {
             mmu_opcode = -1;
             /* CYBERSTORM C2 rung 1. The decoded-op cache is consulted HERE, before
              * x_prefetch, because this is the last moment at which the loop still has a
@@ -6094,8 +6120,9 @@ void m68k_run_mmu040(void)
             /* Snapshot the opcode for the sampler. regs.opcode is fair game for a handler
              * to overwrite, and mmu_opcode is not reset on this loop's path -- neither is
              * a promise, and a sample record that names the wrong instruction is worse
-             * than no sample at all. One store per instruction, profiling build only. */
-            const uae_u16 z3660_prof_op = (uae_u16)regs.opcode;
+             * than no sample at all. One store per instruction, profiling build only.
+             * Declared above the WARP arm, assigned here. */
+            z3660_prof_op = (uae_u16)regs.opcode;
 #endif
 
 #if Z3660_EMU_PROBES
@@ -6288,6 +6315,8 @@ void m68k_run_mmu040(void)
             // default and what the env sets today -- is byte-for-byte the old behaviour;
             // this only makes the existing SERV knob reach the 040 loop as well.
             //
+            }   /* end of the interpreter arm -- a block that retired something skips it */
+
             // C2-prep: the bucket opens BEFORE adjust_cycles() and the sampler hook, so
             // the tail's own accounting work is inside it. In v1 both sat outside and
             // were charged to LOOP, which is part of why LOOP looked like the largest
