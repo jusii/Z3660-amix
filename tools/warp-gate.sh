@@ -39,18 +39,24 @@ for elf in "$@"; do
 	# that a pre-WARP loop did not. Print it, and count the loads in it, because "one load off
 	# a live base" versus "two serially dependent loads" is the distinction two rounds of this
 	# campaign turned on.
-	"$OBJDUMP" -d --disassemble="$SYM" "$elf" 2>/dev/null |
-	awk '
-		/\tblx\tr3$/ && !seen { seen = 1; next }
-		seen && seen < 9 {
-			print "    " $0
-			seen++
-			if ($0 ~ /\t(beq|bne)\t/) exit
-		}
-	'
+	#
+	# A BUILD WITH NO GATE MUST SAY SO RATHER THAN PRINT SOMETHING. The ablation kit's levels
+	# 3, 4 and 5 remove the hook, so the instruction after `blx r3` is ordinary interpreter
+	# dispatch -- and printing eight lines of it under the heading "the gate" is exactly the
+	# kind of plausible wrong answer this script exists to stop. The gate is recognised by its
+	# SHAPE: a load, then a compare against zero, then a conditional branch.
+	dis=$("$OBJDUMP" -d --disassemble="$SYM" "$elf" 2>/dev/null |
+	      awk '/\tblx\tr3$/ && !s { s = 1; next }
+	           s && n < 6 { print; n++ }')
 
-	nl=$("$OBJDUMP" -d --disassemble="$SYM" "$elf" 2>/dev/null |
-	     awk '/\tblx\tr3$/ && !s { s=1; next }
-	          s { if ($0 ~ /\tldr\t/) n++; if ($0 ~ /\t(beq|bne)\t/) { print n+0; exit } }')
-	echo "    loads on the disarmed path: ${nl:-?}"
+	if ! printf '%s\n' "$dis" | head -3 |
+	     awk 'NR==1 && /\tldr\t/ {a=1} NR==2 && /\tcmp\t.*#0$/ {b=1}
+	          NR==3 && /\tb(eq|ne)\t/ {c=1} END {exit !(a && b && c)}'; then
+		echo "    NO WARP GATE -- the run-loop hook is not in this build (ablation level >= 3)"
+		continue
+	fi
+
+	printf '%s\n' "$dis" | head -3 | sed 's/^/    /'
+	nl=$(printf '%s\n' "$dis" | head -3 | grep -c '	ldr	' || true)
+	echo "    loads on the disarmed path: $nl"
 done

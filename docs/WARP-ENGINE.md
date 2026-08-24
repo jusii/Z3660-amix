@@ -3732,6 +3732,16 @@ are the explanation.
 | `BOOT-prof.BIN` | `6973E8B5` | 12 696 676 | (the profiling variant, rebuilt) | — | — | — |
 | `BOOT-q2probe.BIN` | `FCC0CB3F` | 12 795 260 | **untouched**, as gated | — | — | — |
 
+**`tools/warp-gate.sh` reads the whole matrix and its answer is the layer census restated
+independently** — it recognises the gate by its SHAPE (a load, a compare against zero, a
+conditional branch) rather than by position, so a build without one says so rather than
+printing six lines of interpreter dispatch under the wrong heading:
+
+```
+   A0 / A1 / A2 :  2188 B   ldr r3,[r4,#96] / cmp r3,#0 / beq      loads on the disarmed path: 1
+   A3 / A4 / A5 :  2104 B   NO WARP GATE -- the run-loop hook is not in this build
+```
+
 **The static half of the matrix behaves exactly as the design says it must**, and three rows
 are worth reading before any metal time:
 
