@@ -32,9 +32,13 @@ Kickstart's Expansion Board Diagnostic listed two boards:
 
 3. **Board 1 is not an identity this firmware can emit.** Every AutoConfig identity the
    card owns — FPGA Zorro II, FPGA Zorro III, and the extended ROM — uses manufacturer
-   `0x144B` (5195), the only manufacturer number in the tree. `0x3B3B` appears nowhere.
-   Its *shape* is the signature of a **floating-bus read**, and F0 was the first boot in
-   this project's history in which nothing at all answered the Zorro II chain. §4.
+   `0x144B` (5195), and in both FPGA chains the manufacturer nibbles are **unconditional**
+   assignments, so no stale or half-programmed chain state can change them. `0x3B3B`
+   appears nowhere in the tree. Its shape is the signature of an **all-ones `er_Type`**
+   read with no responder: `$FF` decodes as exactly "Zorro II, 4 MB". §4, and §4A for the
+   two hypotheses tested against it after the ghost proved reproducible.
+   **No device this card can present advertises 4 MB** — the only sizes it knows are
+   64 kB, 128 MB and 256 MB (§4A.3).
 
 4. **A1's premise is false in both halves.** The extended-ROM load did **not** fail — the
    ROM demonstrably executed (board 2 exists). And the `Unknown hunk type 00000000` line is
@@ -220,12 +224,145 @@ II chain** — which is exactly the condition under which an unanswered probe is
 
 ### 4.4 Honest limit
 
-That the unanswered Zorro II probe is *sufficient* to produce the ghost is a leading
-hypothesis, not a proven fact — a stock A4000 with empty slots does not normally raise this
-requester, so something about this rig's termination of an unclaimed `$E8xxxx` cycle is
-part of the story, and that part is in the CPLD and the board, not in code this repository
-can change. §8 states what cannot be reached from here. The discriminating test is cheap
-and is §7's first item.
+That an unanswered probe is *sufficient* to produce the ghost is a leading hypothesis, not
+a proven fact — a stock A4000 with empty slots does not normally raise this requester, so
+something about how this rig terminates an unclaimed AutoConfig cycle is part of the story,
+and that part is in the CPLD and the board, not in code this repository can change. §8
+states what cannot be reached from here.
+
+---
+
+## 4A. Addendum — reproducibility, and two hypotheses tested to destruction
+
+Added after §4 was written, on two pieces of live input: the ghost reappeared with the
+**same signature** in a second, independent session (the thermal run following F0), and two
+mechanism hypotheses were put forward. Both are refuted below, one of them three ways. The
+reproducibility does **not** move the verdict, for the reason in §4A.1.
+
+### 4A.1 "Reproducible, therefore not floating" does not follow
+
+An undriven bus read is *deterministic* whenever the cycles preceding it are. Between
+AutoConfig reads the 68060 fetches instructions from the same ROM, executing the same
+expansion.library code, in the same order, on every boot. If the data lines hold the
+previous cycle's value, the residue is the **same residue every time**. Two sessions
+agreeing is therefore exactly what an unanswered read predicts — it rules out *randomness*,
+not *no responder*. What it does rule out is anything genuinely uninitialised in DDR, which
+would vary with boot history.
+
+### 4A.2 The size-code arithmetic — a correction that inverts the inference
+
+The Zorro II size field is `er_Type` bits 2-0, and **`000` is 8 MB, not 4 MB. 4 MB is
+`111`** — the all-ones end of the field, not the zero end. Corroborated three ways inside
+this tree, against the FPGA's own annotated constants:
+
+| `z3660.v` | nibble | comment | standard code |
+|---|---|---|---|
+| `:880` Z2 | `0001` | *"64 kB"* | Z2 `001` = 64 kB ✓ |
+| `:971` Z3 FastRAM | `0100` | *"256MB"* | Z3 ext. `100` = 256 MB ✓ |
+| `:973` Z3 RTG | `1011` | *"128MB"* | Z3 ext. `011` = 128 MB ✓ |
+
+So the record behind the ghost is at the **all-ones** end, not the half-programmed or
+mostly-zero end. That matters twice over:
+
+- A mostly-**zero** `er_Type` has bits 7-6 = `00`, which expansion.library reads as **"no
+  board"** and uses to terminate the chain. A half-programmed record does not become a
+  visible board — it becomes an *absent* one. It cannot be what is on screen.
+- `$FF` gives bits 7-6 = `11` (Zorro II) and bits 2-0 = `111` (4 MB). **"Z2 + 4 MB" is
+  precisely and only what an all-ones `er_Type` reads as.**
+
+Note also that **4 MB is not expressible at all in the Zorro III size encoding** (its
+minimum is 16 MB), so no Zorro III record, in any state of corruption, can display 4 MB.
+
+### 4A.3 Every AutoConfig identity this firmware can present — and none is 4 MB
+
+Asked directly: what might the 4 MB device be? The complete enumeration:
+
+| # | Device | Chain | `er_Type` raw | Shows as | Advertised size | Vendor | Product | Gated by |
+|---|---|---|---|---|---|---|---|---|
+| 1 | piscsi boot board | Zorro II `$E80000` | `$D1` | Z2, DIAGVALID | **64 kB** | 5195 | 3 | `scsiboot` → REG0 b14 |
+| 2 | Z3 Fast RAM | Zorro III `$FF000000` | `$A4` | Z3, MEMLIST | **256 MB** | 5195 | 2 | `autoconfig_ram` → b12 |
+| 3 | Z3 RTG/combo | Zorro III `$FF000000` | `$8B`/`$9B` | Z3 | **128 MB** | 5195 | 1 | `autoconfig_rtg` → b13 |
+| 4 | ext-ROM ConfigDev | *none* — `AddConfigDev` | `$93` | Z3, DIAGVALID | 128 MB | 5195 | 1 | the ext-ROM image |
+
+Non-AutoConfig apertures, which never appear in any chain: CPU RAM (`$08000000`, 128 MB),
+the RTG aperture when RTG AutoConfig is off (`$10000000`, 128 MB), MAPROM (`$00F80000`,
+512 kB), MAPROMEXT (`$00F00000`, 512 kB).
+
+**The only sizes this card knows how to advertise are 64 kB, 128 MB and 256 MB. There is no
+4 MB device, and no combination of enable bits can make one.**
+
+### 4A.4 Hypothesis A — a stale or half-programmed FPGA chain record. Refuted, three ways
+
+The proposal: with RTG/SCSI/256MB AutoConfig all disabled, one of the disabled boards' chain
+state is left half-initialised and answers with a corrupt record.
+
+1. **Manufacturer is unconditional.** In *both* chains the manufacturer nibbles are plain
+   assignments with **no `if` guard at all** — `z3660.v:900-911` (Zorro II) and
+   `z3660.v:993-996` (Zorro III). Any state in which the FPGA answers those addresses
+   yields `~$EB,$B4` = **`0x144B` = 5195**. The ghost reads **15163**. No chain state,
+   stale or otherwise, can produce that.
+2. **Product's high nibble is unconditional too** — `z3660.v:883`, `data[31:28] <= ~4'h0`,
+   so the product byte can never exceed `$0F` after inversion. The ghost reads **200**
+   (`$C8`). Impossible independently of (1).
+3. **The fall-through that would give "Z2 + 4 MB" is unreachable.** The Zorro II read path
+   *does* default to `data <= 32'hFFFFFFFF` (`z3660.v:874`) with `er_Type` gated on
+   `configured_z2==0 && enabled_z2==1` — so a range-claimed-but-gate-false read would
+   indeed return `$FF` and display as **Z2, 4 MB**. But `AUTOCONFIG_Z2_RANGE`
+   (`z3660.v:279`) is `~shutup_z2 && ~(configured_z2 | ~enabled_z2)`, i.e. the range
+   condition is a strict **subset** of the field gate: whenever the FPGA claims the range,
+   the gate is true. The same holds for Zorro III (`z3660.v:280` vs the arms at `:965-986`).
+   The fall-through cannot be entered — and even if it were, (1) says it would still carry
+   vendor 5195.
+
+**Verdict: the FPGA did not answer these cycles at all.**
+
+### 4A.5 Hypothesis B — the ghost is the SCSI-boot ROM's vehicle board, left armed. Refuted
+
+The proposal is structurally well-aimed: device 1 in §4A.3 genuinely *is* an AutoConfig
+board that exists as a vehicle for a boot ROM. It sets `ERTF_DIAGVALID` (`z3660.v:877`,
+nibble `1101`) and advertises `er_InitDiagVec = $6000` (`z3660.v:913-923`), so a board whose
+DiagArea is missing or corrupt failing validation and being flagged **Bad** is a real and
+plausible failure mode. It is nevertheless not what happened:
+
+- **Wrong fields, three of them.** 64 kB not 4 MB; vendor 5195 not 15163 (unconditional,
+  §4A.4.1); product ≤ `$0F` not 200 (unconditional, §4A.4.2).
+- **`scsiboot NO` does suppress it on the real-CPU path.** REG0 bit 14 is cleared at
+  `main.c:1442` (common) *and* at `main.c:1505` (the real-CPU branch's own copy), both
+  before the `FPGA_RESET` pulse at `main.c:1577-1580` that latches `enabled_z2 <= GPIO_s[14]`
+  (`z3660.v:405`). This is the one place the eight-way copy-paste class does **not** bite:
+  the real-CPU branch carries its own correct copy. Independently, `piscsi_init()` returns
+  at `scsi/scsi.c:356-360` when `scsiboot==0`, so `z3660_scsi.rom` is never loaded and the
+  DiagArea at `$E96000` is never populated — there is no vehicle *and* no cargo.
+- **The ext ROM is not this board's boot ROM.** The vehicle board's DiagArea is served from
+  `z3660_scsi.rom`, which `piscsi_init()` copies to `$00E96000` and `$10006000`
+  (`scsi/scsi.c:396-402`) — i.e. Zorro II base `$E90000` + the `$6000` DiagVec.
+  `kick060_scsi.rom` at `$00F00000` is a **different artefact** doing a different job (the
+  full-060 FPU disable, and the `AddConfigDev` of §3). The two are not the same chain, and
+  `CHANGES.md:79`'s "tiny Zorro II board of 64 kB" is device 1, gated by `scsiboot`, not by
+  `ext_kickstart`.
+- **The ext ROM cannot inject a second entry.** Its module calls `FindConfigDev` first and
+  returns if already present, then does exactly one `AllocConfigDev` → fill-every-field →
+  `AddConfigDev` (`kick31_060.asm:182-207`). There is no path to a partially-filled record.
+
+### 4A.6 What the ghost most likely is — revised, and better than §4
+
+Combining §4A.2 with the one fact §4 could not explain — **the address `$40000000`**:
+
+A genuine Zorro II board can never be assigned a Zorro III address. But a board discovered
+in the **Zorro III** AutoConfig space (`$FF000000`, which the FPGA does *not* claim in this
+posture) whose `er_Type` reads all-ones would present type bits `11` = "Zorro II" **in a
+Zorro III slot** — an inconsistent record, hence **Bad** — while being placed at the Zorro
+III base the OS was about to use. That accounts for the type, the 4 MB, the Bad, *and* the
+`$40000000`, which the Zorro II reading of §4 could not.
+
+It also fixes §4's ordering argument, which was wrong: board 2 is added by an
+`RTF_COLDSTART` resident, which runs **after** expansion.library's chain walk. So the ghost
+being listed first says nothing about which chain found it — it only says it was found
+during the walk and board 2 was appended later. §4's inference from list order is withdrawn.
+
+**Consequence for F4: `scsiboot YES` is now expected NOT to remove the ghost.** Every chain
+walk ends with a probe one slot past the last real board, so adding boards moves the
+end-of-chain read later without eliminating it. §7 is revised accordingly.
 
 ---
 
@@ -341,27 +478,57 @@ rewriting.
 
 ## 7. What F4 must do
 
-1. **Boot with `scsiboot YES`.** This is both the discriminator for §4 and what F4 wants
-   anyway (piscsi root). It puts the FPGA's Zorro II board back on the chain, so the Zorro
-   II probe is answered. Note the firmware requires `cpu_ram YES` alongside it —
-   `main.c:1450-1463` disables SCSI boot outright if `cpu_ram` is off, and says so.
-   **If the ghost disappears, §4 is confirmed and F4 is unblocked by configuration alone.**
+*Revised after §4A. The single-knob fix in the first draft is withdrawn: `scsiboot YES` is
+no longer expected to remove the ghost (§4A.6). What follows is a three-boot ladder, one
+variable each, ordered by information per boot. **The vendor field is the discriminator
+throughout** — anything the card emits reads 5195 (§4A.4.1), so a ghost that still reads
+15163 is off-card.*
 
-2. **Do not plan on dismissing the requester remotely.** In the F0 evidence the requester
+1. **Boot A — `ext_kickstart 0`, everything else exactly as F0.** One config edit, and by
+   far the highest-information boot in the ladder, because it tests §3 and §4A.5 at once.
+   Pre-registered predictions:
+   - **Board 2 DISAPPEARS.** It is the ext ROM's own `AddConfigDev` and nothing else
+     creates it. If board 2 survives without an extended ROM, §3 is wrong and this page
+     needs rewriting from §3 down.
+   - **Board 1 is UNCHANGED** — still `Z2 / 15163 / 200 / 4MB / Bad`. If it disappears,
+     §4A.5 is wrong, the ext ROM *is* implicated, and the two anomalies really are one.
+   - The requester should still appear (raised by board 1), now listing one board.
+
+2. **Boot B — F4's intended posture: `scsiboot YES` + `cpu_ram YES` + `ext_kickstart 2`.**
+   Note the firmware requires `cpu_ram YES` alongside `scsiboot` — `main.c:1450-1463`
+   disables SCSI boot outright otherwise, and says so on the serial. Predictions:
+   - A **new** board appears: `Z2 / 5195 / 3 / 64 kB` (device 1 of §4A.3), **OK** if
+     `1:/z3660_scsi.rom` is present and its DiagArea valid, **Bad** if not.
+   - **The ghost persists unchanged at 15163 / 4 MB** (§4A.6). If instead the ghost's
+     vendor becomes **5195**, then it was the card's own record all along and §4A.4 is
+     wrong — that single field decides it.
+
+3. **Boot C — only if A and B disagree with the predictions:** `autoconfig_ram YES` puts a
+   256 MB Zorro III board (product 2) on the Zorro III chain. If the ghost's address or
+   position moves when the *Zorro III* chain gains a member but not when the Zorro II chain
+   does, it is a Zorro III end-of-chain artefact, confirming §4A.6.
+
+4. **Budget for the requester rather than assuming it away.** §4A.6 predicts the ghost is
+   an end-of-chain artefact, i.e. **not config-removable**. If boots A and B confirm that,
+   F4 needs a way past a modal requester, and the only two candidates left are a working
+   remote dismissal (item 5 — currently unproven) or a Kickstart/ROM-side change, which is
+   a much larger piece of work than F4 was scoped for. Escalate rather than improvise.
+
+5. **Do not plan on dismissing the requester remotely.** In the F0 evidence the requester
    is *still on screen* in both `18-HDMI-armB-after-enter.jpg` (after a keypress) and
    `19-HDMI-armB-after-click.jpg` (after a mouse click on Continue). Neither dismissal was
    demonstrated. That may be a capture-before-redraw artefact, but it must not be assumed
    away: treat "make the ghost not appear" as the primary path and "dismiss it" as the
    unproven fallback.
 
-3. **`ext_kickstart 2` is correct and should stay** for a SCSI-boot posture — that ROM is
+6. **`ext_kickstart 2` is correct and should stay** for a SCSI-boot posture — that ROM is
    what registers the `$10000000` aperture and what `CHANGES.md:79` says makes z3660 SCSI
    bootable. Note it is **not** the FPU-disable ROM BLIZZARD D1 wants avoided: the
    FPU-disable path (`kick31_060.asm:83-89`) is gated on `PCR` high word `== $430`, i.e.
    **full 060 only**, and takes the `bne.s no_060_FPU` branch on an LC060 (`$431`). Both
    `kick060.rom` and `kick060_scsi.rom` contain that same gated code.
 
-4. **Re-open F0-M5.** §3.3 — the 128 MB board is not Fast RAM and the AMIX memory contract
+7. **Re-open F0-M5.** §3.3 — the 128 MB board is not Fast RAM and the AMIX memory contract
    on the real-CPU path is still undetermined.
 
 ---
