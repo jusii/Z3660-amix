@@ -19,6 +19,10 @@ cannot fire on it**. §0 is the freeze: it is the authority for everything below
 disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place with the
 correction marked.
 
+**`docs/warp-gen2-prospectus.md`** prices the M1 fork — park generation one, or fund a generation
+two — as scenarios against the R5 metal rows. It is a paper instrument, it carries no
+recommendation, and it scores nothing here: no number in this document is moved by it.
+
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
 updated as items move, and its pre-registrations are never rewritten after the fact.
