@@ -817,7 +817,34 @@ enum {
                                        * largest single cause at 46.9 % of the events.
                                        * DISC = DISC_ROOT + DISC_ATC + DISC_CPUSH + other,
                                        * and that identity is gate G-R4.9                  */
-   Z3660_PROF_C_COUNT           = 64,
+   /* ROUND 5'S BAIL ATTRIBUTION (§0.14.2). Round 4 opened a 7.5 pp gap between the bail rate
+    * (68.486 %) and the decline rate (60.958 %) that round 3 had 0.4 pp apart, and named a
+    * mechanism it could not prove. What the existing counters DO say is that
+    * BAIL - (BLK - ENTER) = 511 in 9.2 million -- so 99.994 % of bails retired NOTHING, and
+    * the whole question is a split of the zero-retirement population into cached decline
+    * stubs and real blocks that declined at their first faultable site. One bit at the
+    * existing site separates them, at zero emitted cost.
+    *
+    * THERE IS NO "FAULT" BUCKET AND THAT IS STRUCTURAL, not an omission: generated code never
+    * takes a fault, because every faultable access is a helper call that DECLINES first. The
+    * instrument that watches that is G2's FAULTS(on) == FAULTS(off) +/- 1, and BAIL_OTHER is
+    * the tripwire for the other direction.
+    *
+    * Appended: no existing id moves, no field changes shape, THE DUMP VERSION STAYS 2. */
+   Z3660_PROF_C_WARP_BAIL_STUB  = 64, /* a cached DECLINE STUB executed (len == 0) --
+                                       * "uncovered opcode at run time", in its cached form */
+   Z3660_PROF_C_WARP_BAIL_MEM   = 65, /* a REAL block bailed. Every one of these is a
+                                       * memory-helper decline BY CONSTRUCTION: e_bail_if()
+                                       * is emitted after `blx R_RD` and after `blx R_WR`
+                                       * and at no other kind of site                      */
+   Z3660_PROF_C_WARP_BAIL_FENCE = 66, /* ... of those, the helper's structural fence:
+                                       * misaligned, or the access crosses a guest page     */
+   Z3660_PROF_C_WARP_BAIL_VERDICT = 67, /* ... the verdict table: SLOW, ATC miss, or a bank
+                                       * that is not directly addressable                   */
+   Z3660_PROF_C_WARP_BAIL_OTHER = 68, /* neither a stub nor a real block. PRE-REGISTERED AT
+                                       * EXACTLY ZERO -- it cannot happen, and a non-zero
+                                       * reading is a defect rather than a statistic        */
+   Z3660_PROF_C_COUNT           = 69,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

@@ -70,7 +70,12 @@ extern "C" const char * const z3660_prof_counter_names[] = {
    "WARP_ENTER", "WARP_BLK", "WARP_INSNS", "WARP_BAIL", "WARP_BAIL_ST",
    "WARP_COMPILE", "WARP_CINSNS", "WARP_CBYTES", "WARP_CFETCH",
    "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE", "WARP_EVICT",
-   "WARP_DISC_EV", "WARP_DISC_ATC", "WARP_DISC_CPUSH"
+   "WARP_DISC_EV", "WARP_DISC_ATC", "WARP_DISC_CPUSH",
+   /* Round 5's bail attribution, ids 64..68 (§0.14.2) -- the split that turns the round-4
+    * bail-vs-decline gap from an argument into a reading. BAIL_OTHER is pre-registered at
+    * exactly zero and exists as a tripwire, not as a statistic. */
+   "WARP_BAIL_STUB", "WARP_BAIL_MEM", "WARP_BAIL_FENCE", "WARP_BAIL_VERDICT",
+   "WARP_BAIL_OTHER"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];
