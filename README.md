@@ -37,8 +37,10 @@
 > predicates — compiled out; and `make profile` gives **`BOOT-prof.BIN`**, the lean image plus an
 > interpreter profiler (a wall-clock guest-PC sampler and per-stage ARM cycle attribution). The
 > profiling image is a measuring instrument, not a production one — it costs measured time to run.
-> Every build also drops a CRC-stamped copy of its image in `sd_card/archive/` (untracked), so a
-> rebuild never destroys the image you are comparing against. Details in
+> Every build also drops a CRC-stamped copy of its image, plus the matching core1 emulator ELF,
+> in `sd_card/archive/` (untracked), so a rebuild never destroys the image you are comparing
+> against, and a flown image's disassembly stays readable after the build directory has moved on.
+> Details in
 > **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
 >
 > A fourth target, `make q2probe`, builds **`BOOT-q2probe.BIN`** — a throwaway experiment image

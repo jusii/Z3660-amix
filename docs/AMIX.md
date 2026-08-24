@@ -421,8 +421,12 @@ still live on the card — existed nowhere on the host afterwards, so the sessio
 the revert it had just decided.
 
 So `make bootbin`, `make lean` and `make profile` each end by copying their image, CRC-stamped,
-into **`Z3660_system/Alfa/sd_card/archive/`** (`BOOT-lean-86C0BC18.BIN` and so on). The step is
-unconditional and needs `python3` on the build host (the docker image has it); the CRC is
+into **`Z3660_system/Alfa/sd_card/archive/`** (`BOOT-lean-86C0BC18.BIN` and so on) — and, same
+basename and CRC, the core1 emulator ELF it was linked from (`BOOT-lean-86C0BC18.elf`). The BIN
+alone cannot be objdumped back to a named function; two build-integrity incidents (§0.13.4,
+§0.15.2 in `docs/WARP-ENGINE.md`) turned on a flown, CRC-identified image whose source could no
+longer be re-examined once its build directory's ELF had been overwritten by a later build. The
+step is unconditional and needs `python3` on the build host (the docker image has it); the CRC is
 `zlib crc32`, the same one the boot menu's `CRC` command prints, so an archived name can be
 matched against a card without recomputing anything. The directory is untracked — everything
 under `Alfa/` except the three `.bif` descriptors is a build artefact — and is never pruned by

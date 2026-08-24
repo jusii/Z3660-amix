@@ -96,13 +96,29 @@ Q2PROBE_BOOTBIN := Z3660_system/Alfa/sd_card/BOOT-q2probe.BIN
 # Unconditional and dumb on purpose: the CRC is the identity, so a rebuild that changes
 # nothing costs one redundant copy of the same bytes, and a rebuild that changes something
 # keeps both. Pruning is a human decision about disk, never the build's.
+#
+# The core1 emulator ELF is archived alongside the BIN, same basename and CRC (e.g.
+# archive/BOOT-lean-86C0BC18.elf), because the BIN alone cannot be objdumped back to a named
+# function -- it is a raw boot image, symbols gone. Two build-integrity incidents
+# (docs/WARP-ENGINE.md 0.13.4, 0.15.2) turned on exactly this: a flown, CRC-identified image's
+# source could no longer be re-examined once its build directory's ELF had been overwritten by
+# a later build. Archiving the ELF next to the BIN it was linked into makes a flown image
+# objdump-readable for as long as the archive entry exists, independent of what the build
+# directory holds later. Best-effort: if the ELF is missing (a stale build directory), the BIN
+# still archives and a warning is printed rather than the build failing.
 ARCHIVE_DIR   := Z3660_system/Alfa/sd_card/archive
 CRC32         := python3 -c 'import sys,zlib; print("%08X" % (zlib.crc32(open(sys.argv[1],"rb").read()) & 0xffffffff))'
 
 define archive_image
 @mkdir -p $(ARCHIVE_DIR)
-@crc=`$(CRC32) $(1)`; dst=$(ARCHIVE_DIR)/`basename $(1) .BIN`-$$crc.BIN; \
- cp -p $(1) $$dst; echo "archived -> $$dst"
+@crc=`$(CRC32) $(1)`; base=`basename $(1) .BIN`; dst=$(ARCHIVE_DIR)/$$base-$$crc.BIN; \
+ cp -p $(1) $$dst; echo "archived -> $$dst"; \
+ if [ -f "$(2)" ]; then \
+   elfdst=$(ARCHIVE_DIR)/$$base-$$crc.elf; \
+   cp -p $(2) $$elfdst; echo "archived -> $$elfdst"; \
+ else \
+   echo "WARNING: $(2) not found -- ELF not archived for $$base-$$crc"; \
+ fi
 endef
 
 # Component directories
@@ -196,7 +212,7 @@ bootbin: bootbin_prepare
 	@echo "Generating BOOT.BIN (DDR $(DDR_SPEED)MHz)"
 	$(BOOTGEN_EXE_HOST) $(BIF) $(BOOTBIN)
 	@echo "BOOT.BIN -> $(BOOTBIN)"
-	$(call archive_image,$(BOOTBIN))
+	$(call archive_image,$(BOOTBIN),$(Z3660_EMU_DIR)/build/Z3660_emu.elf)
 
 # `make lean` -> sd_card/BOOT-lean.BIN, the production image. Core0 and the FSBL are the
 # same binaries the default image uses; only core1 differs. Does NOT touch BOOT.BIN.
@@ -208,7 +224,7 @@ lean: lean_prepare
 	@echo "Generating BOOT-lean.BIN (DDR $(DDR_SPEED)MHz, run-loop diagnostics compiled out)"
 	$(BOOTGEN_EXE_HOST) $(LEAN_BIF) $(LEAN_BOOTBIN)
 	@echo "BOOT-lean.BIN -> $(LEAN_BOOTBIN)"
-	$(call archive_image,$(LEAN_BOOTBIN))
+	$(call archive_image,$(LEAN_BOOTBIN),$(Z3660_EMU_DIR)/build-lean/Z3660_emu.elf)
 
 # `make profile` -> sd_card/BOOT-prof.BIN. Core0 and the FSBL are the same binaries the
 # other two images use; only core1 differs. Does NOT touch BOOT.BIN or BOOT-lean.BIN.
@@ -220,7 +236,7 @@ profile: profile_prepare
 	@echo "Generating BOOT-prof.BIN (DDR $(DDR_SPEED)MHz, lean loop + interpreter profiler)"
 	$(BOOTGEN_EXE_HOST) $(PROF_BIF) $(PROF_BOOTBIN)
 	@echo "BOOT-prof.BIN -> $(PROF_BOOTBIN)"
-	$(call archive_image,$(PROF_BOOTBIN))
+	$(call archive_image,$(PROF_BOOTBIN),$(Z3660_EMU_DIR)/build-prof/Z3660_emu.elf)
 
 # `make q2probe` -> sd_card/BOOT-q2probe.BIN. Core0 and the FSBL are the same binaries the
 # other three images use. Does NOT touch BOOT.BIN, BOOT-lean.BIN or BOOT-prof.BIN.
@@ -232,7 +248,7 @@ q2probe: q2probe_prepare
 	@echo "Generating BOOT-q2probe.BIN (DDR $(DDR_SPEED)MHz, WARP M0 Q2 unwind probe)"
 	$(BOOTGEN_EXE_HOST) $(Q2PROBE_BIF) $(Q2PROBE_BOOTBIN)
 	@echo "BOOT-q2probe.BIN -> $(Q2PROBE_BOOTBIN)"
-	$(call archive_image,$(Q2PROBE_BOOTBIN))
+	$(call archive_image,$(Q2PROBE_BOOTBIN),$(Z3660_EMU_DIR)/build-q2probe/Z3660_emu.elf)
 
 # `make abl1` .. `make abl5` -> sd_card/BOOT-abl<N>.BIN, each archived CRC-stamped like every
 # other image. `make ablation` builds all five. Core0 and the FSBL are the same binaries the
@@ -247,7 +263,7 @@ abl%: bsp_cortexa9_0 z3660 z3660_emu_abl% $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
 	$(BOOTGEN_EXE_HOST) Z3660_system/Alfa/system_cli_abl$*.bif \
 	    Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN
 	@echo "BOOT-abl$*.BIN -> Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN"
-	$(call archive_image,Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN)
+	$(call archive_image,Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN,$(Z3660_EMU_DIR)/build-abl$*/Z3660_emu.elf)
 
 .PHONY: ablation
 ablation: $(addprefix abl,$(ABL_LEVELS))
