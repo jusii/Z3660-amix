@@ -4863,7 +4863,9 @@ extern "C" void z3660_knobs_sync(void)
        * resolver below is unchanged and only Z3660_WARP_ARM resolves to 1 (Q9). */
       if ((unsigned)shared->warp_on == Z3660_WARP_SELFTEST) {
          shared->warp_on = Z3660_WARP_OFF;
+#if !Z3660_WARP_ABL_NO_SELFTEST
          z3660_warp_selftest();
+#endif
       }
       unsigned w = z3660_warp_resolve((unsigned)shared->warp_on);
       if ((int)w != z3660_warp_armed()) {
@@ -5793,7 +5795,9 @@ extern "C" void z3660_dopc_invalidate(int cause)
     * so nothing above it moves: sum(IV_*) - IV_WRAP == DOPC_INVAL is untouched, and WARP's
     * own WARP_DISC reconciles against the same stream. Disarmed it returns immediately --
     * nothing was compiled, so there is nothing to discard. */
+#if !Z3660_WARP_ABL_NO_ENGINE
    z3660_warp_invalidate(cause);
+#endif
 }
 
 /* Rung 1c: the CACR call site proved its request inert, so nothing is invalidated and
@@ -6052,7 +6056,9 @@ void m68k_run_mmu040(void)
              * that as one of the four shapes that were "not the engine". n <= 1 needs no
              * feed at all, because the pass's own tail supplies that one tick (Q10, frozen).
              * =========================================================================== */
+#if !Z3660_WARP_ABL_NO_HOOK
             unsigned z3660_warp_n = 0;
+#endif
 #if Z3660_EMU_PROF
             /* Hoisted above the WARP arm because the tail's sampler reads it and a block
              * pass skips the fetch that would otherwise set it. A block pass therefore
@@ -6061,6 +6067,12 @@ void m68k_run_mmu040(void)
              * capture is not one of them. */
             uae_u16 z3660_prof_op = 0;
 #endif
+            /* THE ABLATION KIT'S L-HOOK LAYER (§0.14.1). Removing this arm leaves the run
+             * loop textually as it was before WARP existed: no gate, no
+             * block-consumes-the-pass branch, and no `else` around the interpreter body.
+             * That is what makes A3's disarmed row a measurement of the HOOK rather than of
+             * the engine's presence -- the engine is still compiled and still linked. */
+#if !Z3660_WARP_ABL_NO_HOOK
             if (z3660_warp_on)
                z3660_warp_n = z3660_warp_step((unsigned)regs.instruction_pc);
 
@@ -6069,6 +6081,7 @@ void m68k_run_mmu040(void)
                if (z3660_warp_n > 1u)
                   z3660_warp_cadence_feed(z3660_warp_n);
             } else {
+#endif
             mmu_opcode = -1;
             /* CYBERSTORM C2 rung 1. The decoded-op cache is consulted HERE, before
              * x_prefetch, because this is the last moment at which the loop still has a
@@ -6324,7 +6337,9 @@ void m68k_run_mmu040(void)
             // default and what the env sets today -- is byte-for-byte the old behaviour;
             // this only makes the existing SERV knob reach the 040 loop as well.
             //
+#if !Z3660_WARP_ABL_NO_HOOK
             }   /* end of the interpreter arm -- a block that retired something skips it */
+#endif
 
             // C2-prep: the bucket opens BEFORE adjust_cycles() and the sampler hook, so
             // the tail's own accounting work is inside it. In v1 both sat outside and

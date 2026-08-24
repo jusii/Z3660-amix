@@ -39,10 +39,25 @@ LDSCRIPT:= $(SRCDIR)/lscript.ld
 # into build-q2probe and produces BOOT-q2probe.BIN, and the probe source is filtered out
 # of the source list for every other variant below -- so the other three images are
 # byte-identical whether this file exists or not.
+#
+# Z3660_WARP_ABLATE=1..5 is the FIFTH..NINTH variant, and it is an INSTRUMENT rather than an
+# image: the disarm-residual ablation kit (docs/WARP-ENGINE.md S0.14.1). Each level is the
+# LEAN build with exactly one layer of the WARP engine removed, so a metal session can
+# measure the same dhrystone against the same reference with one layer missing at a time and
+# read WHICH layer carries the -4.256 % disarm penalty. The truth table lives in
+# src/uae/z3660_warp_ablate.h, not here, so a level cannot mean two things in two places.
+#
+# NO ABLATION VARIANT MAY EVER BE LEFT ON A CARD. Level 0 -- the shipping lean -- must be
+# byte-identical to a build with the flag absent entirely, which is gate G-R5.10.
 Z3660_LEAN ?= 0
 Z3660_PROF ?= 0
 Z3660_Q2PROBE ?= 0
-ifeq ($(Z3660_Q2PROBE),1)
+Z3660_WARP_ABLATE ?= 0
+ifneq ($(Z3660_WARP_ABLATE),0)
+BUILDDIR    := $(ROOT)/build-abl$(Z3660_WARP_ABLATE)
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 \
+               -DZ3660_WARP_ABLATE=$(Z3660_WARP_ABLATE)
+else ifeq ($(Z3660_Q2PROBE),1)
 BUILDDIR    := $(ROOT)/build-q2probe
 VARIANT_DEFS:= -DZ3660_WARP_Q2_PROBE=1
 else ifeq ($(Z3660_PROF),1)
@@ -111,6 +126,15 @@ CXX_SRCS := $(filter-out \
 # its call site in main.cpp), so losing either one still ships nothing.
 ifneq ($(Z3660_Q2PROBE),1)
 CXX_SRCS := $(filter-out $(SRCDIR)/warp_q2probe.cpp,$(CXX_SRCS))
+endif
+# ABLATION LEVEL 5 -- the CLOSURE variant. The engine's whole translation unit leaves the
+# link: the emitter, the block table, the code-cache arena, the self-test and the ARM word
+# executor are not in the image at all. Everything outside it that still names the engine gets
+# the inline no-ops in z3660_warp.h. If A5's own disarmed row is not within the noise floor of
+# zero, the four named layers do not SPAN the cost -- which is a bigger finding than any of
+# them (S0.14.1, decision rule 4).
+ifeq ($(Z3660_WARP_ABLATE),5)
+CXX_SRCS := $(filter-out $(SRCDIR)/uae/z3660_warp.cpp,$(CXX_SRCS))
 endif
 S_SRCS := $(shell find $(SRCDIR) -type f -name "*.S")
 SRCS   := $(C_SRCS) $(CXX_SRCS) $(S_SRCS)
@@ -214,5 +238,7 @@ clean:
 # -- a -D is not a tracked dependency (headers now are, via -MMD), so the variants are
 # kept apart by directory and cleaned together by this target.
 clean-all:
-	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof $(ROOT)/build-q2probe
+	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof $(ROOT)/build-q2probe \
+	       $(ROOT)/build-abl1 $(ROOT)/build-abl2 $(ROOT)/build-abl3 $(ROOT)/build-abl4 \
+	       $(ROOT)/build-abl5
 

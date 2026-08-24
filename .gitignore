@@ -21,6 +21,7 @@ z3660-firmware/Z-TURN/vitis_ide/**/build/
 z3660-firmware/Z-TURN/vitis_ide/**/build-lean/
 z3660-firmware/Z-TURN/vitis_ide/**/build-prof/
 z3660-firmware/Z-TURN/vitis_ide/**/build-q2probe/
+z3660-firmware/Z-TURN/vitis_ide/**/build-abl*/
 z3660-firmware/Z-TURN/vitis_ide/**/*.o
 z3660-firmware/Z-TURN/vitis_ide/**/*.d
 z3660-firmware/Z-TURN/vitis_ide/**/*.a

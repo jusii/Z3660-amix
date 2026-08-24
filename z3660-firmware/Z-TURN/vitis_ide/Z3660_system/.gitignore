@@ -14,6 +14,15 @@
 !/Alfa/system_cli_lean.bif
 !/Alfa/system_cli_prof.bif
 !/Alfa/system_cli_q2probe.bif
+# ... and the WARP disarm-residual ablation kit's five (docs/WARP-ENGINE.md 0.14.1), named
+# one by one for the reason the paragraph above gives. The kit is an INSTRUMENT rather than a
+# shipping image, which makes it exactly the kind of thing that gets left untracked and then
+# cannot be rebuilt by the session that needs to re-run the matrix.
+!/Alfa/system_cli_abl1.bif
+!/Alfa/system_cli_abl2.bif
+!/Alfa/system_cli_abl3.bif
+!/Alfa/system_cli_abl4.bif
+!/Alfa/system_cli_abl5.bif
 /Debug/
 /ReleaseAlfa/
 /Beta/

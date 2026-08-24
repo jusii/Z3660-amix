@@ -89,6 +89,8 @@ typedef struct
 #define CPU_PIPELINE_MAX 4
 #endif
 
+#include "z3660_warp_ablate.h"
+
 struct regstruct
 {
 	uae_u32 regs[16];
@@ -111,7 +113,12 @@ struct regstruct
 	 * 2.17 cycles each against round 1's 5 costing 0.97, which is the whole of the
 	 * unexplained -4.056 % disarm penalty. Read and written ONLY through
 	 * z3660_warp_on / z3660_warp_arm(). */
+	/* ABLATION L-REG (§0.14.1): at level 4 and above the field leaves the struct and every
+	 * member below it moves back to its pre-round-4 displacement. Paired with L-HOOK, so the
+	 * two images that differ by this line are otherwise DYNAMICALLY IDENTICAL. */
+#if !Z3660_WARP_ABL_NO_REGFIELD
 	int warp_on;
+#endif
 
 	uae_u16 irc, ir;
 	volatile uae_atomic spcflags;

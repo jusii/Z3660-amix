@@ -159,6 +159,14 @@ z3660_emu_prof: bsp_cortexa9_1
 z3660_emu_q2probe: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_Q2PROBE=1 -j 4
 
+# THE WARP DISARM-RESIDUAL ABLATION KIT (docs/WARP-ENGINE.md 0.14.1). Five LEAN core1 builds,
+# each with exactly one layer of the engine removed, into Z3660_emu/build-abl1..5. They are an
+# INSTRUMENT: a metal session boots each beside the shipping lean, takes its disarmed
+# dhrystone against the same reference, and reads which layer carries the -4.256 % penalty
+# that two named mechanisms have now failed to explain.
+z3660_emu_abl%: bsp_cortexa9_1
+	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_WARP_ABLATE=$* -j 4
+
 # DDR_SPEED variable can be set to 533, 667, or 800
 DDR_SPEED ?= 533
 
@@ -225,6 +233,24 @@ q2probe: q2probe_prepare
 	$(BOOTGEN_EXE_HOST) $(Q2PROBE_BIF) $(Q2PROBE_BOOTBIN)
 	@echo "BOOT-q2probe.BIN -> $(Q2PROBE_BOOTBIN)"
 	$(call archive_image,$(Q2PROBE_BOOTBIN))
+
+# `make abl1` .. `make abl5` -> sd_card/BOOT-abl<N>.BIN, each archived CRC-stamped like every
+# other image. `make ablation` builds all five. Core0 and the FSBL are the same binaries the
+# other images use -- an ablation changes core1's run loop and nothing else, so rebuilding
+# core0 for it would be noise AND would move a variable the kit is trying to hold still.
+ABL_LEVELS := 1 2 3 4 5
+
+abl%: bsp_cortexa9_0 z3660 z3660_emu_abl% $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
+	@cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+	@mkdir -p $(dir $(BOOTBIN))
+	@echo "Generating BOOT-abl$*.BIN (DDR $(DDR_SPEED)MHz, WARP ablation level $*)"
+	$(BOOTGEN_EXE_HOST) Z3660_system/Alfa/system_cli_abl$*.bif \
+	    Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN
+	@echo "BOOT-abl$*.BIN -> Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN"
+	$(call archive_image,Z3660_system/Alfa/sd_card/BOOT-abl$*.BIN)
+
+.PHONY: ablation
+ablation: $(addprefix abl,$(ABL_LEVELS))
 
 version:
 	python3 Z3660_system/make_version_alfa.py
