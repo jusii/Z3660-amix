@@ -7562,6 +7562,210 @@ static void test_warp_codegen(void)
 
 /* ---------------------------------------------------------------- the bail ---------- */
 
+/* ------------------------------------------------------ round 3: M-VERDICT, owed ------
+ *
+ * §0.9.6 ITEM 1, CLOSED. Round 2 recorded M-VERDICT as "REACHED but NOT CAUGHT" and said
+ * exactly why: "the TTR_NO_WRITE asymmetry needs a read-only TTR region, which the WARP
+ * corpus does not have; §0.5.5's G4 asymmetry cases do. Wiring the accessor corpus to the
+ * engine is a round-3 item and it is an OWED ARM, not a passing one."
+ *
+ * This is that wiring, and it is the shortest correct form of it: build G4's write-protected
+ * transparent window, then hand the ENGINE'S OWN memory helper an address inside it. The
+ * asymmetry is the whole test -- the same address must SERVE a read and DECLINE a write --
+ * because that is what TTR_NO_WRITE means and it is the one verdict a permissive decline arm
+ * would silently turn into a writable region.
+ *
+ * Reaching the helper through generated code would add nothing the bail corpus has not
+ * already proven (§0.9.2 G-R2.5): the mutation lives INSIDE the helper, so the helper is
+ * where the arm has to bite. */
+static void test_warp_verdict_asymmetry(void)
+{
+	const uae_u32 WP = HDIRECT_BASE + 0x30000u;   /* in the identity window, so the helper's
+	                                               * DIRECT-bank fence lets it serve at all */
+
+	printf("[test] WARP M-VERDICT: TTR_NO_WRITE serves a read and refuses a write\n");
+
+	CHECK(harness_direct_ok(),
+	      "the identity window is mapped -- without it the helper declines on the bank test "
+	      "and this arm would test nothing\n");
+	if (!harness_direct_ok()) return;
+
+	mmu040_gen_init();
+	harness_direct_reset();
+	regs.s = 0;                           /* USER -- generation one is user-mode only */
+
+	/* G4's own window, write-protected, S-field on so it matches user too. mmu_tt_modified()
+	 * is what rebuilds the verdict table; the fast path holds no other state. */
+	regs.dtt0 = (HDIRECT_BASE & MMU_TTR_LOGICAL_BASE) | MMU_TTR_BIT_ENABLED
+	          | MMU_TTR_BIT_SFIELD_ENABLED | MMU_TTR_BIT_WRITE_PROTECT;
+	regs.dtt1 = 0;
+	mmu_tt_modified();
+	mmu_flush_atc_all(true);
+	hdirect_poke32(WP, 0x12345678u);
+
+	CHECK_EQ32((uae_u32)Z3660_DFAST_VERDICT(z3660_dfv_r[0][WP >> 24]),
+	           (uae_u32)Z3660_DFAST_XPAR,
+	   "the verdict table reads XPAR for this window...");
+	CHECK_EQ32((uae_u32)Z3660_DFAST_VERDICT(z3660_dfv_w[0][WP >> 24]),
+	           (uae_u32)Z3660_DFAST_SLOW,
+	   "...and SLOW for a write to it -- TTR_NO_WRITE, the asymmetry itself");
+
+	CHECK(z3660_warp_rd(WP, 4, 0) == 1,
+	      "the ENGINE's helper SERVES a read from the write-protected window\n");
+	CHECK_EQ32(z3660_warp_ctx.tmp, 0x12345678u, "...and it read the right word");
+
+	CHECK(z3660_warp_wr(WP, 4, 0xDEADBEEFu) == 0,
+	      "the ENGINE's helper DECLINES a write to it -- the block bails\n");
+	CHECK_EQ32(hdirect_peek32(WP), 0x12345678u, "...and the read-only word did not move");
+
+	/* M-VERDICT: the decline arm made permissive -- the write served with the READ
+	 * resolver's answer, which is exactly what would make a read-only TTR region writable
+	 * from generated code and nothing else. */
+	z3660_warp_set_mutant(Z3660_WARP_MUT_VERDICT);
+	CHECK(z3660_warp_wr(WP, 4, 0xDEADBEEFu) == 1,
+	      "M-VERDICT: the permissive arm serves the forbidden write\n");
+	CHECK_EQ32(hdirect_peek32(WP), 0xDEADBEEFu,
+	   "...and it lands in a read-only region -- CAUGHT, and 0.9.6 item 1 is closed");
+	z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+
+	regs.dtt0 = 0;
+	mmu_tt_modified();
+	mmu040_off();
+}
+
+/* ------------------------------------------------------ round 3: the publish range ----
+ *
+ * THE DEFECT THAT KILLED ROUND 2 ON SILICON, AS A TEST THAT FAILS WHEN IT COMES BACK.
+ *
+ * The R2 metal session took four crashes over two images and zero armed rows, and the harness
+ * that had passed 10^8 lockstep boundaries on the real emitted words saw nothing -- because
+ * warp_publish() is compiled OUT of the harness, so the harness reads the emitted words
+ * through the DATA side and never through the INSTRUCTION side. Plan 0.10.1 names the
+ * mechanism: the two CP15 line loops round their LENGTH up and never round their ADDRESS
+ * down, so a block whose bytes reach past the last line the loop touches keeps its tail
+ * DIRTY IN L1D, never reaching PoC, which is where the instruction side reads from.
+ *
+ * A host has no cache and can never reproduce the symptom. What it CAN do -- and this is the
+ * whole point of putting the arithmetic in the header rather than in the .cpp -- is evaluate
+ * the same predicate the firmware evaluates, over the same (offset, length) product the
+ * target walks. The three arms below are the discriminator, the invariant and the mutation. */
+static void test_warp_publish_range(void)
+{
+	unsigned a, r, uncovered = 0, covered_fixed = 0, r1_covered = 0;
+	unsigned long long pr, ua;
+
+	printf("[test] WARP publish range: the round-2 killer, and the arm that catches it\n");
+
+	/* ARM 1 -- THE DISCRIMINATOR. Round 1 ran a full armed five-row set on this silicon and
+	 * round 2 died four times, and the difference is not "real code": it is that round 1's
+	 * blocks were ALWAYS eight bytes on an eight-aligned bump, so (addr & 31) + 8 <= 32 for
+	 * every offset it could reach. Asserting that here is what keeps the discriminator a
+	 * fact instead of a story. */
+	for (a = 0; a < 32u; a += 8u)
+		if (z3660_warp_publish_covers(0x10000u + a, 8u, 0x10000u + a, 8u)) r1_covered++;
+	CHECK_EQ32(r1_covered, 4u,
+	   "round 1's geometry (8-byte blocks, 8-aligned bump) is covered at every offset -- "
+	   "it could not hit the defect");
+
+	/* ARM 2 -- THE COUNT. Round 2's blocks are 4-aligned and variable, so both the offset and
+	 * the length residue walk all eight 4-aligned values. Plan 0.10.1 pre-registers 28 of the
+	 * 64 pairs uncovered = 43.75 %; the same 64 pairs must ALL be covered once the range is
+	 * rounded out, which is round 3's fix stated as an assertion rather than as a diff. */
+	for (a = 0; a < 32u; a += 4u) {
+		for (r = 0; r < 32u; r += 4u) {
+			unsigned addr = 0x10000u + a;
+			unsigned len  = 64u + r;            /* two whole lines plus the residue */
+			if (!z3660_warp_publish_covers(addr, len, addr, len)) uncovered++;
+			if (z3660_warp_publish_covers(z3660_warp_line_lo(addr),
+			                              z3660_warp_publish_len(addr, len), addr, len))
+				covered_fixed++;
+		}
+	}
+	CHECK_EQ32(uncovered, 28u,
+	   "round 2's (addr,bytes) call leaves the last line unmaintained for exactly 28 of 64 "
+	   "offset/length pairs -- 43.75 %, as pre-registered");
+	CHECK_EQ32(covered_fixed, 64u,
+	   "round 3's rounded-out range covers all 64 -- and that is the fix, asserted");
+
+	/* ARM 3 -- THE LIVE INVARIANT. Every publish the engine performs is checked against that
+	 * same predicate, in EVERY variant and not only here, because the seam it guards is the
+	 * one a host cannot see. Run the real corpora and the counter must stay at zero. */
+	warp_run(Z3660_WARP_ARM, 200);
+	pr = z3660_warp_bad(Z3660_WARP_BAD_PUBRANGE);
+	ua = z3660_warp_bad(Z3660_WARP_BAD_UNALIGNED);
+	CHECK(pr == 0 && ua == 0,
+	      "the real corpus publishes %llu short ranges and %llu unaligned blocks "
+	      "(both must be 0)\n", pr, ua);
+
+	/* ARM 4 -- M-PUBRANGE. Round 2's arguments AND round 2's unaligned bump, put back whole,
+	 * so the arm that catches them is SHOWN to catch them. Rung 1b's attribution test once
+	 * passed a mutation that bypassed the whole attribution; this lane writes the arm. */
+	warp_corpus_build();
+	warp_boot();
+	z3660_warp_set_mutant(Z3660_WARP_MUT_PUBRANGE);
+	warp_write_knob(Z3660_WARP_ARM);
+	z3660_warp_stats_zero();
+	warp_corpus_enter();
+	for (a = 0; a < 200u; a++) m68k_run_mmu040();
+	regs.spcflags = 0;
+	pr = z3660_warp_bad(Z3660_WARP_BAD_PUBRANGE);
+	ua = z3660_warp_bad(Z3660_WARP_BAD_UNALIGNED);
+	z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+	CHECK(pr > 0,
+	      "M-PUBRANGE: round 2's publish range is CAUGHT -- %llu block(s) published with a "
+	      "range that misses part of them\n", pr);
+	CHECK(ua > 0,
+	      "M-PUBRANGE: round 2's unaligned bump is CAUGHT -- %llu block(s) not on a line\n",
+	      ua);
+	warp_boot();
+}
+
+/* ------------------------------------------------------ round 3: the self-test --------
+ *
+ * The on-target self-test's MACHINERY, exercised on the host. What the host cannot supply is
+ * the arm the whole thing exists for: on a machine with an I-cache the test runs each block
+ * once through the instruction side and once through the data side and compares, and here
+ * both arms are the same decoder. So this asserts what a host CAN assert -- that the corpus
+ * compiles, that every family is reached, that the publish invariants stay clean across the
+ * whole sweep, and that the test leaves the engine exactly as it found it -- and the metal
+ * session supplies the rest, under the protocol in plan 0.10.5. */
+static void test_warp_selftest(void)
+{
+	unsigned g0, on0;
+	int ok;
+
+	printf("[test] WARP on-target self-test: the machinery, and it leaves nothing behind\n");
+
+	warp_corpus_build();
+	warp_boot();
+	g0  = z3660_warp_generation();
+	on0 = (unsigned)z3660_warp_armed();
+
+	ok = z3660_warp_selftest();
+	CHECK(ok == 1, "the self-test passes all nine families on the host\n");
+	CHECK_EQ32(z3660_warp_bad(Z3660_WARP_BAD_PUBRANGE), 0u,
+	   "...publishing 76 blocks at every offset in a line misses no range");
+	CHECK(z3660_warp_bad(Z3660_WARP_BAD_UNALIGNED) > 0,
+	      "...and it DID place blocks off a cache line on purpose (%llu of them) -- which is "
+	      "what makes F1 a reproducer rather than a formality: the range covered them anyway\n",
+	      z3660_warp_bad(Z3660_WARP_BAD_UNALIGNED));
+	CHECK_EQ32((uae_u32)z3660_warp_armed(), on0,
+	   "the self-test never arms and never disarms");
+	CHECK(z3660_warp_generation() != g0,
+	      "...and it discards the code cache on the way out, so nothing it compiled can be "
+	      "found by a guest pc (%u -> %u)\n", g0, z3660_warp_generation());
+
+	/* Under M-PUBRANGE the self-test's own invariant refuses the image. That is the gate
+	 * doing its job: on the host it fires from the predicate, and on the target it fires
+	 * from the predicate AND from exec-vs-decode disagreeing. */
+	z3660_warp_set_mutant(Z3660_WARP_MUT_PUBRANGE);
+	ok = z3660_warp_selftest();
+	z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
+	CHECK(ok == 0,
+	      "M-PUBRANGE: the self-test REFUSES the image -- which is the gate, working\n");
+	warp_boot();
+}
+
 /* G-R2.5: A MID-BLOCK FAULT MUST BAIL, WITH BYTE-EXACT ARCHITECTURAL STATE.
  *
  * The engine's whole fault contract is bail-before-fault, and Q2 measured what getting it
@@ -8381,6 +8585,9 @@ int main(int argc, char **argv)
 	test_warp_emitted_words();
 	test_warp_codegen();
 	test_warp_bail();
+	test_warp_publish_range();
+	test_warp_selftest();
+	test_warp_verdict_asymmetry();
 	test_warp_cadence();
 	if (full_lockstep) test_warp_lockstep_full(); else test_warp_lockstep();
 #if Z3660_EMU_PROF
