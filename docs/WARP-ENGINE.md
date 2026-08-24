@@ -2377,6 +2377,180 @@ how a result stops being attributable.
 7. **Everything §0.8.8 said round 2 would not establish**, unchanged.
 
 
+## 0.11 M1 round 3 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.10 was committed before the first line of round-3 code; the
+implementation commits follow it in this repository's log**, which is what §3.4 asks of it —
+round 1's preceded its code by 32 minutes, round 2's by an hour, the SPEC round's by 26 and
+the `f` round's by 29. Every prediction in §0.10 is left byte-untouched above and scored
+beside itself, `ifetch-fastpath.md`'s standard.
+
+### 0.11.1 What was built
+
+| piece | where |
+|---|---|
+| **the fix, part A** — `warp_publish()` maintains the range rounded OUT to whole cache lines; the shared CP15 loops are untouched | `Z3660_emu/src/uae/z3660_warp.cpp` |
+| **the fix, part B** — the arena base aligned up, its size rounded down, and the bump advancing in whole lines so no two blocks share one | same file, `warp_init()` / `warp_compile()` |
+| **the coverage predicate** — `Z3660_WARP_LINE`, `z3660_warp_line_lo/hi`, `z3660_warp_publish_covers`, `z3660_warp_publish_len`, transcribed from the loops and shared with the harness | `z3660_warp.h`, plain C, outside the engine guard |
+| **two shipped invariants** — `WARP_BAD_PUBRANGE`, `WARP_BAD_UNALIGNED`, checked on every publish in **every** variant | `z3660_warp.cpp` |
+| **the disarm-penalty change** — `z3660_warp_step()` out of line and `noinline`, the header keeping only the declaration | `z3660_warp.h` + `z3660_warp.cpp` |
+| **the on-target self-test** — nine families, the alignment sweep, the exec-vs-decode oracle, the R6 bracket, and a scan that REFUSES any block containing a `blx` (the two helper registers are handed in as NULL on purpose, so the guest-memory-free property is enforced and not merely stated) | `z3660_warp.cpp`, `z3660_warp_selftest()` |
+| **the ARM word executor promoted out of the harness**, so the target has a data-side oracle | `z3660_warp.cpp`, `warp_host_exec()` |
+| **the compiler's self-test opcode source** — `warp_cc::src`, so no guest instruction page is read | `z3660_warp.cpp`, `warp_iword()` |
+| **the `WARPTEST` console verb** and core1's one-shot consume at the knob resync | `Z3660/src/debug_console.c`, `uae/newcpu.cpp` |
+| **the regression arms** — the discriminator, the live invariant, `M-PUBRANGE`, the self-test's machinery, and `M-VERDICT` at last | `Z3660_emu/test/host/harness_main.cpp` |
+
+### 0.11.2 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R3.1** harness | green all three; **+25 … +90** default, the **same** in lean, prof a further **0 … +10** | green, `0 failed`: **3 301 / 3 297 / 3 528** against 3 280 / 3 276 / 3 507 — **+21 / +21 / +21** | green; **count MISSED, low** (rounds 1 and 2 missed it low too); "same in lean" **HIT**; prof's further **+0** **HIT** |
+| **G-R3.2** the defect reproduces, then goes green | invariant **> 0** with round 2's range, **0** with the fix; `M-PUBRANGE` **caught** | clean: `PUBRANGE` **0** and `UNALIGNED` **0** over the real corpus; under `M-PUBRANGE` both **> 0**; and inside the self-test's own 64-case sweep, **0** range misses clean against **12** under the mutation | **HIT** |
+| **G-R3.3** the discriminator | round 1's geometry covered at all four offsets; round 2's uncovered for **exactly 28 of 64** pairs = 43.75 % | **4 of 4** covered; **28** uncovered, to the pair; and **64 of 64** covered once the range is rounded out | **HIT** |
+| **G-R3.4** disarmed object equivalence | **≤ 20** functions changed; `m68k_run_mmu040` **2 330 … 2 400 B** | **208 changed** of 25 073 common, 80 base-only / 26 new-only; `m68k_run_mmu040` **`0x9f4` → `0x894` = 2 548 → 2 196 B, −352** | changed-count **MISSED, high** (attributed below); size **MISSED, LOW** — 2 196 is **128 B below round 1's 2 324**, better than the band |
+| **G-R3.5** lockstep identity, unmoved | `WARP_DIVERGE == 0` over `≥ 10⁸`, arms byte-identical | **0 over 100 000 000 guest instructions, 12 500 000 block executions, 100.0 % retired inside blocks** — bit-identical to round 2's run | **HIT** |
+| **G-R3.6** the odd-`A7` audit | no generation-one shape can produce an `A7` the interpreter would not | enumerated in §0.11.5: five shapes can write `A7`, every one of them full-width and identical to `cpuemu_31`; `e_put_reg()` — the only narrow write-back — is never handed an address register; no shape in scope moves `A7` implicitly | **HIT** |
+| **G-R3.7** the self-test exists and is inert | in all three images, verb-only, no guest memory, state restored, **0 bytes** on `m68k_run_mmu040` | present in all three; `m68k_run_mmu040` measures **`0x894` with the self-test and `0x894` without it** — measured by deleting the call, rebuilding and re-reading `nm`, not asserted; **+3 924 B** of cold `.text`; the corpus is a core1 opcode array and its own register/ctx bases, so **no guest page is read or written** | **HIT** |
+| **G-R3.8** M-VERDICT, the owed arm | caught | the helper **serves** a read from a `TTR_NO_WRITE` window and **declines** a write to it; under `M-VERDICT` the write is **served and lands in the read-only region** — caught | **HIT**, and §0.9.6 item 1 is **CLOSED** |
+| **G-R3.9** R6 is runnable | built behind the verb, global timer not PMU, prints cycles per block and per compiled instruction; **not run** | built; prints the bracket on target and *"no clock on this build"* on the host, which is the honest host answer | **HIT (built)**; **NOT RUN** — there is no card in this round |
+| **G-R3.10** images | three rebuilt, CRCs recorded, archive fires; `q2probe` untouched | `BOOT.BIN` **`C8224D10`**, `BOOT-lean.BIN` **`C89953E2`**, `BOOT-prof.BIN` **`D9BD4449`**; 12 762 604 / 12 762 572 / 12 795 484 B; all three archived CRC-stamped; `BOOT-q2probe.BIN` untouched at **`FCC0CB3F`** | **HIT** |
+
+### 0.11.3 The object-equivalence miss, attributed rather than excused
+
+**208 against a pre-registered ≤ 20 is the round's largest miss and it is an LTO result, not a
+behaviour result.** The attribution was measured, not argued: the self-test's call site was
+deleted, the image rebuilt, and the diff re-run.
+
+| build | changed functions | `m68k_run_mmu040` |
+|---|---|---|
+| round 3, complete | **208** | 2 196 B |
+| round 3 with the self-test unreachable (`--gc-sections` drops it) | **205** | **2 196 B** |
+
+**So 205 of the 208 come from taking one hot function out of line, and 3 from the self-test.**
+`-flto` re-decides inlining across the whole program when a translation unit's call graph
+changes materially, and the visible signature is exactly that: dozens of unrelated functions
+moving by one or two instructions (`fill_prefetch` 30 → 29, `exception3_read` 50 → 51,
+`floatx80_is_nan` 18 → 19), the C++ demangler dropped from the link and libstdc++'s
+emergency-pool initialiser pulled in, and the lean image **shrinking 32 696 bytes**.
+
+**Two link-set changes were chased down and removed rather than absorbed**, because they were
+mine and not LTO's: nine function-local `static const` tables in the self-test were given
+guard variables by gcc, which pulled `__cxa_guard_*` in, and a 64-bit division in the R6
+bracket pulled `__aeabi_uldivmod` in. Both are gone — the tables are at file scope and the
+bracket does 32-bit tick arithmetic on a timer that wraps every 7.8 s against a bracket of
+milliseconds.
+
+**What supports "behaviour-neutral" is not the diff.** It is that the same sources are green
+across all three harness variants at 3 301 / 3 297 / 3 528 with zero failures, including the
+10⁸-boundary lockstep oracle returning bit-identical totals to round 2's, and that the one
+function the round set out to change is the one that changed on purpose. **The remaining
+honest gap is the same one this whole round is about: a host cannot prove the silicon, and the
+`WARPTEST` protocol of §0.10.5 is what closes it on the card.**
+
+### 0.11.4 The disarm penalty — what the objdump says, and what is still owed
+
+**Pre-registered `m68k_run_mmu040` = 2 330 … 2 400 B. Measured 2 196. MISSED, and in the cheap
+direction — the band was not wide enough downwards.**
+
+| build | `m68k_run_mmu040` | disarmed gate | armed non-target | disarm penalty |
+|---|---|---|---|---|
+| round 1 (`E80D04EE`) | 2 324 B | 5 | 60 per guest instruction | −2.276 % (metal) |
+| round 2 (`DBF9A5AF`) | 2 548 B | 5 | 11 | **−5.848 % (metal)** |
+| round 3 (`B6304B9C`) | **2 196 B** | **4** | **≈ 15** | **unmeasured — the next metal session** |
+
+**The disarmed gate also fell, 5 → 4, and it was not predicted to.** §0.9.3's five were two
+address materialisations, a flag load, a test and gcc's hoisted argument load. gcc now uses a
+literal-pool load from the function's own constant island for the gate's address (one
+instruction, not two) and — the part that matters — **the argument load is below the branch
+rather than above it**, because with the body out of line there is nothing above the branch to
+hoist it for. The disarmed path is now `ldr` (gate address), `ldr` (the flag), `cmp`, `beq`,
+and nothing else.
+
+**The armed side paid what §0.10.6 said it would**, and slightly less: the early-out through
+`z3660_warp_step()` reaches its return **before** the AAPCS prologue — `push {lr}` is emitted
+only after the trace test — so an armed non-target dispatch is the 4-instruction gate, the
+argument load, the `bl`, seven instructions in the callee, the return and the caller's test:
+**≈ 15**, against the pre-registered ~15 and round 2's 11.
+
+> **The wall clock is NOT scored here and the pre-registration says so.** The target stands as
+> written for the next metal session: **the disarm penalty returns to −2.276 % or better
+> (dhry ≥ 7 988), and the requirement is strictly better than −5.848 %**, with Q11's boot row
+> beside it in the 46 … 48 s band. A 352-byte reduction in the loop that carries the mechanism
+> §0.4.3 named is a *reason to expect* that and not a substitute for measuring it.
+
+**`z3660_warp_run`'s 33-instruction preamble was NOT touched, deliberately** (§0.10.6): the
+function is `0xec` = 236 bytes in both round 2 and round 3, unchanged. It is entirely on the
+armed path, it is the largest single row in §0.9.3's table, and mixing an armed-path reduction
+into the round whose one wall-clock target is a disarmed number would have made neither
+attributable. **Re-owed.**
+
+### 0.11.5 The odd-`A7` audit, in full
+
+§0.10.4 G-R3.6 asked for a static enumeration. Every generation-one shape that can write
+`regs.regs[15]`, with what it writes:
+
+| shape | what it writes to `An` | the interpreter |
+|---|---|---|
+| `MOVE.L <ea>,A7` / `MOVEA.L` | the source, verbatim, 32 bits | identical |
+| `MOVEA.W <ea>,A7` | `e_sxth` then a full 32-bit store | `(uae_s32)(uae_s16)` — identical |
+| `MOVE.B …,An` | **refused** (`warp_emit_insn` returns 0) | — |
+| `ADDQ`/`SUBQ` `#n,A7` (`.W`/`.L`) | a full 32-bit add/sub of the whole register, no flags | identical; `.B` to `An` is refused |
+| `ADDA`/`SUBA` `<ea>,A7` | `.W` source sign-extended, then a full 32-bit add/sub | identical |
+| `CMPA` | writes nothing | — |
+
+**The one narrow write-back path in the compiler, `e_put_reg()`, is never handed an address
+register**: every call site passes a data-register number (`reg` in the `ADDQ`/`SUBQ` arm,
+`rdst` in the ALU arm, both 0 – 7). And nothing in generation one's frozen scope moves `A7`
+implicitly — `BSR`, `LINK`/`UNLK`, `MOVEM`, and `(An)+` / `-(An)` are all out of scope, which
+leaves no path by which a block can push, pop or auto-adjust a stack pointer at all.
+
+**Dynamically the same conclusion was already green and is worth naming:** the all-65 536-opcode
+sweep runs every accepted opcode both ways from six seeded states and compares the whole §3.1
+set, `A7` included — 45 696 differential pairs, 0 divergences.
+
+> **So `a7=8080002A` in occurrence 4 is a consequence and not a cause.** An odd address
+> register is architecturally legal on a 68040 — only its *use* as a stack pointer faults —
+> and the guest reached it after control had already been handed somewhere it should not have
+> been. There is no second defect hiding behind it.
+
+### 0.11.6 Three things worth recording that were not gates
+
+- **The fix has two halves and the corpus proves each one alone.** In the self-test's
+  alignment sweep every block is placed at a deliberate non-zero offset — 56 of the 64 are off
+  a cache line — and **not one of them is published with a range that misses part of it**. That
+  is part A (the rounded-out range) working with part B (the aligned bump) deliberately
+  defeated, which is the only way to show the correctness fix is not leaning on the hardening.
+- **The invariant is shipped, not harness-only, and that is a change of policy.** The other four
+  `WARP_BAD_*` counters are harness assertions about state a host can see. These two are about
+  the one seam a host cannot see, so they are compiled into every image and read back by the
+  self-test. Their cost is two compares on the **compile** path — once per block against Q4's
+  ~42 µs budget — and nothing at all on dispatch.
+- **`mkbootimage` was missing from its expected path and the images were built with the
+  container's copy.** `z3660-firmware/Z-TURN/vitis_ide/Makefile` resolves
+  `BOOTGEN_EXE_HOST` to `mkbootimage` on `PATH` or `$HOME/git/zynq-mkbootimage/mkbootimage`,
+  and neither existed; the binary the docker build image ships at `/usr/local/bin/mkbootimage`
+  was used instead, against the same host-built ELFs. The three images are therefore packaged
+  by the same tool the container would have used, but the host's copy is worth restoring so
+  `make lean` works without one.
+
+### 0.11.7 What round 3 leaves owed
+
+1. **The metal proof of the fix.** §0.10.7 item 1 stands exactly as written: adding a range fix
+   is not evidence of a fix. The next session runs `WARPTEST` first, on the image it intends to
+   arm, and takes no armed row unless it ends `VERDICT: PASS 9/9`.
+2. **The memory-touching families on silicon.** The self-test is guest-memory-free by design,
+   so `(An)` and `d16(An)` stay harness-proven. Re-owed, with M2 as the first honest test.
+3. **`z3660_warp_run`'s preamble**, unchanged at 236 bytes and still the largest row in
+   §0.9.3's table. Re-owed, on the armed path, for a round that measures the armed path.
+4. **The open-coded expansion of the memory fast path** (§0.9.6 item 3), still priced and not
+   built.
+5. **`WARP_INSNS / WARP_BLK` against a representative stream**, still 2.0 … 4.5 as written in
+   §0.8.4 and still the verdict session's to take.
+6. **Q5's second condition and Q6's decision rule.** The bracket is built and prints; the
+   numbers need a card.
+7. **Everything §0.8.8 and §0.10.7 said would not be established, was not.**
+
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
