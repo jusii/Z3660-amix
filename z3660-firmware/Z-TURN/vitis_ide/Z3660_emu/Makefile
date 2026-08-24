@@ -120,6 +120,19 @@ OBJS += $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CXX_SRCS)))
 OBJS += $(patsubst $(SRCDIR)/%.cxx,$(BUILDDIR)/%.o,$(filter %.cxx,$(CXX_SRCS)))
 OBJS += $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(S_SRCS))
 
+# THE OTHER HALF OF -MMD, AND WITHOUT IT THE FIRST HALF IS DECORATION.
+#
+# CFLAGS has carried -MMD -MP since CYBERSTORM C1 and the .d files have been written ever
+# since -- correctly, listing every header each object really reads. Nothing ever READ them.
+# So a header edit still left every object stale and the link still succeeded, which is the
+# exact hazard the -MMD comment above says was fixed.
+#
+# WARP round 4 walked into it: moving the arm flag into `struct regstruct` touched only
+# include/newcpu.h, `make lean` recompiled z3660_warp.cpp alone, and the image shipped a run
+# loop still reading the OLD gate -- provably, because the literal in m68k_run_mmu040's pool
+# still pointed at z3660_warp_gate. An objdump caught it; nothing in the build would have.
+-include $(OBJS:.o=.d)
+
 ELF := $(BUILDDIR)/Z3660_emu.elf
 BIN := $(BUILDDIR)/Z3660_emu.bin
 

@@ -2973,6 +2973,148 @@ absolute floor 8 242 quoted beside it and never removed.**
 6. **Everything §0.8.8, §0.10.7 and §0.11.7 said would not be established**, unchanged.
 
 
+## 0.13 M1a round 4 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.12 was committed at 07:30:43 +0300 (`6afab03`), before the first
+line of round-4 engine code; the implementation commits follow it in this repository's log.**
+Every prediction in §0.12 is left byte-untouched above and scored beside itself.
+
+### 0.13.1 What was built
+
+| piece | where |
+|---|---|
+| **A1** `TST.B/.W/.L Dn` and `TST.W/.L An` — generation one's own frozen scope, never built | `z3660_warp.cpp`, `warp_emit_insn()` |
+| **A2** `ASL`/`ASR`/`LSL`/`LSR`/`ROL`/`ROR`, **immediate count only**, `.B/.W/.L`, `Dn` | same, `e_shift_rot()` |
+| **B1** `MOVEQ.L #<data>,Dn` | same |
+| **B2** the remaining register-destination ALU: memory sources `(An)`/`d16(An)`, and the immediate forms `ADDI`/`SUBI`/`ANDI`/`ORI`/`EORI`/`CMPI` | same, `e_alu_rr()` factored out and shared by three arms |
+| **B3** `(An)+` / `−(An)` **sources**, register destination only | same, `e_src_load()` / `e_auto_wb()` / `warp_auto_step()` |
+| **C** the arm flag moves into `struct regstruct` | `include/newcpu.h`, `z3660_warp.h` |
+| **D** the churn split — `WARP_DISC_EV`, `WARP_DISC_ATC`, `WARP_DISC_CPUSH` (ids 61–63) | `z3660_prof.h/.cpp`, `warp_discard_all()` |
+| **E** four new self-test families, eight new mutation arms, the auto-adjust bail corpus, the accept-set discriminator | `z3660_warp.cpp`, `harness_main.cpp`, `docs/warp-corpus.py` |
+| **the build-integrity fix** — `-include $(OBJS:.o=.d)` | `Z3660_emu/Makefile` |
+
+### 0.13.2 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R4.1** harness | `0 failed`; **+90 … +260**; **same** delta in lean | green, `0 failed`: **3 320 / 3 316 / 3 547** against 3 301 / 3 297 / 3 528 — **+19 / +19 / +19** | green; **count MISSED, low** (as rounds 1–3 all did); "same in lean" **HIT**; prof's further delta **231 both rounds = +0** **HIT** |
+| **G-R4.2** accept-set discriminator | engine == model **exactly**; model **18 168** | engine **17 016**, model 18 168, **agree on 64 384 of 65 536**; the entire disagreement is **1 152 opcodes, every one tagged `shift-reg`**, in ONE direction | ***MISSED***, and attributed to the opcode: they are the register-count shift forms, which §0.12.4 A2 promised and the emitter deliberately refuses. **The engine accepts nothing the model refuses**, so the transcription is exact everywhere it is exercised |
+| **G-R4.3** sweep and differential | 6 seeded states, **0** divergences, **≥ 100 000** pairs | **102 096 pairs over 17 016 accepted opcodes, 0 divergences** (round 3: 45 696 over 7 616) | **HIT** |
+| **G-R4.4** the eight new mutation arms | every one caught, clean when disarmed | **15 of 15 caught**, plus `M-AUTO-ORDER` on four shapes and `M-ALUMEM-EARLY` | **HIT**, with the caveat in §0.13.5 |
+| **G-R4.5** lockstep | `WARP_DIVERGE == 0` over **≥ 10⁸** | **0 over 100 000 000 guest instructions, 12 500 000 block executions, 100.0 % retired inside blocks** | **HIT** |
+| **G-R4.6** `WARPTEST` | **13** families, F1 still **+0**, a new ARM encoding through the executor | **PASS 13/13, 0 mismatches**; F1 **64/64**, **+0** range misses; **FAIL 13/13 with 12** under `M-PUBRANGE`; the new encodings found a real oracle defect (§0.13.5) | **HIT** |
+| **G-R4.7** the disarmed gate, static | **3** instructions, **one** load, **zero** address materialisations, off `r4`; `m68k_run_mmu040` **≤ 2 196 B** | **4** instructions, **2** loads, **zero** address materialisations, off `r4`, **dependency depth 1**; **2 372 B** | shape **HIT** (the mechanism), count **MISSED** by one, size **MISSED, high** — and §0.13.4 is why the size row cannot be read as written |
+| **G-R4.8** the armed entry cost | `E` **108 … 120**; armed non-target **13 … 15** | **E ≈ 112**; armed non-target **16** | `E` **HIT**; gate **MISSED, high by 1** — though it is **−1 against the like-for-like control**, which measures 17 |
+| **G-R4.9** the churn instrument | `DISC_EV == DOPC_INVAL`; the cause buckets partition `DISC` | built and structurally exact — one increment per `warp_discard_all()`, and the three buckets are mutually exclusive arms of one `if`/`else if` chain | **BUILT; NOT MEASURED.** The identity is a metal reading and there is no card in this round |
+| **G-R4.10** images | three rebuilt, CRCs recorded, archive fires; `q2probe` untouched | `BOOT.BIN` **`D7ECBCFF`**, `BOOT-lean.BIN` **`C62AE6E2`**, `BOOT-prof.BIN` **`69FC5996`**; 12 811 748 / 12 811 732 / 12 828 212 B; all three archived CRC-stamped; `BOOT-q2probe.BIN` untouched at **`FCC0CB3F`** | **HIT** |
+| **G-R4.11** object equivalence | not gated | 7 899 of 25 157 common function bodies differ — but **25 205 of 25 215 are byte-identical in SIZE (99.96 %)**, and exactly **10** changed size | not gated; **attributed** in §0.13.3 |
+
+### 0.13.3 The object diff, and why 7 899 changed bodies is a layout result
+
+`warp-objdiff.py` reports 7 899 changed bodies, which looks catastrophic and is not. **Adding
+one field to `struct regstruct` shifts the displacement of every member after it**, so every
+function that touches `regs.s`, `regs.vbr`, `regs.usp` or any later field differs by an
+immediate constant while doing exactly the same work. The measurement that says so is the size
+census, which needs no judgement:
+
+```
+   common .text symbols        25 215
+   identical SIZE              25 205   (99.96 %)
+   size changed                    10
+```
+
+**and all ten are named:**
+
+| function | Δ | why |
+|---|---|---|
+| `warp_emit_insn` | **+1 232** | the round's actual work — six new families |
+| `z3660_warp_selftest` | +164 | F10 – F13 |
+| `warp_st_compare` | +100 | the family walk |
+| `e_exit`, `e_store_flags`, `e_load_flags` | +24 / +16 / +4 | emitter helpers reshaped by new callers |
+| `ExceptionX`, `m68k_reset_newcpu`, `m68k_run_1_ce` | +12 / +12 / +8 | they initialise `regstruct`, which gained a field |
+| **`m68k_run_mmu040`** | **−8** | **the round's one deliberate target, and it went down** |
+
+### 0.13.4 THE BUILD-INTEGRITY FINDING — round 3's shipped image is not what its source builds
+
+**This is the round's most consequential discovery and it was found by accident, which is the
+only reason to write it down this loudly.**
+
+The disarm fix touched `include/newcpu.h` and nothing else in the run loop's own translation
+unit. `make lean` recompiled `z3660_warp.cpp` **alone**, and the resulting image still carried
+a run loop reading the OLD gate — provably, because the literal in `m68k_run_mmu040`'s constant
+pool still pointed at `z3660_warp_gate` rather than into `regs`.
+
+**The cause: `-MMD -MP` has been in `CFLAGS` since CYBERSTORM C1 and the `.d` files have been
+written correctly ever since — and nothing ever `-include`d them.** The dependency data was
+generated and thrown away. `newcpu.d` lists `include/newcpu.h` four times; make never read the
+file. The comment above `CFLAGS` claims the hazard was fixed; only half of it was.
+
+**What that does to round 3's numbers, measured rather than supposed.** Round-3 source was
+checked out and rebuilt **clean**, as a like-for-like control:
+
+| build | `m68k_run_mmu040` | the disarmed gate |
+|---|---|---|
+| round 3 **as shipped** (`C89953E2`, the image metal measured at −4.056 %) | **2 196 B** | `ldr r3,[pc,#2028]` → `ldr r3,[r3]` → `cmp` → `beq` — **4 instructions, depth 2, argument load BELOW the branch** |
+| round 3 **source, clean rebuild** | **2 380 B** | `ldr r3,[pc,#2212]` → `ldr r0,[r4,#88]` → `ldr r3,[r3]` → `cmp` → `beq` — **5 instructions, depth 2** |
+| **round 4, clean rebuild** | **2 372 B** | `ldr r3,[r4,#96]` → `ldr r0,[r4,#88]` → `cmp` → `beq` — **4 instructions, depth 1, ZERO address materialisations** |
+
+> ### **§0.11.2's `2 196 B` and §0.11.4's whole size table describe a build that cannot be reproduced from round 3's own source.** They are not wrong about the image that flew; they are wrong about what the source produces. The honest like-for-like comparison is **2 380 → 2 372, i.e. −8 B**, and against that control round 4's gate is **one instruction shorter with half the dependency depth**.
+
+**§0.12.1's named mechanism survives this and is not weakened by it.** The serial
+dependent-load pair with no slack is exactly what the *shipped* `C89953E2` gate contains, and
+`C89953E2` is the image that measured −4.056 %. What the control adds is that round 3's source
+would have scheduled it slightly better — which makes the shipped image's penalty a
+*combination* of the mechanism and a stale-object build, and means **the −4.056 % baseline is
+not a clean measurement of round 3's source at all**. The next metal session compares round 4
+against a fresh `R`, and that is the only comparison that was ever going to be trustworthy.
+
+**The fix is one line and it is in this round**: `-include $(OBJS:.o=.d)`.
+
+### 0.13.5 Four things worth recording that were not gates
+
+- **THE HOST ARM EXECUTOR NEVER IMPLEMENTED THE SHIFTER CARRY-OUT, and round 4's shift family
+  is the first emitter that reads it.** On ARM a *logical* data-processing instruction with `S`
+  set takes C from the barrel shifter, not the ALU. Rounds 1–3 emitted `movs rd, rm lsl #k`
+  only for N and Z and masked C away at every commit, so `warp_host_exec()` could leave C
+  untouched and nothing noticed. The differential caught it on its first run — **2 207 pairs,
+  every one in `0xE0xx`, every one `ccr 9 vs 8`** — and it was the ORACLE that was wrong, not
+  the emitter. This is why §0.12.5 made growing the executor a gate rather than a detail: a
+  second implementation of ARM that models one flag wrongly turns every future divergence in
+  that flag into a false alarm, or hides a real one.
+- **Three mutation arms could not bite until the corpus was widened, and that is a finding
+  about mutation testing rather than about the engine.** `int d0` could not express
+  `0x80000000`, so a carry-out mutation on a left shift had nothing to lose — `warp_seed()`'s
+  own D0 values never reach bit 31 for these keys. And A7 seeds to the stack page, which the
+  helper does not serve, so the byte-step mutation bailed in both arms and compared equal.
+  **A mutation arm that cannot be caught at all is worse than none: it reports CAUGHT-shaped
+  silence.** The overrides are now 64-bit and there is one for A7.
+- **The auto-adjust bail corpus was written wrong first, and the wrong version passed nothing.**
+  It compared the armed run against the PRE-STATE, on the theory that a declining block changes
+  nothing. A run-loop pass whose block bails with nothing retired **falls through to the
+  interpreter inside the same pass**, so the interpreter takes the fault and the machine is
+  legitimately not what it was. What the bail contract claims is not "nothing happened" but
+  "the interpreter saw exactly what it would have seen", and only an armed-vs-disarmed pair can
+  say that.
+- **`warp_boot()` clears the mutant**, so a mutation set before it is silently disarmed. Two
+  round-4 arms were written that way and reported NOT CAUGHT until the calls were reordered.
+
+### 0.13.6 What round 4 leaves owed
+
+1. **Every metal row.** Round 4 takes none. Coverage, block length, the decline rate, the
+   armed band, the disarm penalty and G-R4.9's identity are all pre-registered in §0.12.7 and
+   all unmeasured.
+2. **The register-count shift forms** (G-R4.2's 1 152). Either build them or amend the model —
+   and the model is part of a pre-registration, so it is the emitter that moves.
+3. **The memory-touching families on silicon**, now larger: B2's memory-source ALU and B3's
+   auto-adjust sources join `(An)`/`d16(An)` `MOVE` as harness-proven only, because the
+   self-test refuses any block containing a `blx`. §0.10.7 item 4, **re-owed and grown**.
+4. **`z3660_warp_run`'s preamble**, unchanged at 236 bytes, still the largest row in §0.9.3's
+   table. **Re-owed** for a round that measures the armed path.
+5. **Whether any earlier image was mis-built.** §0.13.4 proves round 3's was. Rounds 1 and 2
+   are not re-examined here and their objdump numbers carry the same risk.
+6. **Everything §0.8.8, §0.10.7, §0.11.7 and §0.12.8 said would not be established**, unchanged.
+
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
