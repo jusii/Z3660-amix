@@ -30,6 +30,34 @@ The frequency of the 060 can be selected between 50 and 100 MHz, in 5 Mhz steps.
 * v1.03 beta 18 and later FPGA/ARM versions
 The 060 frequency and the CPLD frequency are noe decoupled, so when using an EMU, the 060 will get 50 MHz or less.
 
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+### Fork note (2026-08-24, measured): with a REAL 060 (`bootmode CPU`), only `cpufreq 100` works
+
+The "50 to 100 MHz in 5 MHz steps" range above is a **user-facing statement that does not
+hold on our A4000 + Z3660 when the 68060 is the real CPU**. Measured this date on metal, as a
+single-variable A/B on one preset (only `cpufreq` changed between the two boots):
+
+| `cpufreq` | Result |
+|-----------|--------|
+| **100**   | Boots KS 3.2.3 from reset through to the full Intuition desktop with a live mouse |
+| **50**    | **Nothing at all** — black HDMI output, zero serial output past the ARM banner, held 13 minutes |
+
+This corroborates [`z3660-firmware/CPLD/README.md`](z3660-firmware/CPLD/README.md), which says of
+the CPLD images that *"all firmware here is working only at 100 MHz. I have tried other
+frequencies, but only some 'magic' frequencies work"* — i.e. the CPLD README was right and the
+range above is optimistic for the real-CPU path. **Treat 100 MHz as the only supported real-CPU
+frequency on this fork's hardware** until some other value is demonstrated to boot.
+
+Note also that the *code* does not implement the range this section states: `configure_clk()`
+clamps to `[CPUFREQ_MIN, CPUFREQ_MAX]` = `[50, 120]` (`config_file.h:333-334`) and then replaces
+the requested value with a table entry (`config_clk.c:459-470`, `clk = cd[ind].clk`). So the
+configured number is **not** necessarily the number applied — read the `Clock index %d` line
+back from the serial log rather than trusting the config.
+
+This says nothing about emulated boot modes, where the 060 is a bus-parked passenger and the
+whole 50–100 range remains as documented above.
+<!-- fork:amix end -->
+
 ##SCSI SD emulation
  * v1.01 CPLD and FPGA/ARM versions<br>
 There is a bug in hunk relocation code that makes that one hdf grows upto fill the SD. Please don't use this version of firmware with SCSI SD emulation.
