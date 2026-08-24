@@ -4856,6 +4856,15 @@ extern "C" void z3660_knobs_sync(void)
        * arrives spliced, so every capture reads its arm state from a COUNTER --
        * z3660_warp_entered(), compiled into every variant including the lean one the wall
        * clock comes from. The banner is for a human watching the serial line. */
+      /* THE SELF-TEST REQUEST, CONSUMED BEFORE IT IS ACTED ON. z3660_prof.cpp's prof_ctl
+       * pattern verbatim and for the same reason -- the test takes a visible amount of time,
+       * so the word is cleared first and a request that arrives twice runs twice rather than
+       * looping. It is a SECOND MAGIC on the same mailbox word and it CANNOT ARM: the
+       * resolver below is unchanged and only Z3660_WARP_ARM resolves to 1 (Q9). */
+      if ((unsigned)shared->warp_on == Z3660_WARP_SELFTEST) {
+         shared->warp_on = Z3660_WARP_OFF;
+         z3660_warp_selftest();
+      }
       unsigned w = z3660_warp_resolve((unsigned)shared->warp_on);
       if ((int)w != z3660_warp_armed()) {
          z3660_warp_arm((unsigned)shared->warp_on);

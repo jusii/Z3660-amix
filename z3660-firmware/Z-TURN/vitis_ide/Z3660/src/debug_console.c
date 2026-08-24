@@ -112,6 +112,10 @@ typedef enum {
    DFAST,   ACCESSOR_FAST_PATH,
    /* WARP ENGINE: the 68040 MMU block engine. DEFAULT OFF. APPEND-ONLY. */
    WARP,    WARP_ENGINE,
+   /* WARP ENGINE round 3: the ON-TARGET SELF-TEST. It does not arm and cannot -- it writes
+    * a SECOND magic to the same mailbox word and z3660_warp_resolve() returns 0 for it.
+    * APPEND-ONLY. */
+   WARPTEST, WARP_SELFTEST,
 
    NUM_COMMANDS
 } COMMANDS;
@@ -177,6 +181,7 @@ const char *command_names[] = {
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
       "WARP",    "WARP ENGINE",
+      "WARPTEST","WARP SELFTEST",
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -742,6 +747,33 @@ int debug_thread(struct pt *pt)
                         }
                         else
                            xil_printf("WARP ENGINE OFF requested (the interpreter is the whole machine -- this is the reference arm)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case WARPTEST:
+                  case WARP_SELFTEST:
+                     {  /* THE ON-TARGET ARMED SELF-TEST (docs/WARP-ENGINE.md 0.10.5).
+                        *
+                        * THE RULE IT ENFORCES: no metal session arms the engine on a live
+                        * guest until this reports PASS on the image that is about to be
+                        * armed. Round 2's host harness passed 10^8 lockstep boundaries and
+                        * the armed engine still died four times on silicon, because the
+                        * harness reads the emitted words through the DATA side and the
+                        * machine executes them through the INSTRUCTION side. This runs each
+                        * compiled block BOTH ways on the card and compares.
+                        *
+                        * IT CANNOT ARM ANYTHING. It writes a second magic to the same
+                        * mailbox word; z3660_warp_resolve() is unchanged and returns 0 for
+                        * it, so only 'WARP' can ever arm the engine (Q9). core1 consumes the
+                        * word before acting -- z3660_prof.cpp's prof_ctl pattern -- so a
+                        * request that arrives twice runs twice.
+                        *
+                        * It touches no guest memory and leaves the arm state alone, so it is
+                        * safe on a live guest. core1 prints the whole [WTST] report. */
+                        shared->warp_on=Z3660_WARP_SELFTEST;
+                        xil_printf("WARP SELF-TEST requested -- core1 prints the [WTST] report.\r\n");
+                        xil_printf("          Do not arm unless it ends 'VERDICT: PASS 9/9'. A '>>>' family line\r\n");
+                        xil_printf("          with no result under it names the family that died silently.\r\n");
                      }
                      debug_console.subcmd=0;
                      break;
@@ -1492,7 +1524,11 @@ void debug_console_help(void)
    xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
    xil_printf("'WARP'    or 'WARP ENGINE' toggles the WARP block engine ON/OFF (EMU). DEFAULT OFF -- the one knob here\r\n");
    xil_printf("          whose unset state is OFF; it needs an exact magic to arm and never survives a reboot\r\n");
-   xil_printf("          M1 round 1: every block bails immediately, so no speedup is expected. docs/WARP-ENGINE.md\r\n");
+   xil_printf("          M1 round 2: generation one compiles MOVE/MOVEA, register ALU, Bcc and DBcc. docs/WARP-ENGINE.md\r\n");
+   xil_printf("'WARPTEST' or 'WARP SELFTEST' runs the ON-TARGET self-test (EMU): compiles real blocks, publishes\r\n");
+   xil_printf("          them, EXECUTES them on this silicon and compares against the same words INTERPRETED.\r\n");
+   xil_printf("          It never arms. NEVER ARM WITHOUT IT: round 2 died four times where the host harness saw\r\n");
+   xil_printf("          nothing, because a harness has no I-cache. Arm only after 'VERDICT: PASS 9/9'\r\n");
    xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
    xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
    xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");

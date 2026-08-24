@@ -102,6 +102,22 @@
 #define Z3660_WARP_OFF   0u            /* unset AND the shipped state: DISARMED          */
 #define Z3660_WARP_ARM   0x57415250u   /* ASCII "WARP" -- the one value that arms         */
 
+/* THE ON-TARGET SELF-TEST REQUEST, and it is a SECOND MAGIC ON THE SAME WORD rather than a
+ * new SHARED field -- SHARED is hand-maintained in two headers and a beta resync has already
+ * mis-merged one, so the cheapest correct thing is to add no field at all.
+ *
+ * IT DOES NOT ARM AND CANNOT: z3660_warp_resolve() below is UNCHANGED and returns 0 for it,
+ * because only Z3660_WARP_ARM arms. core1 notices the word at its next knob resync, CONSUMES
+ * it by writing the OFF sentinel back -- z3660_prof.cpp's prof_ctl pattern verbatim, "consume
+ * before acting", and for the same reason: the test takes a visible amount of time -- runs the
+ * families, prints the report, and leaves the engine disarmed.
+ *
+ * WHY IT SHIPS IN EVERY VARIANT. The wall-clock arm of every verdict is a LEAN boot, so a
+ * self-test that existed only in a debug variant would attest a DIFFERENT BINARY from the one
+ * armed -- which is exactly the class of error round 3 is a bug report about (plan 0.10.2).
+ * It is cold .text that never executes unless the console asks for it. */
+#define Z3660_WARP_SELFTEST 0x57545354u /* ASCII "WTST" -- run the on-target self-test     */
+
 /* requested -> 1 (engine live) or 0 (disarmed).
  *
  * A resolved 0 must be a PURE PASSTHROUGH: the run loop's hook returns before it has
@@ -113,6 +129,76 @@
 static inline unsigned z3660_warp_resolve(unsigned requested)
 {
    return (requested == Z3660_WARP_ARM) ? 1u : 0u;
+}
+
+/* ---- THE PUBLISH RANGE, and it is where round 2 died --------------------------------
+ *
+ * ROUND 3'S ROOT CAUSE, in one sentence: the firmware's two CP15 line loops round their
+ * LENGTH up and never round their ADDRESS down, so a block whose bytes reach past the last
+ * line the loop touches is executed from memory the loop never maintained.
+ *
+ *   jit/compemu_midfunc_arm.cpp:566 and :578, both the same shape:
+ *      length = (length + 31) & ~31;
+ *      while (length) { <CP15 op on addr>; addr += 32; length -= 32; }
+ *
+ * With k = ceil(len/32) iterations the loop touches k CONSECUTIVE LINES starting at the line
+ * containing `addr`, so its byte coverage is [addr & ~31, (addr & ~31) + 32k) -- and a block
+ * occupies [addr, addr + bytes). The last line is left unmaintained whenever
+ *
+ *      (addr & 31) + bytes  >  32 * ceil(bytes / 32)
+ *
+ * THE D-CACHE HALF IS THE LOAD-BEARING HALF. arm_flush_cache() is DCCIMVAC -- clean and
+ * invalidate to PoC -- so a line it does not touch stays DIRTY IN L1D AND NEVER REACHES PoC.
+ * The Cortex-A9 has no I/D coherency: the instruction-side linefill reads PoC, which still
+ * holds what was there before the compiler wrote the block. The core executes the block
+ * correctly up to its last line and then executes stale memory -- zeros (which decode as
+ * `andeq r0,r0,r0`, so it walks PAST the block's own `pop {r4-r8,pc}`) on a virgin arena, or
+ * a previous block's bytes after the bump pointer has been reset over written arena.
+ *
+ * ROUND 1 WAS STRUCTURALLY IMMUNE AND ROUND 2 IS A COIN FLIP, and that is the discriminator
+ * the R2 metal session measured without knowing what it was measuring. Round 1's blocks were
+ * ALWAYS eight bytes and the bump advanced by eight, so `addr & 31` was one of {0,8,16,24} and
+ * (addr&31)+8 <= 32 always. Round 2's blocks are 4-aligned and variable: over the eight
+ * reachable offsets and the eight reachable length residues, 28 of the 64 pairs are uncovered
+ * -- 43.75 % of every block published.
+ *
+ * THE FIX IS AT WARP'S CALL SITE AND NOT IN THE SHARED LOOPS. The two primitives are also the
+ * classic JIT's, reached through flush_cpu_icache(), and changing them would move behaviour
+ * outside this engine in a round that is not about that. WARP rounds the range OUT to whole
+ * lines at both ends before it calls them, and separately keeps every block on a line of its
+ * own so the rounding is exact rather than merely safe.
+ *
+ * The predicate lives HERE, in plain C outside the engine guard, because the host harness
+ * asserts it against hand-computed cases -- including round 1's geometry, which is the arm
+ * that keeps the discriminator honest -- and a rule the test re-derives is not the rule the
+ * firmware runs. */
+#define Z3660_WARP_LINE  32u    /* Cortex-A9 L1 cache line, and the CP15 loops' stride     */
+
+/* The byte range the CP15 line loop ACTUALLY maintains when called with (addr, len).
+ * Transcribed from the loops above and from nowhere else. */
+static inline unsigned z3660_warp_line_lo(unsigned addr)
+{
+   return addr & ~(Z3660_WARP_LINE - 1u);
+}
+static inline unsigned z3660_warp_line_hi(unsigned addr, unsigned len)
+{
+   unsigned k = (len + (Z3660_WARP_LINE - 1u)) / Z3660_WARP_LINE;   /* the loop's own k */
+   return z3660_warp_line_lo(addr) + k * Z3660_WARP_LINE;
+}
+/* Does a CP15 line loop called with (call_addr, call_len) reach every byte of the block
+ * [blk_addr, blk_addr + blk_bytes)? Round 2 called it with (blk_addr, blk_bytes) and the
+ * answer is NO for 28 of the 64 reachable (offset, length-residue) pairs. */
+static inline int z3660_warp_publish_covers(unsigned call_addr, unsigned call_len,
+                                            unsigned blk_addr, unsigned blk_bytes)
+{
+   return (z3660_warp_line_lo(call_addr) <= blk_addr)
+       && (z3660_warp_line_hi(call_addr, call_len) >= blk_addr + blk_bytes);
+}
+/* The length WARP passes, so that the answer above is yes for every (addr, bytes). */
+static inline unsigned z3660_warp_publish_len(unsigned addr, unsigned bytes)
+{
+   return ((addr & (Z3660_WARP_LINE - 1u)) + bytes + (Z3660_WARP_LINE - 1u))
+          & ~(Z3660_WARP_LINE - 1u);
 }
 
 /* ---- Block-cache geometry and keying -------------------------------------------------
@@ -241,6 +327,22 @@ extern struct z3660_warp_gate_s z3660_warp_gate;
 unsigned z3660_warp_arm(unsigned requested);
 int      z3660_warp_armed(void);
 
+/* THE ON-TARGET ARMED SELF-TEST (plan 0.10.5). Compiles a corpus of real blocks, publishes
+ * them through the real sequence, EXECUTES them on the silicon, and compares each one against
+ * the same block INTERPRETED FROM ITS OWN WORDS -- the instruction side against the data side,
+ * on the machine that has both. That comparison is the one the host harness cannot make,
+ * because the harness compiles warp_publish() out; it is what round 2's four crashes were
+ * invisible to; and a publish or coherency defect makes exactly those two disagree.
+ *
+ * It touches NO GUEST MEMORY -- neither instruction words (the compiler is fed from a
+ * core1-resident opcode array) nor operands (the corpus is register-only) -- and it restores
+ * regs, the block table, the generation and the bump pointer exactly as it found them, so it
+ * is safe to run at any time on a live guest. It never arms anything.
+ *
+ * Returns 1 if every family passed. THE RULE IT EXISTS FOR: no metal session arms the engine
+ * on a live guest until this reports PASS on the image that is about to be armed. */
+int      z3660_warp_selftest(void);
+
 /* THE ARM ATTESTATION. Compiled into EVERY variant, unlike the profiler's counters, because
  * the wall-clock arm of every verdict is a LEAN boot with no profiler in it -- and a banner
  * is not admissible, because two cores share one unlocked UART and an arm banner arrives
@@ -300,6 +402,15 @@ void z3660_warp_cadence_feed(unsigned insns);
 #ifdef Z3660_WARP_ENGINE
 
 typedef unsigned (*z3660_warp_fn)(void *regbase, void *rd, void *wr, void *ctx);
+
+/* THE MEMORY ABI GENERATED CODE CALLS. Declared here rather than left file-static so the
+ * accessor corpus can be pointed straight at it -- which is what M-VERDICT's owed arm needed
+ * (§0.9.6 item 1): the TTR_NO_WRITE asymmetry lives in a read-only TTR window the WARP corpus
+ * has no way to build, and the shortest correct wiring is to hand the helper an address from
+ * the corpus that does. Return 1 = served (the read leaves its value in ctx.tmp), 0 = declined
+ * and the block bails. */
+int z3660_warp_rd(unsigned addr, unsigned size, unsigned unused);
+int z3660_warp_wr(unsigned addr, unsigned size, unsigned val);
 
 /* One 64-byte set: four ways, one generation stamp, one round-robin victim. Laid out so
  * the four tags are contiguous and land in the first half of the line -- the lookup reads
@@ -385,64 +496,34 @@ extern unsigned int          z3660_warp_gen;
  * pre-registered policy stated as code. */
 #define Z3660_WARP_NO_LAST  0xFFFFFFFFu
 
-#ifdef HOST_TEST_HARNESS
-/* Declared here as well as in the harness block below, because z3660_warp_step() is
- * inlined ABOVE that block and M-XFER lives inside it. In no firmware binary. */
-extern int z3660_warp_mutant;
-#define Z3660_WARP_MUT_XFER 4
-#endif
-
-/* NO `super` ARGUMENT, and its absence is measured rather than stylistic: passing
- * `regs.s ? 1 : 0` at the call site made gcc evaluate it BEFORE the inlined body, so the
- * supervisor byte, its compare and a predicated store all landed above the
- * control-transfer test and were paid on every armed dispatch. Read inside, after the test
- * that leaves, they are paid only when a block might actually be entered -- four ARM
- * instructions off the armed non-target path, off the lean objdump. */
-static __inline__ __attribute__((always_inline))
-unsigned z3660_warp_step(unsigned pc)
-{
-   unsigned d = pc - z3660_warp_last_pc;
-   struct z3660_warp_set *s;
-   unsigned key, i;
-
-   z3660_warp_last_pc = pc;
-
-   /* THE CHEAPEST TEST FIRST, and the ordering is the difference between ten emitted
-    * instructions on the common path and eighteen. The overwhelmingly common case on an
-    * armed dispatch is "not a control-transfer target", so it leaves before the supervisor
-    * byte, the odd-pc test and the trace pair are ever loaded. M-XFER removes the test,
-    * which restores round 1's "discover at every dispatched PC" policy -- not a correctness
-    * defect, which is exactly why it needs its own arm. */
-#ifdef HOST_TEST_HARNESS
-   if (z3660_warp_mutant != Z3660_WARP_MUT_XFER)
-#endif
-   if (d - 2u < 15u)
-      return 0;
-
-   /* GENERATION ONE IS USER-MODE ONLY: a block is never entered with regs.s set. Gated
-    * before discovery, and deliberately NOT counted as a decline -- one decline per
-    * supervisor instruction would make WARP_DECLINE a second copy of INSNS_SUPER. An odd
-    * pc cannot be a block head either; nothing can execute at one on a 68040. */
-   if (regs.s || (pc & 1u))
-      return 0;
-
-   /* TRACE ON IMPLIES INTERPRET. One predicate that removes an entire class of divergence:
-    * do_specialties() stays per-instruction in the interpreter at every cadence, and a
-    * block that retired several instructions under T0/T1 would owe several trace exceptions
-    * it has no way to raise. It is tested HERE and not only at compile time, because a
-    * cached block must not be entered while tracing either. */
-   if (regs.t0 || regs.t1)
-      return 0;
-
-   s   = &z3660_warp_tab[Z3660_WARP_INDEX(pc)];
-   key = Z3660_WARP_KEY(pc, 0);
-   if (s->stamp == z3660_warp_gen) {
-      for (i = 0; i < Z3660_WARP_WAYS; i++)
-         if (s->tag[i] == key)
-            return z3660_warp_run((unsigned)(s - z3660_warp_tab), i);
-   }
-   return z3660_warp_discover(pc);
-}
+/* THE HOOK, AND IT IS OUT OF LINE AGAIN -- round 3's disarm-penalty change, and the
+ * measurement that forces it is on the card right now.
+ *
+ * Round 2 made this `always_inline` on the decoded-op cache's precedent ("at -Os gcc will
+ * happily move a hot lookup out of line to save space, which is the exact trade this rung
+ * exists to refuse"). The trade is not the same one, and metal said so: the DOPC's lookup
+ * runs on the path that is always live, while this one's body is ARMED-ONLY and the shipped
+ * state is DISARMED until the M5 gate. Inlined, the control-transfer test (6 ARM
+ * instructions), the supervisor/odd-pc/trace gates (8) and the four-way hashed lookup (18)
+ * sat inside m68k_run_mmu040 and were branched over on every disarmed pass -- 32 instructions
+ * of L1I footprint doing nothing. m68k_run_mmu040 grew 2 324 -> 2 548 B (+224, G-R2.2, MISSED
+ * high) and the measured disarm penalty went from -2.276 % to -5.848 %, which is 2.57x, on a
+ * gate whose INSTRUCTION COUNT did not move at all. An instruction count is not a cost, and
+ * 0.4.3 named this mechanism before the row existed: "an interpreter dispatch loop in a
+ * 32 KB Cortex-A9 L1I is exactly the workload sensitive to that."
+ *
+ * So the run loop keeps ONE address materialisation, ONE load, ONE test and a perfectly
+ * predicted branch, and every byte behind that branch leaves the loop's cache footprint. The
+ * price is stated rather than hidden: the ARMED path gains one AAPCS call -- non-target
+ * dispatch 11 -> ~15 instructions, per block ~108 -> ~114 -- and that is the correct side to
+ * pay on, because the disarmed cost is SHIPPED and the armed cost is not yet a verdict of any
+ * kind (plan 0.10.6).
+ *
+ * NO `super` ARGUMENT, and its absence is still measured rather than stylistic: passing
+ * `regs.s ? 1 : 0` at the call site made gcc evaluate it BEFORE the body, so the supervisor
+ * byte, its compare and a predicated store were paid on every armed dispatch. It is read
+ * inside, after the test that leaves. */
+unsigned z3660_warp_step(unsigned pc);
 
 /* One interpreted guest instruction's worth of emulated cycles. EVERY handler in the
  * cpuemu_31 table this loop dispatches returns exactly this constant, so a block that
@@ -496,7 +577,11 @@ void z3660_warp_set_cache_limit(unsigned bytes);
 #define Z3660_WARP_MUT_KEY_NOSUP  1  /* M-5:  the block key drops the supervisor bit       */
 #define Z3660_WARP_MUT_NO_ICACHE  2  /* M-ICACHE: publish without the sequence             */
 #define Z3660_WARP_MUT_CONFLICT   3  /* M-CONFLICT: round 1's lookup geometry restored     */
-/* Z3660_WARP_MUT_XFER (4) is defined above, beside the inlined step() that carries it. */
+#define Z3660_WARP_MUT_XFER       4  /* M-XFER: the discovery gate fires at every PC --
+                                      * round 1's policy restored. It lived above the
+                                      * mutation list while step() was inlined into the run
+                                      * loop; round 3 took step() out of line, so it comes
+                                      * home to the list with the rest.                    */
 #define Z3660_WARP_MUT_FENCE      5  /* M-FENCE: the helper's align/page-cross fence gone  */
 #define Z3660_WARP_MUT_VERDICT    6  /* M-VERDICT: the verdict decline arm made permissive */
 #define Z3660_WARP_MUT_BAILPC     7  /* M-3:  the bail stores the block-head pc, not the
@@ -509,7 +594,12 @@ void z3660_warp_set_cache_limit(unsigned bytes);
 #define Z3660_WARP_MUT_FLAG_BCC  13  /* wrong-flag, Bcc: the condition sense inverted      */
 #define Z3660_WARP_MUT_FLAG_DBCC 14  /* wrong-flag, DBcc: the counter tested after, not
                                       *       before, the decrement                        */
-#define Z3660_WARP_MUT_COUNT     15
+#define Z3660_WARP_MUT_PUBRANGE  15  /* M-PUBRANGE: round 2's publish range restored --
+                                      * the raw (dst, bytes) call AND the unaligned bump,
+                                      * i.e. THE DEFECT THAT KILLED ROUND 2 ON SILICON,
+                                      * put back so the arm that catches it can be shown
+                                      * to catch it rather than asserted to               */
+#define Z3660_WARP_MUT_COUNT     16
 void z3660_warp_set_mutant(int which);
 /* The mutant word itself, because z3660_warp_step() is INLINED into the run loop and
  * M-XFER lives inside it. In no firmware binary: the whole block is behind
@@ -524,6 +614,14 @@ extern int z3660_warp_mutant;
 #define Z3660_WARP_BAD_FIXUP       2  /* mmufixup armed at a block head -- only the
                                        * interpreter may ever arm it (§0.3(b))              */
 #define Z3660_WARP_BAD_SUPER       3  /* a block entered with regs.s set                    */
+/* ROUND 3'S INVARIANT, and the one the round-2 harness had no way to hold. Every publish is
+ * checked against z3660_warp_publish_covers(): did the CP15 line loop, called with the
+ * arguments WARP actually passes, reach every byte of the block? Round 2's arguments do not,
+ * for 43.75 % of blocks, and this counter is what says so on a host that has no cache at all.
+ * M-PUBRANGE restores those arguments and drives it non-zero. */
+#define Z3660_WARP_BAD_PUBRANGE    4  /* a block published with a range that misses part of
+                                       * it -- the round-2 killer, as an assertion          */
+#define Z3660_WARP_BAD_UNALIGNED   5  /* a block that does not start on a cache line         */
 unsigned long long z3660_warp_bad(int which);
 
 /* MUTATION M-7 and the counter it lies about, both in newcpu.cpp where the cadence lives.
