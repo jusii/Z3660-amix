@@ -69,6 +69,13 @@ void arm_icache_invalidate(uintptr_t addr, uint32_t length);
  * surviving a reboot -- core0 republishes the OFF sentinel unconditionally on every boot
  * (config_file.c), and this initialiser means a core1 running before core0 has published
  * anything is disarmed rather than reading whatever the DDR happened to hold. */
+/* L-REG's other half (§0.14.1). When the ablation kit takes the flag out of `struct
+ * regstruct`, it has to live somewhere -- and a plain global is precisely where it lived
+ * through round 3, which is what makes the A3->A4 edge a measurement of the MOVE rather than
+ * of some third arrangement. */
+#if Z3660_WARP_ABL_NO_REGFIELD
+int z3660_warp_on_g = 0;
+#endif
 extern "C" { struct z3660_warp_gate_s z3660_warp_gate = { Z3660_WARP_NO_LAST }; }
 
 /* ---------------------------------------------------------------- the block table ---- */
@@ -240,6 +247,7 @@ static __inline__ unsigned warp_index(unsigned pc)
 #define OP_AND 0u
 #define OP_EOR 1u
 #define OP_SUB 2u
+#define OP_RSB 3u
 #define OP_ADD 4u
 #define OP_TST 8u
 #define OP_CMP 10u
@@ -329,6 +337,22 @@ static void e_shift(struct warp_cc *c, unsigned s, unsigned rd, unsigned rm,
    e_dp_reg(c, CC_AL, OP_MOV, s, rd, 0, rm, shtype, shimm);
 }
 
+/* MOV{S} rd, rm <type> rs -- a shift whose AMOUNT IS A REGISTER, which is the whole of what
+ * round 5's register-count shift forms needed the encoder to grow (§0.14.3 T4).
+ *
+ * IT IS ALSO WHERE THE 68k AND ARM AGREE, WHICH IS WHY T4 IS TRACTABLE AT ALL. ARM takes the
+ * amount from the LOW BYTE of rs: 0 leaves the value and the carry alone, 1..31 shift, 32
+ * gives the boundary carry, and anything above 32 gives zero and a clear carry. That is the
+ * 68k's own rule for every count >= 1 at every size once the operand is aligned -- so the
+ * emitted body is the immediate body with this instruction in place of the constant shift,
+ * plus ONE tail for the count == 0 case where the two architectures disagree. */
+static void e_shift_reg(struct warp_cc *c, unsigned cc, unsigned s, unsigned rd,
+                        unsigned rm, unsigned shtype, unsigned rs)
+{
+   wemit(c, (cc << 28) | (OP_MOV << 21) | (s << 20) | (rd << 12)
+            | (rs << 8) | (shtype << 5) | (1u << 4) | rm);
+}
+
 static void e_movw(struct warp_cc *c, unsigned rd, uae_u32 imm16)
 {
    wemit(c, 0xE3000000u | (((imm16 >> 12) & 0xFu) << 16) | (rd << 12) | (imm16 & 0xFFFu));
@@ -352,13 +376,15 @@ static void e_ldr(struct warp_cc *c, unsigned rd, unsigned rn, int off)
    if (a > 4095u) { c->ok = 0; return; }
    wemit(c, 0xE4100000u | (1u << 24) | (u << 23) | (rn << 16) | (rd << 12) | a);
 }
-static void e_str(struct warp_cc *c, unsigned rd, unsigned rn, int off)
+static void e_str_cc(struct warp_cc *c, unsigned cc, unsigned rd, unsigned rn, int off)
 {
    unsigned u = (off >= 0) ? 1u : 0u;
    unsigned a = (unsigned)(off >= 0 ? off : -off);
    if (a > 4095u) { c->ok = 0; return; }
-   wemit(c, 0xE4000000u | (1u << 24) | (u << 23) | (rn << 16) | (rd << 12) | a);
+   wemit(c, (cc << 28) | 0x04000000u | (1u << 24) | (u << 23) | (rn << 16) | (rd << 12) | a);
 }
+static void e_str(struct warp_cc *c, unsigned rd, unsigned rn, int off)
+{  e_str_cc(c, CC_AL, rd, rn, off); }
 
 static void e_push(struct warp_cc *c, unsigned list) { wemit(c, 0xE92D0000u | list); }
 static void e_pop (struct warp_cc *c, unsigned list) { wemit(c, 0xE8BD0000u | list); }
@@ -501,9 +527,9 @@ extern "C" int z3660_warp_rd(uae_u32 addr, uae_u32 size, uae_u32 unused)
 
    (void)unused;
    if (!warp_fence(addr, size))
-      goto decline;
+      goto decl_fence;
    if (!z3660_dfast_read(addr, &pa, &cs))
-      goto decline;
+      goto decl_verdict;
 #ifdef HOST_TEST_HARNESS
    if (WARP_MUTANT(Z3660_WARP_MUT_VERDICT))
       pa = pa;                                        /* see the note in z3660_warp_wr   */
@@ -517,17 +543,30 @@ extern "C" int z3660_warp_rd(uae_u32 addr, uae_u32 size, uae_u32 unused)
    Z3660_PROF_CNT(Z3660_PROF_C_READ);
    WARP_STAT(Z3660_WARP_STAT_MEMHIT);
    return 1;
-decline:
+/* THE TWO DECLINE ARMS ARE SEPARATE COUNTERS AND ONE RETURN (§0.14.2). A helper decline is
+ * the ONLY thing that makes a real block bail, so splitting the decline splits the bail --
+ * and the two causes are different stories: the fence is a shape the guest's own compiler
+ * controls, the verdict is the memory model. One decline produces exactly one bail, which is
+ * what makes BAIL_MEM == BAIL_FENCE + BAIL_VERDICT a gate rather than an accounting habit. */
+decl_fence:
+   WARP_STAT(Z3660_WARP_STAT_BAILFENCE);
+   Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_FENCE);
+   WARP_STAT(Z3660_WARP_STAT_MEMDECL);
+   return 0;
+decl_verdict:
+   WARP_STAT(Z3660_WARP_STAT_BAILVERD);
+   Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_VERDICT);
    WARP_STAT(Z3660_WARP_STAT_MEMDECL);
    return 0;
 }
+
 
 extern "C" int z3660_warp_wr(uae_u32 addr, uae_u32 size, uae_u32 val)
 {
    uaecptr pa; uae_u8 cs;
 
    if (!warp_fence(addr, size))
-      goto decline;
+      goto decl_fence;
 #ifdef HOST_TEST_HARNESS
    /* M-VERDICT: the decline arm made permissive. A write whose verdict table says SLOW --
     * which is what TTR_NO_WRITE produces, the asymmetry §0.5.5's G4 exists to protect -- is
@@ -535,11 +574,11 @@ extern "C" int z3660_warp_wr(uae_u32 addr, uae_u32 size, uae_u32 val)
     * make a read-only TTR region writable from generated code and nothing else. */
    if (WARP_MUTANT(Z3660_WARP_MUT_VERDICT)) {
       if (z3660_dfast_read(addr, &pa, &cs)) goto serve;
-      goto decline;
+      goto decl_verdict;
    }
 #endif
    if (!z3660_dfast_write(addr, &pa, &cs))
-      goto decline;
+      goto decl_verdict;
 #ifdef HOST_TEST_HARNESS
 serve:
 #endif
@@ -552,10 +591,18 @@ serve:
    Z3660_PROF_CNT(Z3660_PROF_C_WRITE);
    WARP_STAT(Z3660_WARP_STAT_MEMHIT);
    return 1;
-decline:
+decl_fence:
+   WARP_STAT(Z3660_WARP_STAT_BAILFENCE);
+   Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_FENCE);
+   WARP_STAT(Z3660_WARP_STAT_MEMDECL);
+   return 0;
+decl_verdict:
+   WARP_STAT(Z3660_WARP_STAT_BAILVERD);
+   Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_VERDICT);
    WARP_STAT(Z3660_WARP_STAT_MEMDECL);
    return 0;
 }
+
 
 /* ==================================================================================== */
 /* ============================ GENERATION ONE'S COMPILERS ============================ */
@@ -933,6 +980,133 @@ static void e_shift_rot(struct warp_cc *c, unsigned typ, unsigned left, unsigned
    e_put_reg(c, reg, sz, 2, 0, 3);
 }
 
+/* ---- shifts and rotates, REGISTER count (M1a tranche 2, T4) -------------------------
+ *
+ * G-R4.2'S OWED 1 152, CLOSED IN THE DIRECTION THE PRE-REGISTRATION REQUIRED. Round 4's
+ * accept-set discriminator disagreed with docs/warp-corpus.py over exactly these opcodes and
+ * over no others; §0.13.6 item 2 fixed the repair's direction -- "the model is part of a
+ * pre-registration, so it is the emitter that moves" -- and this is the emitter moving.
+ *
+ * THE ONE PLACE THE TWO ARCHITECTURES DISAGREE IS A COUNT OF ZERO, and that is the entire
+ * design. For every count >= 1, ARM's register-specified shift already implements the 68k's
+ * rule at every size: the carry is the last bit shifted out, a count at the width gives the
+ * boundary bit, and a count above it gives zero with a clear carry. At a count of ZERO the
+ * 68k CLEARS C, LEAVES X ALONE and takes N and Z from the unshifted operand at its own
+ * width; ARM leaves the flags exactly as it found them. So each body below is its immediate
+ * counterpart with e_shift_reg() in place of the constant shift, followed by one uniform,
+ * BRANCH-FREE tail that substitutes the zero-count answer under a `cmp rc,#0`.
+ *
+ * THE TAIL IS BRANCH-FREE ON PURPOSE. This compiler has no patch list and no label
+ * bookkeeping -- every branch it emits is a forward skip over a sequence whose length is a
+ * function of its arguments -- and a zero-count arm whose length varies by type is exactly
+ * the bookkeeping that design exists to avoid. Predication costs five instructions and keeps
+ * the property.
+ *
+ * THE ORDER IS FORCED: body, then the zero-count answer, then the tail. The body's flags are
+ * captured into r12 by its own `mrs` before the zero-count `movs` clobbers the CPSR, and the
+ * `cmp` that drives the predication is the LAST thing to touch the flags before they are
+ * read. Computing the zero-count answer first would need a sixth live register through the
+ * body, which ROL/ROR does not have.
+ *
+ * ASL IS THE ONLY SHAPE THAT NEEDS MORE, and it needs it for the overflow test rather than
+ * the result. The interpreter's rule -- op_e100_31_ff: V is set when the top cnt+1 bits are
+ * neither all set nor all clear -- becomes `(v ^ (v asr #31)) >> (31-c)` at a runtime count,
+ * and 31-c is meaningless above 31. CLAMPING c TO 31 FIRST IS EXACTLY CORRECT rather than
+ * approximately so: at c >= 31 the rule degenerates to "the operand is neither 0 nor -1",
+ * which is what a shift by zero tests. */
+static void e_shift_rot_reg(struct warp_cc *c, unsigned typ, unsigned left,
+                            unsigned cntreg, unsigned sz, unsigned reg)
+{
+   unsigned s = warp_shift[sz];
+   unsigned w = warp_width[sz];
+   unsigned mask = WARP_MUTANT(Z3660_WARP_MUT_SHIFTREG_MOD) ? 31u : 63u;
+
+   /* r1 = the 68k count. The 68k takes the count register MOD 64 -- not mod the operand
+    * width, and not mod 32. M-SHIFTREG-MOD masks with 31 instead, which makes a count of 32
+    * behave as a count of 0 and is invisible at every count below it. */
+   e_ldr(c, 1, R_REGS, (int)(cntreg * 4u));
+   e_dp_imm(c, CC_AL, OP_AND, 0, 1, 1, mask);
+   e_ldr(c, 0, R_REGS, (int)(reg * 4u));
+
+   if (typ == 3u) {
+      /* ---- ROL / ROR: X untouched, V cleared, C a bit of the RESULT ------------------ */
+      e_shift(c, 0, 2, 0, 0, s);
+      e_shift(c, 0, 2, 2, 1, s);                    /* r2 = the zero-extended operand     */
+      e_dp_imm(c, CC_AL, OP_AND, 0, 3, 1, w - 1u);  /* k = c mod w                        */
+      e_dp_imm(c, CC_AL, OP_RSB, 0, R_KEEP, 3, w);  /* w - k                              */
+      /* k == 0 falls out right: the other half shifts by the full width, which ARM's
+       * register form answers with zero, so the OR reproduces the operand -- and C is then
+       * the operand's own boundary bit, which is what the 68k's "last bit round" means for a
+       * rotate by a multiple of the width. */
+      if (left) {
+         e_shift_reg(c, CC_AL, 0, 12, 2, 0u, 3);
+         e_shift_reg(c, CC_AL, 0, 2, 2, 1u, R_KEEP);
+      } else {
+         e_shift_reg(c, CC_AL, 0, 12, 2, 1u, 3);
+         e_shift_reg(c, CC_AL, 0, 2, 2, 0u, R_KEEP);
+      }
+      e_dp_reg(c, CC_AL, OP_ORR, 0, 2, 12, 2, 0, 0);
+      e_shift(c, 1, 3, 2, 0, s);                    /* N and Z at the operand's width     */
+      e_mrs(c, 12);
+      e_dp_imm(c, CC_AL, OP_AND, 0, 12, 12, 0xC0000000u);
+      if (!WARP_MUTANT(Z3660_WARP_MUT_SHIFT_C)) {
+         e_ubfx(c, 3, 2, left ? 0u : (w - 1u), 1);
+         e_dp_reg(c, CC_AL, OP_ORR, 0, 12, 12, 3, 0u, 29u);
+      }
+   } else if (left) {
+      /* ---- ASL / LSL: top-aligned, one register `movs` for the result, N, Z and C ----- */
+      e_shift(c, 0, 2, 0, 0, s);
+      if (typ == 0u) {
+         e_dp_reg(c, CC_AL, OP_EOR, 0, 3, 2, 2, 2u, 31u);      /* t = v ^ (v asr #31)     */
+         if (WARP_MUTANT(Z3660_WARP_MUT_ASLREG_CLAMP)) {
+            e_mov(c, R_KEEP, 1);                               /* the defect: no clamp    */
+         } else {
+            e_dp_imm(c, CC_AL, OP_CMP, 1, 0, 1, 31u);
+            e_mov(c, R_KEEP, 1);
+            e_dp_imm(c, CC_HI, OP_MOV, 0, R_KEEP, 0, 31u);     /* min(c, 31)              */
+         }
+         e_dp_imm(c, CC_AL, OP_RSB, 0, R_KEEP, R_KEEP, 31u);
+         e_shift_reg(c, CC_AL, 1, 3, 3, 1u, R_KEEP);           /* movs r3, t lsr rK       */
+         e_dp_imm(c, CC_NE, OP_MOV, 0, 3, 0, 1);
+         e_dp_imm(c, CC_EQ, OP_MOV, 0, 3, 0, 0);
+      } else {
+         e_dp_imm(c, CC_AL, OP_MOV, 0, 3, 0, 0);               /* LSL never sets V        */
+      }
+      e_shift_reg(c, CC_AL, 1, 2, 2, 0u, 1);                   /* result, N, Z, C         */
+      e_mrs(c, 12);
+      e_dp_imm(c, CC_AL, OP_AND, 0, 12, 12,
+               WARP_MUTANT(Z3660_WARP_MUT_SHIFT_C) ? 0xC0000000u : 0xE0000000u);
+      e_dp_reg(c, CC_AL, OP_ORR, 0, 12, 12, 3, 0u, 28u);       /* V from r3               */
+      if (s != 0u) e_shift(c, 0, 2, 2, 1, s);                  /* back to the natural pos */
+   } else {
+      /* ---- ASR / LSR: natural position on an extended operand ------------------------ */
+      e_shift(c, 0, 2, 0, 0, s);
+      e_shift(c, 0, 2, 2, (typ == 0u) ? 2u : 1u, s);
+      e_shift_reg(c, CC_AL, 1, 2, 2, (typ == 0u) ? 2u : 1u, 1);
+      e_mrs(c, 12);
+      e_dp_imm(c, CC_AL, OP_AND, 0, 12, 12,
+               WARP_MUTANT(Z3660_WARP_MUT_SHIFT_C) ? 0xC0000000u : 0xE0000000u);
+   }
+
+   /* ---- the zero-count answer, and the uniform predicated tail ---------------------- */
+   e_shift(c, 1, 3, 0, 0, s);                       /* N, Z of the UNSHIFTED operand      */
+   e_mrs(c, R_KEEP);
+   e_dp_imm(c, CC_AL, OP_AND, 0, R_KEEP, R_KEEP, 0xC0000000u);  /* ... with C and V clear */
+   e_dp_imm(c, CC_AL, OP_CMP, 1, 0, 1, 0);
+   if (!WARP_MUTANT(Z3660_WARP_MUT_SHIFTREG_ZERO))
+      e_dp_reg(c, CC_EQ, OP_MOV, 0, 12, 0, R_KEEP, 0, 0);  /* count == 0 -> the 68k's     */
+   e_str(c, 12, R_CTX, (int)CTX_NZCV);
+   /* X: a ROTATE never writes it, and a shift writes it ONLY for a non-zero count. The
+    * predicate is still the `cmp` above -- neither the UBFX nor the STR sets the flags, and
+    * that is load-bearing rather than incidental. */
+   if (typ != 3u && !WARP_MUTANT(Z3660_WARP_MUT_FLAG_ADD)) {
+      e_ubfx(c, 3, 12, 29, 1);
+      e_str_cc(c, WARP_MUTANT(Z3660_WARP_MUT_SHIFTREG_XZERO) ? CC_AL : CC_NE,
+               3, R_CTX, (int)CTX_XFLG);
+   }
+   e_put_reg(c, reg, sz, 2, 0, 3);
+}
+
 /* ==================================================================================== */
 
 /* The compiler's own instruction fetch. It runs inside the TRY of warp_compile(), so an
@@ -1157,10 +1331,139 @@ static unsigned warp_emit_insn(struct warp_cc *c, unsigned pc, unsigned count,
 
       sz = (op >> 6) & 3u;
       if (sz == 3u) return 0;      /* the memory word forms, and the 020 bitfield ops    */
-      if (ir != 0u) return 0;      /* a register count: not built, and §0.12.4 says why  */
       if (typ == 2u) return 0;     /* ROXL / ROXR take X in as well as out               */
-      if (cnt == 0u) cnt = 8u;     /* imm8_table[]: a zero count field means eight       */
-      e_shift_rot(c, typ, left, cnt, sz, reg);
+      if (ir != 0u) {              /* M1a tranche 2, T4 -- G-R4.2's owed 1152            */
+         e_shift_rot_reg(c, typ, left, cnt, sz, reg);
+      } else {
+         if (cnt == 0u) cnt = 8u;  /* imm8_table[]: a zero count field means eight       */
+         e_shift_rot(c, typ, left, cnt, sz, reg);
+      }
+      c->last_ipc = pc; c->last_restart = 1;
+      return 2;
+   }
+
+   /* ---------------------------------- EXT / EXTB (M1a tranche 2, T3) --------------- */
+   /* TESTED BEFORE LEA, AND THAT IS NOT AN ORDERING PREFERENCE. `EXTB.L Dn` is
+    * 0100 1001 1100 0rrr, which matches LEA's 0100 rrr 111 eeeeee pattern exactly with
+    * rrr = 100 and an EA mode of 000 -- an encoding the 68k reassigns to EXTB.L precisely
+    * BECAUSE `LEA Dn,An` is illegal. Test LEA first and every EXTB.L is refused as a bad
+    * LEA instead of compiled. docs/warp-corpus.py carries the same ordering and the same
+    * comment, because the accept-set discriminator would otherwise report the disagreement
+    * without either side knowing which one was right. */
+   if ((op & 0xFFF8u) == 0x4880u || (op & 0xFFF8u) == 0x48C0u
+       || (op & 0xFFF8u) == 0x49C0u) {
+      unsigned reg  = op & 7u;
+      unsigned frombyte = ((op & 0xFFF8u) != 0x48C0u);   /* EXT.W and EXTB.L widen a byte */
+      unsigned dsz = ((op & 0xFFF8u) == 0x4880u) ? (unsigned)W_SZ_W : (unsigned)W_SZ_L;
+
+      e_ldr(c, 0, R_REGS, (int)(reg * 4u));
+      e_mov(c, 2, 0);
+      if (frombyte) { e_shift(c, 0, 2, 2, 0, 24); e_shift(c, 0, 2, 2, 2, 24); }
+      else          { e_sxth(c, 2, 2); }
+      /* N and Z at the DESTINATION size, C and V cleared -- the MOVE family's mask.
+       *
+       * EXT.W'S FLAG WIDTH IS NOT MUTATABLE AND THAT IS A PROPERTY, NOT AN OVERSIGHT. The
+       * value in r2 is a SIGN-EXTENDED BYTE, so its bit 15 and its bit 31 are the same bit
+       * and its low 16 bits are zero exactly when all 32 are: reading the flags at long
+       * width instead of word width produces the identical N and Z for every operand that
+       * exists. An arm for it would report CAUGHT-shaped silence (§0.13.5), so the arm is
+       * pointed at the thing that IS observable instead -- the DESTINATION width. */
+      e_shift(c, 1, 3, 2, 0, warp_shift[dsz]);
+      e_store_flags(c, 12, 0, 0xC0000000u);
+      /* M-EXT-WIDTH: EXT.W writes the whole register instead of its low half, so the upper
+       * 16 bits the 68k leaves alone are overwritten with the sign. */
+      e_put_reg(c, reg,
+                WARP_MUTANT(Z3660_WARP_MUT_EXT_WIDTH) ? (unsigned)W_SZ_L : dsz, 2, 0, 3);
+      c->last_ipc = pc; c->last_restart = 1;
+      return 2;
+   }
+
+   /* ---------------------------------------- LEA (M1a tranche 2, T1) ---------------- */
+   /* NO MEMORY IS READ: the effective address IS the operand, so every mode below is a pure
+    * register computation and LEA sets no flags at all.
+    *
+    * THE INDEXED MODES ARE REFUSED AND THE REASON IS THE NEIGHBOUR RATHER THAN THE
+    * ARITHMETIC (§0.14.3 T1). d8(An,Xn) and d8(PC,Xn) carry an extension word whose bit 8
+    * selects the 68020 FULL format, and a full-format extension can DEREFERENCE MEMORY.
+    * Admitting the brief form means admitting a decode surface whose immediate neighbour
+    * reaches guest memory from a family that otherwise never does, and getting that
+    * discrimination wrong ships a silent memory read inside a block that declares itself
+    * register-only. */
+   if ((op & 0xF1C0u) == 0x41C0u) {
+      unsigned dst  = (op >> 9) & 7u;
+      unsigned mode = (op >> 3) & 7u;
+      unsigned reg  = op & 7u;
+      uae_u32 ea;
+
+      if (mode == EA_IND) {
+         e_ldr(c, 0, R_REGS, (int)((8u + reg) * 4u));
+         e_str(c, 0, R_REGS, (int)((8u + dst) * 4u));
+         c->last_ipc = pc; c->last_restart = 1;
+         return 2;
+      }
+      if (mode == EA_D16) {
+         uae_u32 v = (uae_u32)(uae_s32)(uae_s16)warp_iword(c, pc + 2);
+         unsigned rot, i8;
+         e_ldr(c, 0, R_REGS, (int)((8u + reg) * 4u));
+         if (warp_imm8(v, &rot, &i8))
+            e_dp_imm(c, CC_AL, OP_ADD, 0, 0, 0, v);
+         else if (warp_imm8((uae_u32)(-(uae_s32)v), &rot, &i8))
+            e_dp_imm(c, CC_AL, OP_SUB, 0, 0, 0, (uae_u32)(-(uae_s32)v));
+         else {
+            e_const(c, 1, v);
+            e_dp_reg(c, CC_AL, OP_ADD, 0, 0, 0, 1, 0, 0);
+         }
+         e_str(c, 0, R_REGS, (int)((8u + dst) * 4u));
+         c->last_ipc = pc; c->last_restart = 1;
+         return 4;
+      }
+      if (mode != 7u) return 0;                 /* Dn, An, (An)+, -(An): not legal EAs   */
+      if (reg == 0u) {                          /* (xxx).W                               */
+         ea  = (uae_u32)(uae_s32)(uae_s16)warp_iword(c, pc + 2);
+         len = 4;
+      } else if (reg == 1u) {                   /* (xxx).L                               */
+         uae_u32 hi = (uae_u32)warp_iword(c, pc + 2);
+         uae_u32 lo = (uae_u32)warp_iword(c, pc + 4);
+         ea  = (hi << 16) | lo;
+         len = 6;
+      } else if (reg == 2u) {                   /* d16(PC) -- a COMPILE-TIME constant    */
+         /* The base is the address of the EXTENSION WORD, pc + 2, which is what
+          * m68k_getpc() reads after the opcode fetch. M-LEA-PCBASE uses pc instead: two
+          * bytes wrong, on a family that writes an address register and sets no flag, so
+          * nothing but the differential's register compare can see it. */
+         uae_u32 d = (uae_u32)(uae_s32)(uae_s16)warp_iword(c, pc + 2);
+         ea  = (WARP_MUTANT(Z3660_WARP_MUT_LEA_PCBASE) ? pc : (pc + 2u)) + d;
+         len = 4;
+      } else {
+         return 0;                              /* d8(An,Xn) and d8(PC,Xn): refused      */
+      }
+      e_const(c, 0, ea);
+      e_str(c, 0, R_REGS, (int)((8u + dst) * 4u));
+      c->last_ipc = pc; c->last_restart = 1;
+      return len;
+   }
+
+   /* ---------------------------------------- CLR (M1a tranche 2, T2) ---------------- */
+   /* Dn ONLY. A memory destination is a memory-DESTINATION family, and round 5 declares
+    * that whole class out of scope with a statement rather than a build (§0.14.8).
+    * sz == 3 is MOVE from CCR on the 68010 and up.
+    *
+    * CLR's flags are a constant: N = 0, Z = 1, V = 0, C = 0, and X is UNAFFECTED. So the
+    * flag word is a literal rather than something read back out of the CPSR, which is the
+    * only shape in generation one that never touches MRS at all. */
+   if ((op & 0xFF00u) == 0x4200u) {
+      unsigned mode = (op >> 3) & 7u;
+      unsigned reg  = op & 7u;
+      sz = (op >> 6) & 3u;
+      if (sz == 3u)         return 0;
+      if (mode != EA_DREG)  return 0;
+      e_dp_imm(c, CC_AL, OP_MOV, 0, 2, 0, 0);
+      if (sz != W_SZ_L)
+         e_ldr(c, 0, R_REGS, (int)(reg * 4u));    /* .B/.W leave the upper bits alone     */
+      e_put_reg(c, reg, sz, 2, 0, 3);
+      e_const(c, 12, WARP_MUTANT(Z3660_WARP_MUT_CLR_FLAG) ? 0x00000000u
+                                                          : 0x40000000u);
+      e_str(c, 12, R_CTX, (int)CTX_NZCV);
       c->last_ipc = pc; c->last_restart = 1;
       return 2;
    }
@@ -1857,7 +2160,9 @@ extern "C" unsigned z3660_warp_run(unsigned idx, unsigned way)
     * than a 64-bit increment. Non-zero z3660_warp_entered() is what a lean capture reads
     * back to prove the engine was armed; WARP_BLK is the same quantity in the profiling
     * build's counter block. They cannot disagree because they are the same increment. */
+#if !Z3660_WARP_ABL_NO_ATTEST
    if (++warp_blk_lo == 0) warp_blk_hi++;
+#endif
    WARP_STAT(Z3660_WARP_STAT_BLK);
    Z3660_PROF_CNT(Z3660_PROF_C_WARP_BLK);
 
@@ -1909,6 +2214,23 @@ extern "C" unsigned z3660_warp_run(unsigned idx, unsigned way)
       WARP_STAT_ADD(Z3660_WARP_STAT_BAILST, 1);
       Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL);
       Z3660_PROF_CNT_ADD(Z3660_PROF_C_WARP_BAIL_ST, 1);
+
+      /* ROUND 5'S ATTRIBUTION (§0.14.2), AND IT COSTS ONE COMPARE ON A PATH THAT ALREADY
+       * READS `len`. The zero-retirement population is 99.994 % of every bail round 4
+       * measured, and it has exactly two members: a cached DECLINE STUB, whose compiled span
+       * is zero because the engine refused this head and remembers; and a REAL block that
+       * declined at its first faultable site. Nothing else can reach here -- which is why
+       * BAIL_OTHER is pre-registered at zero rather than given a band. */
+      if (s->len[way] == 0) {
+         WARP_STAT(Z3660_WARP_STAT_BAILSTUB);
+         Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_STUB);
+      } else if (n < (unsigned)s->len[way]) {
+         WARP_STAT(Z3660_WARP_STAT_BAILMEM);
+         Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_MEM);
+      } else {
+         WARP_STAT(Z3660_WARP_STAT_BAILOTHER);
+         Z3660_PROF_CNT(Z3660_PROF_C_WARP_BAIL_OTHER);
+      }
    }
 
    /* AFTER A BLOCK THAT RETIRED SOMETHING, the exit pc is a head candidate whatever it is:
@@ -2017,9 +2339,24 @@ extern "C" int z3660_warp_armed(void) { return z3660_warp_on; }
 
 extern "C" unsigned long long z3660_warp_entered(void)
 {
+#if Z3660_WARP_ABL_NO_ATTEST
+   return 0ULL;   /* L-ATT ablated: the counter is not incremented, so it cannot be read */
+#else
    return ((unsigned long long)warp_blk_hi << 32) | (unsigned long long)warp_blk_lo;
+#endif
 }
 
+/* THE ABLATION KIT'S L-WTST LAYER (§0.14.1). The on-target self-test, its seventeen family
+ * corpora and the ARM word executor they are the only on-target consumer of, all removed
+ * together -- because removing the test while leaving the executor linked would ablate the
+ * name rather than the code. The HOST harness keeps both unconditionally: the executor is the
+ * ONLY way an x86-64 harness can run an emitted ARM word at all (§0.8.5), so ablating it
+ * there would delete the oracle rather than a layer of the image.
+ *
+ * Its predicted contribution is ~0 -- it is cold code that never executes on a disarmed pass
+ * -- and that prediction is the point: a layer with a predicted zero and a measured non-zero
+ * would say the cost is LAYOUT rather than work, which is exactly what the kit is for. */
+#if !Z3660_WARP_ABL_NO_SELFTEST || defined(HOST_TEST_HARNESS)
 /* ==================================================================================== */
 /* ================= THE ARM WORD EXECUTOR -- THE DATA-SIDE ORACLE ==================== */
 /* ==================================================================================== */
@@ -2229,6 +2566,34 @@ static unsigned warp_host_exec(const uae_u32 *code, void *regbase, void *rd, voi
           * flag wrongly turns every future divergence in that flag into a false alarm or, far
           * worse, hides a real one. */
          if (isimm) b = warp_arm_imm(w);
+         else if (w & (1u << 4)) {
+            /* A REGISTER-SPECIFIED SHIFT, and round 5's register-count shift family is the
+             * first emitter that produces one (§0.14.3 T4). ARM takes the amount from the LOW
+             * BYTE of Rs and its rules at the boundaries are exactly the 68k's for any count
+             * >= 1 -- which is what makes T4 the immediate body plus one tail rather than
+             * eighteen new emitters. Modelling them wrongly here would turn every count-32
+             * divergence into a false alarm, which is §0.13.5's lesson about the shifter
+             * carry, one round later and one flag over. */
+            unsigned rm = w & 0xFu, st = (w >> 5) & 3u, rs = (w >> 8) & 0xFu;
+            uae_u32 bv = (uae_u32)m.r[rm];
+            unsigned amt = (unsigned)((uae_u32)m.r[rs] & 0xFFu);
+            if (amt == 0) { b = bv; }                  /* value AND carry both untouched   */
+            else if (st == 0) {                        /* LSL                              */
+               b = (amt < 32u) ? (bv << amt) : 0u;
+               carry = (amt <= 32u) ? (int)((bv >> (32u - amt)) & 1u) : 0;
+            } else if (st == 1) {                      /* LSR                              */
+               b = (amt < 32u) ? (bv >> amt) : 0u;
+               carry = (amt <= 32u) ? (int)((bv >> (amt - 1u)) & 1u) : 0;
+            } else if (st == 2) {                      /* ASR                              */
+               b = (amt < 32u) ? (uae_u32)(((uae_s32)bv) >> amt)
+                               : (uae_u32)(((uae_s32)bv) >> 31);
+               carry = (int)((bv >> ((amt < 32u) ? (amt - 1u) : 31u)) & 1u);
+            } else {                                   /* ROR                              */
+               unsigned r5 = amt & 31u;
+               b = r5 ? ((bv >> r5) | (bv << (32u - r5))) : bv;
+               carry = (int)((bv >> (r5 ? (r5 - 1u) : 31u)) & 1u);
+            }
+         }
          else {
             unsigned rm = w & 0xFu, st = (w >> 5) & 3u, sh = (w >> 7) & 0x1Fu;
             uae_u32 bv = (uae_u32)m.r[rm];
@@ -2257,6 +2622,8 @@ static unsigned warp_host_exec(const uae_u32 *code, void *regbase, void *rd, voi
          case OP_EOR: res = a ^ b; break;
          case OP_SUB: res = a - b; carry = (a >= b);
                       ovf = (((a ^ b) & (a ^ res)) >> 31) & 1; break;
+         case OP_RSB: res = b - a; carry = (b >= a);   /* round 5: the ASL clamp's 31 - c  */
+                      ovf = (((b ^ a) & (b ^ res)) >> 31) & 1; break;
          case OP_ADD: res = a + b; carry = (res < a);
                       ovf = ((~(a ^ b) & (a ^ res)) >> 31) & 1; break;
          case OP_TST: res = a & b; break;
@@ -2470,6 +2837,30 @@ static const uae_u16 warp_st_imm[]   = { 0x0680, 0x0000, 0x0010,   /* ADDI.L #16
                                          0x0202, 0x000F,           /* ANDI.B #15,D2        */
                                          0x0C83, 0x0000, 0x0001 }; /* CMPI.L #1,D3         */
 
+/* ---- M1a TRANCHE 2 (§0.14.3). EVERY ONE OF THESE IS REGISTER-ONLY, so for the first time
+ * since round 2 an entire tranche is coverable ON TARGET -- LEA's accepted modes read no
+ * memory (the effective address IS the operand), and CLR Dn, EXT/EXTB and the register-count
+ * shifts touch none. None of them emits a `blx`, which is what the self-test refuses. */
+static const uae_u16 warp_st_lea[]   = { 0x43D0,             /* LEA (A0),A1              */
+                                         0x45E8, 0x0004,     /* LEA 4(A0),A2             */
+                                         0x47E8, 0xFFF8,     /* LEA -8(A0),A3            */
+                                         0x49F8, 0x1234,     /* LEA ($1234).W,A4         */
+                                         0x4BF9, 0x0012, 0x3456,   /* LEA ($123456).L,A5 */
+                                         0x4DFA, 0x0010 };   /* LEA 16(PC),A6            */
+static const uae_u16 warp_st_clr[]   = { 0x4280, 0x4241, 0x4202, 0x4283 };
+                                         /* CLR.L D0, CLR.W D1, CLR.B D2, CLR.L D3       */
+static const uae_u16 warp_st_ext[]   = { 0x4880, 0x48C1, 0x49C2, 0x4883 };
+                                         /* EXT.W D0, EXT.L D1, EXTB.L D2, EXT.W D3      */
+/* The register-count forms, and the corpus is chosen for the BOUNDARIES rather than for
+ * coverage of the encoding: D1 is the count in each, and warp_st_seed() gives every register
+ * a different value, so the counts these actually run at are whatever the seed produces --
+ * the boundary cases are proven exhaustively in the HOST harness (G-R5.5) and this family's
+ * job is the one thing the host cannot do, which is run the emitted words on the silicon. */
+static const uae_u16 warp_st_shreg[] = { 0xE3A8,             /* LSL.L D1,D0              */
+                                         0xE22A,             /* ASR.B D1,D2              */
+                                         0xE36B,             /* ROL.W D1,D3              */
+                                         0xE2AC };           /* LSR.L D1,D4              */
+
 struct warp_st_case { const uae_u16 *w; unsigned n; };
 
 #define WARP_ST_CASE(a)  { (a), (unsigned)(sizeof (a) / sizeof (a)[0]) }
@@ -2566,11 +2957,15 @@ static const struct warp_st_case warp_st_f7[] = { WARP_ST_CASE(warp_st_db0),
                                                   WARP_ST_CASE(warp_st_db2) };
 static const struct warp_st_case warp_st_f8[] = { WARP_ST_CASE(warp_st_multi) };
 static const struct warp_st_case warp_st_f9[] = { WARP_ST_CASE(warp_st_decl) };
-#define WARP_ST_FAMILIES 13u
+#define WARP_ST_FAMILIES 17u
 static const struct warp_st_case warp_st_f10[] = { WARP_ST_CASE(warp_st_moveq) };
 static const struct warp_st_case warp_st_f11[] = { WARP_ST_CASE(warp_st_tst) };
 static const struct warp_st_case warp_st_f12[] = { WARP_ST_CASE(warp_st_shift) };
 static const struct warp_st_case warp_st_f13[] = { WARP_ST_CASE(warp_st_imm) };
+static const struct warp_st_case warp_st_f14[] = { WARP_ST_CASE(warp_st_lea) };
+static const struct warp_st_case warp_st_f15[] = { WARP_ST_CASE(warp_st_clr) };
+static const struct warp_st_case warp_st_f16[] = { WARP_ST_CASE(warp_st_ext) };
+static const struct warp_st_case warp_st_f17[] = { WARP_ST_CASE(warp_st_shreg) };
 
 extern "C" int z3660_warp_selftest(void)
 {
@@ -2614,6 +3009,10 @@ extern "C" int z3660_warp_selftest(void)
       pass += warp_st_family(11, "TST Dn and An",                   warp_st_f11, 1u, 0, &slot);
       pass += warp_st_family(12, "shifts and rotates, immediate count", warp_st_f12, 1u, 0, &slot);
       pass += warp_st_family(13, "immediate ALU ADDI SUBI ANDI CMPI",   warp_st_f13, 1u, 0, &slot);
+      pass += warp_st_family(14, "LEA (An), d16(An), abs.W/.L, d16(PC)", warp_st_f14, 1u, 0, &slot);
+      pass += warp_st_family(15, "CLR Dn",                              warp_st_f15, 1u, 0, &slot);
+      pass += warp_st_family(16, "EXT.W / EXT.L / EXTB.L",              warp_st_f16, 1u, 0, &slot);
+      pass += warp_st_family(17, "shifts and rotates, REGISTER count",  warp_st_f17, 1u, 0, &slot);
    }
 
    /* R6 / Q5 condition 2 / Q6's decision rule -- the compile-cycles-per-block bracket
@@ -2684,6 +3083,10 @@ extern "C" int z3660_warp_selftest(void)
                 (unsigned long)(warp_bad_pubrange - pr0));
    return 0;
 }
+
+#else /* Z3660_WARP_ABL_NO_SELFTEST -- the whole block above leaves the image */
+extern "C" int z3660_warp_selftest(void) { return 0; }
+#endif
 
 /* ---------------------------------------------------------------- harness door ------- */
 

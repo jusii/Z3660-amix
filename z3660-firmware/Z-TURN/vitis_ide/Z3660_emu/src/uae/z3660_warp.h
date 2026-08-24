@@ -71,6 +71,8 @@
 #ifndef SRC_UAE_Z3660_WARP_H_
 #define SRC_UAE_Z3660_WARP_H_
 
+#include "z3660_warp_ablate.h"
+
 /* ---- Mailbox word values (SHARED.warp_on, 0xFFFF00F0) -------------------------------
  *
  * THE POLARITY IS THE OPPOSITE OF blk_chunk / dopc_on / dfast_on, ON PURPOSE, and it is
@@ -338,7 +340,18 @@ struct z3660_warp_gate_s {
    unsigned last_pc;    /* the previously dispatched pc -- the control-transfer test     */
 };
 extern struct z3660_warp_gate_s z3660_warp_gate;
+/* THE ABLATION KIT'S L-REG LAYER (§0.14.1). At level 4 and above the flag leaves
+ * `struct regstruct` and becomes a plain global again, which puts the displacement of every
+ * member after it back where it sat before round 4 -- 7 899 function bodies by §0.13.3's
+ * census. It is paired with L-HOOK ON PURPOSE: with the hook gone nothing on the disarmed
+ * path reads the flag at all, so A3 and A4 are DYNAMICALLY IDENTICAL and their difference is
+ * layout and nothing else. */
+#if Z3660_WARP_ABL_NO_REGFIELD
+extern int z3660_warp_on_g;
+#define z3660_warp_on       z3660_warp_on_g
+#else
 #define z3660_warp_on       (regs.warp_on)
+#endif
 #define z3660_warp_last_pc  (z3660_warp_gate.last_pc)
 
 /* Arm/disarm from a RAW mailbox value, run through z3660_warp_resolve() so a console
@@ -353,6 +366,18 @@ extern struct z3660_warp_gate_s z3660_warp_gate;
  * acquisition on every arm rather than latching a first failure, which is round 1's own
  * known gap: an engine that asked for the arena before the classic JIT had released it
  * stayed permanently declined for the rest of the boot. */
+#if Z3660_WARP_ABL_NO_ENGINE
+/* ABLATION LEVEL 5: z3660_warp.cpp is filtered out of the source list entirely, so the
+ * emitter, the block table, the code-cache arena, the self-test and the ARM word executor
+ * are not in the image at all. What remains outside that translation unit is the console
+ * knob's own once-per-poll bookkeeping, and it gets inline no-ops rather than an #if around
+ * each of its four call sites -- a cold empty inline costs nothing, and threading five
+ * conditionals through a poll loop to save it would change more than it measured. */
+static __inline__ unsigned z3660_warp_arm(unsigned requested) { (void)requested; return 0u; }
+static __inline__ int      z3660_warp_armed(void)             { return 0; }
+static __inline__ int      z3660_warp_selftest(void)          { return 0; }
+static __inline__ unsigned long long z3660_warp_entered(void) { return 0ULL; }
+#else
 unsigned z3660_warp_arm(unsigned requested);
 int      z3660_warp_armed(void);
 
@@ -383,6 +408,7 @@ int      z3660_warp_selftest(void);
  * in round 2 it is paid ONCE PER BLOCK rather than once per guest instruction, which is
  * where "bind the attestation where it costs nothing" actually lands. */
 unsigned long long z3660_warp_entered(void);
+#endif /* Z3660_WARP_ABL_NO_ENGINE */
 
 /* The out-of-line arms of the run-loop hook. The STEADY-STATE path -- lookup hit, enter,
  * return -- is inlined at the call site below; these are the arms that are allowed to cost
@@ -594,7 +620,17 @@ unsigned long long z3660_warp_stat(int which);
 #define Z3660_WARP_STAT_DISCEV   17   /* discard-all EVENTS -- round 4's churn split       */
 #define Z3660_WARP_STAT_DISCATC  18   /* ... blocks lost at PFLUSH / PFLUSHA               */
 #define Z3660_WARP_STAT_DISCCPUSH 19  /* ... blocks lost at CPUSHL / CINV                  */
-#define Z3660_WARP_STAT_COUNT    20
+/* Round 5's bail attribution (§0.14.2), mirroring prof ids 64..68 so the harness can assert
+ * the two identities before any card is booked:
+ *     BAIL      == BAILSTUB + BAILMEM + BAILOTHER
+ *     BAILMEM   == BAILFENCE + BAILVERD
+ *     BAILOTHER == 0 */
+#define Z3660_WARP_STAT_BAILSTUB  20  /* a cached decline stub executed                    */
+#define Z3660_WARP_STAT_BAILMEM   21  /* a real block bailed -- a memory-helper decline    */
+#define Z3660_WARP_STAT_BAILFENCE 22  /* ... at the align / page-cross fence               */
+#define Z3660_WARP_STAT_BAILVERD  23  /* ... at the verdict table                          */
+#define Z3660_WARP_STAT_BAILOTHER 24  /* neither. Pre-registered at zero                   */
+#define Z3660_WARP_STAT_COUNT    25
 
 void z3660_warp_stats_zero(void);
 /* Lower the code cache's usable size so the eviction path can be reached without emitting
@@ -647,7 +683,31 @@ void z3660_warp_set_cache_limit(unsigned bytes);
 #define Z3660_WARP_MUT_AUTO_BYTEINC 22  /* -(A7)/(A7)+ at byte size steps by 1, not 2     */
 #define Z3660_WARP_MUT_AUTO_ORDER   23  /* the auto-adjust write-back emitted BEFORE the
                                          * access -- the defect §0.12.2 forbids           */
-#define Z3660_WARP_MUT_COUNT        24
+/* M1a TRANCHE 2's arms (§0.14.3). One per new family and one per new DECISION, which is the
+ * standing rule -- a family arm proves the emitter was exercised, a decision arm proves the
+ * decision was load-bearing. */
+#define Z3660_WARP_MUT_SHIFTREG_ZERO   24  /* the count==0 tail dropped, so a zero count
+                                            * keeps the shift's own C instead of clearing it
+                                            * and takes N/Z at the wrong width             */
+#define Z3660_WARP_MUT_SHIFTREG_MOD    25  /* the count masked with 31 instead of 63 -- the
+                                            * 68k takes the count register MOD 64, and this
+                                            * makes a count of 32 behave as a count of 0   */
+#define Z3660_WARP_MUT_SHIFTREG_XZERO  26  /* X written even on a zero count, which is the
+                                            * one thing a zero count must not do           */
+#define Z3660_WARP_MUT_ASLREG_CLAMP    27  /* ASL's variable-width overflow test loses its
+                                            * clamp at 31, so every count above 31 reads an
+                                            * ARM shift by a byte value it never meant     */
+#define Z3660_WARP_MUT_LEA_PCBASE      28  /* LEA d16(PC) bases on pc, not pc+2 -- two bytes
+                                            * wrong on a family that sets no flag at all   */
+#define Z3660_WARP_MUT_CLR_FLAG        29  /* CLR leaves Z clear instead of setting it     */
+#define Z3660_WARP_MUT_EXT_WIDTH       30  /* EXT.W writes the WHOLE register instead of its
+                                            * low half. Its FLAG width is deliberately not
+                                            * the arm: on a sign-extended byte, bit 15 and
+                                            * bit 31 are the same bit, so reading the flags
+                                            * at the wrong width is unobservable for every
+                                            * operand that exists -- an arm for it could
+                                            * only report CAUGHT-shaped silence            */
+#define Z3660_WARP_MUT_COUNT        31
 void z3660_warp_set_mutant(int which);
 /* The mutant word itself, because z3660_warp_step() is INLINED into the run loop and
  * M-XFER lives inside it. In no firmware binary: the whole block is behind
