@@ -29,13 +29,25 @@
  *          `regstruct` field                A3->A4 = STRUCT DISPLACEMENT, ALONE
  *     5    the engine entirely              A0->A5 = closure
  *
- * A3 AND A4 ARE DYNAMICALLY IDENTICAL. With the hook gone nothing on the disarmed path reads
- * the flag at all, so the only difference between those two images is where every member
- * after `warp_on` sits in `struct regstruct` -- 7 899 function bodies by §0.13.3's census.
- * That is the cleanest layout measurement this campaign can construct, and it is why the
- * field is not offered as an independent removal: taking it out while leaving the hook in
- * would put the flag back in a standalone global, which is round 3's arrangement and a
- * different change rather than an ablation.
+ * ROUND 6 CHANGED WHAT LEVELS 3 AND 4 MEAN, AND IT CHANGED IT BY MAKING THEM UNNECESSARY.
+ * The kit's own measurement (§0.16.2) attributed 1.967 pp to L-HOOK and 0.929 pp to L-REG,
+ * and §0.17.1 removed both from the shipping image: the run loop is now instantiated TWICE
+ * (newcpu_mmu040_body.h) so a disarmed image runs a loop with no hook compiled in, and
+ * `warp_on` moved to the END of `struct regstruct` so no existing member's displacement
+ * moves. So on a post-fix tree:
+ *
+ *   - level 3 no longer removes a cost from the disarmed path -- there is none to remove.
+ *     What it removes now is the HOOKED loop, i.e. the ability to arm at all.
+ *   - level 4's field removal moves nothing, because a member appended after the last one
+ *     changes no other member's offset.
+ *
+ * THE EDGES A0->A3 AND A3->A4 ARE THEREFORE PREDICTED TO COLLAPSE INTO THE NOISE FLOOR,
+ * which turns the kit into the fix's own verifier (§0.17.3 G-R6.10). Levels 1, 2 and 5 are
+ * unchanged and are the three a re-measurement session actually needs: the control, the
+ * floor, and closure.
+ *
+ * The pre-fix reading is kept above, byte-untouched, because it is what §0.14.1
+ * pre-registered and §0.16.2 scored.
  *
  * NO VARIANT EXCEPT LEVEL 0 IS EVER A CANDIDATE TO SHIP. Level 0 must also be byte-for-byte
  * what the tree builds with this file's flags absent entirely -- gate G-R5.10 -- so that the

@@ -103,23 +103,6 @@ struct regstruct
 	uae_u32 instruction_pc;
 	uae_u32 trace_pc;
 
-	/* THE WARP ARM FLAG, AND IT LIVES HERE FOR A MEASURED REASON (docs/WARP-ENGINE.md
-	 * S0.12.1). The 040 run loop keeps &regs in a callee-saved register across the whole
-	 * dispatch -- it reads pc, pc_p and pc_oldp and writes instruction_pc on every pass --
-	 * so a flag inside this struct is ONE load off a base that is already live and a cache
-	 * line that is already hot. As a standalone global it was two SERIALLY DEPENDENT loads
-	 * (the literal-pool address, then the flag) issued the instant the interpreter's
-	 * handler returned, with nothing to hide either latency behind: 4 instructions costing
-	 * 2.17 cycles each against round 1's 5 costing 0.97, which is the whole of the
-	 * unexplained -4.056 % disarm penalty. Read and written ONLY through
-	 * z3660_warp_on / z3660_warp_arm(). */
-	/* ABLATION L-REG (§0.14.1): at level 4 and above the field leaves the struct and every
-	 * member below it moves back to its pre-round-4 displacement. Paired with L-HOOK, so the
-	 * two images that differ by this line are otherwise DYNAMICALLY IDENTICAL. */
-#if !Z3660_WARP_ABL_NO_REGFIELD
-	int warp_on;
-#endif
-
 	uae_u16 irc, ir;
 	volatile uae_atomic spcflags;
 	uae_u32 chipset_latch_rw;
@@ -204,7 +187,42 @@ struct regstruct
 	uintptr cache_tags;
 
 #endif
+
+	/* THE WARP ARM FLAG, AND IT IS THE LAST MEMBER FOR A MEASURED REASON
+	 * (docs/WARP-ENGINE.md S0.17.1). It has to be IN this struct: the 040 run loop keeps
+	 * &regs in a callee-saved register across the whole dispatch -- it reads pc, pc_p and
+	 * pc_oldp and writes instruction_pc on every pass -- so a flag inside it is ONE load
+	 * off a base that is already live and a line that is already hot. As a standalone
+	 * global it was two SERIALLY DEPENDENT loads with nothing to hide either latency
+	 * behind (S0.12.1), which is the arrangement round 3 measured at -4.056 %.
+	 *
+	 * AND IT HAS TO BE LAST. Round 4 put it after trace_pc, at offset 96, which moved the
+	 * displacement of every member below it and re-encoded 7 910 function bodies -- 31.5 %
+	 * of the image -- while changing nothing whatever about what the code does. The
+	 * ablation kit priced that layer, L-REG, at 0.929 pp of the 3.445 pp dormant tax
+	 * (S0.16.2). Appended after the last existing member, NO existing displacement moves
+	 * and the layer costs nothing, while the load is still ldr rX,[rN,#imm12].
+	 *
+	 * THE imm12 RANGE IS THE ONE THING THAT COULD UNDO THIS BY ACCIDENT -- past 4 095 the
+	 * compiler goes back to materialising an address, which is round 3's shape again -- so
+	 * it is asserted at build time rather than watched for. Read and written ONLY through
+	 * z3660_warp_on / z3660_warp_arm().
+	 *
+	 * ABLATION L-REG (S0.14.1): at level 4 and above the field leaves the struct and
+	 * becomes a plain global again. Post-fix that edge moves nothing, which is what makes
+	 * it the fix's own negative control (S0.17.3 G-R6.10). */
+#if !Z3660_WARP_ABL_NO_REGFIELD
+	int warp_on;
+#endif
 };
+
+#if !Z3660_WARP_ABL_NO_REGFIELD && defined(__cplusplus)
+/* G-R6.9. A member added below warp_on would push it out of ldr's immediate range and
+ * silently reintroduce the address materialisation S0.12.1 measured; a member added above
+ * it is free, which is the entire point of the field being last. */
+static_assert(__builtin_offsetof(struct regstruct, warp_on) < 4096,
+              "regs.warp_on must stay within ldr's imm12 -- keep it the LAST member");
+#endif
 
 extern struct regstruct regs;
 
