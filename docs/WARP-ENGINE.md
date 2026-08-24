@@ -4,6 +4,21 @@
 card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 185 dhrystones
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
+> ## **STATUS: `M1 CLOSED — PARKED AT GENERATION-ONE SCOPE`, by user decision 2026-08-24.**
+>
+> Six rounds, five metal sessions, **zero correctness failures**, and **no verdict in either
+> direction** — the kill line's 60 % coverage precondition was never met, so §0.2's kill line
+> is **armed, unfired and uncleared**. The armed row rose **5 301 → 7 185 → 7 536 → 7 563**
+> dhrystones — each against its own session's reference, **0.8778× → 0.92432× → 0.92401×** —
+> and never crossed 1.0×; coverage topped out at **20.26 %** against the 60 % bar. **Round 6
+> landed the dormant-tax fix**
+> (§§0.17 – 0.18), so the engine now ships **compiled in, disarmed, and — on every static
+> measure — free**: the disarmed run loop is instruction-for-instruction the loop of an image
+> built with no engine at all, and the `struct regstruct` layout term collapsed from **7 912
+> changed function bodies to 466**, the toolchain's own ambient churn. **Nothing was flashed;
+> the card's standing image is unchanged.** §0.19 is the park: what it preserves, and what
+> reopening would require — **an `E`-round before any new families**.
+
 **Status:** `M0 DONE`, **`M1 round 1 DONE`** — the grill ran on **2026-08-23** and every question
 in §7 is answered; the metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with
 the §1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1
@@ -22,8 +37,10 @@ correction marked.
 **`docs/warp-gen2-prospectus.md`** prices the M1 fork — park generation one, or fund a generation
 two — as scenarios against the R5 metal rows, now scored in full at **§0.16**. It is a paper
 instrument, it carries no recommendation, and it scores nothing here: no number in this document
-is moved by it. **The fork itself is with the user** — this document names the row and prices the
-scenarios; it decides nothing.
+is moved by it. **The fork itself was with the user, and it was ruled on 2026-08-24: `PARK + TAX
+FIX`** — the prospectus's §8 row 2. Round 6 landed the fix and §0.19 is the park. The prospectus
+still decides nothing and still scores nothing; it priced the options and the choice was made
+outside it, which is what its §9 says must happen.
 
 **Status-ledger convention:** every item is `TODO` / `IN PROGRESS` / `DONE` / `GATED(<on what>)`,
 as in `docs/AMIX.md` and the C2 rung docs. This document is the tracker for the project; it is
@@ -4232,6 +4249,191 @@ that it cannot be written after the number.
 6. **Everything §0.8.8, §0.10.7, §0.11.7, §0.12.8, §0.13.6, §0.14.9 and §0.15.7 said would not
    be established**, unchanged — including the memory-touching families on silicon (§0.15.7
    item 4), the indexed `LEA` modes, and `z3660_warp_run`'s preamble.
+
+
+## 0.18 M1 round 6 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.17 was committed at `bed3e41`, before the first line of round-6
+code; the implementation commits follow it in this repository's log.** Every prediction in
+§0.17 is left byte-untouched above and scored beside itself.
+
+### 0.18.1 What was built
+
+| piece | where |
+|---|---|
+| **A** the loop body, extracted verbatim and included twice | `src/uae/newcpu_mmu040_body.h` (new), `src/uae/newcpu.cpp` |
+| **B** the selector, and `SPCFLAG_MODE_CHANGE` at the arm/disarm transition | `src/uae/newcpu.cpp` — `m68k_run_mmu040()`, `z3660_knobs_poll()` |
+| **C** `warp_on` moved to the end of `struct regstruct`, with the `imm12` `static_assert` | `src/uae/include/newcpu.h` |
+| **D** the ablation kit's post-fix meaning for levels 3 and 4 | `src/uae/z3660_warp_ablate.h` |
+| **E** `tools/warp-gate.sh` turned into a **build gate** that exits non-zero, wired into every core1 target | `tools/warp-gate.sh`, `vitis_ide/Makefile` |
+| — | **`z3660_blk_run` gets `always_inline`**, which was NOT in §0.17 and is there because §0.18.2 happened |
+| — | `docs/warp-objdiff.py` gains `--alias` / `--only` / `--self`, so a **renamed** function can be compared with the body it replaced |
+
+### 0.18.2 THE FINDING THE FIX PRODUCED ON ITS FIRST BUILD, AND IT IS AN INLINING ONE
+
+**Splitting the loop in two gave `z3660_blk_run` a second caller, and `-Os` immediately
+stopped inlining it.** Until round 6 that function had exactly ONE call site, so
+`-finline-functions-called-once` inlined it at no size cost — and **every image whose disarmed
+row this campaign has ever measured (`7A5EC595`, `5E2592EF`, `459E51A3`, `BBED0509`) carries it
+inlined into the run loop.** The first build of the fix put a call and a return on rung 0's
+recognizer path, in both loops:
+
+```
+   A4 459E51A3, the loop that measured 8 140 : calls uae_mmu040_get_iword x7, put_long x2,
+                                               z3660_blk_probe x2, flush_cpu_caches_040,
+                                               flush_mmu040, flush_icache, get_long ...
+   the fix, first build                      : calls z3660_blk_run.constprop.0  -- ONE call,
+                                               and every one of the above moved inside it
+```
+
+> ### **THIS IS §0.15.3's AMBIENT CHURN LANDING ON THE ONE PATH THE ROUND IS TRYING TO HOLD STILL.** *"Under `-Os -flto`, ANY change to this image re-decides inlining in about 460 function bodies"* — and a change that duplicates a large function re-decides them where it hurts. **The fix's entire verification is an A/B against A4's measured 8 140, and an A4 row is only a target if the image being compared to it has A4's loop.** So the inline is restored by `always_inline`, **by construction rather than by a heuristic whose input this round deliberately changed**, and the loop's call-target census then matches A4's exactly — same twelve targets, same multiplicities. It is recorded here rather than absorbed, because the next person to duplicate a hot function will meet it again.
+
+### 0.18.3 The two loops, read off the ELF
+
+```
+   selector m68k_run_mmu040        :   28 B   ldr / ldr / cmp / beq / b warp / b nowarp
+   disarmed m68k_run_mmu040_nowarp : 2100 B   NO GATE, and no z3660_warp symbol anywhere
+   armed    m68k_run_mmu040_warp   : 2184 B   ldr r3,[r4,#464] / cmp r3,#0 / beq
+                                              one load, off a live base, zero materialisations
+```
+
+**`sizeof(struct regstruct)` 464 → 472; `warp_on` is the last member, at displacement 464
+against the `imm12` limit of 4 095**, asserted at build time and printed by the gate.
+
+> ### **AND THE CLAIM THAT MATTERS IS EXACT: the shipping lean's disarmed run loop is normalised-IDENTICAL — 0 instruction differences — to the run loop in `BOOT-abl5`, an image built with the engine ENTIRELY ABSENT.** Not similar, not equivalent-modulo-a-gate: the same code, checked by `warp-objdiff.py --only` against all five ablation variants and coming back **0** on every one. The disarmed path of an image that can arm is, instruction for instruction, the path of an image that cannot.
+
+### 0.18.4 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R6.1** harness, three variants | `0 failed`; within ±40 of 3 334 / 3 330 / 3 561, same delta in default and lean | **3 334 / 3 330 / 3 561, `0 failed`** — delta **+0 / +0 / +0** | **HIT**, exactly. The first round whose count estimator was not wrong, because for once it predicted no change |
+| **G-R6.2** accept-set discriminator | engine == model gen 5; **18 368**; symmetric difference **0** | engine **18 368**, model **18 368**, **agree on 65 536 of 65 536**, 0 in both directions | **HIT** — the control held; no emitter moved |
+| **G-R6.3** sweep and differential | ≥ 108 000 pairs, **0** divergences | **110 208 pairs over 18 368 accepted opcodes, 0 divergences**; plus **1 080** shift-count pairs, 0 divergences | **HIT** |
+| **G-R6.4** lockstep, armed | `WARP_DIVERGE == 0` over ≥ 10⁸ | **0 over 100 000 000 guest instructions, 12 500 000 block executions, 100.0 % retired inside blocks** | **HIT — the unchanged-armed-semantics proof** |
+| **G-R6.5** `WARPTEST` | PASS 17/17, F1 64/64, **+0** range misses | **`PASS 17/17 families, 0 mismatches`**; F1 **64/64**, **+0** | **HIT** |
+| **G-R6.6** disarmed loop has no hook | no gate by shape, **no `z3660_warp_*` symbol at all**; armed loop has exactly one gate with one load; script exits non-zero on a violation | both halves clean on all eight builds; **and the guard was fired on purpose**: pointed at the hooked loop it printed both failures and **exited 1** | **HIT**, and the guard is demonstrated rather than asserted |
+| **G-R6.7** object equivalence with the row that measured 8 140 | `nowarp` **identical** to A4 `459E51A3`'s `m68k_run_mmu040`, **0** differences | **526 → 525 instructions, 2 104 → 2 100 B.** Difference in full: two spill slots swapped (`#44`↔`#52`, 6 of the 13 multiset entries, pure renaming), one basic-block reordering that folded a `b`+`bne` into a `beq` (**−1 instruction**), and one `mov r0,r3` → `ldr r0,[sp,#12]` on the `z3660_blk_probe` call. **Call-target census identical: same 12 targets, same multiplicities.** | **MISSED — and the miss is characterised to the instruction.** Three real differences, none on the per-dispatch path. See §0.18.6 |
+| **G-R6.8** the layout term is gone | ≤ 1 200 changed bodies, expected 400 – 700, against 7 910 | fixed lean vs A5 `BBED0509`: **466**. The same census on **R5's** lean vs its A5: **7 912** | **HIT, and inside the expected sub-band.** 7 912 → 466 is a **17× collapse** onto the ambient-churn class (457 / 459 / 462 / 464) |
+| **G-R6.9** the `regstruct` displacement | last member; no existing offset moves; **< 4 096**; plain `ldr`, zero materialisations | `warp_on` at **464**, `sizeof` 464 → 472, gate reads `ldr r3,[r4,#464]`; `static_assert` in `newcpu.h` | **HIT** |
+| **G-R6.10** the kit's `L-REG` edge is now null | A0′→A3 and A3→A4 collapse to the noise class | **A3→A4 = 9 changed bodies** (was **7 910**), with `.text` **identical** at 6 342 604 both. A0′→A1 455, A0′→A2 455, A0′→A3 458, A0′→A5 466 | **HIT, emphatically.** The edge that carried the layout term carries nine functions |
+| **G-R6.11** images | trio + five variants, CRCs, archive fires, ELF beside every BIN; `q2probe` untouched at `FCC0CB3F` | eight built from one tree after `clean-all`, all CRC-stamped, **ELF archived beside every one** (§0.18.5); `BOOT-q2probe.BIN` untouched at **`FCC0CB3F`** | **HIT** |
+| **G-R6.12** the gate runs on every build | invoked by `lean`/`bootbin`/`profile`/`abl%`, fails the build | wired via `warp_gate` in `vitis_ide/Makefile`; it ran on all eight core1 links in this round's own logs | **HIT** |
+
+**Eleven of twelve gates hit.** G-R6.7 is the miss, it is the one §0.17.2 named in advance as the
+thing this round was most likely to be wrong about, and §0.18.6 is what it costs.
+
+### 0.18.5 THE IMAGE MANIFEST — the matrix as rebuilt, before any metal row exists
+
+**All eight images built from one tree after `make -C Z3660_emu clean-all`, CRC-stamped, and
+archived with their core1 ELF beside them.**
+
+| variant | CRC-32 | image B | `.text` | `nowarp` | `warp` | `sizeof(regs)` |
+|---|---|---|---|---|---|---|
+| `BOOT.BIN` (default) | **`15A7FF0C`** | 12 680 188 | — | 2 100 | 2 184 | 472 |
+| **`BOOT-lean.BIN` — A0′, the shipping lean** | **`9AECF99D`** | 12 680 156 | 6 347 084 | **2 100** | **2 184** | 472 |
+| `BOOT-prof.BIN` | **`9D07C731`** | 12 696 700 | 6 371 700 | 1 276 | 1 340 | 472 |
+| `BOOT-abl1.BIN` − `L-WTST` | **`BFC9FC47`** | 12 680 108 | 6 342 228 | 2 100 | 2 184 | 472 |
+| `BOOT-abl2.BIN` − `L-ATT` (the floor) | **`E2C1FBC5`** | 12 680 156 | 6 347 020 | 2 100 | 2 184 | 472 |
+| `BOOT-abl3.BIN` − the hooked loop | **`82D6B35C`** | 12 680 116 | 6 342 604 | 2 100 | absent | 472 |
+| `BOOT-abl4.BIN` − that and the field | **`C8AAB523`** | 12 680 116 | 6 342 604 | 2 100 | absent | **464** |
+| `BOOT-abl5.BIN` − the engine entirely | **`BEC0D2AA`** | 12 663 644 | 6 326 472 | 2 100 | absent | 464 |
+| `BOOT-q2probe.BIN` | `FCC0CB3F` | 12 795 260 | **untouched**, as gated | — | — | — |
+
+**The second run loop's price, measured rather than estimated:** `.text` 6 344 904 (R5's A0) →
+**6 347 084**, **+2 180 B** on a 12.68 MB image, against §0.17.1's pre-registered `+2 104`-ish
+and §6.3's `L-WTST`-class **0.024 pp**. **Nothing was flashed.** The card's standing image is
+unchanged.
+
+> ### **AND THE ONE PROPERTY §0.15.2 PROVED ROUND 4 DID NOT HAVE IS CHECKED HERE RATHER THAN ASSUMED: `9AECF99D` IS WHAT ITS SOURCE BUILDS.** A `clean-all` and a rebuild from the committed tree produce a core1 ELF **byte-identical** to the archived `BOOT-lean-9AECF99D.elf`. Round 4 shipped an image whose source produces a different run loop, measured a penalty on it, rolled a card back on it, and needed a byte search on the artifact to find out. This round asked the question before booking anything, and `tools/warp-gate.sh` now asks it on every build.
+
+### 0.18.6 What G-R6.7's miss costs, stated rather than absorbed
+
+**The band in §0.17.2 is 63 dhrystones wide and the loop is not byte-identical to the one that
+measured 8 140.** Three real instruction differences survive the fix:
+
+1. **Two spill slots swapped.** `#44` ↔ `#52`. Six of the thirteen multiset entries, and it is
+   a renaming — same stores, same loads, same frame size.
+2. **One basic block reordered**, folding a `b` and a `bne` into a `beq`. The fixed loop is
+   **one instruction shorter** for it. This is on the decoded-op-cache miss path.
+3. **One `mov r0,r3` became `ldr r0,[sp,#12]`** — a register-allocation choice on the
+   `z3660_blk_probe` call, i.e. rung 0's MOVE-idiom probe, not the per-dispatch path.
+
+> ### **SO THE 8 140 ROW IS A TARGET, NOT A GUARANTEE, AND §0.17.2's DECISION RULE ALREADY SAYS WHAT TO DO ABOUT THAT.** Rule 4 is the live one: a row between 7 988 and 8 100 is a HIT on the class and a MISS on the band, reported as both. The static case for the fix does not rest on this gate — it rests on **G-R6.8's 7 912 → 466** and on the disarmed loop being **normalised-identical to the engine-free image's loop** (§0.18.3), both of which are exact. What G-R6.7 says is narrower and worth saying: *the fix reproduces A4's code, not A4's binary.*
+
+### 0.18.7 What round 6 leaves owed
+
+1. **Every metal row.** §0.17.2's bands are unmeasured. **Nothing was flashed and nothing is
+   proposed**; the disarmed band, the blessing class, the armed row and the boot window are
+   what a session would be scored against if the park is ever reopened for one.
+2. **The floor must be re-established in that session.** §0.17.2 rule 1: `A0′` against
+   `BOOT-abl2` `E2C1FBC5`, in the same session, before any edge is read.
+3. **Everything §0.15.7 and §0.17.4 left owed**, unchanged — the memory-touching families on
+   silicon, the indexed `LEA` modes, `z3660_warp_run`'s preamble, and the mechanism behind
+   `L-HOOK`'s 1.967 pp, which this round **removed without explaining**.
+
+
+## 0.19 M1 CLOSED — **PARKED AT GENERATION-ONE SCOPE**, by user decision 2026-08-24
+
+**The kill line never became entitled to fire, and that is the outcome rather than a gap.**
+§0.2 bound this plan to a pre-registered kill condition — *armed throughput at or below
+`R×(1+s)` once coverage clears 60 %* — and its **precondition was never met**: coverage
+measured **8.43 %**, **19.10 %** and **20.26 %** across three metal waves against a 60 % bar.
+§0.5.2's decision table has therefore read *"not a verdict in either direction"* for three
+consecutive waves, and it still does. **The plan is not being abandoned and it is not being
+vindicated. It is being parked with its instruments intact.**
+
+### 0.19.1 The final scorecard
+
+| | |
+|---|---|
+| **armed trend, four rounds** | **5 301 → 7 185 → 7 536 → 7 563** dhrystones, ending at **0.92401×** of round 5's same-session `R` = **8 185**. *Each row is quoted against its own session's reference and the ratios are the comparable quantity:* round 2's 5 301 is the **null-block** row — the entry sequence's arrival, in full, with no code generated — then **0.8778× → 0.92432× → 0.92401×**. **Rising, and it never crossed 1.0×** |
+| **coverage** | 8.43 % → 19.10 % → **20.26 %**. §0.14.8's honest reading stands: *generation one's frozen scope has a ceiling around a quarter of this workload, and the 60 % bar is a different engine, not three more families* |
+| **correctness** | **five metal sessions, zero correctness failures.** `WARPTEST` **17/17** on every image it was run on; `WARP_DIVERGE` **0** over 10⁸ retired instructions every round; `FAULTS(on) == FAULTS(off)` exactly (591 == 591); budget closure unattributed **0.000 %** against a ≤ 5 % gate; the accept set **18 368 opcodes** agreeing with its independent model on **65 536 of 65 536** words |
+| **the kill line** | **armed, never fired, never cleared.** Its precondition was unmet in every wave. §0.2's guard — *a miss at 20 % coverage is a bug report, not a verdict* — is what kept it holstered |
+| **the dormant tax** | measured at −3.445 %, **bisected** (§0.16.2), and **removed** (§0.18). The engine ships dormant and, on every static measure available without metal, **free** |
+| **what was refuted, in public** | three named mechanisms for the disarm residual — L1I footprint (§0.11.4), dependency depth (round 4), and the pre-registered favourite `L-REG` at 1.8 – 3.4 pp (§0.16.2, measured 0.929) — plus §0.13's memory-helper bail candidate, refuted at three digits |
+
+### 0.19.2 What the park preserves, and it is deliberately everything
+
+- **The engine ships**, compiled in, `WARP` unset = **OFF**, and the disarmed path is the
+  engine-free run loop instruction for instruction (§0.18.3).
+- **`WARPTEST` stays.** 17 families, the F1 alignment sweep, the mutation arms, the ARM word
+  executor. It is the on-target proof that an image *could* be armed safely, and it costs a
+  disarmed boot nothing.
+- **The accept set stays** — 18 368 opcodes, with `docs/warp-corpus.py` as its independent
+  model and the discriminator gate that compares them over all 65 536 words.
+- **The ablation kit stays**, and the fix turned it into its own verifier: levels 1, 2 and 5
+  are the control, the floor and closure that any re-measurement session needs, and levels 3
+  and 4 now read ~0 by construction (§0.18.4 G-R6.10).
+- **`tools/warp-gate.sh` stays, as a build gate.** The one thing a parked engine cannot
+  tolerate is silently growing a cost again; this refuses the build instead.
+- **The pre-registrations stay, unrewritten.** §§0.5 – 0.17 are the record of what was
+  predicted before each round, including the four times it was wrong.
+
+### 0.19.3 WHAT REOPENING REQUIRES — and the order is the finding
+
+**`docs/warp-gen2-prospectus.md` prices the alternatives and recommends none of them. Its own
+§9.1 is binding on any restart: this document's bands are not a pre-registration, and any
+funded scenario gets its own §0.17-style pre-registration first.** Beyond that, the
+prospectus's arithmetic says one thing loudly enough to record here:
+
+> ### **AN `E`-ROUND COMES FIRST, AND FAMILIES COME SECOND.** The prospectus's §8 closing row is explicit that *"funding families before funding `E` is the expensive order"*: at the measured block-entry cost `E` = 112 cycles, full G2c reaches a ceiling of **1.131×** and §1.5's first-generation band of **1.25× – 1.55×** is **out of reach at any coverage the document prices** — whereas `E` = 40 alone reaches **1.209×**, and `E` = 0 reaches **1.257×**. The gap between every model band and its own Amdahl ceiling is **950 – 1 790 dhrystones**, and the block-entry term is **71 – 85 %** of it. **A restart that adds families without first attacking `z3660_warp_run`'s preamble buys the cost and not the payoff.**
+
+And one nuance from §6.1 that a restart must carry rather than inherit silently: **the
+`L-HOOK` naming verdict rests on two bars and only one of them fires.** Half of A0's own
+same-session penalty is 1.7227 pp and `L-HOOK` measured 1.967 — it names the layer. Half of
+the *pre-registered* figure (round 4's −4.256 %) is 2.128 pp, and 1.967 **misses it by
+0.161 pp** against a floor of 0.513 pp. **The applied reading governs and the pre-registered
+one stands beside it, unrewritten** (§0.16.2). The fix targeted both layers regardless, which
+is why §6's pricing stands either way — but a restart that treats `L-HOOK` as a settled
+mechanism rather than as a named layer is reading more out of this campaign than it put in.
+
+### 0.19.4 The park's own status line
+
+> **`M1 PARKED`.** No further rounds are scheduled. The card's standing image is unchanged and
+> nothing from round 6 has been flashed. §0.17.2's metal bands are written, pre-registered and
+> unmeasured; if a session is ever bought, that is what it is scored against, and §0.18.7 is
+> the list of what it must re-establish first.
 
 
 ---

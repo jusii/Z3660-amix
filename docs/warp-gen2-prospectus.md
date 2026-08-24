@@ -709,9 +709,20 @@ flown in the pre-registered order A0, A2, A3, A4, A5, A1:
 1. **THE FLOOR** = |penalty(A0) − penalty(A2)| = **0.513 pp**, and it came out *negative* —
    removing 64 bytes of cold code made the image measurably **slower**. Nothing smaller than
    0.513 pp may ever be read as a mechanism.
-2. **A single edge recovering ≥ half of A0's own penalty names the mechanism.** Half of
-   3.4453 pp is **1.7227 pp**. `L-HOOK`'s edge is **1.967 pp**. → **`L-HOOK` NAMES THE
-   MECHANISM. It carries 57.1 % of the dormant tax.**
+2. **A single edge recovering ≥ half the measured penalty names the mechanism — and there are
+   TWO BARS, so both are reported** (WARP-ENGINE.md §0.16.2, whose reading governs).
+   `L-HOOK`'s edge is **1.967 pp**, 57.1 % of A0's own 3.4453 pp.
+   - **APPLIED bar** — half of A0's **own same-session** penalty = **1.7227 pp**.
+     1.967 ≥ 1.7227 → **`L-HOOK` NAMES THE MECHANISM.**
+   - **PRE-REGISTERED bar** — §0.14.1 rule 2, byte-untouched, half of round 4's −4.256 % =
+     **2.128 pp**. 1.967 < 2.128, **short by 0.161 pp** → the pre-registered rule would have
+     read rule 3, *"distributed or emergent"*.
+
+   **The applied reading governs; the pre-registered figure stands beside it, unrewritten,
+   because the naming verdict rests on a 0.161 pp margin against a 0.513 pp floor** — and
+   saying so is the difference between an attribution and a claim. **§6.2's pricing is
+   unaffected either way**: the fix targets `L-HOOK` and `L-REG` as *layers*, both measured
+   above the floor, and it does not depend on either one being the mechanism.
 3. Not applicable — an edge cleared the bar.
 4. **A5's own penalty is −0.269 %, inside the 0.513 pp floor of zero.** → **the four named layers
    SPAN the cost.** Nothing outside them carries it.
