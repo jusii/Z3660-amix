@@ -9,10 +9,13 @@ in §7 is answered; the metal half ran the same day and **Q2 came back `TERMINAT
 the §1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1
 pre-registration**, the last of M0's seven items. **M1's first round shipped on 2026-08-24**: the
 engine's skeleton end to end with **no code generation at all** — §0.6 pre-registers it and §0.7
-scores it, and its one number is a *cost*, not a speed. **`M1 round 2 PRE-REGISTERED` — §0.8**,
-committed before the first line of round-2 code: the entry-cost work, the control-transfer-target
-discovery policy, the lookup-structure fix round 1's counters forced, and generation one's first
-compilers. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
+scores it, and its one number is a *cost*, not a speed. **`M1 round 2 DONE`** — §0.8
+pre-registers it and §0.9 scores it: the first round that generates code. The lookup structure that
+recompiled 3.07 million times is fixed and the fix is proven both statically and against its own
+mutation; the entry cost is amortised over real blocks and re-measured; and 7 616 opcodes are
+compiled and compared against the interpreter, instruction for instruction, over 10⁸ boundaries.
+Its numbers are still costs and static counts -- **round 2 takes no metal row, so the kill line
+cannot fire on it**. §0 is the freeze: it is the authority for everything below it, and where a §2 claim
 disagrees with §0's censuses, §0 wins and the §2 text has been corrected in place with the
 correction marked.
 
@@ -1815,6 +1818,201 @@ quantified it, so round 2 subtracts it:
    micro-benchmark that this round does not run.
 7. **That the A2 core0 reset wedge (§ MATRIX A2) has anything to do with WARP.** It is
    separately owned and it cost the round-1 session no row.
+
+
+## 0.9 M1 round 2 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.8 was committed at 02:06:31 on 2026-08-24; the first
+implementation commit follows it in this repository's log, which is what §3.4 asks of it** —
+round 1's pre-registration preceded its code by 32 minutes, the SPEC round's by 26 and the
+`f` round's by 29. Every prediction in §0.8 is left byte-untouched above and scored beside
+itself, `ifetch-fastpath.md`'s standard.
+
+### 0.9.1 What was built
+
+| piece | where |
+|---|---|
+| the contract — the gate struct, the 2048×4 hashed table, the block ABI, the ctx | `Z3660_emu/src/uae/z3660_warp.h` |
+| the **ARM emitter** — encodings, the one-kind exit, the bail arm | `Z3660_emu/src/uae/z3660_warp.cpp` |
+| **generation one's compilers** — MOVE/MOVEA, register ALU, ADDQ/SUBQ, ADDA/SUBA/CMPA, Bcc/BRA, DBcc | same file |
+| the **`jnf_MEM` replacement** — `z3660_warp_rd` / `z3660_warp_wr`, the verdict-table fast path plus every fence | same file |
+| the **host ARM-subset executor** — the harness runs the emitted words | same file, `HOST_TEST_HARNESS` only |
+| the inlined run-loop fast path, the pass-consuming arm, the cadence call-site early-out | `z3660_warp.h` + `newcpu.cpp` |
+| counter **id 60 `WARP_EVICT`**, `Z3660_PROF_C_COUNT` 60 → 61 | `z3660_prof.h`, `z3660_prof.cpp` |
+| the opcode sweep, the fault corpus, the conflict corpus, twelve mutation arms | `Z3660_emu/test/host/harness_main.cpp` |
+
+### 0.9.2 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R2.1** harness | green all three; **+120 … +400** in default, the **same** in lean, prof a further **+10 … +60** | green, `0 failed`: **3 280 / 3 276 / 3 507** against 3 250 / 3 246 / 3 473 — **+30 / +30 / +34**; default and lean gained the **same** number, prof a further **+4** | green; **count MISSED, low** (as round 1's did) |
+| **G-R2.2** disarmed object equivalence | **≤ 25** functions changed; `m68k_run_mmu040` **+40 … +160 bytes** | **21 changed of 25 135 common**, +18 new symbols and −1 (`z3660_warp_dispatch`, replaced by the inlined step plus `z3660_warp_discover`/`z3660_warp_run`); `m68k_run_mmu040` `0x914` → `0x9f4` = **2 324 → 2 548 B, +224** | changed-count **HIT**; growth **MISSED, high** |
+| **G-R2.3** lockstep identity | `WARP_DIVERGE == 0` over `≥ 10⁸`, executing the emitted words, arms byte-identical | **`WARP_DIVERGE = 0` over 100 000 000 guest instructions**, 12 500 000 block executions, **100 % of them retired inside blocks**, every 200 000-instruction chunk ending with the two arms in a byte-identical machine state; the armed arm executed the emitted ARM words through the harness's decoder | **HIT** |
+| **G-R2.4** counter identities | all exact, with `WARP_ENTER > 0` | all exact: `DOPC_HIT+DOPC_MISS == (INSNS − WARP_ENTER) + FAULTS` in both arms with **`WARP_ENTER` = 4 000**; the reconstruction `(INSNS − WARP_ENTER) + WARP_INSNS` closes against the disarmed `INSNS` exactly; `FAULTS`, `READ`, `WRITE`, `MISALIGN_R/W`, `DOPC_INVAL`, `sum(IV_*) − IV_WRAP` and all three `BLK_*` unchanged; `INSNS` **falls** (4 000 vs 32 000) | **HIT** |
+| **G-R2.5** fault injection | bail, never a fault inside a block; state byte-exact | both injections (an **unmapped page** and a **misaligned** access) retired exactly the four instructions before the faultable site and bailed there; `WARP_BAIL` 1, `WARP_BAIL_ST` 1, the decline raised by the **resolver** and not a stub; sixteen registers, pc, `instruction_pc`, CCR, X, `mmu_restart`, `mmufixup[0..1]` and the data page **byte-identical** to the interpreter after the same four instructions | **HIT** |
+| **G-R2.6** mutation arms | each caught and shown | **M-5**, **M-7**, **M-ICACHE**, **M-ARM**, **M-REPUB** still bite; **M-3** caught (bail pc 0040 0008 vs 0040 0000); **M-4** caught (violations >0 clean, 0 mutated); **M-8**/`BAILX` caught; **M-CONFLICT** caught (16 compiles → **1 600**, 0 evictions → **1 596**); **M-XFER** caught (1 compile → 4, 80 block executions → 200); **M-FENCE** caught (state diverges); and **one wrong-flag arm per covered family** — MOVE, ADD, SUB, CMP, Bcc, DBcc — **all six caught**. **M-VERDICT is REACHED but NOT CAUGHT** and it is recorded as an owed arm, not a passing one | **HIT with one named gap** |
+| **G-R2.7** images | three rebuilt, CRCs recorded, archive fires; `q2probe` not rebuilt | `BOOT.BIN` **`A8CEC0C5`** (was `9C7A2AD3`), `BOOT-lean.BIN` **`DBF9A5AF`** (was `E80D04EE`), `BOOT-prof.BIN` **`21464241`** (was `423CB391`); 12 795 284 / 12 795 268 / 12 828 132 B; all three archived CRC-stamped; `BOOT-q2probe.BIN` untouched at `FCC0CB3F` | **HIT** |
+| **G-R2.8** entry cost | disarmed **3**; armed non-target **3 … 6**; armed steady state **26 … 38 per BLOCK** | disarmed **5**; armed non-target **11**; armed per block **≈ 108** | **all three MISSED, high** — §0.9.3 |
+| **G-R2.9** state-sync | on-path **0**; bail-arm **2 … 4**; stores per bail **1 … 2** | on-path **0** ✔; bail-arm **8** (an exit is 8 or 10 words); `WARP_BAIL_ST / WARP_BAIL` = **1** | on-path **HIT**; bail-arm **MISSED, high**; stores per bail **HIT** (and it **MISSES §0.5.4's 3 … 8 LOW**, exactly as §0.8.4 predicted it would) |
+| **G-R2.10** the lookup fix | `WARP_COMPILE ==` distinct heads exactly; `WARP_EVICT == 0`; **> 0** under M-CONFLICT | **`WARP_COMPILE` = 16 == the 16 distinct heads, over 6 400 block executions**; `WARP_EVICT` = **0**; ratio **0.250 %**, inside the pre-registered ≤ 0.5 %; under M-CONFLICT **1 600 compiles and 1 596 evictions** | **HIT** |
+| **G-R2.11** block length | `WARP_INSNS / WARP_BLK` = **2.0 … 4.5** | **8.00 on the harness corpora** — which are written entirely inside generation one's scope and are therefore not a mix. **NOT MEASURED**: the prediction is about a representative instruction stream and only the verdict session has one | **UNMEASURED, prediction stands** |
+| **G-R2.12** cadence | 41 → 10 polls; the same run polls the same however it arrives | 41 retired instructions at cadence 4 poll **10** times clean and **0** mutated (M-7); and through the real run loop, **800 guest instructions poll 200 times interpreted and 200 times in eight-instruction blocks** | **HIT** |
+
+**Free in the same run, and worth more than some of the gates.** The compiler was offered
+**all 65 536 opcodes** one at a time and **accepts 7 616 of them (11.62 %)** — that is
+generation one's scope as BUILT rather than as described. Every accepted opcode was then run
+both ways from six seeded states and compared across the whole §3.1 set: **45 696
+differential pairs, 0 divergences.** Code bytes per compiled guest instruction: **50.0**.
+
+### 0.9.3 The entry cost, read off the lean disassembly — and the prediction it missed
+
+**Pre-registered 26 – 38 ARM instructions per BLOCK. Measured ≈ 108. MISSED, high.** The
+prediction is left where it was written; here is what the disassembly shows, counted along
+the steady-state path (block cached, way 0 hit, `build-lean/Z3660_emu.elf`, `DBF9A5AF`):
+
+| segment | instructions |
+|---|---|
+| the gate — address materialisation, flag load, test, branch, and gcc's hoisted pc load | 5 |
+| the control-transfer-target test — last-pc load, store, two subs, compare, branch | 6 |
+| supervisor, odd-pc and trace gates | 8 |
+| the lookup — hashed index, set base, generation compare, way-0 tag compare | 18 |
+| `z3660_warp_run` before the block — prologue, the split attestation, the ctx set-up, the entry load | 33 |
+| the block's own prologue — `push` plus the four bases | 6 |
+| the block's exit — pc, ipc, restart, count, `pop` | 8 |
+| `z3660_warp_run` after the block — the flag commit, pc, ipc, `mmu_restart`, epilogue | 17 |
+| the run loop's pass-consuming arm — cycles, the cadence early-out | 7 |
+| **total, armed, per BLOCK** | **≈ 108** |
+| **armed, per non-target dispatch** (pre-registered 3 … 6) | **11** |
+| **disarmed** (pre-registered 3; round 1 measured 5) | **5** |
+
+**Four things about that table are findings rather than numbers.**
+
+- **The disarmed gate did not move: 5, exactly as round 1.** Two of the five are the
+  address materialisation, which is unavoidable on a target with no literal pool
+  (`-DARMV6T2`, §0.3(c)); one is the argument load, which gcc schedules above the branch
+  whether or not the arm is taken. Packing the flag and the previous pc into ONE struct
+  removed a second materialisation from the ARMED path and nothing from the disarmed one.
+  **The pre-registered −0.9 % … −2.0 % disarm penalty therefore has no mechanism behind it
+  and should be expected to reproduce round 1's −2.276 %.** Said here, before the row.
+- **Two of the reductions §0.7.3 asked for landed and are visible.** The lazy `warp_inited`
+  check is gone (it moved to arm time, and it now RETRIES the arena rather than latching a
+  first failure — round 1's known gap, closed). The cadence feed's call-and-prologue-to-do-
+  nothing is gone: the `n > 1` test is at the call site and costs one compare.
+- **Two more were measured into existence rather than argued.** Passing `regs.s ? 1 : 0` as
+  an argument made gcc evaluate it above the inlined body, so the supervisor byte, its
+  compare and a predicated store were paid on EVERY armed dispatch: reading it inside, after
+  the test that leaves, took the armed non-target path from **18 to 11**. And writing the
+  flag commit through the architectural `SET_*FLG` macros made gcc vectorise a four-bit
+  update into a NEON load/and/or/store pair; on the machdep arm whose `flag_struct` IS the
+  ARM CPSR layout the commit is a masked store, and taking that path took `z3660_warp_run`
+  from **65 instructions to 50**.
+- **The exit grew, and the differential is why.** §0.8.4 priced the bail arm at 2 – 4
+  instructions; it is 8, because `regs.instruction_pc` and `mmu_restart` are in §0.5.5's
+  comparison set and two generation-one shapes move them (§0.8.3's write-back MOVE and
+  DBcc's `m68k_setpci` exits). The opcode sweep found it on its first run. **A cheaper
+  contract was available and was refused: excluding memory-destination MOVE as a write-back
+  family would have removed the obligation and halved the family's coverage.** The scope is
+  frozen; the words were paid.
+
+**The metal expectation, re-derived from the measurement.** §0.8.6's band was derived from
+E = 26 … 38 and a 4-instruction gate and is left as written; at E ≈ 108 and a gate of 11 the
+same arithmetic, at the same measured IPC 0.46 (2.17 cycles per ARM instruction), gives:
+
+```
+   LOW  c = 0.19, L = 2.0  ->  entry 0.19 x (108/2.0) x 2.17 = 22.3 cy
+                              gate  0.81 x 11 x 2.17         = 19.3 cy   -> 19.4 % of 214.2
+                              removal 3.65 %   ->  1/(1 - 0.0365 + 0.194) = 0.86x
+   HIGH c = 0.62, L = 4.5  ->  entry 0.62 x (108/4.5) x 2.17 = 32.3 cy
+                              gate  0.38 x 11 x 2.17         =  9.1 cy   -> 19.3 %
+                              removal 25.01 %  ->  1/(1 - 0.2501 + 0.193) = 1.06x
+```
+
+| row | §0.8.6 as pre-registered | re-derived from the measured counts |
+|---|---|---|
+| armed dhry c4 against `R` = 8 174 | 0.97× – 1.25×, dhry 7 910 – 10 190 | **0.86× – 1.06×, dhry ≈ 7 030 – 8 660** |
+| disarm penalty | −0.9 % … −2.0 %, dhry 8 011 – 8 100 | **no mechanism moved it; expect round 1's −2.276 % class** |
+
+**The reading rules are §0.6.5's, unchanged.** This is a cost and a static count, not a
+verdict; **round 2 takes no metal row at all**, so the M1 kill line cannot fire on it, and
+`kill-R` remains the CLEAN INTERPRETER LINEAGE row rather than a disarmed WARP image (the
+ruling of 2026-08-24). What the re-derivation says is that **the entry cost is still the
+dominant term and the amortisation is not yet paying for it** — at L = 8 the same arithmetic
+gives 1.14×, so the lever with the most left in it is block length, which generation one's
+own exclusions (`MOVEQ`, `(An)+`/`-(An)`, `BSR`, every memory-destination ALU shape) are what
+bound. That is M1a's argument, and it is now an arithmetic one.
+
+### 0.9.4 The lookup fix, and what the counters say about it
+
+§0.8.2's diagnosis is proven twice over, once without executing anything:
+
+- **Statically:** sixteen block heads 2 KiB apart occupy **one set** under round 1's
+  `(pc >> 1) & 1023` and **sixteen** under `((pc>>1) ^ (pc>>12) ^ (pc>>23)) & 2047`. The
+  index addressed a 2 KiB window of guest text; every head in a wider span collided.
+- **Dynamically:** the same sixteen heads, chained and executed 6 400 times, compile
+  **exactly sixteen times** with `WARP_EVICT` = 0. Restore round 1's geometry with
+  M-CONFLICT and the same run compiles **1 600 times with 1 596 evictions** — one compile
+  per execution, which is the 3 066 944-compile pathology reproduced in a fixture and then
+  *attributed*, which round 1 could not do at all.
+
+**The recompile budget now closes**: `WARP_COMPILE = first-compiles + WARP_DISC + WARP_EVICT
++ flush losses`, with id 60 supplying the term that was missing. Round 1's unattributed share
+was **95.2 %**; on the fixed geometry it is **0 %**, and on metal the pre-registered target is
+≤ 5 % unattributed.
+
+**Two more round-1 gaps closed beside it.** A **declined head is now cached** as round 1's
+two-word null block, so a PC the engine refuses costs one lookup instead of a fresh discovery
+on every arrival. And the **`WARP_FLUSH` path is exercised**: round 1 filled 73 % of the arena
+in a 34 s window and never wrapped, which was "not yet" rather than "never"; the harness
+lowers the limit and reaches it deliberately, with both invariants intact.
+
+### 0.9.5 Four things worth recording that were not gates
+
+- **The harness now executes the emitted words** (§0.8.5), and that is what caught every real
+  defect this round: the write-back MOVE's restart bookkeeping, a refused opcode leaking its
+  post-state into the previous instruction's exit, and a bail arm handing the interpreter the
+  wrong per-site pc. None of them is visible in a source diff and none would have been caught
+  by asserting the emitted bytes without running them. The honest limit narrows but does not
+  vanish: the executor is a **second implementation of ARM**, so a shared misreading is
+  invisible to it, and **nothing about the silicon** — I-cache publication, the Q3 barrier
+  sequence, ordering, behaviour at volume — is proven by it.
+- **Q8 is honoured by construction, and the construction is worth naming.** Rung 0's
+  recogniser claims exactly three head shapes — `MOVE (An)+`, `MOVE (An)+,(An)+` and `CPUSHL`
+  — and all three use predecrement/postincrement or are privileged, so all three are outside
+  generation one's frozen scope. WARP refuses them as heads and a block ends in front of one
+  rather than swallowing it. `BLK_HIT` / `BLK_INSNS` / `BLK_BYTES` are identical between the
+  arms, measured.
+- **The compiler's instruction fetch is NOT the interpreter's.** Written through
+  `uae_mmu040_get_iword()` it put eight compile-path fetches inside the interpreter's own
+  ifetch bracket, and the harness read `FETCH` = 8 armed against 0 disarmed — which would
+  have made §0.5.6's declared fall of `FETCH`/`IFETCH_CALLS` arithmetically impossible, the
+  exact law that section exists to enforce. It reads `mmu_get_iword()` and charges
+  `WARP_CFETCH`, which is now non-zero for the first time. **Q6's counter is live; its
+  decision rule needs the compile-cycle micro-benchmark and is deferred to the verdict
+  session with Q5's second condition.**
+- **The `jnf_MEM` replacement is a shared helper, not an open-coded sequence**, and §0.8.3
+  registered the deviation before it was built. What it bought is equivalence by
+  construction — the helper calls the same `always_inline` resolver the interpreter's
+  accessors call — and what it costs is a `blx` plus an AAPCS boundary on a path where
+  nothing is dirty. **The corpus also proved it SERVES**: without a data page inside the
+  harness's direct-bank window every generated access declined, every MOVE bailed, and the
+  whole accessor half of the engine would have gone untested with every test still passing.
+  That is the failure a state-equivalence corpus is blindest to, and it was caught by an
+  engagement counter rather than by luck.
+
+### 0.9.6 What round 2 leaves owed
+
+1. **M-VERDICT is reached but not caught.** The TTR_NO_WRITE asymmetry needs a read-only TTR
+   region, which the WARP corpus does not have; §0.5.5's G4 asymmetry cases do. Wiring the
+   accessor corpus to the engine is a round-3 item and it is an **owed arm**, not a passing
+   one.
+2. **`WARP_INSNS / WARP_BLK` is unmeasured** against a representative stream. §0.8.4's
+   2.0 – 4.5 stands as written and the verdict session takes it.
+3. **The open-coded expansion of the memory fast path** is priced by this round's objdump and
+   not built. So is the inlining of `z3660_warp_run`'s prologue, and the 33 instructions it
+   spends before the block runs are the largest single row in §0.9.3's table.
+4. **Q5's second condition and Q6's decision rule** both need the compile-cycles-per-block
+   micro-benchmark, which is a cycle bracket on target (§0.5.6) and needs a card.
+5. **Everything §0.8.8 said round 2 would not establish, it did not establish.**
 
 
 ---
