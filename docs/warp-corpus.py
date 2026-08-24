@@ -37,6 +37,14 @@ ROUND 5 ADDS gen 5 AND CHANGES NOTHING BELOW IT. Sec 0.14.3's corpus table is th
 `--dis` report's R5 column; Sec 0.15.4's G-R5.2 is the `--compare` exit status. The
 gen-3 and gen-4 predicates are left byte-untouched, including the one line whose
 disagreement with the engine scored G-R4.2 MISSED -- see the note beside it.
+
+--prospectus IS AN ANALYSIS MODE AND SCORES NOTHING. It exists for
+docs/warp-gen2-prospectus.md and it is deliberately built OUTSIDE accept(): the
+candidate generation-two families live in a separate predicate, accept_gen2(),
+so no gate, no bitmap and no --compare exit status can be moved by it. There is
+no `gen 6` inside accept() and there must never be one until a generation-two
+round is pre-registered and built -- a scored model line is a claim that an
+engine matched it, and nothing has matched this one.
 """
 
 import argparse
@@ -429,18 +437,305 @@ def compare(path, gen):
     return 0 if not (only_model or only_engine) else 1
 
 
+# ============================================================ ANALYSIS MODE ====
+# Everything below this line is for docs/warp-gen2-prospectus.md. It SCORES
+# NOTHING: no gate reads it, no pre-registration quotes it as a prediction an
+# engine must match, and it is kept out of accept() so that it cannot.
+
+EA_MEMDST = (EA_IND, EA_PI, EA_PD, EA_D16)
+
+# The generation-two candidate families, named from the CALLEES exclusion
+# histogram rather than from taste. W1 and W2 are Sec 0.14.8's own "what a
+# tranche 3 would need"; W3 and W4 are priced beside them because the
+# whole-.text histogram makes them look decisive and the executed tier does not.
+GEN2_FAMS = ('W1', 'W2', 'W3', 'W4')
+
+
+def accept_gen2(op, fams):
+    """(accepted, tag) for one opcode word under gen 5 PLUS the named candidates.
+
+    fams is a set drawn from GEN2_FAMS:
+      W1  memory-DESTINATION MOVE/MOVEA -- (An), (An)+, -(An), d16(An) as the
+          destination, with any source mode generation one already reads. This
+          is the Sec 2e write-back exclusion, lifted.
+      W2  the frame quartet -- LINK / UNLK / RTS / JSR (+ BSR, the same
+          contract). A stack write inside a control transfer.
+      W3  PEA -- a stack write with no control transfer.
+      W4  MOVEM to/from memory -- N stack writes in one instruction.
+
+    Mode 7 (absolute, PC-relative, immediate) as a DESTINATION stays out: it is
+    Sec 0.5.1 item 4's `(xxx).L` MOVE, still M4's, and admitting it here would
+    quietly price a family the freeze parked.
+    """
+    ok, tag = accept(op, 5)
+    if ok:
+        return True, tag
+
+    if 'W1' in fams and (op & 0xC000) == 0x0000 and (op & 0x3000) != 0x0000:
+        szf = (op >> 12) & 3
+        sz = W_B if szf == 1 else (W_W if szf == 3 else W_L)
+        smode = (op >> 3) & 7
+        dmode = (op >> 6) & 7
+        if dmode in EA_MEMDST and smode in (EA_DREG, EA_AREG, EA_IND, EA_PI,
+                                            EA_PD, EA_D16):
+            if not (sz == W_B and smode == EA_AREG):
+                return True, 'W1-MOVE-memdst'
+
+    if 'W2' in fams:
+        if (op & 0xFFF8) == 0x4E50:
+            return True, 'W2-LINK'
+        if (op & 0xFFF8) == 0x4E58:
+            return True, 'W2-UNLK'
+        if op == 0x4E75:
+            return True, 'W2-RTS'
+        if (op & 0xFFC0) == 0x4E80:                      # JSR <ea>
+            mode, reg = (op >> 3) & 7, op & 7
+            if mode in (EA_IND, EA_D16) or (mode == 7 and reg in (0, 1, 2)):
+                return True, 'W2-JSR'
+        if (op & 0xFF00) == 0x6100:                      # BSR
+            d8 = op & 0xFF
+            if d8 != 0xFF and not (d8 and (d8 & 1)):
+                return True, 'W2-BSR'
+
+    if 'W3' in fams and (op & 0xFFC0) == 0x4840:         # PEA <ea>
+        mode, reg = (op >> 3) & 7, op & 7
+        if mode in (EA_IND, EA_D16) or (mode == 7 and reg in (0, 1, 2)):
+            return True, 'W3-PEA'
+
+    if 'W4' in fams and (op & 0xFB80) == 0x4880:         # MOVEM <-> memory
+        if ((op >> 3) & 7) in EA_MEMDST:
+            return True, 'W4-MOVEM'
+
+    return False, tag
+
+
+def transfer_kind(op):
+    """None / 'static' / 'indirect' -- what a control transfer does to a CHAIN.
+
+    A chain survives a transfer whose target is known when the block is
+    compiled. It cannot survive one whose target is a runtime value: RTS reads
+    the stack, JMP/JSR (An) reads a register. That is the whole difference
+    between a block boundary and a chain boundary.
+    """
+    if (op & 0xF000) == 0x6000:                          # Bcc / BRA / BSR
+        return 'static'
+    if (op & 0xF0F8) == 0x50C8:                          # DBcc
+        return 'static'
+    if (op & 0xFFC0) in (0x4E80, 0x4EC0):                # JSR / JMP <ea>
+        mode, reg = (op >> 3) & 7, op & 7
+        if mode == 7 and reg in (0, 1, 2):               # (xxx).W/.L, d16(PC)
+            return 'static'
+        return 'indirect'
+    if op in (0x4E75, 0x4E73, 0x4E77):                   # RTS / RTE / RTR
+        return 'indirect'
+    return None
+
+
+def segment(rows, fams, page=4096, rts_chains=False):
+    """-> (block runs, chain runs), both in guest instructions.
+
+    BLOCK rule, Sec 2a's own: a block ends AFTER any control transfer, BEFORE
+    any instruction the engine declines, and at a guest page boundary.
+
+    CHAIN rule: a chain ends at a declined instruction or at an INDIRECT
+    transfer. It does NOT end at a page boundary -- a chained target on another
+    page is a separate block that validated its own translation when it was
+    compiled, and the invalidation contract is what keeps it honest.
+
+    rts_chains models a return-address prediction stack, which turns RTS from a
+    chain terminator into a chain link. It is an UPPER bound, and on a linear
+    disassembly it is only that: the model continues along the text rather than
+    back to a caller it cannot see.
+    """
+    blocks, chains = [], []
+    b = c = 0
+    prev = None
+    for addr, op, _f, _t in rows:
+        if not accept_gen2(op, fams)[0]:
+            if b:
+                blocks.append(b)
+            if c:
+                chains.append(c)
+            b = c = 0
+            prev = None
+            continue
+        if prev is not None and (addr // page) != (prev // page):
+            if b:
+                blocks.append(b)
+            b = 0
+        b += 1
+        c += 1
+        prev = addr
+        k = transfer_kind(op)
+        if k == 'static':
+            blocks.append(b)
+            b = 0
+        elif k == 'indirect':
+            blocks.append(b)
+            b = 0
+            if not (rts_chains and op == 0x4E75):
+                chains.append(c)
+                c = 0
+    if b:
+        blocks.append(b)
+    if c:
+        chains.append(c)
+    return blocks, chains
+
+
+def _mean(xs):
+    return (sum(xs) / float(len(xs))) if xs else 0.0
+
+
+# The three metal rows the block model is calibrated against:
+# CINSNS / (COMPILE - DECLINE), read off each round's own profiler dump.
+METAL_L = {3: 1.5810, 4: 2.4208, 5: 2.4689}
+
+TIERS = (("WHOLE .text", lambda f: True),
+         ("HOT SET (main + callees)", lambda f: f in HOT),
+         ("CALLEES ONLY", lambda f: f in CALLEES))
+
+LADDER = (("gen 5 -- the shipping engine", frozenset()),
+          ("+W1  memory-destination MOVE", frozenset({'W1'})),
+          ("+W2  LINK/UNLK/RTS/JSR", frozenset({'W2'})),
+          ("+W1+W2  == G2a", frozenset({'W1', 'W2'})),
+          ("+W1+W2+W3  (PEA)", frozenset({'W1', 'W2', 'W3'})),
+          ("+W1+W2+W3+W4  (MOVEM)", frozenset({'W1', 'W2', 'W3', 'W4'})))
+
+
+def prospectus(path):
+    insns, data = parse(path)
+    print("corpus            : %s" % path)
+    print("decoded lines     : %d instruction, %d data/continuation"
+          % (len(insns), data))
+    print()
+
+    print("=== 1. THE BLOCK MODEL, CALIBRATED AGAINST THREE METAL ROWS ===")
+    print("Sec 2a's block rule applied to the callees tier, against each round's")
+    print("measured CINSNS/(COMPILE-DECLINE). The offset is what makes it usable.")
+    print("  gen   model L_blk   metal L    model/metal   doc's run-length model")
+    rows = [r for r in insns if r[2] in CALLEES]
+    ratios = []
+    for gen in (3, 4, 5):
+        blocks = []
+        b = 0
+        prev = None
+        for addr, op, _f, _t in rows:
+            if not accept(op, gen)[0]:
+                if b:
+                    blocks.append(b)
+                b = 0
+                prev = None
+                continue
+            if prev is not None and (addr // 4096) != (prev // 4096):
+                if b:
+                    blocks.append(b)
+                b = 0
+            b += 1
+            prev = addr
+            if transfer_kind(op) is not None:
+                blocks.append(b)
+                b = 0
+        if b:
+            blocks.append(b)
+        runs, cur = [], 0
+        for _a, op, _f, _t in rows:
+            if accept(op, gen)[0]:
+                cur += 1
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = 0
+        if cur:
+            runs.append(cur)
+        lb = _mean(blocks)
+        ratios.append(METAL_L[gen] / lb)
+        print("   %d      %6.3f       %6.4f      %.4f        %6.3f"
+              % (gen, lb, METAL_L[gen], ratios[-1], _mean(runs)))
+    print("  calibration factor: %.4f .. %.4f, mean %.4f"
+          % (min(ratios), max(ratios), sum(ratios) / len(ratios)))
+    print()
+
+    print("=== 2. THE gen-5 EXCLUSION HISTOGRAM -- what drives the family list ===")
+    for label, sel in TIERS:
+        rr = [r for r in insns if sel(r[2])]
+        n = len(rr)
+        ref = collections.Counter()
+        for _a, op, _f, text in rr:
+            ok, tag = accept(op, 5)
+            if not ok:
+                ref[(tag, mnemonic(text))] += 1
+        print("--- %s : %d instructions, %d refused (%.2f %%)"
+              % (label, n, sum(ref.values()), 100.0 * sum(ref.values()) / n))
+        for (tag, mn), k in ref.most_common(12):
+            print("      %-18s %-9s %4d   %5.2f %% of the tier"
+                  % (tag, mn, k, 100.0 * k / n))
+        print()
+
+    print("=== 3. THE CANDIDATE LADDER -- accept share, block length, chain length ===")
+    for label, sel in TIERS:
+        rr = [r for r in insns if sel(r[2])]
+        n = len(rr)
+        print("--- %s : %d instructions" % (label, n))
+        print("    %-30s %6s %8s %8s %9s %9s"
+              % ("accept set", "acc", "acc %", "L_blk", "L_chain", "blk/chain"))
+        for name, fams in LADDER:
+            a = sum(1 for r in rr if accept_gen2(r[1], fams)[0])
+            blocks, chains = segment(rr, fams)
+            lb, lc = _mean(blocks), _mean(chains)
+            print("    %-30s %6d %7.2f%% %8.3f %9.3f %9.2f"
+                  % (name, a, 100.0 * a / n, lb, lc, (lc / lb) if lb else 0.0))
+        print()
+
+    print("=== 4. THE CHAIN BAND -- RTS as a terminator, and as a link ===")
+    print("The lower end is chaining as generation two would first build it.")
+    print("The upper end adds a return-address prediction stack, and is an")
+    print("upper bound the linear-text model cannot tighten.")
+    for label, sel in TIERS:
+        rr = [r for r in insns if sel(r[2])]
+        print("--- %s" % label)
+        for name, fams in (LADDER[0], LADDER[3], LADDER[5]):
+            for rts in (False, True):
+                blocks, chains = segment(rr, fams, rts_chains=rts)
+                lb, lc = _mean(blocks), _mean(chains)
+                print("    %-30s RTS %-9s L_blk %6.3f  L_chain %6.3f  blk/chain %.2f"
+                      % (name, "links" if rts else "breaks", lb, lc,
+                         (lc / lb) if lb else 0.0))
+        print()
+
+    print("=== 5. THE CONTROL-TRANSFER CENSUS -- why chains are short ===")
+    for label, sel in TIERS:
+        rr = [r for r in insns if sel(r[2])]
+        c = collections.Counter()
+        for _a, op, _f, text in rr:
+            k = transfer_kind(op)
+            if k:
+                c[(k, mnemonic(text))] += 1
+        tot = sum(c.values())
+        print("--- %s : %d control transfers (%.2f %% of the tier)"
+              % (label, tot, 100.0 * tot / len(rr)))
+        for (k, mn), v in c.most_common(10):
+            print("      %-9s %-9s %4d" % (k, mn, v))
+        print()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dis', help='objdump -d output of the corpus')
     ap.add_argument('--bitmap', type=int, help='dump the model accept bitmap for a generation')
     ap.add_argument('--compare', help="the harness's warp-accept.txt, for gate G-R4.2")
     ap.add_argument('--gen', type=int, default=4, help='generation to compare against')
+    ap.add_argument('--prospectus', help='ANALYSIS ONLY: the gen-2 pricing report '
+                                         '(docs/warp-gen2-prospectus.md). Scores nothing')
     a = ap.parse_args()
     if a.bitmap:
         bitmap(a.bitmap)
         return
     if a.compare:
         sys.exit(compare(a.compare, a.gen))
+    if a.prospectus:
+        prospectus(a.prospectus)
+        return
     n3 = sum(1 for o in range(65536) if accept(o, 3)[0])
     n4 = sum(1 for o in range(65536) if accept(o, 4)[0])
     n5 = sum(1 for o in range(65536) if accept(o, 5)[0])
