@@ -3219,9 +3219,15 @@ static void test_prof_wire_format(void)
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_DECLINE], "WARP_DECLINE") == 0
 	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_EVICT], "WARP_EVICT") == 0,
 	      "all fourteen WARP names line up with the ids S0.5.6 and S0.8.2 pre-registered\n");
-	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   64, "64 counters -- ids 61..63 are round 4's "
-	           "churn split: DISC_EV separates EVENTS from BLOCKS, which round 3 could not do "
-	           "at all, and DISC_ATC / DISC_CPUSH name the two causes that are 87 % of them");
+	CHECK_EQ32((uae_u32)Z3660_PROF_C_COUNT,   69, "69 counters -- 61..63 are round 4's churn "
+	           "split (DISC_EV separates EVENTS from BLOCKS, DISC_ATC / DISC_CPUSH name the two "
+	           "causes that are 87 % of them) and 64..68 are round 5's bail attribution");
+	CHECK(strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_BAIL_STUB], "WARP_BAIL_STUB") == 0
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_BAIL_MEM], "WARP_BAIL_MEM") == 0
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_BAIL_FENCE], "WARP_BAIL_FENCE") == 0
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_BAIL_VERDICT], "WARP_BAIL_VERDICT") == 0
+	   && strcmp(z3660_prof_counter_names[Z3660_PROF_C_WARP_BAIL_OTHER], "WARP_BAIL_OTHER") == 0,
+	      "round 5's five bail-attribution names line up with ids 64..68\n");
 	/* The append is deliberately NOT a version bump: no id below it changed meaning, the
 	 * binary header layout is untouched, and a v2 symbolizer reports an id past the end of
 	 * its table uninterpreted rather than mis-labelled. Bumping would make every existing
@@ -7410,6 +7416,18 @@ static void warp_seed(uae_u32 k)
 	mmufixup[0].reg = mmufixup[1].reg = -1;
 }
 
+/* Apply a mutation arm's seed overrides. Split out because the two legs of every arm must
+ * apply the SAME overrides -- an override applied to one leg and not the other manufactures a
+ * divergence and reports CAUGHT for a mutation that was never exercised, which is the failure
+ * mode this whole table is built to avoid. */
+static void warp_arm_overrides(const uae_s64 *d0, const uae_s64 *d1, const uae_s64 *a7, int x)
+{
+	if (*d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)*d0;
+	if (*d1 >= 0) m68k_dreg(regs, 1) = (uae_u32)*d1;
+	if (*a7 >= 0) m68k_areg(regs, 7) = (uae_u32)*a7;
+	if (x) { SET_XFLG(1); MakeSR(); }
+}
+
 static void warp_poke_insn(uae_u16 op)
 {
 	uae_u32 base = WARP_PCODE | (WARP_VCODE & 0xFFF);
@@ -7549,21 +7567,35 @@ static void test_warp_codegen(void)
 		 * mutation bailed in both arms and compared equal. A mutation arm that can only
 		 * be caught by luck is not an arm, and one that cannot be caught at all is worse
 		 * than none: it reports CAUGHT-shaped silence. -1 means "leave the seed alone". */
+		/* ROUND 5 ADDS `d1` AND `x` TO THIS TABLE, AND BOTH WIDENINGS WERE FORCED BY ARMS
+		 * THAT DID NOT BITE -- the same way `d0` and `a7` were forced in round 4.
+		 *
+		 * A register-count shift needs the COUNT and the OPERAND to be different registers,
+		 * because a count of zero on a shape where they are the same register also makes the
+		 * operand zero, and a zero operand has nothing to say about N. `d1` supplies the
+		 * count.
+		 *
+		 * And X could not be set AT ALL from this table: warp_seed() takes X from bit 27 of
+		 * its key, and every key this loop builds (0x1234*(s+1) + op) is below 2^27, so X was
+		 * ZERO in all eight seeds and an arm that flips X had nothing to flip. That is
+		 * CAUGHT-shaped silence in its purest form and it was found by an arm reporting NOT
+		 * CAUGHT rather than by review. -1 means "leave the seed alone". */
 		static const struct {
 			int mut; const char *name; uae_u16 op; uae_s64 d0; uae_s64 a7;
+			uae_s64 d1; int x;
 		} arms[] = {
-			{ Z3660_WARP_MUT_FLAG_MOVE, "MOVE: C and V not cleared",          0x2400, -1, -1 },
-			{ Z3660_WARP_MUT_FLAG_ADD,  "ADD: X not copied from C",           0xD081, -1, -1 },
-			{ Z3660_WARP_MUT_FLAG_SUB,  "SUB: carry inversion dropped",       0x9081, -1, -1 },
-			{ Z3660_WARP_MUT_FLAG_SUB,  "CMP: carry inversion dropped",       0xB081, -1, -1 },
-			{ Z3660_WARP_MUT_FLAG_BCC,  "Bcc: the condition sense inverted",  0x6602, -1, -1 },
+			{ Z3660_WARP_MUT_FLAG_MOVE, "MOVE: C and V not cleared",          0x2400, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_FLAG_ADD,  "ADD: X not copied from C",           0xD081, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "SUB: carry inversion dropped",       0x9081, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_FLAG_SUB,  "CMP: carry inversion dropped",       0xB081, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_FLAG_BCC,  "Bcc: the condition sense inverted",  0x6602, -1, -1, -1, 0 },
 			/* DBcc's defect is only visible when the OLD counter is 0 or 1 -- that is the
 			 * whole difference between testing before and after the decrement -- so the arm
 			 * puts it there rather than hoping a seed lands on it. A mutation arm that can
 			 * only be caught by luck is not an arm. */
 			{ Z3660_WARP_MUT_FLAG_DBCC, "DBcc: counter tested after the "
-			                            "decrement",                          0x51C8, 0, -1 },
-			{ Z3660_WARP_MUT_BAILX,     "the commit writes nzcv but not X",   0xD081, -1, -1 },
+			                            "decrement",                          0x51C8, 0, -1, -1, 0 },
+			{ Z3660_WARP_MUT_BAILX,     "the commit writes nzcv but not X",   0xD081, -1, -1, -1, 0 },
 			/* ---- ROUND 4'S ARMS, one per new family and one per new DECISION -------
 			 *
 			 * The family arms say the emitter computes the right flags. The DECISION arms
@@ -7576,26 +7608,58 @@ static void test_warp_codegen(void)
 			 * omission: it needs a source read that DECLINES, and this table's corpus is
 			 * a served window. It is exercised by test_warp_auto_bail() below, where a
 			 * decline can be arranged. */
-			{ Z3660_WARP_MUT_MOVEQ_FLAG,   "MOVEQ: C and V not cleared",      0x7205, -1, -1 },
-			{ Z3660_WARP_MUT_TST_FLAG,     "TST: C and V committed",          0x4A80, -1, -1 },
+			{ Z3660_WARP_MUT_MOVEQ_FLAG,   "MOVEQ: C and V not cleared",      0x7205, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_TST_FLAG,     "TST: C and V committed",          0x4A80, -1, -1, -1, 0 },
 			/* D0 = 0x80000000 so the left shift HAS a carry to drop, and D0 = 1 so the
 			 * right one does. Both are the seed the defect needs, stated rather than
 			 * hoped for. */
 			{ Z3660_WARP_MUT_SHIFT_C,      "LSL: the carry-out dropped",      0xE388,
-			                               0x80000000LL, -1 },
-			{ Z3660_WARP_MUT_SHIFT_C,      "ASR: the carry-out dropped",      0xE280, 1, -1 },
+			                               0x80000000LL, -1, -1, 0 },
+			{ Z3660_WARP_MUT_SHIFT_C,      "ASR: the carry-out dropped",      0xE280, 1, -1, -1, 0 },
 			{ Z3660_WARP_MUT_SHIFT_X,      "ROL: X written, which only ROXd "
 			                               "may do",                          0xE398,
-			                               0x80000000LL, -1 },
+			                               0x80000000LL, -1, -1, 0 },
 			{ Z3660_WARP_MUT_IMM_CARRY,    "SUBI: the carry inversion "
-			                               "dropped",                         0x0480, -1, -1 },
+			                               "dropped",                         0x0480, -1, -1, -1, 0 },
 			{ Z3660_WARP_MUT_IMM_CARRY,    "CMPI: the carry inversion "
-			                               "dropped",                         0x0C80, -1, -1 },
+			                               "dropped",                         0x0C80, -1, -1, -1, 0 },
 			/* A7 into the SERVED data page: the byte-step defect only exists on a write-back
 			 * that actually happens, and on the stack page the helper declines and both arms
 			 * bail identically. §0.12.2's areg_byteinc[] rule is what this arm is about. */
 			{ Z3660_WARP_MUT_AUTO_BYTEINC, "(A7)+ at byte size steps by 1",   0x101F,
-			                               -1, (uae_s64)WARP_VDATA }
+			                               -1, (uae_s64)WARP_VDATA, -1, 0 },
+			/* ---- ROUND 5'S ARMS (§0.14.3), AND THE SEED IS THE ARM -------------------
+			 *
+			 * Every T4 arm is invisible at a "normal" count, so the count register is
+			 * DRIVEN to the value the defect needs rather than left to warp_seed()'s key
+			 * arithmetic. The opcodes are `<shift>.<sz> D1,D0` -- COUNT in D1, OPERAND in
+			 * D0 -- because a shape whose count and operand are the same register cannot
+			 * express "count 0 on a non-zero operand", which is the case three of these
+			 * arms turn on.
+			 *
+			 *    0xE228  LSR.B D1,D0     0xE1A0  ASL.L D0,D0     0xE0A8  LSR.L D0,D0
+			 *
+			 * ZERO reads N at the wrong WIDTH (its carry is not observable: ARM leaves C
+			 * alone at a zero count and the executor's C is already 0 there, so the
+			 * mutant and the truth agree on C and disagree on N). MOD needs a count of
+			 * exactly 32, which is the only value mod-32 and mod-64 disagree about below
+			 * 33. XZERO needs X SET going in, which is what the `x` column exists for.
+			 * CLAMP needs a count above 31 on an ASL, which is the only shape with a V. */
+			{ Z3660_WARP_MUT_SHIFTREG_ZERO,  "LSR.B by a zero count reads N at "
+			                                 "long width",                   0xE228, 0x80, -1, 0, 0 },
+			{ Z3660_WARP_MUT_SHIFTREG_MOD,   "the count masked mod 32, not "
+			                                 "mod 64",                       0xE0A8, 32, -1, -1, 0 },
+			{ Z3660_WARP_MUT_SHIFTREG_XZERO, "X written on a zero count",    0xE228, 0x80, -1, 0, 1 },
+			{ Z3660_WARP_MUT_ASLREG_CLAMP,   "ASL's overflow test loses its "
+			                                 "clamp at 31",                  0xE1A0, 40, -1, -1, 0 },
+			{ Z3660_WARP_MUT_LEA_PCBASE,     "LEA d16(PC) bases on pc, not "
+			                                 "pc+2",                         0x41FA, -1, -1, -1, 0 },
+			{ Z3660_WARP_MUT_CLR_FLAG,       "CLR leaves Z clear",           0x4280, -1, -1, -1, 0 },
+			/* The DESTINATION width, not the flag width -- see the emitter's comment: on a
+			 * sign-extended byte the two flag widths are indistinguishable for every
+			 * operand, so an arm on them could only report CAUGHT-shaped silence. */
+			{ Z3660_WARP_MUT_EXT_WIDTH,      "EXT.W overwrites the register's "
+			                                 "upper half",                   0x4880, 0x80, -1, -1, 0 }
 		};
 		unsigned a;
 		for (a = 0; a < sizeof arms / sizeof arms[0]; a++) {
@@ -7605,16 +7669,14 @@ static void test_warp_codegen(void)
 				struct warp_state ref, run;
 				warp_write_knob(Z3660_WARP_OFF);
 				warp_seed(0x1234u * (s + 1u) + arms[a].op);
-				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
-				if (arms[a].a7 >= 0) m68k_areg(regs, 7) = (uae_u32)arms[a].a7;
+				warp_arm_overrides(&arms[a].d0, &arms[a].d1, &arms[a].a7, arms[a].x);
 				m68k_run_mmu040(); regs.spcflags = 0;
 				warp_snap(&ref);
 
 				z3660_warp_set_mutant(arms[a].mut);
 				warp_write_knob(Z3660_WARP_ARM);   /* re-arm: the mutation changes CODE */
 				warp_seed(0x1234u * (s + 1u) + arms[a].op);
-				if (arms[a].d0 >= 0) m68k_dreg(regs, 0) = (uae_u32)arms[a].d0;
-				if (arms[a].a7 >= 0) m68k_areg(regs, 7) = (uae_u32)arms[a].a7;
+				warp_arm_overrides(&arms[a].d0, &arms[a].d1, &arms[a].a7, arms[a].x);
 				m68k_run_mmu040(); regs.spcflags = 0;
 				warp_snap(&run);
 				z3660_warp_set_mutant(Z3660_WARP_MUT_NONE);
@@ -7630,6 +7692,159 @@ static void test_warp_codegen(void)
 	}
 
 	free(ops);
+	warp_boot();
+	warp_corpus_build();
+}
+
+
+/* ------------------------------------------------------------------------------------
+ * G-R5.5 -- THE SHIFT-COUNT DIFFERENTIAL, AND IT EXISTS BECAUSE THE SWEEP CANNOT REACH IT.
+ *
+ * test_warp_codegen() runs every accepted opcode from six SEEDED states, and warp_seed()
+ * derives the data registers from a key -- so the count a register-count shift actually sees
+ * is whatever that arithmetic produces, not a value anyone chose. The T4 emitter is written
+ * for the boundaries (0, the width, the width+1, 32, above 32, and the mod-64 wrap) and a
+ * differential that never reaches them proves nothing about the code that handles them.
+ * §0.13.5's rule -- "a mutation arm that cannot be caught at all is worse than none" --
+ * applies just as hard to a differential that cannot reach its case.
+ *
+ * So this drives every T4 SHAPE across every boundary COUNT explicitly, armed against
+ * disarmed, over the whole S3.1 comparison set. 18 shapes x 15 counts x 4 operands.
+ * ------------------------------------------------------------------------------------ */
+static void test_warp_shift_counts(void)
+{
+	/* count in D1, operand in D0: 1110 ccc d ss 1 tt rrr with ccc = 001, rrr = 000. */
+	static const struct { const char *name; unsigned left, typ; } shapes[] = {
+		{ "ASR", 0, 0 }, { "ASL", 1, 0 },
+		{ "LSR", 0, 1 }, { "LSL", 1, 1 },
+		{ "ROR", 0, 3 }, { "ROL", 1, 3 }
+	};
+	static const uae_u32 counts[] = { 0, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255 };
+	static const uae_u32 opnds[]  = { 0x00000000u, 0x00000001u, 0x80000000u, 0xDEADBEEFu };
+	unsigned sh, sz, ci, oi, tested = 0, diverged = 0;
+
+	printf("[test] WARP T4: every register-count shift shape across every boundary count\n");
+	warp_corpus_build();
+	warp_boot();
+
+	for (sh = 0; sh < sizeof shapes / sizeof shapes[0]; sh++)
+	for (sz = 0; sz < 3u; sz++) {
+		uae_u16 op = (uae_u16)(0xE000u | (1u << 9) | (shapes[sh].left << 8)
+		                       | (sz << 6) | (1u << 5) | (shapes[sh].typ << 3) | 0u);
+		warp_poke_insn(op);
+		for (ci = 0; ci < sizeof counts / sizeof counts[0]; ci++)
+		for (oi = 0; oi < sizeof opnds / sizeof opnds[0]; oi++) {
+			struct warp_state ref, run;
+
+			warp_write_knob(Z3660_WARP_OFF);
+			warp_seed(0xC0071u + op + counts[ci] + opnds[oi]);
+			m68k_dreg(regs, 0) = opnds[oi];
+			m68k_dreg(regs, 1) = counts[ci];
+			m68k_run_mmu040(); regs.spcflags = 0;
+			warp_snap(&ref);
+
+			warp_write_knob(Z3660_WARP_ARM);
+			warp_seed(0xC0071u + op + counts[ci] + opnds[oi]);
+			m68k_dreg(regs, 0) = opnds[oi];
+			m68k_dreg(regs, 1) = counts[ci];
+			m68k_run_mmu040(); regs.spcflags = 0;
+			warp_snap(&run);
+
+			tested++;
+			if (memcmp(&ref, &run, sizeof ref) != 0) {
+				if (diverged < 4)
+					printf("       DIVERGE %s.%c op=%04X count=%u operand=%08X"
+					       "  d0 %08X vs %08X  ccr %X vs %X  x %X vs %X\n",
+					       shapes[sh].name, "BWL"[sz], op, counts[ci], opnds[oi],
+					       ref.d[0], run.d[0], ref.ccr, run.ccr, ref.x, run.x);
+				diverged++;
+			}
+		}
+	}
+	printf("       %u armed/disarmed pairs over 18 shapes x 15 counts x 4 operands\n", tested);
+	CHECK_EQ32(diverged, 0u,
+	           "not one register-count shift diverges at any boundary: the zero count, each "
+	           "size's own width, the 32 and >32 cases, and the mod-64 wrap");
+	warp_boot();
+	warp_corpus_build();
+}
+
+/* ------------------------------------------------------------------------------------
+ * G-R5.8 -- THE BAIL-ATTRIBUTION IDENTITIES, ASSERTED BEFORE ANY CARD IS BOOKED.
+ *
+ * The second identity is the load-bearing one and it is a claim about the EMITTER rather than
+ * about arithmetic: a real block bails if and only if a memory helper declined, because
+ * e_bail_if() is emitted after `blx R_RD` and after `blx R_WR` and after no other kind of
+ * site. If BAIL_MEM != BAIL_FENCE + BAIL_VERDICT then either a helper declined without a bail
+ * following it or a block bailed without a helper declining, and both are holes in the bail
+ * contract -- found by an identity here rather than by a soak on metal.
+ *
+ * BAIL_OTHER is pre-registered at exactly zero (§0.14.2). It is a tripwire, not a statistic.
+ * ------------------------------------------------------------------------------------ */
+static void test_warp_bail_split(void)
+{
+	unsigned long long bail, stub, mem, fence, verd, other;
+	unsigned op, s;
+
+	printf("[test] WARP bail attribution: the split, and the two identities that gate it\n");
+	warp_corpus_build();
+	warp_boot();
+	z3660_warp_stats_zero();
+	warp_write_knob(Z3660_WARP_ARM);
+
+	/* A corpus that produces BOTH kinds of bail: opcodes the engine refuses outright become
+	 * cached DECLINE STUBS, and memory-source shapes pointed at the stack page -- which the
+	 * helper does not serve -- decline at the verdict table. A misaligned long is the fence
+	 * arm. All three have to appear or the identities are being asserted over zeros. */
+	{
+		static const uae_u16 corpus[] = {
+			0x4E71,   /* NOP           -- outside scope: a decline stub                */
+			0x4E75,   /* RTS           -- ditto                                        */
+			0x2010,   /* MOVE.L (A0),D0 -- served or declined depending on A0           */
+			0xD090,   /* ADD.L (A0),D0  -- ditto                                        */
+			0x2018    /* MOVE.L (A0)+,D0                                                */
+		};
+		unsigned i;
+		for (i = 0; i < sizeof corpus / sizeof corpus[0]; i++) {
+			warp_poke_insn(corpus[i]);
+			for (s = 0; s < 6; s++) {
+				warp_seed(0xBA17u * (s + 1u) + corpus[i]);
+				/* every other pass points A0 at the stack page, which the helper
+				 * refuses, and at an ODD address, which the fence refuses */
+				if (s & 1) m68k_areg(regs, 0) = (uae_u32)(WARP_VSTK | 0xE00);
+				if (s == 3) m68k_areg(regs, 0) = (uae_u32)(WARP_VDATA + 1u);
+				m68k_run_mmu040(); regs.spcflags = 0;
+			}
+		}
+		(void)op;
+	}
+
+	bail  = z3660_warp_stat(Z3660_WARP_STAT_BAIL);
+	stub  = z3660_warp_stat(Z3660_WARP_STAT_BAILSTUB);
+	mem   = z3660_warp_stat(Z3660_WARP_STAT_BAILMEM);
+	fence = z3660_warp_stat(Z3660_WARP_STAT_BAILFENCE);
+	verd  = z3660_warp_stat(Z3660_WARP_STAT_BAILVERD);
+	other = z3660_warp_stat(Z3660_WARP_STAT_BAILOTHER);
+	printf("       BAIL %llu = STUB %llu + MEM %llu + OTHER %llu ; MEM = FENCE %llu + "
+	       "VERDICT %llu\n", bail, stub, mem, other, fence, verd);
+
+	CHECK(bail > 0 && stub > 0 && mem > 0,
+	      "the corpus produced BOTH kinds of bail -- an identity asserted over zeros is not "
+	      "an identity (bail %llu stub %llu mem %llu)\n", bail, stub, mem);
+	CHECK(bail == stub + mem + other,
+	      "BAIL == BAIL_STUB + BAIL_MEM + BAIL_OTHER, exactly (%llu vs %llu)\n",
+	      bail, stub + mem + other);
+	CHECK(mem == fence + verd,
+	      "BAIL_MEM == BAIL_FENCE + BAIL_VERDICT, exactly: one helper decline produces one "
+	      "bail, which is a claim about the emitter (%llu vs %llu)\n", mem, fence + verd);
+	CHECK(other == 0,
+	      "BAIL_OTHER is ZERO -- a bail that is neither a stub nor a real block cannot "
+	      "happen, and this is the tripwire that says so (%llu)\n", other);
+	CHECK(fence > 0 && verd > 0,
+	      "both helper decline arms were reached, so neither sub-counter is asserted over a "
+	      "path that never ran (fence %llu verdict %llu)\n", fence, verd);
+
+	warp_write_knob(Z3660_WARP_OFF);
 	warp_boot();
 	warp_corpus_build();
 }
@@ -8776,6 +8991,8 @@ int main(int argc, char **argv)
 	test_warp_block_cache();
 	test_warp_emitted_words();
 	test_warp_codegen();
+	test_warp_shift_counts();
+	test_warp_bail_split();
 	test_warp_bail();
 	test_warp_publish_range();
 	test_warp_selftest();
