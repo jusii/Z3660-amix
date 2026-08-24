@@ -2089,6 +2089,24 @@ static int warp_st_family(int idx, const char *name, const struct warp_st_case *
             bytes = warp_compile_words(cases[c].w, use, pc, dst, WARP_ST_SLOT - 128u, &insns);
             if (bytes == 0) { z3660_printf("[WTST]     F%d case %u: nothing emitted\r\n",
                                            idx, c); fails++; continue; }
+
+            /* THE GUEST-MEMORY-FREE PROPERTY, ENFORCED RATHER THAN ASSERTED. The corpus is
+             * register-only, so no block should contain a `blx` -- and the two helper
+             * registers are handed in as NULL precisely so that a block which did would be
+             * refused here instead of branching to zero on a live guest's card. A future
+             * corpus edit that reaches memory therefore fails loudly and harmlessly. */
+            {
+               const uae_u32 *wds = (const uae_u32 *)(const void *)dst;
+               unsigned q, bad = 0;
+               for (q = 0; q < bytes / 4u; q++)
+                  if ((wds[q] & 0x0FFFFFF0u) == 0x012FFF30u) bad = 1;
+               if (bad) {
+                  z3660_printf("[WTST]     F%d REFUSED case %u: the block calls a memory "
+                               "helper, and this test hands it none\r\n", idx, c);
+                  fails++;
+                  return 0;
+               }
+            }
             warp_publish(dst, bytes);
 
             bad = warp_st_compare((const uae_u32 *)(const void *)dst, pc,

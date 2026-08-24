@@ -7738,6 +7738,8 @@ static void test_warp_selftest(void)
 
 	warp_corpus_build();
 	warp_boot();
+	z3660_warp_set_cache_limit(0);        /* an earlier corpus may have lowered it to reach
+	                                       * the flush path; the sweep needs the whole arena */
 	g0  = z3660_warp_generation();
 	on0 = (unsigned)z3660_warp_armed();
 
