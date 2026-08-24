@@ -2458,6 +2458,13 @@ direction — the band was not wide enough downwards.**
 | round 2 (`DBF9A5AF`) | 2 548 B | 5 | 11 | **−5.848 % (metal)** |
 | round 3 (`B6304B9C`) | **2 196 B** | **4** | **≈ 15** | **unmeasured — the next metal session** |
 
+> **`corrected at R5`, rounds 1 and 2 only.** Clean rebuilds of those two rounds' own sources
+> (§0.15.2) produce **2 144 B** and **2 348 B**, roughly 180 – 200 B below the flown images
+> this table measures, and round 1's gate is **four instructions at depth 2** rather than five
+> at depth 1. The flown images and their metal penalties are unchanged; what the SOURCES build
+> is not what this table says. Round 3's row is confirmed exactly and is the only one that was.
+
+
 **The disarmed gate also fell, 5 → 4, and it was not predicted to.** §0.9.3's five were two
 address materialisations, a flag load, a test and gcc's hoisted argument load. gcc now uses a
 literal-pool load from the function's own constant island for the gate's address (one
@@ -2669,6 +2676,12 @@ lineage), verbatim:**
 what a pair of dual-issuable ALU ops plus one load resolves to. **The same loop, one fewer
 instruction, 2.24× the cost per instruction.** Two independent readings — the objdump's shape
 and the two metal rows' arithmetic — name the same thing.
+
+> **`corrected at R5`.** §0.15.2 clean-rebuilt round 1's own source and it produces
+> **four instructions at dependency depth 2** — `ldr [pc,#1976]` → `ldr [r3]` → `cmp` → `beq`
+> — not the five ALU-immediate instructions at depth 1 this table charges it with. **There was
+> never a depth difference between the two rows this argument is built on.** The paragraph is
+> left byte-untouched; the row it rests on is not what round 1's source produces.
 
 **Why gcc did it.** `-Os` prefers one literal-pool load to a `movw`/`movt` pair, and with the
 body moved out of line (§0.10.6) there was nothing left above the branch to keep an address
@@ -3004,6 +3017,11 @@ Every prediction in §0.12 is left byte-untouched above and scored beside itself
 | **G-R4.5** lockstep | `WARP_DIVERGE == 0` over **≥ 10⁸** | **0 over 100 000 000 guest instructions, 12 500 000 block executions, 100.0 % retired inside blocks** | **HIT** |
 | **G-R4.6** `WARPTEST` | **13** families, F1 still **+0**, a new ARM encoding through the executor | **PASS 13/13, 0 mismatches**; F1 **64/64**, **+0** range misses; **FAIL 13/13 with 12** under `M-PUBRANGE`; the new encodings found a real oracle defect (§0.13.5) | **HIT** |
 | **G-R4.7** the disarmed gate, static | **3** instructions, **one** load, **zero** address materialisations, off `r4`; `m68k_run_mmu040` **≤ 2 196 B** | **4** instructions, **2** loads, **zero** address materialisations, off `r4`, **dependency depth 1**; **2 372 B** | shape **HIT** (the mechanism), count **MISSED** by one, size **MISSED, high** — and §0.13.4 is why the size row cannot be read as written |
+
+> **G-R4.7 `corrected at R5`.** The measured column above describes `C62AE6E2`, the image that
+> flew. §0.15.2 proves byte-wise that round 4's **source** builds a different run loop —
+> **3 instructions, one load, 2 188 B** — so **on round 4's source G-R4.7 is a HIT on every
+> clause, including the size bound**. The verdict as written is left standing beside this note.
 | **G-R4.8** the armed entry cost | `E` **108 … 120**; armed non-target **13 … 15** | **E ≈ 112**; armed non-target **16** | `E` **HIT**; gate **MISSED, high by 1** — though it is **−1 against the like-for-like control**, which measures 17 |
 | **G-R4.9** the churn instrument | `DISC_EV == DOPC_INVAL`; the cause buckets partition `DISC` | built and structurally exact — one increment per `warp_discard_all()`, and the three buckets are mutually exclusive arms of one `if`/`else if` chain | **BUILT; NOT MEASURED.** The identity is a metal reading and there is no card in this round |
 | **G-R4.10** images | three rebuilt, CRCs recorded, archive fires; `q2probe` untouched | `BOOT.BIN` **`D7ECBCFF`**, `BOOT-lean.BIN` **`C62AE6E2`**, `BOOT-prof.BIN` **`69FC5996`**; 12 811 748 / 12 811 732 / 12 828 212 B; all three archived CRC-stamped; `BOOT-q2probe.BIN` untouched at **`FCC0CB3F`** | **HIT** |
@@ -3056,9 +3074,16 @@ checked out and rebuilt **clean**, as a like-for-like control:
 |---|---|---|
 | round 3 **as shipped** (`C89953E2`, the image metal measured at −4.056 %) | **2 196 B** | `ldr r3,[pc,#2028]` → `ldr r3,[r3]` → `cmp` → `beq` — **4 instructions, depth 2, argument load BELOW the branch** |
 | round 3 **source, clean rebuild** | **2 380 B** | `ldr r3,[pc,#2212]` → `ldr r0,[r4,#88]` → `ldr r3,[r3]` → `cmp` → `beq` — **5 instructions, depth 2** |
+| round 3 **source, clean rebuild** — `corrected at R5` | **2 196 B** | `ldr r3,[pc,#2028]` → `ldr r3,[r3]` → `cmp` → `beq` — **4 instructions, depth 2**, i.e. **byte-for-byte the shipped image's gate, down to the literal offset** |
 | **round 4, clean rebuild** | **2 372 B** | `ldr r3,[r4,#96]` → `ldr r0,[r4,#88]` → `cmp` → `beq` — **4 instructions, depth 1, ZERO address materialisations** |
 
 > ### **§0.11.2's `2 196 B` and §0.11.4's whole size table describe a build that cannot be reproduced from round 3's own source.** They are not wrong about the image that flew; they are wrong about what the source produces. The honest like-for-like comparison is **2 380 → 2 372, i.e. −8 B**, and against that control round 4's gate is **one instruction shorter with half the dependency depth**.
+
+> **`corrected at R5` — THIS PARAGRAPH IS REFUTED AND THE FINDING MOVES TO ROUND 4.** §0.15.2
+> rebuilt round 3's source clean, in a fresh worktree, on the same host and toolchain, and got
+> **2 196 B with the shipped image's exact gate**. Round 3's source reproduces its image.
+> **Round 4's does not** — proven on the archived artifact by a byte search for the two gate
+> encodings. §0.11.2's and §0.11.4's numbers stand; this section's attribution does not.
 
 **§0.12.1's named mechanism survives this and is not weakened by it.** The serial
 dependent-load pair with no slack is exactly what the *shipped* `C89953E2` gate contains, and
@@ -3610,6 +3635,230 @@ absolute floor 8 242 quoted beside it and never removed.**
 6. **`z3660_warp_run`'s preamble**, unchanged and still the largest row in §0.9.3's table.
 7. **Everything §0.8.8, §0.10.7, §0.11.7, §0.12.8 and §0.13.6 said would not be established**,
    unchanged.
+
+
+## 0.15 M1a round 5 — built, and its gates scored (2026-08-24)
+
+**The pre-registration in §0.14 was committed at `d152a50`, before the first line of round-5
+engine code; the implementation commits follow it in this repository's log.** Every prediction
+in §0.14 is left byte-untouched above and scored beside itself.
+
+### 0.15.1 What was built
+
+| piece | where |
+|---|---|
+| **A** the ablation kit — `Z3660_WARP_ABLATE=1…5`, five build dirs, five `.bif`s, five images | `Z3660_emu/Makefile`, `vitis_ide/Makefile`, `src/uae/z3660_warp_ablate.h`, `Z3660_system/Alfa/system_cli_abl*.bif` |
+| **B** the bail attribution — `WARP_BAIL_STUB` / `_MEM` / `_FENCE` / `_VERDICT` / `_OTHER`, ids 64–68 | `z3660_prof.h/.cpp`, `z3660_warp.cpp` |
+| **C** tranche 2 — `LEA` (non-indexed), `CLR Dn`, `EXT`/`EXTB`, and the 1 152 register-count shift forms | `z3660_warp.cpp`, `e_shift_rot_reg()` / `e_shift_reg()` |
+| **D** `WARPTEST` F14–F17, the targeted shift-count differential, seven new mutation arms | `z3660_warp.cpp`, `harness_main.cpp` |
+| **E** the rounds-1/2 re-derivation | four clean rebuilds in disposable worktrees; §0.15.2 |
+| — | **`tools/warp-gate.sh`**, which was NOT in §0.14.6 and is there because §0.15.2 happened |
+
+### 0.15.2 THE BUILD-INTEGRITY FINDING, CORRECTED AND MOVED — §0.13.4 named the wrong round
+
+**§0.14.5 asked for a cheap re-derivation and expected round 3 to serve as the control that
+reproduces. It does not reproduce. It refutes.**
+
+Four clean rebuilds, each in a fresh worktree at that round's own scored commit, on **this
+host with the toolchain that built every one of the images that flew** (`arm-none-eabi-g++
+14.2.1 20241119`, the same one, the same day):
+
+| round | scored at | the doc's claim | **clean rebuild** | the gate, clean |
+|---|---|---|---|---|
+| 1 | `b16967d` | **2 324 B**, gate **5 insns** (`movw`,`movt`,`ldr`,test,`b`), depth 1 | **2 144 B** | `ldr [pc,#1976]` → `ldr [r3]` → `cmp` → `beq` — **4 insns, depth 2** |
+| 2 | `a392fbe` | **2 548 B** | **2 348 B** | `ldr [pc,#2172]` → `ldr [r3]` → `cmp` → `beq` — **4 insns, depth 2** |
+| 3 | `1adb64c` | 2 196 shipped; §0.13.4's clean control **2 380 B**, 5 insns | **2 196 B** | `ldr [pc,#2028]` → `ldr [r3]` → `cmp` → `beq` — **4 insns, depth 2** |
+| 4 | `64d66dd` | **2 372 B**, **4** insns, **2** loads (G-R4.7 scored MISSED) | **2 188 B** | `ldr [r4,#96]` → `cmp` → `beq` — **3 insns, ONE load, zero materialisations** |
+
+> ### **§0.13.4 IS CORRECTED AT R5 IN BOTH DIRECTIONS. Round 3's source reproduces its shipped image EXACTLY — 2 196 B, the same four instructions, down to the same literal-pool offset `#2028`. Round FOUR's does not.**
+
+**And it is proven on the artifact rather than argued from a rebuild.** The gate words of the
+flown image and of the clean rebuild are different byte sequences, and each appears in exactly
+one of the two:
+
+```
+   ldr r3,[r4,#96] ; ldr r0,[r4,#88] ; cmp r3,#0     e5943060 e5940058 e3530000
+      in the flown BOOT-lean-C62AE6E2.BIN : 1        in the round-4 clean ELF : 0
+
+   ldr r3,[r4,#96] ; cmp r3,#0 ; beq +0x98 ; ldr ..  e5943060 e3530000 0a00000a e5940058
+      in the flown BOOT-lean-C62AE6E2.BIN : 0        in the round-4 clean ELF : 1
+```
+
+> ### **THE IMAGE THAT MEASURED −4.256 % IS NOT WHAT ROUND 4'S SOURCE BUILDS, AND THE CONSEQUENCE IS THAT §0.12.1'S FIX WAS NEVER FLOWN.** The design was three instructions, one load off a live base, zero address materialisations. The clean build produces exactly that. The image that went to metal carries a fourth instruction — the argument load `ldr r0,[r4,#88]` hoisted ABOVE the branch, so the disarmed path executes it on every pass. **G-R4.7 was scored `MISSED` against an image its own source does not produce; on round 4's source it is a HIT on every clause, including the size bound it missed by 176 B.**
+
+**How, given that round 4 is the round that fixed the `.d` hazard.** The images were built at
+09:28 and `-include $(OBJS:.o=.d)` was committed at 09:33. **The fix landed after the images
+did, and nothing rebuilt them.** `-MMD` writes the dependency data and `-include` finally
+reads it — but a tree whose objects are *already* stale still links happily, and neither half
+of that mechanism can repair a build that has already happened. Only a clean can.
+
+**What this does and does not move:**
+
+- **It does not re-open a single metal row.** The images that flew are the images that flew
+  and their measured penalties stand as measurements of *those images*. −2.276 %, −5.848 %,
+  −4.056 % and −4.256 % are all still true of the binaries they were taken on.
+- **It moves what those rows are EVIDENCE FOR.** §0.12.1's mechanism argument compared round
+  1's *"five instructions, two ALU immediates, depth 1"* against round 3's *"four, depth 2"* —
+  and round 1's **source** produces **four instructions at depth 2**, the same shape as round
+  3's. **There was never a depth difference between the two rows the argument was built on.**
+  That is an independent reason §0.12.1's prediction failed, and a better one than "the
+  mechanism was wrong".
+- **§0.13.4's "the −4.056 % baseline is not a clean measurement of round 3's source" falls.**
+  Round 3's baseline is clean. Rounds 1, 2 and 4's are the ones that are not.
+- **`tools/warp-gate.sh` exists so the next round cannot do this again.** It reads
+  `m68k_run_mmu040`'s size and its disarmed gate straight off the built ELF and prints them.
+  An image is a container nobody disassembles; an ELF is not.
+
+**One caveat, stated rather than buried.** These rebuilds link the prebuilt BSP from the main
+tree by symlink and build `z3660_emu_lean` alone rather than the whole `lean` target. Neither
+reaches core1's `.text` — `make lean`'s only core1 step *is* `z3660_emu_lean`, and `libxil.a`
+is the same file in all four builds and in the builds that flew. **The artifact-side byte
+search above needs none of that to hold**, which is why it is the evidence and the rebuilds
+are the explanation.
+
+### 0.15.3 THE ABLATION MANIFEST — the matrix as built, before any metal row exists
+
+**All eight images built from one tree after `make clean-all`, CRC-stamped and archived.**
+
+| variant | CRC-32 | image B | removes | `m68k_run_mmu040` | `.text` | predicted recovery |
+|---|---|---|---|---|---|---|
+| **A0** `BOOT-lean.BIN` | **`7A5EC595`** | 12 680 148 | nothing — **the shipping lean** | **2 188** | 6 344 904 | — (the control) |
+| **A1** `BOOT-abl1.BIN` | **`0BAEECE1`** | 12 663 716 | `L-WTST` — the self-test, its 17 corpora, the ARM word executor | 2 188 | 6 340 032 | **0.0 – 0.5 pp** |
+| **A2** `BOOT-abl2.BIN` | **`161412F2`** | 12 680 148 | `L-ATT` — the arm attestation | 2 188 | 6 344 840 | **0.0 – 0.3 pp — THE NOISE FLOOR** |
+| **A3** `BOOT-abl3.BIN` | **`5E2592EF`** | 12 680 116 | `L-HOOK` — the run-loop gate | **2 104** | 6 342 612 | **0.6 – 1.4 pp** |
+| **A4** `BOOT-abl4.BIN` | **`459E51A3`** | 12 680 116 | `L-HOOK` + `L-REG` — and the `regstruct` field | **2 104** | 6 342 580 | **1.8 – 3.4 pp — THE FAVOURITE** |
+| **A5** `BOOT-abl5.BIN` | **`BBED0509`** | 12 663 644 | the engine entirely | 2 104 | 6 326 448 | **3.9 – 4.6 pp — closure** |
+| `BOOT.BIN` | `F48DDEED` | 12 680 180 | (the default variant, rebuilt) | — | — | — |
+| `BOOT-prof.BIN` | `6973E8B5` | 12 696 676 | (the profiling variant, rebuilt) | — | — | — |
+| `BOOT-q2probe.BIN` | `FCC0CB3F` | 12 795 260 | **untouched**, as gated | — | — | — |
+
+**The static half of the matrix behaves exactly as the design says it must**, and three rows
+are worth reading before any metal time:
+
+```
+   A0 -> A2   removing the attestation :   -64 B of .text, run loop UNCHANGED at 2188
+   A0 -> A3   removing the hook        : -2292 B of .text, run loop 2188 -> 2104  (-84)
+   A3 -> A4   removing the field       :   -32 B of .text, run loop UNCHANGED at 2104
+```
+
+> ### **A3 AND A4 DIFFER BY 32 BYTES OF CODE AND 7 910 CHANGED FUNCTION BODIES.** `warp-objdiff.py` over the pair: 25 096 functions, **7 910 changed**, 0 added, 0 removed — reproducing §0.13.3's 7 899 on a pair that is **dynamically identical**. One added struct member re-encodes an immediate constant in **31.5 % of the image's functions** while changing nothing whatever about what the code does. If layout is what the disarm penalty is made of, this is the edge that will show it.
+
+**And the kit's own noise floor has a STATIC reading too, which was not asked for and is the
+most useful thing the matrix produced before the card:**
+
+```
+   A0 vs A2  (remove 64 B of COLD code)         :   457 function bodies changed
+   A1 vs A2  (two different single layers)      :   462
+   A0 vs A3  (remove the hook)                  :   459
+   round-4 clean vs round-5 A0 (a whole round)  :   457
+   A3 vs A4  (the layout edge)                  : 7 910
+```
+
+> ### **Under `-Os -flto`, ANY change to this image re-decides inlining in about 460 function bodies.** Four completely different edges — one cold-code removal, one hot-path removal, two unrelated layers, and an entire round of engine work — all land within five of each other. **That is the ambient churn of the toolchain, not a property of any of the changes**, and it is why §0.14.1 insisted on a negative control before any of these rows are read. The layout edge stands **17×** above it. Nothing else does.
+
+### 0.15.4 The gates
+
+| gate | pre-registered | measured | verdict |
+|---|---|---|---|
+| **G-R5.1** harness | `0 failed`; **+120 … +400**; the **same** delta in lean | green, `0 failed`: **3 334 / 3 330 / 3 561** against 3 320 / 3 316 / 3 547 — **+14 / +14 / +14** | green; count ***MISSED, low*** (as rounds 1–4 all did); "same in lean" **HIT**; prof's further delta **231 both rounds = +0** **HIT** |
+| **G-R5.2** accept-set discriminator | engine == model gen 5 **exactly**; **18 368**; symmetric difference **0** | engine **18 368**, model **18 368**, **agree on 65 536 of 65 536**, difference **0 in both directions** | **HIT. G-R4.2's owed 1 152 is closed** |
+| **G-R5.3** sweep and differential | 6 seeded states, **0** divergences, **≥ 108 000** pairs | **110 208 pairs over 18 368 accepted opcodes, 0 divergences** (round 4: 102 096 over 17 016) | **HIT** |
+| **G-R5.4** the new mutation arms | every one caught, every one clean disarmed, none demonstrably uncatchable | **22 of 22 caught.** Four of the seven new arms first reported NOT CAUGHT and each was diagnosed rather than dropped (§0.15.6) | **HIT**, and the diagnosis is the finding |
+| **G-R5.5** the shift-count differential | every T4 shape × the 15 pre-registered counts, **0** divergences | **1 080 armed/disarmed pairs over 18 shapes × 15 counts × 4 operands, 0 divergences** | **HIT** |
+| **G-R5.6** lockstep | `WARP_DIVERGE == 0` over **≥ 10⁸** | **0 over 100 000 000 guest instructions, 12 500 000 block executions, 100.0 % retired inside blocks** | **HIT** |
+| **G-R5.7** `WARPTEST` | **17** families, F1 still **+0**, a new ARM encoding through the executor | **PASS 17/17, 0 mismatches**; F1 **64/64**, **+0**; F17 drives the register-specified shift and `RSB` through `warp_host_exec` | **HIT** |
+| **G-R5.8** the bail-split identities | all three exact, in the harness before any metal | **BAIL 22 = STUB 12 + MEM 10 + OTHER 0**; **MEM 10 = FENCE 3 + VERDICT 7**; **OTHER 0** — and both sub-arms non-zero, so nothing is asserted over a path that never ran | **HIT** |
+| **G-R5.9** the ablation matrix, static | each variant's removed layer absent from its objdump; every CRC recorded | `z3660_warp_step` absent from A3/A4/A5; `z3660_warp_selftest` absent from A1/A5; the run loop 2 188 → 2 104 exactly at the hook edge; A3/A4 identical in run-loop size and 7 910 bodies apart; all eight CRCs recorded | **HIT** |
+| **G-R5.10** object equivalence, flags OFF | **0** changed function bodies | the lean ELF built with `-DZ3660_WARP_ABLATE=0` forced is **BYTE-IDENTICAL** to the shipping lean built with the flag absent; `warp-objdiff.py`: 25 102 common, **0 changed** | **HIT** |
+| **G-R5.11** images | trio + five variants, CRCs, archive fires; `q2probe` untouched | eight built and archived CRC-stamped (§0.15.3); `BOOT-q2probe.BIN` untouched at **`FCC0CB3F`** | **HIT** |
+| **G-R5.12** the rounds-1/2 re-derivation | both complete, sizes recorded whether or not they match | four completed; **three of the four doc claims move**, and the finding is bigger than the gate (§0.15.2) | **HIT — and it refuted §0.13.4** |
+
+**Eleven of twelve gates hit. G-R5.1's count missed low for the fifth consecutive round** — a
+pre-registered range that has been wrong every single time it has been written is a statement
+about the estimator rather than about the rounds, and it is recorded as one. **G-R5.12 "hit"
+in the sense that it ran and reported; what it reported is §0.15.2.**
+
+### 0.15.5 The bail split, read in the harness — and what it does NOT yet say
+
+`test_warp_bail_split()` produces both populations deliberately and both identities close
+exactly. **The harness reading is a MECHANISM CHECK, not the measurement**: 22 bails on a
+five-opcode corpus says the counters are wired to the right sites and says nothing about
+dhrystone's mix. **§0.14.2's prediction — `BAIL_STUB/BAIL` in 0.80 – 0.97 — is a claim about
+metal and stays unmeasured.**
+
+What the harness does settle, and it is the part that could have been wrong:
+
+- **`BAIL_MEM == BAIL_FENCE + BAIL_VERDICT` holds exactly**, which is a claim about the
+  emitter rather than about arithmetic — one helper decline produces one bail, because the
+  `CMP` / `e_bail_if` pair follows every `blx` and no other kind of site emits one. Had a bail
+  existed without a decline in front of it, this is where it would have shown.
+- **`BAIL_OTHER == 0`**, the tripwire, on a corpus built to reach every arm.
+- **Both sub-causes are non-zero** (fence 3, verdict 7), so neither sub-counter is an identity
+  asserted over a path that never ran — §0.5.5 G4's engagement rule, applied to a counter
+  rather than to a corpus.
+
+### 0.15.6 Five things worth recording that were not gates
+
+- **FOUR OF THE SEVEN NEW MUTATION ARMS FIRST REPORTED `NOT CAUGHT`, AND ALL FOUR WERE
+  DIAGNOSED RATHER THAN DROPPED.** §0.13.5 named the failure mode — *"a mutation arm that
+  cannot be caught at all is worse than none: it reports CAUGHT-shaped silence"* — and round 5
+  walked into four fresh instances of it in one afternoon:
+  - **`X` could not be set from the arm table at all.** `warp_seed()` takes X from bit 27 of
+    its key and every key the loop builds is below 2²⁷, so **X was zero in all eight seeds**
+    and an arm that flips X had nothing to flip. The table grew an `x` column.
+  - **A count and an operand in the same register cannot express "count 0 on a non-zero
+    operand"**, which is what three of the four T4 arms turn on. The table grew a `d1` column
+    and the opcodes moved to `<shift> D1,D0`.
+  - **Two arms named the wrong opcode** — `0xE1A8` is `LSL`, which has no overflow test at
+    all, where the ASL-clamp arm needed `0xE1A0`.
+  - **`EXT.W`'s FLAG WIDTH IS NOT MUTATABLE, and that is a property rather than an
+    oversight.** The value being tested is a *sign-extended byte*, so its bit 15 and its bit 31
+    are the same bit and its low 16 bits are zero exactly when all 32 are: reading the flags at
+    long width instead of word width gives the identical N and Z **for every operand that
+    exists**. The arm was pointed at the destination width, which is observable. **A mutation
+    that cannot be observed is not a weak test; it is a proof that two programs are the same
+    program, and it is worth writing down as one.**
+- **`docs/warp-corpus.py`'s gen-4 line was deliberately left unamended at 18 168.** Editing it
+  to 17 016 would have made a scored gate pass retroactively. §0.13.6 fixed the direction of
+  the repair and this round took it: **the emitter moved.**
+- **`EXT` must be decoded before `LEA` or every `EXTB.L` is silently refused.** `EXTB.L Dn` is
+  `0100 1001 1100 0rrr`, which matches `LEA`'s pattern with `rrr = 100` and an EA mode of
+  `000` — an encoding the 68k reassigns precisely *because* `LEA Dn,An` is illegal. Both the
+  emitter and the model carry the ordering and the comment; the accept-set discriminator would
+  otherwise have reported a disagreement with neither side knowing which was right.
+- **The five ablation `.bif`s had to be named one by one in `Z3660_system/.gitignore`**, whose
+  own comment predicted this: *"An ignore rule that has to be defeated by a forced add is a
+  rule that will eventually not be defeated."* The kit is an instrument rather than a shipping
+  image, which makes it exactly the kind of thing that gets left untracked and then cannot be
+  rebuilt by the session that needs to re-run the matrix.
+- **The shipping lean carries §0.12.1's designed gate for the first time.** `7A5EC595`'s
+  disarmed path is `ldr r3,[r4,#96]` / `cmp r3,#0` / `beq` — **three instructions, one load off
+  a base the loop already holds, zero address materialisations, `m68k_run_mmu040` at 2 188 B**.
+  Round 4 designed it, scored it MISSED against an image that did not contain it, and rolled
+  the card back on a row that never tested it.
+
+### 0.15.7 What round 5 leaves owed
+
+1. **Every metal row.** Round 5 takes none. The ablation matrix, the bail split's shares, the
+   coverage band, the armed band and the disarm penalty are all pre-registered in §0.14 and
+   all unmeasured.
+2. **The decision rule's own bar needs re-reading against A0's own row.** §0.14.1 rule 2 pins
+   it at 2.128 pp = half of round 4's −4.256 %, and §0.15.2 has just established that
+   −4.256 % was measured on an image round 4's source does not build. **The rule is applied to
+   HALF OF A0's OWN SAME-SESSION PENALTY**, and §0.14.1's 2.128 pp is left byte-untouched
+   beside it as what was written before the row.
+3. **Whether A0's disarmed row is different at all now.** The gate it ships is one instruction
+   and one load lighter than the one that measured −4.256 %. If the penalty moves on that
+   alone, §0.12.1's mechanism is back in play — and it will have been resolved by a build
+   discipline rather than by a theory.
+4. **The memory-touching families on silicon.** §0.14.4 specifies the helper-substitution
+   self-test arm; round 5 did not build it. **Re-owed, now with a design rather than a
+   complaint.**
+5. **The indexed `LEA` modes** — 6 of the 240 hot instructions, refused with a named reason
+   (§0.14.3 T1) and worth a pre-registration of their own if a later tranche wants them.
+6. **`z3660_warp_run`'s preamble**, unchanged, still the largest row in §0.9.3's table.
+7. **Everything §0.8.8, §0.10.7, §0.11.7, §0.12.8, §0.13.6 and §0.14.9 said would not be
+   established**, unchanged.
 
 
 
