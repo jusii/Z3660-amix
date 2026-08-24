@@ -31,7 +31,12 @@ opcode-for-opcode -- so a transcription error is a test failure, not a silent wr
 prediction. Run:
 
     python3 docs/warp-corpus.py --dis <objdump-output>
-    python3 docs/warp-corpus.py --bitmap 3 > /tmp/model3.txt   (for the gate)
+    python3 docs/warp-corpus.py --compare <harness>/warp-accept.txt --gen 5   (the gate)
+
+ROUND 5 ADDS gen 5 AND CHANGES NOTHING BELOW IT. Sec 0.14.3's corpus table is the
+`--dis` report's R5 column; Sec 0.15.4's G-R5.2 is the `--compare` exit status. The
+gen-3 and gen-4 predicates are left byte-untouched, including the one line whose
+disagreement with the engine scored G-R4.2 MISSED -- see the note beside it.
 """
 
 import argparse
@@ -338,22 +343,22 @@ def report(path):
         n = len(rows)
         a3 = sum(1 for r in rows if accept(r[1], 3)[0])
         a4 = sum(1 for r in rows if accept(r[1], 4)[0])
+        a5 = sum(1 for r in rows if accept(r[1], 5)[0])
         print("=== %s : %d instructions ===" % (label, n))
-        print("  accepted by R3 : %5d  %6.2f %%   declined %6.2f %%"
-              % (a3, 100.0 * a3 / n, 100.0 * (n - a3) / n))
-        print("  accepted by R4 : %5d  %6.2f %%   declined %6.2f %%"
-              % (a4, 100.0 * a4 / n, 100.0 * (n - a4) / n))
-        print("  newly accepted : %5d  %6.2f pp of the corpus"
-              % (a4 - a3, 100.0 * (a4 - a3) / n))
+        for tag, a in (("R3", a3), ("R4", a4), ("R5", a5)):
+            print("  accepted by %s : %5d  %6.2f %%   declined %6.2f %%"
+                  % (tag, a, 100.0 * a / n, 100.0 * (n - a) / n))
+        print("  newly accepted : %5d  %6.2f pp of the corpus  (R4 -> R5)"
+              % (a5 - a4, 100.0 * (a5 - a4) / n))
         gained = collections.Counter()
         refused = collections.Counter()
         for _, op, _f, text in rows:
-            ok3, _ = accept(op, 3)
-            ok4, tag4 = accept(op, 4)
-            if ok4 and not ok3:
-                gained[(tag4, mnemonic(text))] += 1
-            elif not ok4:
-                refused[(tag4, mnemonic(text))] += 1
+            ok4, _ = accept(op, 4)
+            ok5, tag5 = accept(op, 5)
+            if ok5 and not ok4:
+                gained[(tag5, mnemonic(text))] += 1
+            elif not ok5:
+                refused[(tag5, mnemonic(text))] += 1
         print("  --- what R4 gains ---")
         for (tag, mn), c in gained.most_common(14):
             print("      %-16s %-10s %5d" % (tag, mn, c))
@@ -370,7 +375,7 @@ def report(path):
         if not rows:
             continue
         print("=== %s : mean accepted RUN length (a proxy for block length) ===" % label)
-        for gen in (3, 4):
+        for gen in (3, 4, 5):
             runs, cur = [], 0
             for _, op, _f, _t in rows:
                 if accept(op, gen)[0]:
@@ -438,8 +443,9 @@ def main():
         sys.exit(compare(a.compare, a.gen))
     n3 = sum(1 for o in range(65536) if accept(o, 3)[0])
     n4 = sum(1 for o in range(65536) if accept(o, 4)[0])
-    print("model accept over all 65536 opcode words: R3 %d, R4 %d (+%d)"
-          % (n3, n4, n4 - n3))
+    n5 = sum(1 for o in range(65536) if accept(o, 5)[0])
+    print("model accept over all 65536 opcode words: R3 %d, R4 %d (+%d), R5 %d (+%d)"
+          % (n3, n4, n4 - n3, n5, n5 - n4))
     print()
     if a.dis:
         report(a.dis)
