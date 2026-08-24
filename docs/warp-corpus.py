@@ -64,6 +64,12 @@ def accept(op, gen):
     one's own frozen scope completed (TST, the shift/rotate register forms) plus
     M1a tranche 1 (MOVEQ, the remaining register-destination ALU shapes, and
     (An)+ / -(An) SOURCES with a register destination).
+
+    gen == 5 is M1a TRANCHE 2, pre-registered in Sec 0.14.3: LEA (the
+    non-indexed modes), CLR with a Dn destination, EXT/EXTB, and the
+    REGISTER-COUNT shift/rotate forms -- the 1152 opcodes G-R4.2 measured as the
+    entire round-4 disagreement between this model and the engine, closed in the
+    direction the pre-registration requires (the emitter moves, not the model).
     """
     # ------------------------------------------------------- MOVE / MOVEA ----
     if (op & 0xC000) == 0x0000 and (op & 0x3000) != 0x0000:
@@ -143,9 +149,70 @@ def accept(op, gen):
         if typ == 2:
             return (False, 'ROXd')               # needs X in AND out: not built
         ir = (op >> 5) & 1
+        # G-R4.2's 1152, AND THIS LINE IS DELIBERATELY LEFT WHERE IT WAS. The
+        # gen-4 model accepted the register-count forms; the round-4 ENGINE
+        # refused them, and the gate scored MISSED over exactly these 1152
+        # opcodes. Sec 0.13.6 item 2 fixed the direction of the repair -- "the
+        # model is part of a pre-registration, so it is the emitter that moves" --
+        # so gen 4 still reads 18 168 here, unamended, and round 5 closes the gap
+        # by BUILDING them (Sec 0.14.3 T4). Editing this line to 17 016 would have
+        # made the round-4 gate pass retroactively, which is the one repair the
+        # pre-registration discipline forbids.
         if gen >= 4:
             return (True, 'shift-imm' if ir == 0 else 'shift-reg')
         return (False, 'shift')
+
+    # ------------------------------------------------- EXT / EXTB (T3) --------
+    # EXT.W 0x4880|r, EXT.L 0x48C0|r, EXTB.L 0x49C0|r -- always Dn. The mode field
+    # is what separates EXT.W/.L from MOVEM, whose encodings start at 0x4888/0x48C8.
+    #
+    # AND IT IS TESTED BEFORE LEA, WHICH IS NOT A STYLE CHOICE. EXTB.L is
+    # 0100 1001 1100 0rrr, and that matches LEA's 0100 rrr 111 eeeeee pattern
+    # exactly with rrr=100 and an EA mode of 000 -- an encoding the 68k reassigns
+    # to EXTB.L precisely because `LEA Dn,An` is illegal. Test LEA first and every
+    # EXTB.L is classified as a refused LEA instead of an accepted EXT.
+    if (op & 0xFFF8) in (0x4880, 0x48C0, 0x49C0):
+        return ((gen >= 5), 'EXT')
+
+    # ------------------------------------------------------------ LEA (T1) ----
+    # 0100 rrr 111 eeeeee. The destination is always An and NO memory is read --
+    # the effective address IS the operand -- so every mode below is a pure
+    # register computation. CHK is 0100 rrr 1s0 eeeeee and does not alias: bits
+    # 8..6 are 111 here and 110/100 there.
+    #
+    # THE INDEXED MODES ARE REFUSED AND THE REFUSAL IS NAMED BEFORE THE CORPUS IS
+    # COUNTED (Sec 0.14.3). d8(An,Xn) and d8(PC,Xn) carry an extension word whose
+    # bit 8 selects the 68020 FULL format, and a full-format extension can
+    # DEREFERENCE MEMORY (memory-indirect addressing) -- so admitting the brief
+    # form means admitting a decode surface whose neighbour reaches guest memory
+    # from a family that otherwise never does. That is its own pre-registration.
+    if (op & 0xF1C0) == 0x41C0:
+        if gen < 5:
+            return (False, 'other')
+        mode = (op >> 3) & 7
+        reg = op & 7
+        if mode == EA_IND or mode == EA_D16:
+            return (True, 'LEA')
+        if mode == 6:
+            return (False, 'LEA-indexed')
+        if mode == 7:
+            if reg in (0, 1):            # (xxx).W, (xxx).L -- a constant
+                return (True, 'LEA')
+            if reg == 2:                 # d16(PC) -- a COMPILE-TIME constant
+                return (True, 'LEA')
+            return (False, 'LEA-indexed' if reg == 3 else 'LEA-ea')
+        return (False, 'LEA-ea')         # Dn, An, (An)+, -(An): not legal EAs
+
+    # ------------------------------------------------------------ CLR (T2) ----
+    # 0100 0010 ss eeeeee, Dn ONLY. A memory destination is a memory-DESTINATION
+    # family, and round 5 declares that whole class out of scope with a statement
+    # rather than a build (Sec 0.14.3). sz == 3 is MOVE from CCR on the 68010+.
+    if (op & 0xFF00) == 0x4200:
+        if ((op >> 6) & 3) == 3:
+            return (False, 'MOVEfromCCR')
+        if gen >= 5 and ((op >> 3) & 7) == EA_DREG:
+            return (True, 'CLR')
+        return (False, 'CLR-ea')
 
     # ---------------------- immediate ALU: ADDI/SUBI/ANDI/ORI/EORI/CMPI ------
     if (op & 0xF000) == 0x0000:

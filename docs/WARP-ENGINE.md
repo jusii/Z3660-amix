@@ -3114,6 +3114,504 @@ against a fresh `R`, and that is the only comparison that was ever going to be t
    are not re-examined here and their objdump numbers carry the same risk.
 6. **Everything §0.8.8, §0.10.7, §0.11.7 and §0.12.8 said would not be established**, unchanged.
 
+## 0.14 M1a round 5 — pre-registered, before the first line of round-5 code (2026-08-24)
+
+**This section is written before any round-5 engine code and is scored as written.** §3.4's
+two rules govern it exactly as they governed §0.6, §0.8, §0.10 and §0.12: the pre-registration
+commit precedes the implementation commits, provably, by commit timestamp in this repository;
+and a pre-registration that gets rewritten is not one, so every number below is left
+byte-untouched and scored beside itself.
+
+**Round 5 is routed by the same clause round 4 was.** §0.5.2's decision table sends a
+below-band coverage wave to the next tranche of §0.5.1's frozen extension order, and §0.12.7
+pre-registered — before round 4's row existed — that *"this tranche does NOT reach 60 %, and
+M1a tranche 2 is predicted now rather than after a disappointing number."* Coverage measured
+**19.10 %**. The kill line is untouched, still armed, still unfired.
+
+### 0.14.0 THE METHOD THAT IS BEING RETIRED, AND THE ONE THAT REPLACES IT
+
+**Two named mechanisms for the disarm-penalty residual have now been refuted on metal, and
+both were produced the same way: read the shipping objdump, name a shape, predict a number,
+measure it, miss.**
+
+| round | named mechanism | where it was named | metal verdict |
+|---|---|---|---|
+| 3 | **L1I footprint** — the disarmed loop got bigger | §0.10.6 | ***REFUTED*** (§0.11.4): round 3's loop was 128 B **smaller** than round 1's and cost **1.78×** as much |
+| 4 | **dependency depth** — a serial load-to-load pair with no slack | §0.12.1 | ***REFUTED*** (round-4 metal): the gate landed at depth 1 with zero address materialisations, exactly as designed, and the penalty got **0.2 pp worse** |
+
+> ### **THE METHOD IS RETIRED FOR THIS PROBLEM.** Guessing a mechanism from a disassembly and then buying a metal row to test it has been tried twice, has cost two flashes and two card rollbacks, and has produced two refutations and no attribution. A third guess would be the same experiment a third time. **Round 5 does not name a mechanism at all. It builds an instrument that bisects the cost, and it pre-registers the decision rule that reads the instrument** (§0.14.1).
+
+**What survives the two refutations, and it is worth stating because it constrains round 5.**
+Both refuted mechanisms were **local to the gate** — a property of the four or five ARM
+instructions the run loop gained. Two independent local mechanisms have failed. **The one
+change round 4 made that is not local is `struct regstruct` gaining a field**, which
+`warp-objdiff.py` measured as **7 899 changed function bodies** across the image (§0.13.3).
+That is the shape of a candidate the previous two were not, and §0.14.1 pre-registers it as
+the favourite — but as a *variant to be measured*, not as a mechanism to be announced.
+
+**A second, quieter thing the two refutations cost, and it is fixed here rather than
+absorbed.** Every disarm penalty this campaign has quoted is the difference between two
+separately-built images. Nothing has ever measured how much of that difference is simply *two
+builds*. Round 5 carries a **negative control** — a variant whose ablated layer is provably
+off the disarmed path — and whatever it measures is the round's **noise floor**. No edge
+smaller than the floor may be read as a mechanism, by anyone, afterwards.
+
+### 0.14.1 THE DISARM-RESIDUAL ABLATION KIT — the instrument, its variants, and its decision rule
+
+**The disarmed cost being decomposed is round 4's measured −4.256 %** — `C62AE6E2`'s disarmed
+dhrystone against the same-session clean-interpreter `R`. The question the kit answers is not
+*"what shape is the gate"* but *"which of the layers WARP adds to a disarmed image carries the
+cost"*, and it answers it by **removing one layer at a time and re-measuring**.
+
+**Four candidate layers, enumerated from the code rather than from a theory:**
+
+| layer | what it is, concretely | why it could cost |
+|---|---|---|
+| **L-REG** | `int warp_on` inside `struct regstruct` (`include/newcpu.h`) | **displacement.** Every member after it moves, so every function that touches `regs.s`, `regs.vbr`, `regs.usp` or any later field re-encodes its offsets. **7 899 bodies changed** (§0.13.3). Some offsets can cross an addressing-mode boundary; the whole image's I-cache layout moves |
+| **L-HOOK** | the run loop's `if (z3660_warp_on) … z3660_warp_step()` and the block-consumes-the-pass branch (`newcpu.cpp`) | **the hot path.** Four ARM instructions on every disarmed dispatch, plus a restructured loop body around them |
+| **L-ATT** | the split-pair arm attestation and the lean-side stat plumbing (`z3660_warp.cpp`) | **presence only.** It lives inside `z3660_warp_run`, which a disarmed image never calls. **This is the negative control** |
+| **L-WTST** | `z3660_warp_selftest()`, its 13 family corpora and the ARM word executor, linked into every shipping lean image | **cold code and link layout.** Never executed until its verb arrives; it still occupies address space and moves everything after it |
+
+**Six images, built from ONE source tree by `-D` flags, so the matrix is reproducible and no
+variant is a different checkout.** Each build gets its own build directory and its own `.bif`,
+because a `-D` is not a tracked dependency and this repository has already been bitten by a
+variant switch leaving another variant's objects in place.
+
+| variant | flag | removes | edge it reads |
+|---|---|---|---|
+| **A0** | *(none — the shipping lean)* | nothing; all four layers present | the control; its penalty is the number being decomposed |
+| **A1** | `Z3660_WARP_ABLATE=1` | **L-WTST** | A0→A1 = cold code + link layout |
+| **A2** | `Z3660_WARP_ABLATE=2` | **L-ATT** | A0→A2 = **THE NOISE FLOOR** |
+| **A3** | `Z3660_WARP_ABLATE=3` | **L-HOOK** | A0→A3 = the hot-path gate |
+| **A4** | `Z3660_WARP_ABLATE=4` | **L-HOOK + L-REG** | **A3→A4 = struct displacement, ALONE** |
+| **A5** | `Z3660_WARP_ABLATE=5` | the engine entirely (`z3660_warp.cpp` filtered out) | A0→A5 = **closure** |
+
+> ### **A3 AND A4 ARE DYNAMICALLY IDENTICAL AND DIFFER ONLY IN `struct regstruct`'S LAYOUT.** With `L-HOOK` removed nothing on the disarmed path reads the flag at all, so the only difference between the two images is where every field after `warp_on` sits. **That edge is the cleanest measurement of layout displacement this campaign can construct**, and it is the reason `L-REG` is not offered as an independent removal: taking the field out while leaving the hook in would put the flag back in a standalone global, which is round 3's arrangement — a different change, not an ablation.
+
+**THE PRE-REGISTERED FAVOURITE, STATED BEFORE ANY CRC EXISTS: `L-REG`, the struct
+displacement, read on the A3→A4 edge.** The reasoning is not a new objdump — it is that the
+two mechanisms already refuted were both *local to the gate*, and `L-REG` is the only layer
+round 4 added that is *global to the image*. It is named here so that it cannot be adopted
+after a row, and so that it can be **wrong in public** the way §0.10.6's and §0.12.1's were.
+
+**Predicted signs and magnitudes, each stated per edge:**
+
+| edge | predicted recovery of the −4.256 % | direction |
+|---|---|---|
+| A0→A1 (`L-WTST`) | **0.0 – 0.5 pp** | ~0. Cold code that never executes on a disarmed pass |
+| A0→A2 (`L-ATT`) | **0.0 – 0.3 pp** | **0 by construction.** Whatever it measures IS the floor |
+| A0→A3 (`L-HOOK`) | **0.6 – 1.4 pp** | +. Four instructions at §0.9.3's 214.2 cy/guest-insn, priced the way round 1's five were |
+| **A3→A4 (`L-REG`)** | **1.8 – 3.4 pp** | **+, and this is the favourite** |
+| A0→A5 (whole engine) | **3.9 – 4.6 pp**, i.e. A5's own penalty within the floor of **0** | +. The closure |
+
+**THE DECISION RULE, pre-registered:**
+
+```
+   1. THE FLOOR is |penalty(A0) - penalty(A2)|.  No edge smaller than the floor is
+      read as a mechanism, in this round or any later one.
+
+   2. A single edge that recovers >= HALF the measured penalty NAMES the mechanism.
+      Round 4 measured -4.256 %, so the bar is 2.128 pp.
+
+   3. If NO edge recovers >= half, the cost is DISTRIBUTED OR EMERGENT.  That is a
+      FINDING and the doc says so in those words -- it retires "one layer carries it"
+      as a hypothesis, and the method that would find it is a different one again.
+
+   4. If A5's own penalty is NOT within the floor of zero, the four named layers do
+      not SPAN the cost.  Something outside all four carries it, and that is a bigger
+      finding than any of the four.
+
+   5. ADDITIVITY GATE:
+         (A0-A1) + (A0-A2) + (A0-A3) + (A3-A4)  ==  (A0-A5)   +/- 2 x floor
+      A miss here says the layers INTERACT, which is itself the attribution.
+```
+
+**The flight order, and the drop order, both fixed before the session.** The metal session
+runs A0, A2, A3, A4, A5, A1 **in that order**: the control, then the floor, then the two edges
+that carry the pre-registered prediction, then closure, then the cheapest hypothesis last. **If
+the session runs short, images are dropped from the END of that list** — A1 first, then A5.
+Saying so now is what stops a short session from looking like a choice made after a number.
+
+**What the kit costs and what it does not.** Six flashes plus their boots and dhrystone arms;
+the standing `/etc/haltsys`-before-deploy discipline and both CRC gates apply to every one of
+them. **No variant except A0 is ever a candidate to ship**, and A5 in particular is a
+measurement build in exactly the sense §0.5.4's elided-state-sync build was — it is removed
+from nothing, because it is a flag rather than a code path, but it must never be left on a
+card. The end-state rule is unchanged and unrelated to the kit: **the card ships round 5's A0
+lean image if and only if A0's own disarmed row meets the ≥ 7 988 class** (§0.12.7 step 3,
+carried forward verbatim), and otherwise goes back to `F294E75A`.
+
+### 0.14.2 THE BAIL-ATTRIBUTION COUNTER — and a prediction the existing counters already constrain
+
+**Round 4 opened a 7.5 pp gap between two rates that round 3 had 0.4 pp apart:** bail rate
+`BAIL/BLK` **68.486 %** against decline rate `DECLINE/COMPILE` **60.958 %**. §0.13's verdict
+named a mechanism — *"round 4's auto-adjust `(An)+`/`−(An)` sources compile successfully but
+bail at run time on the memory helper"* — and called it **not proven**. It is not proven, and
+the counters that exist already say something about it.
+
+**The arithmetic, off round 4's own dump, and it is a measured fact rather than a model:**
+
+```
+   WARP_BLK   13 446 848      WARP_ENTER  4 238 096      WARP_BAIL  9 209 263
+   BLK - ENTER = 9 208 752   <- block executions that retired NOTHING
+   BAIL - (BLK - ENTER) = 511 <- block executions that retired SOME and then bailed
+```
+
+> ### **99.994 % of round 4's bails retired nothing at all.** `WARP_ENTER` is incremented only when a block retired ≥ 1 instruction, so `BLK − ENTER` is exactly the zero-retirement population, and `WARP_BAIL` exceeds it by **511** in 9.2 million. **Whatever the gap is, it is not blocks that got part-way through and then met a memory helper** — that population is five hundred executions.
+
+**So the zero-retirement population is the whole question, and it has exactly two members:** a
+**cached decline stub** (`len == 0`, the engine refused this head and remembers) and a **real
+block that declined at its very first faultable site**. The existing counters cannot separate
+them; one bit at the existing site can.
+
+**The counters, append-only, no id moves, no field changes shape, dump version stays 2,
+`Z3660_PROF_C_COUNT` 64 → 69:**
+
+| id | counter | site | topology check |
+|---|---|---|---|
+| 64 | `WARP_BAIL_STUB` | `z3660_warp_run`'s bail arm, `s->len[way] == 0` | a cached decline stub executed. **Uncovered opcode at run time, in its cached form.** Costs no emitted code |
+| 65 | `WARP_BAIL_MEM` | same arm, `len > 0` | a real block bailed. **Every bail from a real block is a memory-helper decline, by construction:** `e_bail_if()` is emitted at exactly two kinds of site — after `blx R_RD` and after `blx R_WR` — and nowhere else |
+| 66 | `WARP_BAIL_FENCE` | inside `z3660_warp_rd`/`_wr`, the `warp_fence()` refusal | the sub-cause: misaligned, or the access crosses a guest page |
+| 67 | `WARP_BAIL_VERDICT` | same helpers, the `z3660_dfast_*` refusal | the sub-cause: `SLOW` verdict, ATC miss, or a non-direct bank |
+| 68 | `WARP_BAIL_OTHER` | the bail arm, neither of the above | **the residual, and it is pre-registered at exactly 0.** A bail that is neither a stub nor a real block cannot exist |
+
+**Where the "fault" bucket went, stated rather than omitted.** The dispatch's fourth cause has
+no site in this engine: **generated code never takes a fault**, because every faultable access
+is a helper call that *declines* first and the block leaves through its bail arm. That is the
+bail contract, and the instrument that watches it is §0.5.5 G2's existing
+`FAULTS(on) == FAULTS(off) ± 1`, not a new counter. **If the contract ever leaked, the leak
+would arrive as a fault the interpreter did not take — which G2 catches — and not as a bail.**
+`WARP_BAIL_OTHER` is the tripwire for the other direction.
+
+**Two structural identities, and both are gates:**
+
+```
+   WARP_BAIL      ==  WARP_BAIL_STUB + WARP_BAIL_MEM + WARP_BAIL_OTHER     exact
+   WARP_BAIL_MEM  ==  WARP_BAIL_FENCE + WARP_BAIL_VERDICT                  exact
+   WARP_BAIL_OTHER == 0                                                    exact
+```
+
+**The second one is the load-bearing one** and it is a claim about the emitter, not about
+arithmetic: one helper decline produces one bail, because the `CMP`/`e_bail_if` pair follows
+every `blx` immediately. If it does not close, either a helper declined without a bail
+following it or a block bailed without a helper declining — and either is a defect in the bail
+contract, found by an identity rather than by a soak.
+
+> ### **THE PREDICTION, MADE BEFORE THE SPLIT EXISTS: THE GAP IS THE DECLINE STUB, AND THE SESSION'S NAMED CANDIDATE IS PREDICTED TO BE REFUTED.** `WARP_BAIL_STUB / WARP_BAIL` is pre-registered at **0.80 – 0.97, point 0.88**; `WARP_BAIL_MEM / WARP_BAIL` at **0.03 – 0.20, point 0.12**. **The rule that makes it falsifiable: if `WARP_BAIL_MEM / WARP_BAIL` ≥ 0.30, the memory-helper candidate is CONFIRMED and this prediction is marked MISSED beside itself.**
+>
+> The derivation, so the number is not a feeling: if a cached stub is entered about as often as a real block — round 3 measured **349.1** executions per stub against **342.0** per real block, 2.1 % apart (§0.12.0) — then the stub share of `WARP_BLK` is approximately the decline rate itself, and the bail rate exceeds it by exactly the real blocks that bailed at their first site. Round 4's 7.53 pp gap over a 68.49 % bail rate is **11 %** of the bails, which is the point estimate. **The alternative that the band's width admits is that stubs are entered *more* often than real blocks** — a short refused head arrives more often than a long compiled one — in which case the stub share exceeds the decline rate and the memory-helper term is smaller still.
+
+**The sub-split's own prediction:** `WARP_BAIL_FENCE / WARP_BAIL_MEM` ≤ **0.10, point 0.02**.
+The guest's own compiler aligns its accesses and a byte access cannot be misaligned at all, so
+the fence should fire almost only on a long that straddles a 4 K boundary.
+
+**What was priced and declined: a per-emitter-arm attribution.** Splitting `WARP_BAIL_MEM` by
+*which family* bailed — auto-adjust source against plain `(An)`/`d16(An)` source — needs a
+compile-time cause constant stored at every bail arm, which is two emitted ARM instructions per
+bail site in every block. That charges the instrument into the armed path this round is not
+measuring, and §0.5.6's own rule about not bracketing the compile path applies in the same
+form. **It is declined here, before the number, so that it cannot be adopted afterwards to
+rescue a reading.**
+
+### 0.14.3 M1a TRANCHE 2 — the accept set, pre-registered, and what it is predicted to buy
+
+**§0.12.3 named the next three levers before round 4's row, exactly so this section could not
+look like a rescue:** *"the next three levers are `LEA`, `CLR` and `EXT`/`EXTB` — all three in
+the M0 census's fully register-only family list … They are tranche 2's to pre-register, on
+their own commit, and this paragraph is the record that the temptation was priced and
+declined."* This is that commit. Round 5 builds those three, and closes G-R4.2's owed 1 152.
+
+| | family | scope, and every exclusion named |
+|---|---|---|
+| **T1** | **`LEA`** | destination `An`, modes **`(An)`, `d16(An)`, `(xxx).W`, `(xxx).L`, `d16(PC)`**. No memory is read — the effective address **is** the operand — so every one of these is a pure register computation, and `d16(PC)` resolves to a **compile-time constant** |
+| **T2** | **`CLR`** | **`Dn` destination only**, `.B`/`.W`/`.L` |
+| **T3** | **`EXT.W` / `EXT.L` / `EXTB.L`** | `Dn` only. 24 opcodes |
+| **T4** | the **register-count** shift/rotate forms | `ASL`/`ASR`/`LSL`/`LSR`/`ROL`/`ROR`, count in `Dn`, `.B`/`.W`/`.L`, `Dn` destination — **G-R4.2's 1 152**. `ROXL`/`ROXR` stay excluded for round 4's reason, unchanged |
+
+**T1's one refusal, named before the corpus is counted, because it is the expensive one.**
+`d8(An,Xn)` and `d8(PC,Xn)` — the **indexed** modes — are **refused**. The reason is not the
+brief extension word's arithmetic, which is cheap; it is that **bit 8 of that extension word
+selects the 68020 FULL format, and a full-format extension can dereference memory**
+(memory-indirect addressing). Admitting the brief form means admitting a decode surface whose
+immediate neighbour reaches guest memory from a family that otherwise never does, and getting
+the discrimination wrong ships a silent memory read inside a block that declares itself
+register-only. **That is its own pre-registration and it is not smuggled in here.** §0.14.3's
+corpus table prices the refusal: **6 of the 240 hot instructions**, the largest single thing
+tranche 2 leaves behind.
+
+**T2's one refusal is the round's whole out-of-scope statement in miniature.** `CLR` to
+`(An)`, `d16(An)`, `(An)+`, `−(An)` or an absolute address is a **memory-DESTINATION** family,
+and round 5 declares that entire class out of scope with a statement (§0.14.3's closing
+paragraphs) rather than a build.
+
+**T3's encoding trap, recorded because the model walked into it and the engine would have.**
+`EXTB.L Dn` is `0100 1001 1100 0rrr`, which matches `LEA`'s `0100 rrr 111 eeeeee` pattern
+exactly with `rrr = 100` and an EA mode of `000` — an encoding the 68k reassigns to `EXTB.L`
+precisely *because* `LEA Dn,An` is illegal. **`EXT` must be tested before `LEA`**, in the
+emitter and in `docs/warp-corpus.py` alike, or every `EXTB.L` is classified as a refused `LEA`.
+
+**T4 is the repair §0.13.6 item 2 specified, in the direction it specified.** The gen-4 model
+accepted the register-count forms and the gen-4 engine refused them; the gate scored MISSED
+over exactly those 1 152 opcodes. *"The model is part of a pre-registration, so it is the
+emitter that moves."* **`docs/warp-corpus.py`'s gen-4 line is therefore left unamended and
+still reads 18 168** — editing it to 17 016 would have made a scored gate pass retroactively,
+which is the one repair this discipline forbids — and round 5 builds the forms instead.
+
+**How T4 is emitted, and the one uniform device that makes 18 shapes tractable.** ARM's own
+register-specified shifts already implement the 68k's rules for every count ≥ 1, at every
+size, once the operand is top-aligned for the left forms and sign/zero-extended for the right
+ones: `MOVS rd, rm, LSL rs` takes C from bit `32−rs` for `1 ≤ rs ≤ 32` and clears it above,
+which is the 68k's "last bit shifted out" verbatim. **The 68k and ARM disagree in exactly one
+place — a count of zero**, where the 68k clears C, leaves X alone and takes N/Z from the
+unshifted operand at its own width, and ARM leaves the flags where they were. So every
+register-count shape is the immediate shape's body plus one branch-free tail:
+
+```
+   movs  r3, <operand>, lsl #s     ; N,Z of the OPERAND at its own width
+   mrs   rX  /  and rX, #0xC0000000 ; -> the count==0 flag word: N,Z kept, C and V cleared
+   cmp   r1, #0                     ; r1 = the count, already masked to 0..63
+   moveq r12, rX                    ; count == 0 -> use it
+   strne r3x, [ctx, #XFLG]          ; X is written ONLY when the count is non-zero
+```
+
+**`ASL` needs one thing more and it is stated because it is the only variable-width test in
+the round.** Its overflow rule is the interpreter's — *the top `cnt+1` bits are neither all set
+nor all clear* — which at a runtime count needs `t >> (31−c)` with `t = v ^ (v asr #31)`, and
+`31−c` is meaningless for `c > 31`. **Clamping `c` to 31 before the `rsb` is exactly correct**
+rather than approximately so: at `c ≥ 31` the rule degenerates to `t ≠ 0`, which is what a
+shift by zero tests.
+
+**The seeds must reach the count edges or the differential is vacuous there, and this is
+§0.13.5's own lesson applied forward.** `warp_seed()` derives the data registers from a key, so
+the all-65 536 sweep reaches an arbitrary count and not a chosen one. **Round 5 adds a targeted
+arm** that drives every T4 shape across counts `{0, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64,
+65, 255}` — the zero case, each size's width and width+1, the 32 and >32 boundaries, and the
+mod-64 wrap — against the interpreter. *"A mutation arm that cannot be caught at all is worse
+than none"*, and so is a differential that cannot reach the case the emitter was written for.
+
+**THE CORPUS, re-run on the same disassembly and the same script** (`docs/warp-corpus.py`,
+gen 5; the dhrystone binary every WARP row has been measured on, `sum -r 52076`, 8 135 bytes):
+
+| corpus | insns | R4 accepts | **R5 accepts** | R4 mean run | **R5 mean run** |
+|---|---|---|---|---|---|
+| whole `.text` | 632 | 28.48 % | **31.80 %** | 2.500 | **2.544** |
+| hot set (`main` + callees) | 609 | 28.41 % | **31.69 %** | 2.662 | **2.644** |
+| **`Proc_`/`Func_` callees only** | **240** | **43.75 %** | **47.92 %** | **2.763** | **3.026** |
+
+```
+   model accept over all 65536 opcode words:  R4 18 168  ->  R5 18 368   (+200)
+     LEA 152  +  CLR 24  +  EXT 24
+   and the ENGINE moves 17 016 -> 18 368  (+1 352):  the same 200, plus G-R4.2's 1 152
+```
+
+**The tiers disagree more this round than last, and that is reported rather than smoothed.**
+Round 4's callees run length was 2.763 against the hot set's 2.662 — 3.8 % apart. Round 5's is
+**3.026 against 2.644 — 14 % apart**, because `main`'s once-only printf banner is 102 `pea`
+pushes that tranche 2 does not touch while the callees gain `CLR`/`EXT` runs that lengthen
+theirs. §0.12.3's own words are the rule: *"the gap between the tiers is itself the measure of
+how far to trust it"*, and the band below is widened for it rather than the point estimate
+being moved.
+
+### 0.14.4 `WARPTEST` grows to 17 families — and the `blx` refusal gets the statement it is owed
+
+**Every tranche-2 family is register-only, so for the first time since round 2 an entire
+tranche is coverable on target.** `T1`'s accepted `LEA` modes read no memory, `CLR Dn`,
+`EXT`/`EXTB` and the register-count shifts touch none, so all four go into the self-test:
+
+| F14 | `LEA` | F15 | `CLR` | F16 | `EXT`/`EXTB` | F17 | register-count shifts |
+
+**THE OWED STATEMENT (§0.10.7 item 4, §0.12.8 item 3, §0.13.6 item 3 — re-owed three times and
+answered here as a design note).** `z3660_warp_selftest()` refuses any block containing a `blx`
+(§0.11.1), so `MOVE` with `(An)`/`d16(An)`, round 4's memory-source ALU and round 4's
+auto-adjust sources **have never executed on silicon under a test that checks them**. They are
+harness-proven only. **What would make them self-testable, stated so it can be built or
+rejected on its merits rather than deferred a fourth time:**
+
+1. **The refusal exists for one reason and it is a good one.** The self-test runs on a **live
+   guest** at any moment, and it must touch **no guest memory** — neither instruction words
+   (the compiler is fed a core1-resident opcode array) nor operands. A `blx` in a compiled
+   block is a call to `z3660_warp_rd`/`_wr`, which reads or writes **the guest's address
+   space**. A self-test that let one through would corrupt a running AMIX.
+2. **The smallest honest fix is a scratch page the helpers may serve, and it is not small.**
+   The helpers resolve through `z3660_dfast_read`/`_write`, which consult the guest's ATC and
+   `mem_banks[]`. Serving a core1-resident scratch buffer means either a synthetic bank
+   (which changes the resolver the test is supposed to be testing) or a real guest page
+   borrowed for the duration (which is exactly the "touch no guest memory" property being
+   given up).
+3. **The version that keeps the property is a HELPER SUBSTITUTION, not a memory window.** The
+   self-test already hands each block its two helper pointers at entry (`R_RD`, `R_WR` are
+   arguments, not globals — §0.8.5's pointer-width-independence made them so). **A self-test
+   arm can therefore pass its own pair of helpers** — ones that serve a core1-resident 64-byte
+   array and count their calls — and the block under test executes the real emitted `blx`
+   sequence, the real bail arm and the real fence, against memory that is not the guest's.
+   **What it would prove:** the emitted call sequence, the argument marshalling, the bail arm's
+   state, the auto-adjust write-back's *position*. **What it would still not prove:** the
+   resolver's own verdicts, which is the half `WARPTEST` was never going to reach and which M2
+   is the first honest test of.
+4. **It is not built in round 5**, and the reason is scope rather than difficulty: it is a
+   fifth deliverable in a round that already carries four, and it is the *armed* path while
+   round 5's one wall-clock question is a *disarmed* number. **Re-owed, with the design above
+   as the specification** — the next round that touches the self-test builds it or says why not.
+
+### 0.14.5 THE ROUNDS-1 AND -2 OBJDUMP RE-DERIVATION — cheap, and owed by §0.13.6 item 5
+
+§0.13.4 proved round 3's shipped image is not what round 3's source builds, and §0.13.6 item 5
+left the same question open for rounds 1 and 2: *"their objdump numbers carry the same risk."*
+The `.d` fix landed in round 4, so the re-derivation is now a checkout and a clean build.
+
+**Method, identical to §0.13.4's:** check out each round's scored commit, build `lean` **from
+scratch** (no stale objects, so the absent `-include` cannot bite), and read `m68k_run_mmu040`'s
+size and its disarmed gate off the ELF.
+
+| round | scored at | claimed in the doc | to be re-derived |
+|---|---|---|---|
+| 1 | `b16967d` | `m68k_run_mmu040` **2 324 B**, gate **5 insns** (`movw`,`movt`,`ldr`,test,`b`) — §0.7.3, §0.12.1 | size and gate shape from a clean build |
+| 2 | `a392fbe` | **2 548 B** — §0.9.3, §0.12.1 | same |
+| 3 | `1adb64c` | 2 196 B as shipped; **2 380 B** clean (§0.13.4) | re-confirmed, as the control that the method reproduces |
+
+**What is scored:** whether each clean rebuild reproduces the size the doc claims. **Every
+claim that moves is marked `corrected at R5` beside itself and the original is left
+byte-untouched**, which is this document's house style and has been applied to itself in
+§0.4.2, §0.11.3 and §0.13.4 already. **A round whose number does not move is worth exactly as
+much as one whose does**, and both outcomes are recorded.
+
+**What it explicitly does NOT do:** re-open any metal row. The images that flew are the images
+that flew and their measured penalties stand. This corrects what the *source* produces, which
+is what a later round has to build on.
+
+### 0.14.6 What round 5 builds
+
+| A | **the ablation kit** — `Z3660_WARP_ABLATE=1…5`, six build directories, six `.bif`s, six images (§0.14.1) |
+| B | **the bail-attribution split** — ids 64–68, `Z3660_PROF_C_COUNT` 64 → 69, dump version stays 2 (§0.14.2) |
+| C | **M1a tranche 2** — `LEA` (non-indexed), `CLR Dn`, `EXT`/`EXTB`, and the 1 152 register-count shift forms (§0.14.3) |
+| D | **`WARPTEST` F14–F17**, the targeted shift-count differential arm, and new mutation arms one per new family and one per new decision (§0.14.7 G-R5.4) |
+| E | **the rounds-1/2 re-derivation** (§0.14.5) |
+
+**Explicitly NOT built, each with a reason rather than an omission:** the indexed `LEA` modes
+(§0.14.3 T1); every memory-**destination** family (§0.14.8); `(xxx).L` `MOVE` (§0.5.1 item 4,
+still M4's); `ROXL`/`ROXR` (round 4's reason, unchanged); the helper-substitution self-test arm
+(§0.14.4 item 4, **re-owed with a specification**); the per-emitter-arm bail attribution
+(§0.14.2, priced and declined); `z3660_warp_run`'s 33-instruction preamble (**re-owed** for a
+round that measures the armed path); the open-coded memory fast path (§0.9.6 item 3); Q5
+(§0.12.0, deader than before); Q6 (dead, §0.11).
+
+### 0.14.7 The round-5 gates, with their predictions
+
+| gate | pre-registered |
+|---|---|
+| **G-R5.1** harness green, all three variants | `0 failed`; count **+120 … +400** over 3 320 / 3 316 / 3 547, and the **same** delta in lean |
+| **G-R5.2** the accept-set discriminator | the engine's accept set over all 65 536 opcode words equals `docs/warp-corpus.py` gen 5 **exactly**; model **18 368**, engine **18 368**, symmetric difference **0**. **G-R4.2's owed 1 152 closes in this gate or not at all** |
+| **G-R5.3** the sweep and the differential | every accepted opcode both ways from six seeded states; **0** divergences; pair count **≥ 108 000** |
+| **G-R5.4** the new mutation arms | every one **caught**, every one **clean** when disarmed; and every arm demonstrated to be *catchable* — no CAUGHT-shaped silence (§0.13.5) |
+| **G-R5.5** the shift-count differential | every T4 shape × the 15 pre-registered counts, armed against disarmed, **0** divergences |
+| **G-R5.6** lockstep | `WARP_DIVERGE == 0` over **≥ 10⁸** retired guest instructions |
+| **G-R5.7** `WARPTEST` | **17** families, sentinels = results, F1's 64/64 alignment sweep still **+0** range misses, and the new families exercise at least one newly emitted ARM encoding through the word executor |
+| **G-R5.8** the bail-split identities | `BAIL == BAIL_STUB + BAIL_MEM + BAIL_OTHER`, `BAIL_MEM == BAIL_FENCE + BAIL_VERDICT`, `BAIL_OTHER == 0` — all exact, in the harness before any metal |
+| **G-R5.9** the ablation matrix, static | six images build from one tree; each variant's removed layer **absent from its objdump** (`z3660_warp_selftest` gone from A1, the run-loop gate gone from A3/A4/A5, `regs.warp_on`'s displacement changed between A3 and A4, `z3660_warp_step` absent from A5); every CRC recorded in the manifest |
+| **G-R5.10** object equivalence, ablation flags OFF | **the shipping lean is the all-layers build.** A0 built with `Z3660_WARP_ABLATE` unset must be byte-identical in the `.text` symbol census to A0 built without the flag existing — i.e. the flag's OFF path adds nothing. Gated: **0** changed function bodies |
+| **G-R5.11** images | the shipping trio plus five ablation variants, CRCs recorded, archive fires; `q2probe` untouched at `FCC0CB3F` |
+| **G-R5.12** the rounds-1/2 re-derivation | both clean builds complete and their sizes recorded, whether or not they match the doc |
+
+### 0.14.8 The round-5 metal bands, derived before the row
+
+**Derived by §0.12.3/§0.12.7's method, on round 4's own measured row as the calibration
+base** — the method that landed coverage within 0.9 pp and the decline rate within 0.76 pp of
+their point estimates, which is the only reason it is used again.
+
+```
+   R4 measured:  BLK 13 446 848   ENTER 4 238 096   INSNS 12 193 164   I_true 63 845 050
+   productive-entry fraction  R4  4238096/13446848 = 31.517 %
+                              R4 static (callees) 43.75 %  ->  measured/static = 0.7204
+                              R5 static 47.92 %  x 0.7204  =  34.52 %
+   retired per productive entry  R4  12193164/4238096 = 2.8770
+                              scaled by the run-length ratio 3.026/2.763 = 1.0952
+                              R5  =  2.8770 x 1.0952  =  3.151
+   WARP_BLK held at R4's value -- an ASSUMPTION with a direction: block ENTRIES are driven by
+   the workload's control-transfer arrivals, not by the engine, and R3->R4 moved it +3.3 %
+   (13 016 813 -> 13 446 848) across six new families.  Charged 1.00.
+   WARP_INSNS(R5) = 13 446 848 x 0.3452 x 3.151 = 14.63 M  ->  c = 14.63/63.85 = 22.9 %
+```
+
+| row | pre-registered band | point estimate |
+|---|---|---|
+| **coverage `c`** | **0.20 – 0.28** | **0.229** |
+| **`WARP_INSNS`/`WARP_BLK`** | **0.92 – 1.32** | **1.088** |
+| **compiled length `CINSNS`/(`COMPILE`−`DECLINE`)** | **2.30 – 3.10** | **2.651** |
+| **decline rate `DECLINE`/`COMPILE`** | **51 – 62 %** | **56.8 %** |
+| **bail rate `BAIL`/`BLK`** | **58 – 70 %** | **64.3 %** |
+| **`WARP_DISC_EV` per M retired insns** | **75 – 110** | **90.6** |
+| **`WARP_BAIL_STUB`/`WARP_BAIL`** | **0.80 – 0.97** | **0.88** |
+| **`WARP_BAIL_MEM`/`WARP_BAIL`** | **0.03 – 0.20** | **0.12** |
+| **`WARP_BAIL_FENCE`/`WARP_BAIL_MEM`** | **≤ 0.10** | **0.02** |
+
+**The `DISC_EV` band is TIGHTENED rather than repeated, and that is a stronger claim.** Round 4
+pre-registered 80 – 140 and measured 90.55; the quantity is the guest's own cache- and
+ATC-maintenance rate, which no engine change can move, so round 5 re-registers it at
+**75 – 110**. A miss now means something happened to the guest, not to the engine.
+
+> ### **THE COVERAGE CALL, MADE BEFORE THE ROW, FOR THE SECOND CONSECUTIVE ROUND: TRANCHE 2 DOES NOT REACH 60 % EITHER, AND IT IS NOT CLOSE.** 0.20 – 0.28 against a 60 % bar. The kill line's precondition stays unmet for a third wave, the kill line stays armed and unfired, and **round 5 takes no verdict of any kind.**
+>
+> **AND HERE IS WHAT WOULD REACH IT, PRICED AND NOT BUILT.** The callees corpus refuses 125 of 240 instructions after tranche 2. The three largest refusals are **`MOVE` to `−(An)` (22)**, **`MOVE (An)+,mem` (22)** and the **`LINK`/`UNLK`/`RTS`/`JSR` frame quartet (40)**. Together they are **35 % of the corpus** — and every one of them is a **memory-DESTINATION or a stack-frame family**, which is to say **§2e's write-back exclusion is what stands between generation one and the bar**, not the family list.
+>
+> **What a tranche 3 would need, stated without building any of it:** (1) a **restartable write-back contract** — the interpreter advances the register, sets `instruction_pc` to the advanced pc and clears `mmu_restart` *before* it stores, so a block that bails at a memory destination must reproduce that exact post-state rather than the pre-state, which means the exit sequence gains a per-site *write-back shape* rather than a per-site pc; (2) a **source/destination aliasing analysis per shape**, because `MOVE.L (A0)+,(A0)` computes its destination EA from the *incremented* `A0` (§0.12.2 refused the undo-on-bail shortcut for exactly this); (3) `JSR`/`BSR`/`RTS` need a **stack write inside a control transfer**, which is two faultable sites and a block boundary in the same instruction. **None of it is scoped here, and none of it is promised.** The honest reading of three rounds of coverage — 8.43 %, 19.10 %, and a predicted 22.9 % — is that **generation one's frozen scope has a ceiling around a quarter of this workload**, and the 60 % bar is a *different engine*, not three more families.
+
+**Step 2 — the armed dhrystone band.** §0.12.7's arithmetic, with its gate term re-calibrated
+on round 4's own row rather than round 3's:
+
+```
+   R4 measured 0.92432x  ->  T' = 214.2/0.92432 = 231.7 cy   (net +17.5 cy per guest insn)
+   entry(R4) = 0.1910 x (112/2.4208) x 2.17 = 19.17 cy       (E = 112, measured, G-R4.8)
+   removal(R4) = 19.18%..40.34% x 0.1910 x 214.2 = 7.8..16.4 cy
+   -> the gate term must be 17.5 - 19.17 + (7.8..16.4) = 6.1..14.7 cy over 0.809 of dispatches
+   -> G_eff = 16 instructions costing 10.4 cy = 0.65 cy each   (RE-CALIBRATED, once, on R4)
+
+   R5 LOW    c=0.20, L=2.30, E=112 (held; T4 and LEA are short bodies)
+      entry   0.20 x (112/2.30) x 2.17          = 21.14 cy
+      gate    0.80 x 10.4                       =  8.32 cy
+      removal 19.18% x 0.20 x 214.2             =  8.22 cy
+      T' = 214.2 - 8.22 + 29.46 = 235.4         ->  0.910x
+   R5 HIGH   c=0.28, L=3.10, E=112
+      entry   0.28 x (112/3.10) x 2.17          = 21.95 cy
+      gate    0.72 x 10.4                       =  7.49 cy
+      removal 40.34% x 0.28 x 214.2             = 24.19 cy
+      T' = 214.2 - 24.19 + 29.44 = 219.5        ->  0.976x
+```
+
+> ### **The round-5 armed band: 0.910× – 0.976× of the same-session clean-interpreter reference row `R`.** Round 4 measured 0.92432×, inside its own band at the first attempt; this band's floor is **below** that row and its ceiling is **above** it, which is the honest shape of a tranche that widens coverage while the entry cost per block is unchanged. **It still does not cross 1.0×, and it is still not supposed to** — §0.5.3's arithmetic says amortisation starts paying above `L` ≈ 8 and the predicted `L` is 3.1.
+>
+> **`TAILPOLL` is charged ZERO again and the correction is restated rather than inherited silently.** At `L` = 2.3 – 3.1 the service poll runs *more* often per four instructions than interpretation would, so its removal row is negative and is charged 0. The band's floor is optimistic by exactly that amount, in both rounds, and this sentence is the record of it for the second time.
+
+**Step 3 — the disarmed row, which is the one that gates the card, and it is UNCHANGED.**
+
+> ### **The blessing gate is carried forward verbatim: −2.276 % or better, i.e. dhry ≥ 7 988 against the same-session reference.** It is an **absolute class**, it has now been missed twice (−4.056 %, −4.256 %), and round 5 **does not predict that it will be met** — because round 5 does not fix the residual, it *bisects* it. **The pre-declared end-state condition is unchanged: the card ships A0 if and only if A0's disarmed row meets the ≥ 7 988 class, and otherwise goes back to `F294E75A` for a third consecutive round.** Naming that outcome as the likely one, here, before the row, is the alternative to being disappointed by it afterwards.
+>
+> **Q11's boot row rides beside it: 45 … 50 s**, widened at the top from round 4's 45 … 47 because tranche 2 adds emitter code to an image whose boot is disarmed and because round 4's own row measured 49 s.
+
+**Every band above is quoted against `R` measured in the SAME session, `n` ≥ 5, with §0.5.2's
+absolute floor 8 242 quoted beside it and never removed.**
+
+### 0.14.9 What round 5 explicitly does not establish
+
+1. **A verdict.** Coverage is pre-registered below the bar for the third consecutive wave
+   (§0.14.8). The kill line's precondition is unmet, the kill line does not fire and is not
+   cleared, and no row taken this round may be read as pricing the engine.
+2. **A mechanism for the disarm residual.** The kit **bisects**; it does not explain. A variant
+   that recovers half the penalty names a *layer*, and a layer is not yet a mechanism —
+   §0.10.6 and §0.12.1 are what naming a mechanism without an instrument produced twice.
+3. **That the memory-touching families work on silicon.** Round 4's memory-source ALU and
+   auto-adjust sources remain harness-proven only. §0.14.4 specifies the arm that would change
+   that and round 5 does not build it. **Re-owed, now with a design.**
+4. **That the bail split's *causes* generalise.** Dhrystone is small and resident. The fence
+   and verdict sub-causes are exactly the ones a paging-heavy workload would move, which is
+   M2's question.
+5. **That any ablation edge transfers to a different image.** Every edge below the noise floor
+   is unreadable by construction, and every edge above it is a property of *this* build of
+   *this* toolchain at `-Os -flto`. A layout result is not a portable one.
+6. **`z3660_warp_run`'s preamble**, unchanged and still the largest row in §0.9.3's table.
+7. **Everything §0.8.8, §0.10.7, §0.11.7, §0.12.8 and §0.13.6 said would not be established**,
+   unchanged.
+
+
 
 ---
 
