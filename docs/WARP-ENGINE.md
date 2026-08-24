@@ -2551,6 +2551,428 @@ set, `A7` included — 45 696 differential pairs, 0 divergences.
 7. **Everything §0.8.8 and §0.10.7 said would not be established, was not.**
 
 
+## 0.12 M1a round 4 — pre-registered, before the first line of round-4 code (2026-08-24)
+
+**This section is written before any round-4 engine code and is scored as written.** §3.4's
+two rules govern it exactly as they governed §0.6, §0.8 and §0.10: the pre-registration commit
+precedes the implementation commits, provably, by commit timestamp in this repository; and a
+pre-registration that gets rewritten is not one, so every number below is left byte-untouched
+and scored beside itself.
+
+**Round 4 is the M1a wave §0.5.2's decision table routed round 3 into**, and it is legitimate
+only because §0.5.1 froze its family list before the first measurement existed. It extends the
+engine in that frozen order and it does not touch the kill line, which remains armed and
+unfired for the first wave whose coverage is in band.
+
+### 0.12.0 THE CHURN, ATTRIBUTED — the cause is named, and the framing it came with is refuted
+
+§0.11's verdict flagged `WARP_DISC` 37 399 against `WARP_COMPILE` 37 499 — *"99.7 % of
+everything compiled in the window was discarded inside it, across `WARP_DISC_ROOT` = 8 125
+discard-all events (~271/s). The block cache never accumulates a working set."* — and claimed
+no mechanism. **The attribution is available in the R3 evidence directory itself, it names the
+cause exactly, and it also corrects two numbers in that sentence.**
+
+**First correction: 8 125 is not an event count.** `warp_discard_all()` charges
+`WARP_DISC_ROOT` with `warp_live`, the number of live blocks, exactly as it charges
+`WARP_DISC` — so 8 125 is *blocks discarded at `IV_ROOT` causes*, not events. The event count
+is `DOPC_INVAL`, because `z3660_warp_invalidate()` hangs off the decoded-op cache's own choke
+point and is called once per performed invalidation.
+
+**Second correction: the per-cause split is already measured, by the `IV_*` block (ids 28–38),
+and the identity closes exactly.**
+
+| cause (id) | events | share | what it is |
+|---|---|---|---|
+| `IV_FLUSH` (28) | **3 171** | **46.87 %** | `CPUSHL` / `CINV` — the guest's own cache maintenance. Names a PHYSICAL address |
+| `IV_PFLUSHA` (36) | **2 712** | **40.09 %** | `PFLUSHA`, and `mmu_set_tc()`/`mmu_reset()` through it — flush every ATC entry |
+| `IV_PFLUSH` (35) | **591** | **8.74 %** | `PFLUSH` of ONE page. The only cause that names a LOGICAL address |
+| `IV_ROOT` (29) | **263** | **3.89 %** | `MOVEC` to `URP`/`SRP` — the address space changed. **Q5's cause** |
+| `IV_DMA` (30) | **28** | **0.41 %** | core0 wrote guest DRAM |
+| `IV_TABLE`/`KNOB`/`WRAP`/`MAP`/`CACR` | **0** | — | none in the window |
+| **total** | **6 765** | | **= `DOPC_INVAL` 6 765, EXACTLY** — §0.5.5 G2's third identity |
+| `IV_CACR_SKIP` (38) | 14 886 | — | narrowed at the call site; **never reaches the choke point**, so it costs WARP nothing. 68.75 % of 21 651 requests were already refused before this |
+
+> ### The named cause: **87.0 % of the events that empty WARP's code cache are cache- and ATC-maintenance instructions the guest executes — `CPUSHL`/`CINV` (46.87 %) and `PFLUSHA` (40.09 %).** `IV_ROOT`, the only cause Q5 can address, is **3.89 %** of them.
+
+**The rate, corrected and made window-independent.** The armed profiling window is 34 s
+(`PROF ZERO` 06:48:18 → `PROFD` 06:48:52, `SWITCH-STATE-LOG.txt`), so 6 765 events is
+**199 per second**, not 271. The rate that does not depend on reading a clock off a serial log
+is **108.3 discard-all events per million retired guest instructions**, and that is the number
+this section is scored on.
+
+**And now the framing.** *"The block cache never accumulates a working set"* is not what these
+counters say. Blocks per event and executions per compile are both computable from the same
+dump and they point the other way:
+
+```
+   discard-all events                          6 765   (= DOPC_INVAL)
+   live blocks discarded, all causes          37 399   -> 5.53 blocks per event
+   live blocks discarded at IV_ROOT            8 125   ->  30.89 per IV_ROOT event
+   ... at every other cause          37399-8125=29 274 ->   4.50 per event
+
+   WARP_BLK / WARP_COMPILE  = 13016813 / 37499  =  347.1 executions per compile
+     real blocks   3558475 entries / 10404 real compiles  =  342.0 each
+     decline stubs 9458338 exec    / 27095 stubs          =  349.1 each
+
+   compile cost  37499 x 1.427 us (R6 lean)  =  53.5 ms  /  34 s  =  0.157 % of one core
+```
+
+> ### **A compiled block is executed 342 times before it is discarded.** That is amortisation, not churn. `WARP_DISC ≈ WARP_COMPILE` is a DEFINITIONAL artefact of a small hot working set discarded often — `WARP_DISC` sums *live* blocks at each event, so in any steady state where nothing is evicted and nothing wraps, discards must equal compiles minus the residue. `WARP_EVICT` = 0 and `WARP_FLUSH` = 0 say exactly that. **The 99.7 % is an identity, not a pathology, and round 3 read it as one because the counter that separates events from blocks did not exist.**
+
+**Therefore round 4 builds the counters and does NOT build a fix, and the reason is measured
+rather than preferred.** The churn costs 0.157 % of a core, the cache amortises 342×, and the
+coverage miss is fully explained by the two counters that already agree — bail rate 72.66 %,
+decline rate 72.26 %. There is nothing here to buy back.
+
+**Q5 is NOT re-opened, and the new evidence makes it deader rather than closer.** §0.11's R6
+row closed it on cost (`c2` = 0.0426 % against a 2 % bar, failing by 47×). This attribution
+adds a second, independent reason: a per-address-space generation addresses `IV_ROOT`, which
+is **3.89 % of the events**. Funding the smallest cause of a cost that is already 0.157 % of a
+core is not a trade this campaign takes. **`IV_FLUSH` and `IV_PFLUSHA` — the 87 % — cannot be
+narrowed by a generation stamp at all**: the first names a physical address while every WARP
+tag is logical, and the second is a statement that *every* logical→physical mapping may have
+moved, which is precisely the event a logically-keyed cache must honour in full.
+
+**What round 4 builds instead is the instrument that turns this inference into a counter**
+(§0.12.4 D). The attribution above is arithmetic over counters that were not designed to
+answer it; ids 61–63 make it a direct reading.
+
+### 0.12.1 THE DISARM-PENALTY RESIDUAL — the mechanism, read off the shipping objdump
+
+**§0.10.6's named mechanism is refuted and §0.11.4 said so: round 3's `m68k_run_mmu040` is
+2 196 B, 128 B BELOW round 1's 2 324, and its penalty is 1.78× round 1's.** A smaller loop
+costing more is not an L1I-footprint story. Here is what the disassembly of the image that was
+actually measured says, and it is a *shape* result rather than a size one.
+
+**The gate, `build-lean/Z3660_emu.elf` (`m68k_run_mmu040` = `0x894` = 2 196 B, the C89953E2
+lineage), verbatim:**
+
+```
+   3024f490:  blx  r3                       <- the interpreter handler returns here
+   3024f494:  ldr  r3, [pc, #2028]          <- literal pool: the ADDRESS of z3660_warp_gate
+   3024f498:  ldr  r3, [r3]                 <- the flag  -- DEPENDENT on the load above
+   3024f49c:  cmp  r3, #0
+   3024f4a0:  beq  3024f4d0                 <- the disarmed exit, perfectly predicted
+```
+
+> ### The named mechanism: **round 3's four-instruction gate contains a SERIAL LOAD-TO-LOAD ADDRESS DEPENDENCY WITH ZERO SLACK.** `ldr r3,[pc,#2028]` produces the base that `ldr r3,[r3]` immediately consumes, and the pair is issued in the shadow of nothing — it sits directly after the handler's `blx` returns, so there is no independent work to hide either load's use latency behind. Round 1's five instructions were **two ALU immediates** (`movw`/`movt`, no memory port, freely schedulable) feeding **one** load. **The instruction count fell 5 → 4 and the dependency depth rose 1 → 2, and it is the depth that is billed.**
+
+**The arithmetic, and it is a check rather than the claim.** At §0.9.3's own measured
+214.2 cycles per interpreted guest instruction:
+
+| build | gate instructions | measured penalty | implied cycles | implied cycles/instruction |
+|---|---|---|---|---|
+| round 1 `E80D04EE` | 5 (movw, movt, ldr, test, b) | −2.276 % | **4.87** | **0.97** |
+| round 3 `C89953E2` | 4 (ldr, ldr, cmp, b) | −4.056 % | **8.69** | **2.17** |
+
+**2.17 cycles per instruction is exactly §0.9.3's measured IPC 0.46 on this loop**, and 0.97 is
+what a pair of dual-issuable ALU ops plus one load resolves to. **The same loop, one fewer
+instruction, 2.24× the cost per instruction.** Two independent readings — the objdump's shape
+and the two metal rows' arithmetic — name the same thing.
+
+**Why gcc did it.** `-Os` prefers one literal-pool load to a `movw`/`movt` pair, and with the
+body moved out of line (§0.10.6) there was nothing left above the branch to keep an address
+register alive for. §0.11.4 recorded the change and read it as a win — *"one instruction, not
+two"* — which is the instruction-count-is-not-a-cost error §0.4.3 warned about, made in the
+other direction.
+
+**THE FIX: the gate reads a base register the loop already holds.** The same disassembly shows
+`r4` is live across the whole dispatch and is `&regs`:
+
+```
+   3024f448:  ldr  r4, [pc, #2088]   -> 0x307aeee8  =  B regs
+   ... every pass: ldr [r4,#64] [r4,#68] [r4,#72] [r4,#76] [r4,#80], str [r4,#88]
+```
+
+So the arm flag moves **into `regstruct`**, beside the pc fields the loop already reads and
+writes on every single pass, and the gate becomes one load off a live base and a hot line:
+
+```
+   ldr  rX, [r4, #off]
+   cmp  rX, #0
+   beq  ...
+```
+
+**Three instructions, ONE load, ZERO address materialisation, and the load hits a cache line
+the loop has already touched this pass.** `struct regstruct` is already carrying a block of
+fork-added MMU state (`mmu_fslw` … `fc030`, `mmu_enabled`, `mmu_page_size`), so this is inside
+the existing fork boundary rather than a new one; no offset in the tree is hardcoded (the JIT
+uses `offsetof`, checked: zero literal offsets), and nothing memsets or memcpys `regs`
+(checked: zero sites). `z3660_warp_gate.last_pc` stays where it is — it is read only on the
+ARMED path, which pays its own address materialisation inside the out-of-line `step()`.
+
+### 0.12.2 THE `(An)+` / `−(An)` STATIC READ — §0.5.1's named M1a question, ANSWERED
+
+§0.5.1 left this as *"a named M1 scoping question with a static answer — read the generated
+handler, before any metal time."* Here is the read, on `cpuemu_31.cpp`, the table the 040 loop
+actually dispatches.
+
+**`MOVE.L (An)+,Dn` — `op_2018_31_ff`:**
+
+```
+   srca = m68k_areg(regs, srcreg);              <- the PRE-increment value
+   mmufixup[0].reg   = srcreg;
+   mmufixup[0].value = m68k_areg(regs, srcreg); <- armed with the CURRENT value
+   uae_s32 src = get_long_mmu040(srca);         <- THE ONLY FAULTABLE SITE
+   m68k_areg(regs, srcreg) += 4;                <- the write-back is AFTER the access
+   mmufixup[0].reg = -1;
+```
+
+**`MOVE.L −(An),Dn` — `op_2020_31_ff`** has the identical shape: `srca = An − 4`, fixup armed
+with the unmodified `An`, the access, and only then `An = srca`.
+
+> ### The answer: **PERMISSIVE, and the reason is that `mmufixup` is a NO-OP RESTORE on the source side.** The register write-back happens strictly *after* the faultable access, so at the moment the access can fault the register still holds its original value — and `mmufixup[0].value` is that same original value. §2e's write-back rule bars a family whose register state is architecturally complete before its access; on a source auto-adjust it is not. **A bail before the access is byte-identical to the interpreter's post-fault state, and generated code never needs to arm `mmufixup` at all.**
+
+**The contrast that makes the read binding rather than convenient.** The DESTINATION side is
+exactly what §2e says it is — `MOVE.L Dn,(An)+`, `op_20c0_31_ff`:
+
+```
+   m68k_areg(regs, dstreg) += 4;      <- the write-back is BEFORE the store
+   ... m68k_incpci(2);
+   regs.instruction_pc = m68k_getpci();
+   mmu_restart = false;
+   mmufixup[0].reg = -1;
+   put_long_mmu040(dsta, src);        <- the faultable site, on a COMPLETE instruction
+```
+
+**and so does the double form** `MOVE.L (An)+,(An)+` (`op_20d8_31_ff`): the source increment
+lands before the destination EA is even read, so a decline at the store cannot be restarted.
+
+> ### **THE RULE ROUND 4 ADOPTS, and it is narrower than §0.5.1 item 3 as written: an `(An)+` / `−(An)` SOURCE is compiled ONLY when the instruction has EXACTLY ONE FAULTABLE SITE — that is, only with a REGISTER destination.** Auto-adjusting sources feeding a memory destination are **refused**, because the source's register side effect lands between the two faultable sites and a bail at the second one would re-execute an instruction whose base register has already moved. This is stated before the corpus is counted, and §0.12.3 prices what the restriction costs: 22 of the 240 instructions in the hot corpus, the single largest thing round 4 leaves on the table.
+>
+> The alternative — emitting an undo on the bail arm — was considered and refused. It is not equivalent in general: for `MOVE.L (A0)+,(A0)` the interpreter computes the destination EA from the *incremented* `A0`, so deferring or undoing the write-back changes the address. A correct version needs a source/destination aliasing analysis per shape, and that is tranche 2's to price, not a rule to smuggle in here.
+
+**`A7` is handled and it is not a footnote.** `areg_byteinc[] = { 1,1,1,1,1,1,1,2 }`
+(`newcpu.cpp:165`), and every byte-size auto-adjust in the generated table indexes it — one
+handler covers all eight registers. The emitter uses the same table, and the all-65 536-opcode
+differential sweep is what proves it did.
+
+### 0.12.3 THE CORPUS — what the engine refused, derived because no counter recorded it
+
+**There is no decline histogram in the R3 evidence directory** (checked: `WARP_DECLINE` is a
+scalar and nothing samples the refused opcode). So the pre-registered decline drop is
+**derived from the workload's own text**, by `docs/warp-corpus.py`, committed with this section
+so the derivation can be re-run. It disassembles the AMIX dhrystone binary every WARP row has
+been measured on (`sum -r 52076`, 8 135 bytes) and classifies each opcode word under a hand
+transcription of `warp_emit_insn()`'s accept predicate.
+
+**The transcription is not trusted** — gate G-R4.2 requires the ENGINE's own accept set over
+all 65 536 opcode words to agree with the model's, opcode for opcode.
+
+| corpus | insns | R3 accepts | R4 accepts | R3 mean accepted run | R4 mean accepted run |
+|---|---|---|---|---|---|
+| whole `.text` | 632 | 21.99 % | 28.48 % | 1.655 | 2.500 |
+| hot set (`main` + callees) | 609 | 21.67 % | 28.41 % | 1.714 | 2.662 |
+| **`Proc_`/`Func_` callees only** | **240** | **31.67 %** | **43.75 %** | **1.583** | **2.763** |
+
+> ### **The corpus model reproduces the metal row it was not fitted to.** Round 3 measured **1.581** compiled guest instructions per real block on silicon (`WARP_CINSNS`/(`COMPILE` − `DECLINE`) = 16 448 / 10 404). The callees-only static run length is **1.583**. Three digits, on a number derived from a disassembly and a source transcription with no metal input at all. **That is what licenses using the same model to predict round 4**, and it is the strongest single piece of evidence in this pre-registration.
+
+**The tier split is load-bearing, not decoration.** `main` carries both the measured loop and a
+printf banner that runs once; on a 632-instruction image that banner is **102 `pea <abs.L>`**
+argument pushes — 16 % of the text and ~0 % of the executions. The callees-only tier is the
+closest a static count honestly gets to the executed mix, and the gap between the tiers is the
+measure of how far to trust it. Two further limits are stated rather than buried: **libc is
+absent** (the binary is dynamically linked, so `strcpy`/`strcmp` — which Dhrystone leans on —
+are in no corpus here at all), and **a switch table inside `Proc_6` disassembles as
+instructions** (11 words are identified as data and dropped; the count is reported).
+
+**What round 4 gains, and what it still refuses, on the callees tier:**
+
+```
+   GAINS (29 of 240)   MOVEQ 15 | TST.L 5 | ALU-mem 4 (addl,cmpb,cmpl) | IMM 4 | shift-imm 1
+   REFUSES (135)       MOVE to -(An)      22   <- write-back destination, S2e, permanent for gen 1
+                       MOVE (An)+,mem     22   <- S0.12.2's one-faultable-site rule
+                       LINK/UNLK          22   | RTS 11 | LEA 9 | JSR 7 | CLR 6 | MOVEM 4
+                       PEA 3 | EXTB 3 | ORI to mem 3 | the rest 23
+```
+
+> **Named here, before the row, so it cannot be discovered afterwards: the next three levers are `LEA`, `CLR` and `EXT`/`EXTB` — all three in the M0 census's *fully register-only* family list — and they are in NEITHER §0.5.1's generation-one table NOR its frozen M1a list. Round 4 does not build them.** Adding a family because the corpus says it would help is exactly the rescue §0.5.1's freeze exists to forbid. They are tranche 2's to pre-register, on their own commit, and this paragraph is the record that the temptation was priced and declined.
+
+### 0.12.4 What round 4 builds
+
+**A — generation one's own frozen scope, COMPLETED. This is a shortfall being closed, not an
+extension, and it is scored separately from the M1a tranche.** §0.5.1's generation-one table
+names *"the mixed `ADD ADDA AND CMP CMPA EOR OR SUB SUBA TST` and the shift/rotate families the
+census already found fully pure"*. **`TST` and every shift/rotate register form were named in
+the frozen scope and were never built** — `warp_emit_insn()` refuses all of them today. Round 4
+builds them and reports the gap as a finding.
+
+| A1 | `TST.B`/`.W`/`.L` `Dn`, and `TST.W`/`.L` `An` |
+| A2 | `ASL`/`ASR`/`LSL`/`LSR`/`ROL`/`ROR`, immediate and register count, `.B`/`.W`/`.L`, `Dn` destination. **`ROXL`/`ROXR` are excluded and the exclusion is named**: they take `X` *in* as well as out, which no other generation-one shape does, and the block-entry flag seam packs `X` as a separate word |
+
+**B — M1a tranche 1, in §0.5.1's frozen order.**
+
+| B1 | item 1 — `MOVEQ.L #<data>,Dn` |
+| B2 | item 2 — the remaining **register-destination** shapes of `ADD`/`SUB`/`AND`/`OR`/`CMP`/`EOR`: a **memory source** (`(An)`, `d16(An)`) with a `Dn` or `An` destination, and the **immediate** forms `ADDI`/`SUBI`/`ANDI`/`ORI`/`EORI`/`CMPI` with a `Dn` destination. Mode 7 (absolute, PC-relative, immediate-as-EA) stays out — `(xxx).L` is item 4 |
+| B3 | item 3 — `MOVE`/`MOVEA` **and** the B2 ALU shapes with an `(An)+` / `−(An)` **SOURCE**, restricted by §0.12.2's one-faultable-site rule to a register destination |
+
+**C — the disarm-penalty fix** (§0.12.1): the arm flag moves into `regstruct`; the gate becomes
+`ldr`/`cmp`/`b` off `r4`.
+
+**D — the churn instrument** (§0.12.0), append-only, no id moves, no field changes shape, **dump
+version stays 2**, `Z3660_PROF_C_COUNT` 61 → **64**:
+
+| 61 | `WARP_DISC_EV` | discard-all **events**, one per call — the quantity round 3 had to borrow `DOPC_INVAL` for |
+| 62 | `WARP_DISC_ATC` | blocks discarded at `IV_PFLUSH` + `IV_PFLUSHA` |
+| 63 | `WARP_DISC_CPUSH` | blocks discarded at `IV_FLUSH` |
+
+**E — the harness and the on-target self-test grow with the engine** (§0.12.5).
+
+**Explicitly NOT built, and each has a reason rather than an omission:** `z3660_warp_run`'s
+33-instruction preamble (§0.11.7 item 3) — it is on the ARMED path and round 4's one wall-clock
+target is a DISARMED number, which is §0.10.6's own rule for keeping a row attributable, so it
+stays **re-owed**; the open-coded memory fast path (§0.9.6 item 3); `LEA`/`CLR`/`EXT`
+(§0.12.3); any churn fix (§0.12.0); Q5 (§0.12.0); Q6 (dead, §0.11).
+
+### 0.12.5 Correctness — the machinery grows with the engine, and the new arms are enumerated
+
+**G4/G5's standing rule applies to every new family: a family is not in the engine until it is
+in the sweep, in the differential, in a mutation arm and — if it is register-only — in the
+on-target self-test.**
+
+**The 65 536-opcode sweep** runs every ACCEPTED opcode both ways from six seeded states and
+compares §3.1's whole set. Round 3's run was 45 696 differential pairs, 0 divergences; the pair
+count rises with the accept set.
+
+**`WARPTEST` grows from 9 families to 13.** The self-test is guest-memory-free by design and
+**refuses any block containing a `blx`** (§0.11.1), so the memory-touching additions — B2's
+memory-source ALU and B3's auto-adjust sources — **cannot** be covered on target and stay
+harness-proven, exactly as `(An)`/`d16(An)` `MOVE` already does (§0.10.7 item 4, still re-owed).
+The four new families are all register-only:
+
+| F10 | `MOVEQ` | F11 | `TST` | F12 | shifts and rotates | F13 | immediate ALU |
+
+**The ARM word executor must grow too, and that is a gate rather than a detail.** The
+exec-vs-decode oracle is a second implementation of ARM; any host instruction the new emitters
+produce that `warp_host_exec()` cannot decode makes the oracle silently weaker. Every newly
+emitted ARM encoding is added to it and G-R4.6 requires the self-test to exercise one.
+
+**New mutation arms, one per new family and one per new decision** (`Z3660_WARP_MUT_COUNT`
+16 → 24):
+
+| M-MOVEQ-FLAG | `MOVEQ`'s keep-mask made `0xF0000000` — C and V survive instead of being cleared |
+| M-TST-FLAG | `TST` commits C and V |
+| M-SHIFT-C | the shift's carry taken from the wrong bit |
+| M-SHIFT-X | the shift's `X` written on a zero count (the 68k rule is that a zero count leaves `X` alone) |
+| M-IMM-CARRY | the immediate ALU's carry inversion dropped |
+| M-ALUMEM-EARLY | the memory-source ALU commits flags BEFORE the source read can decline |
+| M-AUTO-BYTEINC | the auto-adjust uses 1 for `A7` at byte size instead of `areg_byteinc[]`'s 2 |
+| M-AUTO-ORDER | the auto-adjust write-back emitted BEFORE the access — the defect §0.12.2's read exists to forbid, put back so the arm that catches it is shown to catch it |
+
+**Fault injection on the new families**, and `M-AUTO-ORDER`'s corpus is the load-bearing one:
+a declining source read on an `(An)+` shape must leave `An` **unchanged** and bail with the
+per-site pc, `instruction_pc` and `mmu_restart` of the instruction *before* it.
+
+**G3** (no `throw` reachable from generated code) is re-run over the new helper set. **G1**
+lockstep is re-run to ≥ 10⁸ with `WARP_DIVERGE == 0`.
+
+### 0.12.6 The round-4 gates, with their predictions
+
+| gate | pre-registered |
+|---|---|
+| **G-R4.1** harness green, all three variants | `0 failed`; count **+90 … +260** over 3 301 / 3 297 / 3 528, and the **same** delta in lean |
+| **G-R4.2** the accept-set discriminator | the engine's accept set over all 65 536 opcode words equals `docs/warp-corpus.py`'s model **exactly**; model counts **R3 7 616 → R4 18 168**, and the engine must land on **18 168** |
+| **G-R4.3** the sweep and the differential | every accepted opcode run both ways from six seeded states; **0 divergences**; pair count **≥ 100 000** |
+| **G-R4.4** the eight new mutation arms | every one **caught**; every one **clean** when disarmed |
+| **G-R4.5** lockstep | `WARP_DIVERGE == 0` over **≥ 10⁸** retired guest instructions |
+| **G-R4.6** `WARPTEST` | **13** families, sentinels = results, F1's 64/64 alignment sweep still `+0` range misses, and the new families exercise at least one newly emitted ARM encoding through the word executor |
+| **G-R4.7** the disarmed gate, static | **3** ARM instructions, **one** load, **zero** address materialisations, off `r4`; `m68k_run_mmu040` **≤ 2 196 B** |
+| **G-R4.8** the armed entry cost, static | `E` per block re-read off the lean objdump; pre-registered **108 … 120** (round 3's ≈ 114 after the out-of-line change), armed non-target gate **13 … 15** |
+| **G-R4.9** the churn instrument | `WARP_DISC_EV` == `DOPC_INVAL` exactly, and `DISC_ROOT + DISC_ATC + DISC_CPUSH + other == DISC` exactly |
+| **G-R4.10** images | three rebuilt, CRCs recorded, archive fires; `q2probe` untouched at `FCC0CB3F` |
+| **G-R4.11** object equivalence | not gated. §0.11.3 established that `-flto` re-decides inlining program-wide when a call graph moves; round 4 moves it again and a changed-function count is not evidence of anything |
+
+### 0.12.7 The round-4 metal bands, derived before the row
+
+**Every band below is derived at the MEASURED entry cost `E ≈ 114` the way §0.9.3 derived
+round 3's — the band that contained the result — and NOT at a guessed `E`.** §0.8.6's band A
+was derived at a guessed `E` and missed low by 754 dhrystones; §0.9.3's band B was derived at
+the measured one and contained the row with 146 to spare. This section uses band B's method.
+
+**Step 1 — the mix, from §0.12.3's corpus, carried onto the measured R3 row.** The static
+model reads 3.93 pp optimistic against R3's measured decline rate (68.33 % static against
+72.26 % measured), and that offset is carried:
+
+```
+   productive-entry fraction  R3 measured 3558475/13016813 = 27.34 %
+                              R3 static 31.67 %  ->  measured/static = 0.8633
+                              R4 static 43.75 %  x 0.8633  =  37.77 %
+   retired per productive entry  R3 measured 5422222/3558475 = 1.5238
+                              scaled by the run-length ratio 2.763/1.583 = 1.7455
+                              R4  =  1.5238 x 1.7455  =  2.660
+   I_true = (INSNS - WARP_ENTER) + WARP_INSNS = 64 320 252, a workload constant
+   WARP_INSNS(R4) = 13016813 x 0.3777 x 2.660 = 13.08 M   ->  c = 13.08/64.32 = 20.3 %
+```
+
+| row | pre-registered band | point estimate |
+|---|---|---|
+| **coverage `c`** | **0.15 – 0.28** (low: block length rises, entries do not; high: +40 % on the arrival shift) | **0.20** |
+| **`WARP_INSNS`/`WARP_BLK`** | **0.75 – 1.35** | **1.005** |
+| **compiled length, `CINSNS`/(`COMPILE`−`DECLINE`)** | **2.2 – 3.2** | **2.76** |
+| **decline rate `DECLINE`/`COMPILE`** | **55 – 65 %** | **60.2 %** |
+| **bail rate `BAIL`/`BLK`** | **56 – 68 %** | **62.2 %** |
+| **`WARP_DISC_EV` per M retired insns** | **80 – 140** | **108** |
+
+> ### **THE COVERAGE CALL, MADE BEFORE THE ROW: this tranche does NOT reach 60 %, and M1a tranche 2 is predicted now rather than after a disappointing number.** 0.15 – 0.28 against a 60 % bar is not close, and §0.12.3 names the three families that stand between here and there. The kill line's precondition therefore stays unmet for a second consecutive wave, the kill line stays armed and unfired, and **round 4 takes no verdict of any kind.** Saying so in the pre-registration is the only place it can honestly be said.
+
+**Step 2 — the armed dhrystone band, §0.9.3's arithmetic with its gate term calibrated on
+round 3's own row.** §0.9.3's raw form over-predicts the cost of round 3's armed row by
+6.4 – 10.2 cycles per guest instruction, because it charges the armed non-target gate at the
+full 2.17 cycles per instruction when most of those fifteen instructions are independent. The
+calibration is done once, on the row that exists, and then applied:
+
+```
+   R3 measured 0.8778x  ->  T' = 214.2/0.8778 = 244.0 cy   (net +29.8 cy per guest insn)
+   entry(R3) = 0.0843 x (114/1.5238) x 2.17 = 13.68 cy
+   removal(R3) = 19.18%..40.34% x 0.0843 x 214.2 = 3.5..7.3 cy
+   -> the gate term must be 29.8 - 13.68 + (3.5..7.3) = 19.6..23.4 cy over 0.9157 of dispatches
+   -> G_eff = 15 instructions costing 22.1 cy  =  1.47 cy each   (CALIBRATED, once)
+
+   R4 LOW    c=0.15, L=2.2, E=114, G_eff = 22.1 x 14/15 = 20.6 cy
+      entry   0.15 x (114/2.2) x 2.17          = 16.87 cy
+      gate    0.85 x 20.6                      = 17.51 cy
+      removal 19.18% x 0.15 x 214.2            =  6.16 cy
+      T' = 214.2 - 6.16 + 34.38 = 242.4        ->  0.883x
+   R4 HIGH   c=0.28, L=3.2, E=114, G_eff = 22.1 - 4.3 = 17.8 cy  (the load chain removed)
+      entry   0.28 x (114/3.2) x 2.17          = 21.63 cy
+      gate    0.72 x 17.8                      = 12.82 cy
+      removal 40.34% x 0.28 x 214.2            = 24.19 cy
+      T' = 214.2 - 24.19 + 34.45 = 224.5       ->  0.954x
+```
+
+> ### **The round-4 armed band: 0.883× – 0.954× of the same-session clean-interpreter reference row `R`.** Against R3's `R` = 8 185 that is **dhry ≈ 7 227 – 7 810**. Round 3 measured 0.8778× = 7 185, so the floor of this band is **above** round 3's row by 0.6 % and the ceiling by 7.7 %. **This band does not cross 1.0× and it is not supposed to** — the engine is still narrow, the entry cost still dominates, and §0.5.3's arithmetic says amortisation only starts paying above `L` ≈ 8.
+>
+> **`TAILPOLL`'s removal row is charged ZERO in both ends and the correction is declared.** §0.5.3 priced it as `1 − 4/L` at a pre-registered `L` of 4 – 8. At `L` = 2.2 – 3.2 that is *negative*: the service poll now runs once per block, which is MORE often than once per four instructions, so it is a net ADD of `(4/L − 1)` polls per four instructions and not a removal at all. It is charged 0 rather than negative, which leaves the band's floor optimistic by exactly that amount, and this sentence is the record of it.
+
+**Step 3 — the disarmed row, which is the one that gates the card.**
+
+> ### **The disarm penalty returns to the round-1 class: −2.276 % or better, i.e. dhry ≥ 7 988 against the same-session reference.** Mechanism: §0.12.1 removes one of the two serially dependent loads, which by the same 214.2-cycle arithmetic is worth ~4.3 cycles = ~2.0 pp. **This is the card-blessing gate** — round 3's card was rolled back to `F294E75A` because 7 853 missed the ≥ 7 988 class by 135 dhrystones, and the pre-declared end-state condition is unchanged: **the card ships round 4's lean image IF and ONLY IF its disarmed row meets the ≥ 7 988 class.**
+>
+> **Q11's boot row rides beside it: 45 … 47 s**, the clean lineage's own band, tighter than round 3's 46 … 48 because the change removes work from the loop rather than adding it.
+
+**Every band above is quoted against `R` measured in the SAME session, `n` ≥ 5, with §0.5.2's
+absolute floor 8 242 quoted beside it and never removed.**
+
+### 0.12.8 What round 4 explicitly does not establish
+
+1. **A verdict.** Coverage is pre-registered below the bar (§0.12.7). The kill line's
+   precondition is unmet, the kill line does not fire and is not cleared, and no row taken this
+   round may be read as pricing the engine.
+2. **That the disarm fix works on silicon.** Round 4 takes no metal row. A three-instruction
+   gate in an objdump is a *reason to expect* the round-1 class and not a substitute for
+   measuring it — §0.11.4's own words about a 352-byte reduction, which then missed.
+3. **The memory-touching families on silicon.** B2's memory-source ALU and B3's auto-adjust
+   sources emit a helper call, so the guest-memory-free self-test cannot reach them. They are
+   harness-proven only, alongside `(An)`/`d16(An)` `MOVE`. **Re-owed**, with M2 as the first
+   honest test.
+4. **That the churn attribution's *cost* claim survives a wider workload.** 0.157 % of a core
+   is a dhrystone number. `IV_FLUSH` and `IV_PFLUSHA` are kernel behaviour, and a
+   paging-heavy workload may invalidate far more often — which is M2's question, not this
+   round's.
+5. **`z3660_warp_run`'s preamble**, unchanged and still the largest row in §0.9.3's table.
+6. **Everything §0.8.8, §0.10.7 and §0.11.7 said would not be established**, unchanged.
+
+
 ---
 
 # 1. Goal, non-goals, and honest bounds
