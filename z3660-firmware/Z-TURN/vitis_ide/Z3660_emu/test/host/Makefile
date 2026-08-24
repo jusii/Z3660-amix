@@ -125,8 +125,17 @@ CORE0_CONFIG_H := $(ROOT)/../Z3660/src/config_file.h $(ROOT)/../Z3660/src/overhe
 AMIX_RAM_BIN := $(BUILD)/amix_ram_test
 CORE0_AMIX_RAM_H := $(ROOT)/../Z3660/src/amix_ram.h
 
-.PHONY: all clean clean-all objs run run-lean run-prof run-scsi run-bootmode run-amix-ram
-all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
+# ROM-window admission guard. Compiles ONLY Z3660/src/rom_window.h (self-contained,
+# same reason as the two above). Pins the predicate both ROM loaders consult before
+# enabling a MAPROM/MAPROMEXT decode -- the check that was absent when BLIZZARD F0
+# mapped a 384-byte extended ROM plus ~512 KB of uninitialised DDR and printed
+# "File read OK".
+ROM_WINDOW_BIN := $(BUILD)/rom_window_test
+CORE0_ROM_WINDOW_H := $(ROOT)/../Z3660/src/rom_window.h
+
+.PHONY: all clean clean-all objs run run-lean run-prof run-scsi run-bootmode run-amix-ram \
+        run-rom-window
+all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
@@ -150,7 +159,8 @@ $(BUILD)/host/%.o: %.cpp
 	@echo "  CXX   host/$*.cpp"
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
--include $(BUILD)/bootmode_test.d $(BUILD)/amix_ram_test.d $(BUILD)/scsi_cd_test.d
+-include $(BUILD)/bootmode_test.d $(BUILD)/amix_ram_test.d $(BUILD)/scsi_cd_test.d \
+         $(BUILD)/rom_window_test.d
 
 $(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
 	@mkdir -p $(BUILD)
@@ -162,11 +172,17 @@ $(AMIX_RAM_BIN): amix_ram_test.cpp $(CORE0_AMIX_RAM_H)
 	@echo "  CXX+LINK  amix_ram_test.cpp"
 	@$(CXX) $(CXXFLAGS) amix_ram_test.cpp -o $@
 
-run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN)
+$(ROM_WINDOW_BIN): rom_window_test.cpp $(CORE0_ROM_WINDOW_H)
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  rom_window_test.cpp"
+	@$(CXX) $(CXXFLAGS) rom_window_test.cpp -o $@
+
+run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN)
 	@$(BIN)
 	@$(SCSI_CD_BIN)
 	@$(BOOTMODE_BIN)
 	@$(AMIX_RAM_BIN)
+	@$(ROM_WINDOW_BIN)
 
 # The lean (production) firmware's core1, through the same suites. scsi_cd/bootmode/
 # amix_ram do not touch the run loop, so the variant that matters is the MMU harness.
@@ -188,6 +204,9 @@ run-bootmode: $(BOOTMODE_BIN)
 
 run-amix-ram: $(AMIX_RAM_BIN)
 	@$(AMIX_RAM_BIN)
+
+run-rom-window: $(ROM_WINDOW_BIN)
+	@$(ROM_WINDOW_BIN)
 
 clean:
 	rm -rf $(BUILD)

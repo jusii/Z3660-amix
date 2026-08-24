@@ -9,9 +9,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "main.h"
 #include "cpu_emulator.h"
 #include "config_file.h"
+#include "rom_window.h"
 #include "xscuwdt.h"
 #include "scsi/scsi.h"
 #include "floppy/floppy.h"
@@ -89,6 +91,18 @@ int load_rom(void)
       unsigned int NumBytesRead;
       int total_bytes_to_read=512*1024; // 512 KB
       total_bytes_to_read=f_size(&fil);
+      /* Same bound as the extended window: the loop below is sized by the file,
+       * so anything over 512 KB would run off the end of the MAPROM window. */
+      ROM_LOAD_VERDICT verdict=rom_window_verdict(total_bytes_to_read,total_bytes_to_read);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: kickstart \"%s\": %s -> not mapped\n",
+               kickstart_pointer,rom_load_verdict_name(verdict));
+         f_close(&fil);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
       if((total_bytes_to_read==512*1024) || (total_bytes_to_read==256*1024))
       {
          printf("ROM filesize %d bytes\n",total_bytes_to_read);
@@ -97,6 +111,9 @@ int load_rom(void)
       {
          printf("ROM filesize %d is NOT 256KB or 512KB\n",total_bytes_to_read);
       }
+      /* A ROM shorter than the window leaves the tail visible to the reset
+       * vector fetch and the RomTagScanner; zero it rather than expose DDR. */
+      memset(ROM,0,ROM_WINDOW_SIZE);
       printf("Loading Kickstart at address: 0x%08lX length %d KB\n",(uint32_t)ROM,total_bytes_to_read/1024);
       printf("Reading %s file:\n[----------------]\n\033[F",kickstart_pointer);
 #define BYTES_TO_READ 128
@@ -238,11 +255,36 @@ int load_romext(void)
          return(2);
       }
       printf("Loading Extended Kickstart at address: 0x%08lX\n",(uint32_t)EXT_ROM);
-      unsigned int NumBytesRead;
+      unsigned int NumBytesRead=0;
       unsigned int size=fil.obj.objsize;
       printf("Extended Kickstart file size: 0x%08lX\n",(uint32_t)size);
+      /* Bound BEFORE reading: the read below is sized by the file, not by the
+       * window, so an oversized image would overrun $00F00000+512KB. */
+      ROM_LOAD_VERDICT verdict=rom_window_verdict(size,size);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: extended kickstart \"%s\": %s -> not mapped\n",
+               ext_kickstart_pointer,rom_load_verdict_name(verdict));
+         f_close(&fil);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
+      /* Kickstart SCANS the whole window for $4AFC resident matchwords, so the
+       * tail behind a short image must not be left as uninitialised DDR. */
+      memset(EXT_ROM,0,ROM_WINDOW_SIZE);
       f_read(&fil, EXT_ROM, size,&NumBytesRead);
       f_close(&fil);
+      verdict=ext_rom_verdict(size,NumBytesRead,((unsigned int)EXT_ROM[0]<<8)|EXT_ROM[1]);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: extended kickstart \"%s\": %s -> not mapped\n",
+               ext_kickstart_pointer,rom_load_verdict_name(verdict));
+         memset(EXT_ROM,0,ROM_WINDOW_SIZE);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
       printf("File read OK\n");
    }
    Xil_L1DCacheFlush();
