@@ -35,10 +35,22 @@
 #
 
 # Set the path to bootgen.exe on your host system (e.g., macOS or Linux).
-# Prefer an mkbootimage on PATH (the docker build image ships one in
-# /usr/local/bin); fall back to the host checkout. Overridable from the
-# command line / environment.
-BOOTGEN_EXE_HOST ?= $(or $(shell command -v mkbootimage 2>/dev/null),$(HOME)/git/zynq-mkbootimage/mkbootimage)
+# Resolution order, each candidate existence-checked so a missing one falls
+# through instead of failing later with Error 127:
+#   1. an mkbootimage on PATH
+#   2. a host checkout at $(HOME)/git/zynq-mkbootimage
+#   3. the copy the docker/ build image ships at /usr/local/bin/mkbootimage,
+#      run for just this one step via `docker run` -- a host with the ARM
+#      toolchain installed natively (mkbootimage isn't packaged anywhere for
+#      that case) doesn't need the whole build dockerized just for this.
+# Overridable from the command line / environment; IMAGE picks the tag,
+# matching docker/run.sh.
+IMAGE ?= z3660-build:latest
+DOCKER_MKBOOTIMAGE := docker run --rm -v $(CURDIR):/work -w /work $(IMAGE) bash -lc 'exec mkbootimage "$$@"' _
+BOOTGEN_EXE_HOST ?= $(or \
+	$(wildcard $(shell command -v mkbootimage 2>/dev/null)), \
+	$(wildcard $(HOME)/git/zynq-mkbootimage/mkbootimage), \
+	$(DOCKER_MKBOOTIMAGE))
 MAKE = make
 
 # Paths (Unix side). system_cli.bif uses explicit ELF paths (mkbootimage-friendly)
