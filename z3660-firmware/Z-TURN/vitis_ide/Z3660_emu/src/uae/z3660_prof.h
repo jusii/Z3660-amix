@@ -800,7 +800,24 @@ enum {
                                        * field changes shape, THE DUMP VERSION STAYS 2 --
                                        * the same reasoning ids 20, 46 and 47..59 rode in
                                        * under                                             */
-   Z3660_PROF_C_COUNT           = 61,
+   /* ROUND 4'S CHURN INSTRUMENT (§0.12.0). Round 3 read WARP_DISC 37 399 against
+    * WARP_COMPILE 37 499 as "99.7 % discarded, the cache never accumulates a working set",
+    * and could not do better because NO COUNTER SEPARATED EVENTS FROM BLOCKS: DISC and
+    * DISC_ROOT both sum `warp_live`, so 8 125 was read as an event count when it is a block
+    * count. The event count had to be borrowed from DOPC_INVAL and the per-cause split
+    * inferred from the IV_* block. These three make the reading direct, and the arithmetic
+    * they enable is what refuted the framing -- 6 765 events, 5.53 blocks each, and 342
+    * executions per compiled block, which is amortisation rather than churn. */
+   Z3660_PROF_C_WARP_DISC_EV    = 61, /* discard-all EVENTS, one per call. Must equal
+                                       * DOPC_INVAL exactly -- the code cache hangs off the
+                                       * decoded-op cache's own choke point                */
+   Z3660_PROF_C_WARP_DISC_ATC   = 62, /* blocks discarded at IV_PFLUSH + IV_PFLUSHA -- ATC
+                                       * maintenance, 48.8 % of the events measured        */
+   Z3660_PROF_C_WARP_DISC_CPUSH = 63, /* blocks discarded at IV_FLUSH (CPUSHL/CINV) -- the
+                                       * largest single cause at 46.9 % of the events.
+                                       * DISC = DISC_ROOT + DISC_ATC + DISC_CPUSH + other,
+                                       * and that identity is gate G-R4.9                  */
+   Z3660_PROF_C_COUNT           = 64,
    /* The way block's base, so the lookup can index it by way. Locked to the enumeration
     * by a compile-time tripwire in z3660_prof.cpp, same as the IV_ block. */
    Z3660_PROF_C_DOPC_WAY_BASE   = Z3660_PROF_C_DOPC_WAY0,

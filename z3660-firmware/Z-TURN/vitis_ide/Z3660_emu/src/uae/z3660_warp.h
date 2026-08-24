@@ -304,12 +304,41 @@ extern "C" {
  * PREDICTED BRANCH, and that is a SHIPPED cost until the M5 gate rather than a free one:
  * §30's pricing law says work prepended to the path arrives in full, and the one thing this
  * round must not do is charge itself nothing. */
+/* ROUND 4 MOVES THE ARM FLAG OUT OF THIS STRUCT AND INTO `regs`, AND THE REASON IS THE ONE
+ * MEASUREMENT ROUND 3 COULD NOT EXPLAIN (plan §0.12.1).
+ *
+ * Round 3 took the body out of line and the disarmed gate fell from five instructions to
+ * four -- and the penalty went the WRONG WAY, -2.276 % to -4.056 %, on a loop 128 bytes
+ * SMALLER than round 1's. §0.10.6's L1I-footprint mechanism cannot explain that and §0.11.4
+ * left it owed. The objdump of the image that was actually measured does explain it:
+ *
+ *     3024f490:  blx  r3                  <- the interpreter handler returns here
+ *     3024f494:  ldr  r3, [pc, #2028]     <- literal pool: the ADDRESS of the gate
+ *     3024f498:  ldr  r3, [r3]            <- the flag, DEPENDENT on the load above
+ *     3024f49c:  cmp  r3, #0
+ *     3024f4a0:  beq  ...
+ *
+ * A SERIAL LOAD-TO-LOAD ADDRESS DEPENDENCY WITH ZERO SLACK, issued the instant the handler
+ * returns so nothing hides either use latency. Round 1's five were two `movw`/`movt` ALU
+ * immediates -- no memory port, freely scheduled -- feeding ONE load. The instruction count
+ * fell and the dependency depth rose, and it is the depth that is billed: 8.69 cycles for
+ * four instructions against 4.87 for five, on §0.9.3's own 214.2 cycles per guest
+ * instruction. gcc chose it because -Os prefers one instruction to two, which is the
+ * "an instruction count is not a cost" error §0.4.3 named, made in the other direction.
+ *
+ * So `on` moves into `regstruct`, beside the pc fields the run loop already reads and writes
+ * on EVERY pass, and the gate becomes `ldr rX,[r4,#off]` / `cmp` / `b` -- three
+ * instructions, one load, NO address materialisation, on a base that is already live and a
+ * line that is already hot. `last_pc` stays here: it is read only on the ARMED path, inside
+ * the out-of-line step(), which pays its own materialisation once and does not care.
+ *
+ * The macro spelling is unchanged, which is the point -- core0's console and three years of
+ * comments call it `z3660_warp_on` and none of them had to move. */
 struct z3660_warp_gate_s {
-   int      on;         /* the arm flag the run loop's hook tests                       */
    unsigned last_pc;    /* the previously dispatched pc -- the control-transfer test     */
 };
 extern struct z3660_warp_gate_s z3660_warp_gate;
-#define z3660_warp_on       (z3660_warp_gate.on)
+#define z3660_warp_on       (regs.warp_on)
 #define z3660_warp_last_pc  (z3660_warp_gate.last_pc)
 
 /* Arm/disarm from a RAW mailbox value, run through z3660_warp_resolve() so a console
@@ -562,7 +591,10 @@ unsigned long long z3660_warp_stat(int which);
 #define Z3660_WARP_STAT_BAILST   14   /* writeback stores executed on bail arms            */
 #define Z3660_WARP_STAT_MEMHIT   15   /* memory helper served                              */
 #define Z3660_WARP_STAT_MEMDECL  16   /* memory helper declined -> the block bailed        */
-#define Z3660_WARP_STAT_COUNT    17
+#define Z3660_WARP_STAT_DISCEV   17   /* discard-all EVENTS -- round 4's churn split       */
+#define Z3660_WARP_STAT_DISCATC  18   /* ... blocks lost at PFLUSH / PFLUSHA               */
+#define Z3660_WARP_STAT_DISCCPUSH 19  /* ... blocks lost at CPUSHL / CINV                  */
+#define Z3660_WARP_STAT_COUNT    20
 
 void z3660_warp_stats_zero(void);
 /* Lower the code cache's usable size so the eviction path can be reached without emitting
@@ -599,7 +631,23 @@ void z3660_warp_set_cache_limit(unsigned bytes);
                                       * i.e. THE DEFECT THAT KILLED ROUND 2 ON SILICON,
                                       * put back so the arm that catches it can be shown
                                       * to catch it rather than asserted to               */
-#define Z3660_WARP_MUT_COUNT     16
+/* ROUND 4'S ARMS -- one per new family and one per new DECISION, which is the half that
+ * matters. A family arm proves the emitter computes the right flags; a decision arm proves
+ * the round's reasoning was load-bearing. M-AUTO-ORDER is the second kind: it puts the
+ * auto-adjust write-back BEFORE the access, which is precisely the arrangement §0.12.2's
+ * static read exists to forbid, so the corpus has to show that a bail then leaves an
+ * already-advanced An behind. */
+#define Z3660_WARP_MUT_MOVEQ_FLAG   16  /* MOVEQ keeps C and V instead of clearing them   */
+#define Z3660_WARP_MUT_TST_FLAG     17  /* TST commits C and V                            */
+#define Z3660_WARP_MUT_SHIFT_C      18  /* a shift drops its carry-out                    */
+#define Z3660_WARP_MUT_SHIFT_X      19  /* a ROTATE writes X, which only ROXd may do      */
+#define Z3660_WARP_MUT_IMM_CARRY    20  /* SUBI/CMPI lose the carry inversion             */
+#define Z3660_WARP_MUT_ALUMEM_EARLY 21  /* a memory-source ALU computes from a value read
+                                         * before the source could decline                */
+#define Z3660_WARP_MUT_AUTO_BYTEINC 22  /* -(A7)/(A7)+ at byte size steps by 1, not 2     */
+#define Z3660_WARP_MUT_AUTO_ORDER   23  /* the auto-adjust write-back emitted BEFORE the
+                                         * access -- the defect §0.12.2 forbids           */
+#define Z3660_WARP_MUT_COUNT        24
 void z3660_warp_set_mutant(int which);
 /* The mutant word itself, because z3660_warp_step() is INLINED into the run loop and
  * M-XFER lives inside it. In no firmware binary: the whole block is behind

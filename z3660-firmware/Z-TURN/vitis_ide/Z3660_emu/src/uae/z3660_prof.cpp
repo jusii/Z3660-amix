@@ -69,7 +69,8 @@ extern "C" const char * const z3660_prof_counter_names[] = {
     * see, and without which a recompile budget cannot be decomposed at all. */
    "WARP_ENTER", "WARP_BLK", "WARP_INSNS", "WARP_BAIL", "WARP_BAIL_ST",
    "WARP_COMPILE", "WARP_CINSNS", "WARP_CBYTES", "WARP_CFETCH",
-   "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE", "WARP_EVICT"
+   "WARP_DISC", "WARP_DISC_ROOT", "WARP_FLUSH", "WARP_DECLINE", "WARP_EVICT",
+   "WARP_DISC_EV", "WARP_DISC_ATC", "WARP_DISC_CPUSH"
 };
 typedef char z3660_prof_bucket_names_complete[
    (sizeof(z3660_prof_bucket_names)/sizeof(z3660_prof_bucket_names[0]) == Z3660_PROF_B_COUNT) ? 1 : -1];

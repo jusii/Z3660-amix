@@ -101,6 +101,18 @@ struct regstruct
 	uae_u32 instruction_pc;
 	uae_u32 trace_pc;
 
+	/* THE WARP ARM FLAG, AND IT LIVES HERE FOR A MEASURED REASON (docs/WARP-ENGINE.md
+	 * S0.12.1). The 040 run loop keeps &regs in a callee-saved register across the whole
+	 * dispatch -- it reads pc, pc_p and pc_oldp and writes instruction_pc on every pass --
+	 * so a flag inside this struct is ONE load off a base that is already live and a cache
+	 * line that is already hot. As a standalone global it was two SERIALLY DEPENDENT loads
+	 * (the literal-pool address, then the flag) issued the instant the interpreter's
+	 * handler returned, with nothing to hide either latency behind: 4 instructions costing
+	 * 2.17 cycles each against round 1's 5 costing 0.97, which is the whole of the
+	 * unexplained -4.056 % disarm penalty. Read and written ONLY through
+	 * z3660_warp_on / z3660_warp_arm(). */
+	int warp_on;
+
 	uae_u16 irc, ir;
 	volatile uae_atomic spcflags;
 	uae_u32 chipset_latch_rw;
