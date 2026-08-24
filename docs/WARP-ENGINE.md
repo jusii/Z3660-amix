@@ -5955,3 +5955,25 @@ Written now, before any measurement, so it cannot be written to fit one.
    consequences of that for amortisation are unquantified.
 6. **That any of the session estimates are right.** They are `assumed`, they are stated so they can
    be wrong in public, and they are not a commitment.
+
+### 0.19.5 Addendum — the blessing row (2026-08-24 evening)
+
+The park's closing metal session (evidence `2026-08-24-warp-r6-blessing`, 124 files) scored
+§0.17.2: the tax-fixed lean `9AECF99D` measured **7 947** against the ≥ 7 988 gate — MISSED by
+41; band 8 100–8 163 missed low by 153; **rule 3 fires and the row is not re-banded**. The same
+session's floor variant (`BOOT-abl2` `E2C1FBC5`, the same tree minus 64 B of cold attestation
+`.text`) measured **8 130 — inside the band, gate cleared by 142** — and a closing re-flight of
+the reference read 8 174.0 against an opening 8 174.0, zero drift. The 183-dhrystone gap between
+two near-identical binaries is a binary property: link layout, the ±0.5 pp ambient class §0.15
+priced. **The fix's code is vindicated; the nominated binary drew a losing layout; no rescue
+round was taken** — chasing a 41-dhrystone gate through the layout lottery is the sub-floor
+guessing this campaign retired. Armed for the record: 7 100 with all six counter bands HIT and
+the engine's work identical to five significant figures. `WARPTEST` PASS 17/17 on everything
+flown; selector clean both directions; console boot-path exact.
+
+**The park's physical posture, final:** the standing card image is the clean interpreter lineage
+`F294E75A` (fourth consecutive rollback, CRC-verified); the engine is preserved in-repo —
+buildable, gated by `tools/warp-gate.sh`, `WARPTEST`-proven — as `BOOT-lean.BIN` `9AECF99D`.
+Shipping a WARP-carrying lean requires layout control first, which is the same class of work §8
+of the prospectus already orders ahead of any reopening (the E-round). Orchestrator ruling,
+2026-08-24: the miss is accepted as scored.
