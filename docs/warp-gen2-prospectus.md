@@ -810,6 +810,9 @@ n = 7, spread 0.42 %); §0.5.2's absolute floor **8 242**; the disarmed blessing
 
 *Five options. One row each. No recommendation — that is carried outside this document.*
 
+**Ruled 2026-08-24: PARK + TAX FIX** (user decision; carried in `WARP-ENGINE.md` §0.19, the
+fix built in round 6). The table below is kept as priced, for the day the fork reopens.
+
 | option | dhry band vs `R` = 8 185 | cost | risk grade | what it forecloses |
 |---|---|---|---|---|
 | **PARK** — freeze at G1, `WARP` stays `unset = OFF`, no further rounds | **disarmed 7 903 (−3.445 %)**; armed 7 563 available on request | **0 rounds** | **LOW.** Nothing changes; the correctness machinery, the 18 368-opcode accept set and the ablation kit all stay in the tree as evidence | Forecloses nothing technically — every family list and every contract is written down. Ships a card carrying a **permanent −3.445 % tax on a feature nobody uses**, which has now missed the ≥ 7 988 blessing class **three consecutive rounds**; the standing card stays `F294E75A` |
