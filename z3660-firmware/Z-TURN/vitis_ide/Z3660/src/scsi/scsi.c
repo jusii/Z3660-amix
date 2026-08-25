@@ -16,6 +16,12 @@
 
 #include "z3660_scsi_enums.h"
 #include "scsi.h"
+#include "rdb_scan.h"
+/* rdb_scan.h is standalone so the host harness can include it; keep its constants
+ * pinned to the ones the rest of this file uses. */
+_Static_assert(RDB_SCAN_CHUNK == PISCSI_MAX_BLOCK_SIZE, "rdb_scan chunk != PISCSI_MAX_BLOCK_SIZE");
+_Static_assert(RDB_SCAN_LIMIT == RDB_BLOCK_LIMIT, "rdb_scan limit != RDB_BLOCK_LIMIT");
+_Static_assert(RDB_SCAN_IDENTIFIER == RDB_IDENTIFIER, "rdb_scan id != RDB_IDENTIFIER");
 #include "../config_file.h"
 #include "../debug_console.h"
 #include "../cpu_emulator.h"
@@ -606,54 +612,62 @@ int isPrintableChar(char c)
    if(c>=' ' && c<='~') return 1; // printable chars
    return(0);
 }
+/* The two FatFS seams rdb_scan() reads a disk image through.  Cache maintenance is a
+ * transport concern and lives here, not in the policy. */
+static int rdb_fatfs_read_sector(void *ctx, uint32_t sector, uint8_t *buf)
+{
+   FIL *fd = (FIL *)ctx;
+   unsigned int n_bytes;
+   f_lseek(fd, (FSIZE_t)sector * RDB_SCAN_SECTOR);
+   if(f_read(fd, buf, RDB_SCAN_SECTOR, &n_bytes)!=FR_OK)
+      return 0;
+   Xil_L1DCacheFlush();
+   return n_bytes==RDB_SCAN_SECTOR;
+}
+static uint32_t rdb_fatfs_read_chunk(void *ctx, uint32_t index, uint8_t *buf)
+{
+   FIL *fd = (FIL *)ctx;
+   unsigned int n_bytes;
+   f_lseek(fd, (FSIZE_t)index * RDB_SCAN_CHUNK);
+   if(f_read(fd, buf, RDB_SCAN_CHUNK, &n_bytes)!=FR_OK)
+      return 0;
+   Xil_L1DCacheFlush();
+   return n_bytes;
+}
 int piscsi_parse_rdb(PISCSI_DEV *d) {
    ACTIVITY_LED_ON; // ON
    FIL *fd = d->fd;
    int i = 0;
    uint8_t *block = malloc(PISCSI_MAX_BLOCK_SIZE);
 
-   /* non-AMIX path = byte-identical upstream: single seek-to-0, then 64K-stride reads below. */
-   if(!config.amix_mode && fd>(FIL *)1)
-      f_lseek(fd, 0);
+   if(fd>(FIL *)1)
+   {
+      /* Image-file path: the scan policy lives in rdb_scan.h, which the host harness
+       * drives directly.  It replaces the old amix_mode gate -- see that header for
+       * why the key is the disk's own sector 0 and not a config flag. */
+      rdb_reader reader = { rdb_fatfs_read_sector, rdb_fatfs_read_chunk, fd };
+      rdb_scan_result found = rdb_scan(&reader, block, &i);
+      if(found==RDB_SCAN_NONE)
+         goto no_rdb_found;
+      if(found==RDB_SCAN_SUB_LBA0)
+         printf("[PISCSI] RDB at sector %d (sector 0 empty).\n", i);
+      goto rdb_found;
+   }
+   /* Raw SD path: unchanged.  It already reads one 512-byte block per index for every
+    * disk, so it has always scanned blocks 0..15 without the phase-2 key. */
    for (i = 0; i < RDB_BLOCK_LIMIT; i++) {
-      if(fd>(FIL *)1)
-      {
-         unsigned int n_bytes;
-         if(config.amix_mode)
-         {
-            /* AMIX root RDB is at sector 2 (byte 1024).  The upstream 64K-stride scan only
-             * tested the first 4 bytes of each 64K read -> sampled offsets 0,64K,128K,... ->
-             * NEVER saw the sub-64K RDB -> "No RDB found" -> AMIX booted the no-RDB fallback,
-             * mounted root R/W, stamped fs_state=FSACTIVE before bcheckrc's fsck -m -> fsck-
-             * every-boot loop.  Read one 512-byte block per index so the RDB is found.
-             * AMIX-ONLY: a hybrid AmigaOS HDF (MBR at sector 0, Amiga RDB at sector 2 - like
-             * this card's Workbench image) has its sector-2 RDB FOUND by this per-sector scan
-             * and is then given RDB geometry it was never used with on stock (whose 64K scan
-             * misses it -> synthetic fallback) -> Kickstart can't read DH0 (insert-disk) + a
-             * downstream [Core0] DataAbort in the PISCSI debug-msg path.  So gate the scan. */
-            f_lseek(fd, (FSIZE_t)i * 512);
-            f_read(fd, block, 512, &n_bytes);
-         }
-         else
-         {
-            f_read(fd, block, PISCSI_MAX_BLOCK_SIZE,&n_bytes);
-         }
-      }
-      else
-      {
-         //DRESULT res = 
+      //DRESULT res =
 //         disk_read(0,block,i * 512 + d->start_block,PISCSI_MAX_BLOCK_SIZE/512);
-         disk_read(0,block,i + d->start_block,1);
+      disk_read(0,block,i + d->start_block,1);
 
-         printf("disk_read block %08lX i=%d %02X%02X%02X%02X ",(uint32_t)(i * 512 + d->start_block),i,block[0],block[1],block[2],block[3]);
-         printf("%c",isPrintableChar(block[0])?block[0]:'.');
-         printf("%c",isPrintableChar(block[1])?block[1]:'.');
-         printf("%c",isPrintableChar(block[2])?block[2]:'.');
-         printf("%c\n",isPrintableChar(block[3])?block[3]:'.');
-      }
+      printf("disk_read block %08lX i=%d %02X%02X%02X%02X ",(uint32_t)(i * 512 + d->start_block),i,block[0],block[1],block[2],block[3]);
+      printf("%c",isPrintableChar(block[0])?block[0]:'.');
+      printf("%c",isPrintableChar(block[1])?block[1]:'.');
+      printf("%c",isPrintableChar(block[2])?block[2]:'.');
+      printf("%c\n",isPrintableChar(block[3])?block[3]:'.');
+
       Xil_L1DCacheFlush();
-      uint32_t first = be32toh(*((uint32_t *)&block[0]));
-      if (first == RDB_IDENTIFIER)
+      if (rdb_magic_here(block))
          goto rdb_found;
    }
    goto no_rdb_found;

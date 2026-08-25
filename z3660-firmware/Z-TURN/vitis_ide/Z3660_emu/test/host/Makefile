@@ -133,9 +133,16 @@ CORE0_AMIX_RAM_H := $(ROOT)/../Z3660/src/amix_ram.h
 ROM_WINDOW_BIN := $(BUILD)/rom_window_test
 CORE0_ROM_WINDOW_H := $(ROOT)/../Z3660/src/rom_window.h
 
+# RDB location-policy guard. Compiles ONLY Z3660/src/scsi/rdb_scan.h (self-contained,
+# same reason as the three above -- scsi.c itself needs FatFs + the Xilinx BSP). Pins
+# the scan that BLIZZARD F4-M2 found unreachable on the real-CPU path, and the
+# hybrid-disk protection the amix_mode gate used to provide.
+RDB_SCAN_BIN := $(BUILD)/rdb_scan_test
+CORE0_RDB_SCAN_H := $(ROOT)/../Z3660/src/scsi/rdb_scan.h
+
 .PHONY: all clean clean-all objs run run-lean run-prof run-scsi run-bootmode run-amix-ram \
-        run-rom-window
-all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN)
+        run-rom-window run-rdb-scan
+all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
@@ -160,7 +167,7 @@ $(BUILD)/host/%.o: %.cpp
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
 -include $(BUILD)/bootmode_test.d $(BUILD)/amix_ram_test.d $(BUILD)/scsi_cd_test.d \
-         $(BUILD)/rom_window_test.d
+         $(BUILD)/rom_window_test.d $(BUILD)/rdb_scan_test.d
 
 $(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
 	@mkdir -p $(BUILD)
@@ -177,12 +184,18 @@ $(ROM_WINDOW_BIN): rom_window_test.cpp $(CORE0_ROM_WINDOW_H)
 	@echo "  CXX+LINK  rom_window_test.cpp"
 	@$(CXX) $(CXXFLAGS) rom_window_test.cpp -o $@
 
-run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN)
+$(RDB_SCAN_BIN): rdb_scan_test.cpp $(CORE0_RDB_SCAN_H)
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  rdb_scan_test.cpp"
+	@$(CXX) $(CXXFLAGS) rdb_scan_test.cpp -o $@
+
+run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN)
 	@$(BIN)
 	@$(SCSI_CD_BIN)
 	@$(BOOTMODE_BIN)
 	@$(AMIX_RAM_BIN)
 	@$(ROM_WINDOW_BIN)
+	@$(RDB_SCAN_BIN)
 
 # The lean (production) firmware's core1, through the same suites. scsi_cd/bootmode/
 # amix_ram do not touch the run loop, so the variant that matters is the MMU harness.
@@ -207,6 +220,9 @@ run-amix-ram: $(AMIX_RAM_BIN)
 
 run-rom-window: $(ROM_WINDOW_BIN)
 	@$(ROM_WINDOW_BIN)
+
+run-rdb-scan: $(RDB_SCAN_BIN)
+	@$(RDB_SCAN_BIN)
 
 clean:
 	rm -rf $(BUILD)
