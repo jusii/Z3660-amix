@@ -65,9 +65,11 @@ extern server_t server;
 
 #include "lwip/dns.h"
 char version_string[5000];
-char version_string_export[50];
-char version_scsirom_string_export[50];
-char version_jed_string_export[50];
+/* Every ver_string_export passed to genericRecvVersionCallback() is one of these. */
+#define VERSION_EXPORT_SIZE 50
+char version_string_export[VERSION_EXPORT_SIZE];
+char version_scsirom_string_export[VERSION_EXPORT_SIZE];
+char version_jed_string_export[VERSION_EXPORT_SIZE];
 volatile int received=0;
 struct netif *netif;
 volatile int TcpFastTmrFlag = 0;
@@ -893,35 +895,51 @@ err_t genericRecvVersionCallback(uint32_t *filesize,uint32_t *checksum32,char *v
 #ifdef USE_RTOS
       hdmi_tick(0); // 0 = roll the bar
 #endif
-      memcpy(&version_string, p->payload, p->len);
+      /* Copy the WHOLE pbuf chain, bounded, and terminate it.  p->len is only the FIRST
+       * pbuf of a chain this code then acknowledges as p->tot_len, and nothing
+       * NUL-terminated the buffer, so a version file that arrived split was parsed
+       * truncated.  That is not theoretical: jed_version.txt is the longest of the three
+       * (67 bytes) and the only one that crossed the split.  Its "checksum32=A6AE44DF"
+       * was read as "A6AE44" -> 0x00A6AE44, which can never equal the correctly computed
+       * 0xA6AE44DF, so boot-menu 'D' refused every CPLD download with "bad checksum"
+       * (measured on metal, BLIZZARD F4-M2:
+       *  "Checksum-32 2796438751 (A6AE44DF) 10923588 (00A6AE44)"). */
+      u16_t got=pbuf_copy_partial(p, version_string, sizeof(version_string)-1, 0);
+      version_string[got]=0;
+
+      /* Fail closed on a malformed file.  Each of these used to be dereferenced
+       * unchecked, so a server that answered with anything but the exact three
+       * CR-terminated fields wrote through a NULL. */
       char *version=strstr(version_string,"version=");
-      if(version!=NULL && version==version_string) // version is in the downloaded text, and also is the first work
+      char *plen=strstr(version_string,"length=");
+      char *pcheck=strstr(version_string,"checksum32=");
+      char *vend=strchr(version_string,'\r');
+      char *lend=plen?strchr(plen,'\r'):NULL;
+      char *cend=pcheck?strchr(pcheck,'\r'):NULL;
+      if(version==version_string && vend!=NULL && lend!=NULL && cend!=NULL) // version is in the downloaded text, and also is the first work
       {
          version=version_string+8;
-         char *plen=strchr(version_string,'\r');
-         *plen=0;
+         *vend=0;
          printf("Version: %s\n", version);
-         strcpy(ver_string_export,version);
-         *plen='\r';
-         plen=strstr(version_string,"length=");
-         char *pcheck=strchr(plen,'\r');
-         *pcheck=0;
+         strncpy(ver_string_export,version,VERSION_EXPORT_SIZE-1);
+         ver_string_export[VERSION_EXPORT_SIZE-1]=0;
+         *vend='\r';
+         *lend=0;
          *filesize=atoi(plen+7);
          printf("File size: %ld\n",*filesize);
-         *pcheck='\r';
-         pcheck=strstr(version_string,"checksum32=");
-         char *last=strchr(pcheck,'\r');
-         *last=0;
+         *lend='\r';
+         *cend=0;
          *checksum32=hextoi(pcheck+11);
+         *cend='\r';
 
          altcp_recved(tpcb, p->tot_len);
-         pbuf_free(p);
          received=1;
       }
       else
       {
          printf("The update server may be down.\nPlease let us know about this on the z3660 discord channel.\n");
       }
+      pbuf_free(p);
       return altcp_close(tpcb);
    }
    return ERR_OK;
