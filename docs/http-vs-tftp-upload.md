@@ -112,6 +112,54 @@ It is *not* faster in the way the first draft claimed — the guest stops either
 
 ## Practical guidance
 
+### The boot menu is single-key, and several of those keys are destructive
+
+Everything in this section is driven by **one keystroke at a time** at the pre-boot menu. There
+is no line editing, no confirmation, and no way to take a key back. `D` downloads and flashes
+the **CPLD**, `O` overwrites `z3660scsi.rom`, `U` overwrites `Z3660.bin`, `F` overwrites
+`FAILSAFE.bin`, `P` starts the HTTP server.
+
+**Never send a word to this menu.** A runtime console command typed here is executed letter by
+letter: `DOPC` is `D`, `O`, `P`, `C`. Console words belong to the running emulator's `C`
+console, which is a different prompt reached after boot — see `AMIX.md`, *"Never send a console
+word to the boot menu"*. Two adjacent traps worth knowing before driving this menu from a
+script: the boot-time memory-test prompts **drain buffered `C` keys**, so power-on `C`-spam can
+miss the menu (`carrier-bringup-checklist.md`), and a bare ESC on the serial console spins core0
+forever (`core0-loop-blocking-audit.md` B3).
+
+### `D` never worked: the version-file parse was truncated (fixed 2026-08-25)
+
+Boot-menu `D` refused every CPLD download with `File z3660.jed NOT written (bad checksum)`.
+BLIZZARD F4-M2 caught it on metal:
+
+```
+Checksum-32 2796438751 (A6AE44DF) 10923588 (00A6AE44)
+```
+
+The **computed** value is right — recomputing the shipped `update_system_files/z3660.jed` with
+the firmware's own algorithm (sum of big-endian 32-bit words over `filesize/4` words) gives
+exactly `A6AE44DF`, which is what `jed_version.txt` declares. The **expected** value was wrong:
+`0x00A6AE44` is the first *six* hex digits of `A6AE44DF`, so the parser had read a truncated
+string.
+
+Cause, in `lwip.c`'s `genericRecvVersionCallback()`: it copied `p->len` — the first pbuf of a
+chain it then acknowledged as `p->tot_len` — and never NUL-terminated the buffer. A version file
+that arrived split was parsed short. `jed_version.txt` is the longest of the three version files
+(67 bytes against 57 and 45) and the only one that crossed the split, which is why `D` alone was
+broken while `U`/`F`/`T` and `O` worked.
+
+Fixed by copying the whole chain with `pbuf_copy_partial()`, bounded and terminated. The same
+pass made the field parse fail closed — `version=`, `length=` and `checksum32=` and their `\r`
+terminators were each dereferenced unchecked, so a server answering with anything else wrote
+through a NULL — bounded the version-string copy, and freed the pbuf on the reject path, which
+leaked.
+
+**This bug was load-bearing protection.** `D` reflashes the CPLD, the one operation on this card
+that needs a jumper board and a hands-on recovery if it goes wrong
+(`z3660-cpld-flash-needs-jumper`). It has been refusing to run since the update system shipped.
+Now that it can run, treat it as the hazard it is: create `FAILSAFE.bin` (menu `J`) first, and
+do not press `D` unless a CPLD update is actually intended.
+
 ### Getting files onto the card — `PUT /upload`, volume `1:` only
 
 - **Disk images (`.hdf`, `.iso`) → HTTP.** They live on `1:`, which is the only volume HTTP can

@@ -472,6 +472,23 @@ runtime from the serial **C** (console) menu — they are *not* `z3660cfg.txt` o
 
 Both default to off (quiet) in normal operation.
 
+#### Never send a console word to the boot menu
+
+Every command on this page is a **word** typed at the running emulator's `C` console. The
+**boot menu** — the pre-boot prompt reached by spamming `C` at power-on — reads **one key at a
+time**, and several of its keys are destructive. Typing a console word there is not a no-op and
+is not an error message: it is executed letter by letter.
+
+`DOPC` at the boot menu is `D`, `O`, `P`, `C` — *download and flash the CPLD firmware*,
+*overwrite `z3660scsi.rom`*, *start the HTTP server*, and then `C` catches the autoboot
+countdown. `PSTAT`, `PROF`, `DEMU`, `DSCSI` and `SERV` all start with menu keys too.
+
+So: **reach the running console first, then type the word.** Sending it earlier is not safer —
+it is the one way to make it dangerous. The same applies to anything that emits an escape
+sequence: a bare ESC on the serial console spins core0 forever (`core0-loop-blocking-audit.md`
+B3), so arrow keys, terminal status queries and a `screen`/`tmux` partial sequence are all live
+hazards on this port.
+
 #### One UART, two cores: turn `PSTAT` off before any long dump
 
 Core0 and core1 print through the **same UART behind the same semaphore**
