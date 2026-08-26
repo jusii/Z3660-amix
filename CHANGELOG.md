@@ -1,5 +1,208 @@
 # Changelog
 
+## 2026-08-25 — the ARM's own data abort, located in the binary (716d4bd)
+
+- `docs/core0-async-data-abort-2026-08-25.md`: the 2026-08-25 `[Core0] DataAbortHandler()`
+  (DFSR `0x00001c06`) decoded and symbolised against the exact running image
+  (`BOOT-lean-9CE3F6A6`). The abort PC `0x0100b2c8` is the completion-poll branch of
+  `Xil_L2CacheFlush()` — the PL310 whole-cache Clean-and-Invalidate by Way — reached from
+  `scsi.c:1878` (`SETFSH`, "no filesystem handler"). Two defects named in passing:
+  `Xil_L2CacheFlush()` masks no interrupts where its L1 sibling masks IRQ+FIQ, and the 60 Hz
+  vblank ISR calls the same whole-cache flush in `bootmode CPU`, so a PL310 background
+  operation can be re-programmed from interrupt context while it runs. Corrects the bench
+  reading of the fault record: `WnR` is architecturally UNKNOWN on an asynchronous fault, so
+  "write" was never a measurement either — only DFAR was previously known to be garbage.
+  Every Amiga-side window (FPGA regs at `0x80000000`, PL, IOP peripherals) is excluded
+  architecturally: all are `RESERVED` or `STRONG_ORDERED` in core 0's table, and those give
+  *synchronous* aborts. Includes a six-candidate table with per-candidate discriminators, the
+  electrical-vs-software family assessment, a survivability assessment of the reboot-on-abort
+  handler, and seven registered logging discriminators for a second sighting. No firmware
+  change.
+
+## 2026-08-25 — an AMIX root is found on the real 060, and boot-menu `D` is unblocked (767af71..e1e98c4)
+
+- **The only RDB scan that can find an AMIX root was unreachable on `bootmode CPU`, and no
+  single line was wrong (`767af71`).** Three shipped lines formed a chain that closed:
+  `config_file.c:1322` forces `cpu_ram=0` under `amix_mode`, `main.c:1450` disables SCSI boot
+  without `cpu_ram`, and `scsi.c:621` gated the per-512-byte-sector scan on `amix_mode` — so on
+  the real-CPU path `amix_mode` and `scsiboot` were mutually exclusive and an AMIX root got
+  `No RDB found on disk, making up some CHS values.` Proven single-variable on metal
+  (BLIZZARD F4-M2): duplicating the RDSK block to sector 0 turned boot 1's insert-disk into
+  boot 2's `UNIX_Root (9)` / `UNIX_Swap (9)` / `UNIX_Boot (9)` with nothing else altered.
+  The gate was protecting something real — a hybrid image (foreign container or MBR at sector
+  0 plus a sub-64K RDB) gets geometry it was never used with on stock, and **this repo ships
+  two**: `hdf/Amix_small.hdf` / `_su.hdf`, `conectix` cookie at sector 0, checksum-valid RDSK
+  at sector 10. **Replacement key is the disk's own sector 0, not a config flag.** Three
+  phases, in `scsi/rdb_scan.h`: sector 0 on magic alone (every AmigaOS disk decided on the
+  first read, exactly as before, no checksum added where one could reject a disk that boots
+  today); sectors 1..15 — the RDB spec's own location limit — **only** when sector 0 is
+  entirely zero and only for a checksum-balancing candidate; then upstream's remaining 64K
+  sample points in their old order. `piscsi_parse_rdb()` keeps no scan loop of its own on the
+  image-file path, and `_Static_assert`s pin the header's constants to `PISCSI_MAX_BLOCK_SIZE`,
+  `RDB_BLOCK_LIMIT` and `RDB_IDENTIFIER`. **Compatibility measured, not argued:** both policies
+  replayed against all 41 disk images in the workspace — **15 identical, 26 differ, and every
+  differing row is an AMIX root**; nine AmigaOS RDB disks, both `conectix` hybrids, three
+  blanks and an ADF are unchanged. Host harness `rdb_scan_test.cpp`, **32 checks**, in a suite
+  of **3587**. **Scored on metal the same day:** the lean image `9CE3F6A6` printed
+  `[PISCSI] RDB at sector 2 (sector 0 empty).` and the three partitions on a real 68060 —
+  `docs/rdb-location-policy.md` §8 predictions 1 and 2 HIT (that run ended in the unrelated
+  core0 abort above). The raw-SD path is deliberately untouched and recorded as a known
+  asymmetry: it already reads one 512-byte block per index for every disk, so it keeps the
+  hybrid exposure phase 2's key removes on the image path.
+
+- **Boot-menu `D` has never worked, and the cause was a truncated pbuf (`45a11a2`).**
+  `genericRecvVersionCallback()` copied `p->len` — the **first** pbuf of a chain it then
+  acknowledged as `p->tot_len` — and never NUL-terminated the buffer, so a version file that
+  arrived split was parsed short. `jed_version.txt` is the longest of the three (67 bytes
+  against 57 and 45) and the only one that crossed the split: `checksum32=A6AE44DF` was read as
+  `0x00A6AE44`, so every CPLD download was refused as a bad checksum, while `U`/`F`/`T` and `O`
+  worked. Measured on metal (BLIZZARD F4-M2:
+  `Checksum-32 2796438751 (A6AE44DF) 10923588 (00A6AE44)`) — the *computed* value was right all
+  along. Fixed by copying the whole chain with `pbuf_copy_partial()`, bounded and terminated;
+  the field parse now fails closed (`version=`, `length=`, `checksum32=` and each `\r`
+  terminator were dereferenced unchecked, so a server answering with anything else wrote
+  through a NULL), the export copies are bounded to their real buffer size, and the pbuf is
+  freed on the reject path, which leaked. **The bug was load-bearing protection**: `D`
+  reflashes the CPLD, the one operation on this card that needs a jumper board and a hands-on
+  recovery if it goes wrong, and it has been refusing to run since the update system shipped.
+  Create `FAILSAFE.bin` (boot menu `J`) first and treat `D` as live from here.
+
+- **Docs (`e1e98c4`).** `docs/rdb-location-policy.md` — the gate chain, what the `amix_mode`
+  gate was really protecting, the 41-image census (26 AMIX roots: **all** with an empty sector
+  0, RDSK at sector 2; every disk that must not change has *something* at sector 0), the
+  old-vs-new differential, harness coverage, and a six-prediction metal pre-registration with
+  falsifiers — including the warning that `f4m2-work-root.hdf` now carries RDSK at **both**
+  sector 0 and sector 2, so as it stands it exercises phase 1 and not the fix.
+  `docs/AMIX.md` + `docs/http-vs-tftp-upload.md` gain the **single-key hazard**: the boot menu
+  reads one key at a time, several of them destructive, so a runtime console word typed there
+  is executed letter by letter — `DOPC` is `D`, `O`, `P`, `C` (flash the CPLD, overwrite
+  `z3660scsi.rom`, start the HTTP server, catch the countdown), and `PSTAT`, `PROF`, `DEMU`,
+  `DSCSI`, `SERV` all begin with menu keys too. Console words belong to the running emulator's
+  `C` console. Two adjacent traps recorded alongside: the boot-time memory-test prompts drain
+  buffered `C` keys, so power-on `C`-spam can miss the menu, and a bare ESC on the serial
+  console spins core0 forever.
+
+## 2026-08-24 — the WARP run-loop gate met a second compiler, and it was the gate that was wrong (ca47eac, a474435)
+
+- **`make bootbin` through the Vitis docker failed G-R6.6 on the ARMED loop, and the loop was
+  fine (`ca47eac`, `docs/WARP-ENGINE.md` §0.19.5).** gcc 12.2.0 hoists the `z3660_warp_step`
+  argument load (`regs.instruction_pc`, displacement 88) between the flag load and the compare,
+  where gcc 14.2.1 sinks it below the branch; `tools/warp-gate.sh` matched the gate on three
+  **fixed** lines after the handler's `blx r3`, so a scheduled-in instruction moved the compare
+  to line 3 and the script reported a loop that plainly engages the engine as having no gate.
+  **It was wrong in the dangerous direction too**: pointed at a hooked loop through the
+  disarmed symbol on that same image, the old matcher printed `no gate after the handler
+  returns -- as designed`; the build failed only because the independent "names no `z3660_warp`
+  symbol" test caught it. And the variable was never recorded anywhere — **all ten ELFs the
+  campaign archived were built by the host `arm-none-eabi-gcc` 14.2.1** while `CLAUDE.md`
+  documents the Vitis docker (gcc 12.2.0) as the build path; not one measured row is a docker
+  build, and no manifest row, CRC or build log could have shown it. §0.18.5's `BOOT.BIN` row is
+  corrected in two cells — the default variant's loops are **3 204 / 3 284 B**, not 2 100 /
+  2 184, which are lean's, transcribed; the CRC, image size and `sizeof(regs)` were right, a
+  clean rebuild at `43aa971` reproduces `BOOT-15A7FF0C.elf` byte-identically and passes the
+  gate, and G-R6.12 is unaffected. **Nothing about the engine, the loops or any measured row
+  moves**: all three variants rebuild byte-identical to their round-6 archive entries
+  (`15A7FF0C`, `9AECF99D`, `9D07C731`), the harness is unchanged at 3 334 / 3 330 / 3 561, and
+  `M1 PARKED` stands.
+
+- **The gate is now matched by its dataflow, not by one compiler's schedule (`a474435`).** A
+  compare against zero whose register was loaded earlier in the window, immediately followed by
+  a conditional branch — wherever the scheduler put them. The "exactly one load" rule becomes
+  the property it always meant: `warp_on` reached in **one load off a live base**, with no
+  address materialised first, so round 3's literal-pool arrangement (−4.056 %) still fails and
+  a surplus scheduled load no longer masquerades as it. The disarmed loop is still refused if
+  it carries the same dataflow, and still checked independently for naming any `z3660_warp`
+  symbol. Every verdict line now names the **producer** that built the ELF (`readelf -p
+  .comment`, all GCC strings, deduplicated), because the whole incident was one invisible
+  variable. New `make gate` re-reads **every** core1 build directory at once without rebuilding
+  anything — the per-variant hook checks an event, not the tree — plumbed through the top-level
+  Makefile. `tools/warp-gate.sh --selftest` checks the matcher itself against five windows
+  lifted verbatim off real builds: both compilers' schedules of the armed gate, round 3's
+  materialised address, the disarmed loop, and a compare fed by no load. No assembler, no ELF,
+  no build.
+
+## 2026-08-24 — BLIZZARD F0 fallout: both ROM windows fail closed, and the AutoConfig ghost is not this card (a2ec4bc..43aa971)
+
+- **What F0's two AutoConfig boards actually are (`a2ec4bc`, `43aa971`,
+  `docs/real-cpu-autoconfig-and-ext-rom.md`).** The first `bootmode CPU` boot this project has
+  ever run listed two boards, and neither was what it looked like.
+  - **Board 2 (`Z3 / 5195 / 1 / $10000000 / 128 MB / OK`) is the extended ROM itself**, not the
+    FPGA: every one of the four fields is a literal in
+    `z3660-drivers/kick31_060/kick31_060.asm`, visible in the shipped 384-byte image at offset
+    `0xC5`, hand-built into a `ConfigDev` and handed to `AddConfigDev()` by an `RTF_COLDSTART`
+    resident. **Which also proves the extended ROM worked** — the RomTagScanner had to find its
+    `$4AFC` matchword and call it — so A1's "the extended kickstart failed to load" premise is
+    false in both halves.
+  - **Board 2 is therefore NOT Fast RAM**: its `er_Type` is `$93`, `ERTF_MEMLIST` **clear**, and
+    `cd_Flags` is `CDF_CONFIGME` with `ConfigBoard()` commented out. It publishes an address
+    range — the FPGA's RTG aperture at `$10000000` — not usable memory. **BLIZZARD F0-M5's
+    memory-contract question is re-opened**, which is the correction with the most downstream
+    consequence.
+  - **Board 1 (`Z2 / 15163 ($3B3B) / 200 / 4 MB / Bad`) is an identity this card cannot emit.**
+    Manufacturer `0x144B` (5195) is assigned **unconditionally** in both FPGA chains and the
+    product byte's high nibble likewise, so no stale or half-programmed chain state can produce
+    15163/200; `0x3B3B` appears nowhere in the tree. `4 MB` is the **all-ones** Z2 size code
+    (`000` is 8 MB), and the complete enumeration of what this card can advertise is 64 kB,
+    128 MB and 256 MB — there is no 4 MB device and no combination of enable bits makes one.
+    The ghost reproduced with the same signature in a second session, which **rules out
+    randomness, not a no-responder read**: an undriven bus read is deterministic whenever the
+    cycles before it are. Revised reading: a **Zorro III end-of-chain read**, which accounts for
+    the type bits, the 4 MB, the `Bad` *and* the `$40000000` address the Zorro II reading could
+    not; §4's inference from list order is withdrawn (board 2 is appended by a `RTF_COLDSTART`
+    resident, after the chain walk). **Consequence: `scsiboot YES` is no longer expected to
+    clear it**, and F4 gets a three-boot ladder keyed on the vendor field — anything the card
+    emits reads 5195, so a ghost that still reads 15163 is off-card.
+  - Also recorded: the real-CPU **`FPGA_RESET` latch-ordering defect** (feature bits are
+    assigned only inside the FPGA's reset branch; the emulated path brackets its writes in an
+    explicit pulse, the real-CPU path has none of its own and relies on the incidental
+    `monitor_switch()` pulse ~160 lines before MAPROM/MAPROMEXT are set) — upstream's WIP note
+    at `CHANGES.md:41`, **pre-registered in §6 and deliberately NOT shipped**, because it
+    explains neither board and F0 is evidence the current timing worked. And the standing
+    caveat on every RTL citation: **the FPGA bitstream is a vendored binary this repo cannot
+    rebuild** — the newest `design_1_wrapper.bit` is beta 20 with an internal build stamp of
+    2026/02/09, and beta 21 shipped no new bitstream, so `z3660.v` is a *description* of the
+    FPGA on the card, not a guarantee.
+
+- **Both ROM windows fail closed, and their tails are zeroed (`37b8a12`).** `load_romext()`
+  validated **nothing** — not the size against the 512 KB window, not `f_read`'s byte count,
+  not the image id — printed `File read OK` and returned success unconditionally, so
+  `main.c:1723` enabled MAPROMEXT regardless. That matters because the window is not a buffer
+  the guest reads on request: once the decode is on, **Kickstart scans it** for `$4AFC` resident
+  matchwords and calls what it finds, so F0's 384-byte image published ~512 KB of
+  uninitialised DDR to the guest's instruction fetch. Now: the size is bounded **before** the
+  read (the read is sized by the file, not by the window, so an oversized image overran into
+  whatever the ARM map holds above `$00F80000`), the whole window is zeroed before the read,
+  and the byte count and the `$1111` extended-ROM id are checked after — a refusal re-zeroes
+  the window and leaves the decode **disabled**. `load_rom()` gets the same bound and the same
+  pre-zero; it is deliberately not magic-gated, because the kickstart slots legitimately hold
+  whole-ROM images of several vintages plus DiagROM. Policy lives in the self-contained
+  `Z3660/src/rom_window.h` (no BSP, no FatFs, no UAE types — the pattern of
+  `boot_mode_is_emulated()` and `amix_ram.h`), guarded by
+  `Z3660_emu/test/host/rom_window_test.cpp`, **31 checks**, including that all four shipped
+  `kick060*.rom` sizes are admitted and that a truncated file is diagnosed as truncated rather
+  than as a bad id.
+
+- **The floppy hunk parse checks its open (`068706b`).** The open and the seek of
+  `1:/z3660_scsi.rom` were both unchecked, so a missing file walked `process_hunks()` into an
+  uninitialised stack `FIL` and printed `Unknown hunk type 00000000` — the tree's **only**
+  `debug=1` hunk call site, 40 lines away in `main()` from the extended-kickstart load, which is
+  exactly how it was misread as an ext-ROM failure during F0. Now it fails closed and names the
+  file. `0x2600` is left as found: it is **not** `PISCSI_DRIVER_OFFSET` (`0x1000`) and holds
+  zeros in the shipped 16 KB image, so `pifloppy_hreloc` has always been empty and
+  `reloc_hunks()` has always relocated nothing, in every mode, on every boot — the right offset
+  is an upstream question, not a guess to make here.
+
+- **A real 68060 runs at 100 MHz only — measured, not the documented 50–100 (`2e1c4e5`,
+  `KNOWN_ISSUES.md` `fork:amix` section).** Single-variable A/B on metal, one preset, only
+  `cpufreq` changed: **100** boots KS 3.2.3 from reset to a full Intuition desktop with a live
+  mouse; **50** gives a black HDMI output and zero serial past the ARM banner, held 13 minutes.
+  That corroborates `CPLD/README.md`'s *"all firmware here is working only at 100 MHz … only
+  some 'magic' frequencies work"* over the user-facing range. Noted alongside: the code does not
+  implement the range the section states — `configure_clk()` clamps to `[50,120]` and then
+  replaces the request with a table entry, so **the configured number is not the applied one**;
+  read the `Clock index %d` line back from the serial. Says nothing about emulated modes, where
+  the 060 is a bus-parked passenger.
+
 ## 2026-08-24 — Plan WARP ENGINE: M1 built over six rounds, scored, and PARKED at generation-one scope (ffda114..e32056a)
 
 A JIT under the guest's 68040 MMU, taken from a plumbing slice to a working generation-one
