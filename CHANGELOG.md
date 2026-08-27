@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-27 — the reboot soak that never rebooted, and the count that goes with it (d40ce94, 0fe57b4)
+
+- `tools/amix-stress/amix_soak.sh`: fixed two defects that made every reboot cycle a
+  no-op scoring green. The shutdown ended in `&`, which the telnet runner's appended
+  `; echo DONE_$?` turned into a Bourne syntax error (`&;`), so it never executed; and
+  the post-reboot check was a bare TCP connect to port 23, which a box that never
+  rebooted answers instantly. The background job is now parenthesised, and a reboot must
+  clear two independent gates — telnet going DOWN within `DOWN_WAIT`, and the SVR4
+  `who -b` boot stamp CHANGING across the cycle — with an unprovable reboot a hard
+  failure (exit 3). `SOAK DONE` now reports `reboots_proven=N`; new env knobs
+  `REBOOT_EVERY` / `DOWN_WAIT` / `UP_WAIT`.
+- `docs/AMIX.md`: the "27-reboot soak with concurrent fork/exec load, all clean" claim is
+  half retracted at all three occurrences. The workload half stands (scored from the
+  firmware wild-PC guard over the serial UART, independent of the soak's telnet path);
+  the reboot count is withdrawn as unestablished. Re-establishment procedure noted:
+  5 cycles = 1 proven reboot, ~30 min on the box.
+
 ## 2026-08-25 — the ARM's own data abort, located in the binary (716d4bd)
 
 - `docs/core0-async-data-abort-2026-08-25.md`: the 2026-08-25 `[Core0] DataAbortHandler()`
