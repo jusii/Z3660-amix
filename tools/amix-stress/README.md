@@ -31,7 +31,7 @@ growth + heavy fork/exec).
 | `amixstress` | AMIX guest | Precompiled for **AMIX 2.1c** (ELF32-BE m68k, dyn-linked `libc.so.1`). Run directly or recompile from source. |
 | `telnet_storm.py` | host | Storms telnet connects so inetd fork/exec's `in.telnetd` repeatedly — the ~100% reproducer of the crash. |
 | `gsoak.sh` | AMIX guest | Sustained loop: `amixstress` (varied depth) + fork/exec churn. One login → no inetd throttling. The reliable soak driver. |
-| `amix_soak.sh` | host | Acceptance soak: N workload cycles + periodic clean reboots, polling the firmware's wild-PC guard; hard-fails on a latch. |
+| `amix_soak.sh` | host | Acceptance soak: N workload cycles + periodic **proven** reboots, polling the firmware's wild-PC guard; hard-fails on a latch (exit 2) or on a reboot it cannot prove (exit 3). |
 | `overnight.sh` | host | Overnight burn-in: launch `gsoak.sh` on the guest, then watch the wild-PC guard via the serial log for ~3h. |
 
 ## Build / run
@@ -61,6 +61,9 @@ python3 telnet_storm.py 192.168.2.39 30 0.4
 
 # acceptance soak (env-overridable bench config; see headers):
 ./amix_soak.sh 50
+# reboots every REBOOT_EVERY'th cycle (default 5), so 5 cycles = 1 proven reboot,
+# ~30 min on the box. The closing SOAK DONE line reports reboots_proven=N -- that
+# count is the only reboot number worth quoting anywhere.
 
 # overnight burn-in:
 ./overnight.sh
@@ -77,6 +80,28 @@ Instrumented firmware (AMIX-gated, one-shot) prints a `[WILD]` dump to the **ser
 instant a user process's PC goes wild — *before* AMIX even prints its console `User BUS ERROR`.
 The soak scripts treat any rise in the serial `"user PC went wild"` count (or any
 `"User BUS ERROR"` on the serial) as a hard failure. With the fix, the count never moves.
+
+## How the reboot gate works (`amix_soak.sh`)
+
+A reboot is **proven, never assumed**. Until 2026-08-27 it was neither: the shutdown command
+ended in `&`, and `amixsh.py` appends `; echo DONE_$?` to every command, so the box received
+`… 2>&1 &; echo DONE_$?` — a Bourne **syntax error**. The shutdown never ran. The check could
+not see that either, because it was a bare TCP connect to port 23, which a box that never
+rebooted answers instantly; every cycle logged `boot OK`.
+
+Both are fixed. The shutdown is parenthesised — `(… &)` ends in `)`, takes the trailing `;`
+fine, and stays detached — and a reboot must now clear two independent gates:
+
+1. telnet goes **down** within `DOWN_WAIT` s (default 120) of the shutdown, and
+2. the SVR4 `who -b` **boot stamp changes** across the cycle, where the box will produce one.
+
+Gate 2 catches what gate 1 alone would misread — telnet bouncing for a reason other than a
+reboot, e.g. the inetd `nowait` throttle. Either gate failing exits 3. If the box cannot
+produce a boot stamp the run continues on gate 1 alone and **says so** in the log rather than
+claiming corroboration it does not have.
+
+**Any reboot count quoted from this tool must come from its `reboots_proven=` line.** Counts
+from before this fix cannot be attributed to the script.
 
 ## Validation result (2026-06-25, real A4000+Z3660)
 
