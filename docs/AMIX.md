@@ -11,9 +11,10 @@ existing list. Upstream Z3660 behaviour is unchanged.
 
 > **Status in one line:** AMIX 2.1 **boots reliably to a stable multiuser login shell** under this
 > firmware — SVR4 banner, multi-user, root login on the HDMI console and over telnet. It survives
-> repeated reboots and sustained fork/exec load (a 27-reboot soak ran clean). One rare demand-paging
-> edge case under extreme load is tracked but does not block normal use. See
-> [Current status](#current-status) below.
+> sustained fork/exec load with the firmware's wild-PC guard never latching; the **reboot count**
+> that used to be quoted here ("a 27-reboot soak") is **indeterminate** and is being re-established
+> with a fixed tool. One rare demand-paging edge case under extreme load is tracked but does not
+> block normal use. See [Current status](#current-status) below.
 
 > **Upstream base:** this fork sits on upstream firmware **v1.03 beta 21**. Upstream rewrote its
 > history, so there is no merge base and the resync was a guided replay rather than a merge. The
@@ -572,9 +573,35 @@ board comes back in ~2.5 minutes.
 
 AMIX 2.1 **boots reliably to a stable multiuser login shell** under this firmware: the dynamic
 linker and `/sbin/init` run, the SVR4 banner and memory sizing appear, the system reaches
-multi-user, and you get a root login on both the HDMI console and over telnet. It has survived
-repeated warm/cold reboots (a 27-reboot soak with concurrent fork/exec load, all clean) and stays
-up under sustained load.
+multi-user, and you get a root login on both the HDMI console and over telnet. It stays up under
+sustained load, and warm/cold reboots work in day-to-day use.
+
+> **Correction (2026-08-27) — the old "27-reboot soak with concurrent fork/exec load, all clean"
+> claim is half retracted.**
+>
+> **The workload half stands.** That half is scored from the firmware's wild-PC guard, which
+> `tools/amix-stress/amix_soak.sh` reads off the **serial UART over ssh** — a path completely
+> independent of the telnet session the workload runs on. Nothing below touches it: the guard did
+> not latch under sustained fork/exec and deep-recursion demand-paging load, and that result is
+> unaffected.
+>
+> **The reboot half is indeterminate.** `amix_soak.sh` is the only recorded reboot-soak tool, and
+> its reboot step was broken from its first commit. The shutdown it sent ended in `&`, and the
+> telnet runner appends `; echo DONE_$?` to every command, so the box received `… &; echo DONE_$?`
+> — a Bourne syntax error. The shutdown never executed. The script could not detect that either:
+> its post-reboot check was a bare TCP connect to port 23, which a box that never rebooted answers
+> instantly, so a no-op scored as `boot OK`. The 27 reboots may have been driven by hand — the
+> record does not say, and the count does not match the script's every-fifth-cycle cadence. So the
+> number is withdrawn rather than restated: it is not disproven, it is unestablished.
+>
+> Both defects are fixed. The shutdown is parenthesised, and a reboot must now be **proven** —
+> telnet has to go *down* after the shutdown, and the `who -b` boot stamp has to *change* across
+> the cycle — with an unprovable reboot a hard failure instead of a green line.
+>
+> **Re-establishing the number:** run `tools/amix-stress/amix_soak.sh <cycles>` against the bench.
+> It reboots every 5th cycle, so **5 cycles = 1 proven reboot, roughly 30 minutes on the box**
+> (~25 min of workload plus a ~2.5 min boot). The closing `SOAK DONE … reboots_proven=N` line is
+> the count; that number, and no remembered one, is what belongs in this document.
 
 The post-banner stalls that earlier blocked login are **resolved in practice.** The boot-time
 failures came down to emulator-side 68030 bus-error-frame corruption on the demand-paging path —
@@ -584,8 +611,10 @@ completion-ordering stall no longer occurs in normal operation.
 
 **Known remaining issue (does not block normal use):** under *extreme* sustained demand-paging load
 a rare 68030 bus-error-frame SR-flip can still trip the emulator's user-PC sanity guard. It did not
-recur across a 27-reboot, multi-hour soak; normal boot and interactive use are unaffected. It is
-tracked for a future fix.
+recur across a multi-hour fork/exec soak — that workload result stands on its own, since the wild-PC
+guard is read from the serial UART independently of the soak's telnet path — but the "27-reboot"
+framing of that run is indeterminate; see the correction above. Normal boot and interactive use are
+unaffected. It is tracked for a future fix.
 
 The deeper guest-side analyses (the `a3091` driver disassembly, the `lpsched` memory-coherency
 investigation) are retained under [`docs/investigations/`](investigations/) for reference and for
