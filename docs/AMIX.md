@@ -490,6 +490,31 @@ sequence: a bare ESC on the serial console spins core0 forever (`core0-loop-bloc
 B3), so arrow keys, terminal status queries and a `screen`/`tmux` partial sequence are all live
 hazards on this port.
 
+#### `SCT` is a write to the SD card
+
+Most console words are toggles. **`SCT` (`SAVE_CURRENT_TIMINGS`) is not** — it calls
+`write_timings()` (`debug_console.c:1038-1041`), which opens the timings file named by
+`1:/timings/timings.txt` with `FA_CREATE_ALWAYS` and rewrites **all 15 clock-index blocks** from
+the firmware's in-RAM table. No prompt, no confirmation, no backup, and any comments or
+formatting the file carried are gone.
+
+Whether that is harmless or destructive depends on something you cannot see from the console:
+
+- if the firmware **read** the timings file at boot, RAM holds the card's own values and `SCT`
+  writes them straight back — near enough a no-op;
+- if it **failed** to read it — a missing, renamed or misspelt file, which
+  `read_timings()` reports by returning 0 while printing **nothing** — RAM holds the
+  compile-time fallback table, and `SCT` overwrites the card's file with that.
+
+On a card whose timings have been adapted at all (and this fork's bench card is one — see
+[`clock-timings.md`](clock-timings.md)), the second case destroys the only copy of the tuning.
+The same `write_timings()` sits behind the ZTop timings-editor OK button, and behind the mobotest
+`G` key, which loads the compiled defaults first and is therefore *always* destructive.
+
+None of the three is on the boot path, and a failed read never writes anything by itself — so
+the whole hazard is operator-side. Keep a copy of the card's timings file off the card, and treat
+`SCT` the way you would treat any other console command that writes storage.
+
 #### One UART, two cores: turn `PSTAT` off before any long dump
 
 Core0 and core1 print through the **same UART behind the same semaphore**
@@ -700,6 +725,8 @@ binaries, used to compare real vs. emulated 030 throughput and to tune `service_
 - [`README.md`](../README.md) — project overview and quick start
 - [**amix-kerntools**](https://github.com/jusii/amix-kerntools) — the AMIX guest-side drivers (`amix-z3660scsi`, `amix-z3660net`) that run inside AMIX
 - [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) — hardware/firmware limitations
+- [`clock-timings.md`](clock-timings.md) — how the clock table is loaded, what this fork's bench
+  card tuned, and the `SCT` / ZTop / mobotest paths that overwrite it
 - [`docker/README.md`](../docker/README.md) — building the firmware from source
 - [`AMIX_SCSI_design.md`](../z3660-firmware/Z-TURN/vitis_ide/Z3660_emu/AMIX_SCSI_design.md),
   [`AMIX_ethernet_driver_plan.md`](../z3660-drivers/amix/AMIX_ethernet_driver_plan.md) — design notes
