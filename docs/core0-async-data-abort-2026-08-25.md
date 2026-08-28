@@ -326,8 +326,12 @@ Enumerated rather than asserted, since §3.1 forbids reading the direction off t
 3. **The provenance leg.** `1:/timings/default_timings.txt` on the card was byte-identical to the
    previous session's copy and was never written; the on-card firmware CRC was `9CE3F6A6` before and
    after. The board's own `Clock index 0` line and the printed `PCLK 050.00 / BCLK 025.00 PHASE 060`
-   match that file's index-0 block, so the file (not the compiled fallback table in
-   `config_clk.c:534+`) was in force, unchanged.
+   match that file's index-0 block, so the file (not a compiled table) was in force, unchanged.
+   *(Correction, 2026-08-28: `config_clk.c:534+` is `set_default_timings()`, which runs only when
+   something calls it and writes itself to the SD when it does. The table a failed
+   `read_timings()` silently leaves in place is the compile-time initialiser at
+   `config_clk.c:13-149`, which is different again — see [`clock-timings.md`](clock-timings.md)
+   §1.)*
 
 4. **The failure-kind leg.** Timing marginality on a non-ECC DDR interface or a CDC boundary produces
    **wrong data**, silently. This event is a **refusal**: some slave answered an access with an error
