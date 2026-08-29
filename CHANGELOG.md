@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-28 — the card's timing table is hand-tuned, and three ways to lose it (7c57b6a, ad07033)
+
+- **`docs/clock-timings.md` (new).** There are three clock tables in the firmware and the file
+  on the SD is none of them. This fork's bench card runs a customised `default_timings.txt`
+  (byte-verified, sha256 `fbe6cb7a…`): it differs from the compiled defaults at exactly two
+  indices, and only in dividers — every phase is identical. Index 0 takes the bus-side dividers
+  64 → 32 (25.00 MHz, not 12.50); index 6 rewrites M/D 28/5 → 4/1 (VCO 1120 → 800) landing PCLK,
+  AXICLK and CLKEN on identical numbers and moving only the 060 bus-side clocks 20 → 25 MHz.
+  That is why it reads as unmodified at a glance, and why an SD refresh from this repo's template
+  reverts it silently. Both index blocks recorded verbatim.
+- **The AXI relation, from source:** `read_timings()` sets `axi.divider = pclk.divider / 2`
+  (`config_clk.c:299`), so **`AXICLK = 2 × PCLK`** — 160 MHz at 80 MHz PCLK, which the board
+  prints. Confirmed at three indices across two VCOs. (Under an emulator PCLK's divider is
+  doubled and AXI's is not, giving `AXICLK = 4 × PCLK` there.)
+- **`emu_extra_phase` is inert with a real 68060** — applied only when `emu != 0`; the real-CPU
+  path programs with `emu = 0`. Measured across cpufreq 80/70/60/50: every printed phase equalled
+  the file value. Stated in the SD `timings/README.md`, which previously did not say it.
+- **`docs/AMIX.md`: `SCT` is a write to the SD card, not a toggle** — `SAVE_CURRENT_TIMINGS`
+  calls `write_timings()` with `FA_CREATE_ALWAYS`, no prompt, no backup; harmless if boot-time
+  `read_timings()` succeeded, destructive (silently) if it failed. Same function behind the ZTop
+  editor OK button and the mobotest `G` key.
+
 ## 2026-08-27 — the reboot soak that never rebooted, and the count that goes with it (d40ce94, 0fe57b4)
 
 - `tools/amix-stress/amix_soak.sh`: fixed two defects that made every reboot cycle a
