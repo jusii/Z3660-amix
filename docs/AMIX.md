@@ -462,6 +462,38 @@ the RDB scan is skipped. On the AMIX side that is what `cdfs` mounts.
 > `scsi4 6`, which produces no working CD. Treat the shipped example as a demonstration of the
 > trap, not as a template.
 
+### `arm_frequency N` — Zynq ARM clock (upstream's key, with an AMIX trap)
+
+Also upstream's, also worth a warning here. `arm_frequency` sets the Zynq PS clock; the accepted
+values are the sixteen names in `arm_frequency_names[]` (`config_file.c:200`), 667 through 1300 MHz,
+and the firmware's own default is **667**.
+
+> ⚠️ **`arm_frequency 1100` corrupts kernel reads on the real-CPU path.** Measured 2026-09-01 on
+> card B (`bootmode CPU`, a real MC68LC060; see [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) for the card
+> naming). The SVR4 loader reaches the disk and then stops at:
+>
+> ```
+> WARNING! Kernel file checksum mismatch. Expected 0x0000A7D9, found 0x000054A2.
+> ```
+>
+> **`Expected` is constant and `found` differs on every boot** — 0x3A7E, 0xCC59, 0x8A7D, 0x54A2
+> across one session. That is a corrupt read path, not a stale stored checksum, and it is the
+> reading of earlier campaigns' "kernel checksum mismatch" rows too.
+
+Three things are worth knowing before spending time on it:
+
+- **`arm_frequency 667` reduces it but does not fix it.** It came back on a later cold power-on
+  after three clean boots. Treat 667 as the value to run, not as a cure.
+- **The SD card is not the source.** `CRC 1:/hdf/Amix.hdf` from the boot menu returned
+  **522F16D2 (104857600 bytes) twice** — a stable, repeatable read of the same image the loader
+  chokes on. The bit errors are downstream of the SD, in the 060↔Zynq transfer.
+- **`service_cadence` is not a lever here.** It is an 030-MMU run-loop knob and is inert with a
+  real CPU.
+
+The measured `arm_frequency 1100` rows elsewhere in this repo — the WARP campaign sections of
+[`WARP-ENGINE.md`](WARP-ENGINE.md) — were taken under an *emulated* boot mode on card A, before
+this was known. They are not a recommendation to run 1100.
+
 ### Runtime debug toggles (not config-file options)
 
 The emulator prints verbose debug traces that visibly slow interactive use. These are gated at

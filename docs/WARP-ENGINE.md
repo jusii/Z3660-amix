@@ -533,6 +533,10 @@ every image today (§0.3(c)).
 **Metal, 2026-08-23 22:21:46, one boot of `BOOT-q2probe.BIN` (on-card CRC `FCC0CB3F`), preset 7
 (`UAE_040_MMU`, `amix_ram 128`, `service_cadence 4`, `arm_frequency 1100`), piscsi root.**
 
+> *`arm_frequency 1100` is a record of the configuration these rows were taken under, not a
+> recommendation. It was later found to corrupt kernel reads on the real-CPU path — see
+> [`AMIX.md`](AMIX.md#arm_frequency-n--zynq-arm-clock-upstreams-key-with-an-amix-trap).*
+
 ```
 [WARP-Q2] A: stub @ 0x308edca0 = e92d4010 e12fff30 e8bd4010 e12fff1e  (icache seq: shipped, as-is)
 [WARP-Q2] A: RESULT = CONTAINED (status=0x57515221, prb=22353)
@@ -3899,7 +3903,7 @@ What the harness does settle, and it is the part that could have been wrong:
 shares, the coverage band, the armed band and the disarm penalty — every one pre-registered in
 §0.14 and left unmeasured when §0.15 was written — were taken on **2026-08-24, 11:55 – 13:34
 EEST**, A4000 + Z3660, piscsi-root installed AMIX, preset 7 (`amix_ram 128`, `service_cadence 4`,
-`arm_frequency 1100`, `UAE_040_MMU`). Eight flashes, eight guest boots, forty-five scored
+`arm_frequency 1100` — see the caveat at §0.4.1, `UAE_040_MMU`). Eight flashes, eight guest boots, forty-five scored
 dhrystone rows across nine arms, two `WARPTEST` gates, two `PROFZ`-fenced counter windows. Every
 number below is read off `Amix/tmp/2026-08-24-warp-r5-metal/MATRIX.md`, `MATRIX-SCORING.txt`,
 `R-VERDICT.txt` and `R5-VERDICT.txt`; the same numbers are reproduced a third time in
