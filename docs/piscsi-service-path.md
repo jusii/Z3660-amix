@@ -9,6 +9,11 @@ the static-analysis follow-up it exists to test is `docs/core0-loop-blocking-aud
 **Firmware under analysis:** `amix-main` — the tree that produced the prod `Z3660.bin` CRC-32 `59FAE8CA`
 currently on the card. **Not** beta 21; see §6.
 
+> **Historical branch names.** The `piscsi-crawl` and `amix-main` named above are the pre-resync
+> line. This fork's branch of record is now **`amix-main-2`** (upstream v1.03 beta 21); see
+> [`port-ledger-beta21.md`](port-ledger-beta21.md). The mechanism this document maps is unchanged
+> by the resync — the branch names simply date it.
+
 This document answers three questions that came out of the 2026-08-14 → 08-17 install-workload
 regression:
 

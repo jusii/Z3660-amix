@@ -6,6 +6,12 @@
 **Upstream target:** `upstream/main` @ `1dddf79` ("Update adf", 2026-07-22) — firmware **v1.03 beta 21**
 **Old fork base:** local branch `main` @ `159b3b5` ("Copy all update system files from beta to alfa folder", 2026-05-13)
 
+> **Historical, and deliberately so.** This is the planning artefact written *before* the resync,
+> so every branch and commit named here is as it stood on 2026-07-25. The resync it planned was
+> carried out and produced **`amix-main-2`**, which is this fork's branch of record; `amix-main` is
+> the superseded pre-beta-21 line. Read this for *why* the replay took the shape it did, not as a
+> description of the current tree.
+
 This is the planning artefact for the beta-21 resync. It answers three questions:
 
 1. Which commits are actually *ours*?

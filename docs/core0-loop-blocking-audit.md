@@ -9,6 +9,11 @@ each entry is `C0STAT` (`z3660-firmware/Z-TURN/vitis_ide/Z3660/src/core0_stats.[
 **Date:** 2026-08-17
 **Branch:** `piscsi-crawl` (off `amix-main`)
 
+> **Historical branch names.** `piscsi-crawl` and `amix-main` are the pre-resync line. This fork's
+> branch of record is now **`amix-main-2`** (upstream v1.03 beta 21); see
+> [`port-ledger-beta21.md`](port-ledger-beta21.md). Line numbers cited below are those of the tree
+> named above.
+
 ## Why this audit exists
 
 `docs/piscsi-service-path.md` §9 records the 2026-08-17 metal numbers. The short version: the

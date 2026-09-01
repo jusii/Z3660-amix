@@ -15,11 +15,16 @@
 >   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating and the
 >   `perf_stats`/`emu_probes`/`core0_stats` run-loop overhead switches (all default to the
 >   unchanged behaviour).
-> - **Guest-side AMIX drivers** — `amix-z3660scsi` / `amix-z3660net` (SCSI + ethernet inside AMIX)
->   live in the companion **[amix-kerntools](https://github.com/jusii/amix-kerntools)** repo.
+> - **Guest-side AMIX drivers** — the SCSI and ethernet drivers that run *inside* AMIX against the
+>   protocol this firmware serves have their own repos:
+>   **[amix-z3660scsi](https://github.com/jusii/amix-z3660scsi)** and
+>   **[amix-z3660net](https://github.com/jusii/amix-z3660net)**. The kernel that carries them is
+>   assembled with the shared build harness in
+>   **[amix-kerntools](https://github.com/jusii/amix-kerntools)**.
 >
 > ### Quick start — try a pre-built firmware
-> 1. Download `BOOT.BIN` from this repo's **Releases** (no build needed).
+> 1. Download `BOOT.BIN` from this repo's **Releases** (no build needed), or build it yourself —
+>    see *Build it yourself* below.
 > 2. Copy it to the SD card's FAT32 boot partition; use the layout in
 >    [`z3660-zturn_SD_content/`](z3660-zturn_SD_content/) for the rest.
 > 3. **You supply your own Kickstart ROM(s) and disk image** — Amiga OS ROMs and AMIX itself are
@@ -54,6 +59,24 @@
 > on the **SCSI id it was installed on** (id 6 for the usual A3000 install — see the note in
 > docs/AMIX.md). AMIX 2.1 **boots to a stable multiuser login shell**; full setup, the SCSI-id rule
 > and current status are in **[docs/AMIX.md](docs/AMIX.md)**.
+>
+> ### Branches
+> - **`amix-main-2` — the branch of record.** The Amix work rebuilt on upstream firmware
+>   **v1.03 beta 21**. Upstream rewrote its history, so there was no merge base and the resync had
+>   to be a guided replay rather than a merge;
+>   **[docs/port-ledger-beta21.md](docs/port-ledger-beta21.md)** is the analysis behind it.
+> - **`amix-main`** — the superseded pre-beta-21 line, kept for reference. It shares no ancestry
+>   with `amix-main-2`. Documents dated before the resync describe that tree and say so.
+>
+> ### The fork's own documents
+> - **[docs/AMIX.md](docs/AMIX.md)** — the AMIX reference: boot modes, the new config keys, how the
+>   A3000-SCSI bootstrap works, current status, and the upstream defects this resync turned up.
+> - **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — limitations, including the fork note on the real-CPU
+>   `cpufreq` ceiling being a per-card property.
+> - **[CHANGELOG.md](CHANGELOG.md)** — this fork's history and its measurements. (Upstream's own
+>   history is the separate **CHANGES.md**, which the text below points you at.)
+> - **[docs/](docs/)** — the engineering references: clock timings, the piscsi service path, the
+>   HTTP/TFTP deploy route, the WARP decoded-op-cache engine, the interpreter profiler.
 <!-- fork:amix end -->
 
 <br>Z3660 is an Amiga 4000 CPU accelerator board based on A3660 and Z-turn FPGA board.

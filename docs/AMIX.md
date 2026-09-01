@@ -30,7 +30,7 @@ existing list. Upstream Z3660 behaviour is unchanged.
 |---|---|
 | **68030 PMMU emulation** | New `bootmode UAE_030_MMU` — a cycle-accurate 68030 interpreter **with a working PMMU** (demand paging, `mmu.library` sees it). AMIX needs a real MMU; the stock 68040-JIT modes don't provide the 030 PMMU semantics it expects. |
 | **Emulated A3000 SCSI** | An emulated Commodore A3000 mainboard SCSI (SuperDMAC + WD33C93). This is AMIX's **kernel bootstrap** path — AMIX boots its kernel through the A3000 SCSI driver, then hands off to the native Z3660 drivers. |
-| **Native AMIX drivers** | [`amix-z3660scsi` / `amix-z3660net`](https://github.com/jusii/amix-kerntools) run inside AMIX against the Z3660 PISCSI + ethernet register protocol this repo owns — they live in the companion **amix-kerntools** repo. |
+| **Native AMIX drivers** | [`amix-z3660scsi`](https://github.com/jusii/amix-z3660scsi) and [`amix-z3660net`](https://github.com/jusii/amix-z3660net) run inside AMIX against the Z3660 PISCSI + ethernet register protocol this repo owns. Each is its own repo; the kernel carrying them is assembled with the shared build harness in [amix-kerntools](https://github.com/jusii/amix-kerntools). |
 | **AMIX warm-reboot fix** | A clean Zynq reboot on an AMIX `reboot`, instead of the register-flood / data-abort the naïve path produced. |
 | **Emulator perf + debug knobs** | `service_cadence` (CPU throughput vs. interrupt latency) and per-category debug gating (`DEMU` / `DSCSI`) to silence the emulator's debug floods. |
 | **Run-loop overhead switches** | `perf_stats` / `emu_probes` / `core0_stats` turn off the firmware's own per-instruction and per-loop-iteration instrumentation at runtime, so its cost can be measured rather than assumed. All default to on (unchanged behaviour). |
@@ -755,10 +755,15 @@ binaries, used to compare real vs. emulated 030 throughput and to tune `service_
 ## See also
 
 - [`README.md`](../README.md) — project overview and quick start
-- [**amix-kerntools**](https://github.com/jusii/amix-kerntools) — the AMIX guest-side drivers (`amix-z3660scsi`, `amix-z3660net`) that run inside AMIX
+- [**amix-z3660scsi**](https://github.com/jusii/amix-z3660scsi) and
+  [**amix-z3660net**](https://github.com/jusii/amix-z3660net) — the guest-side AMIX drivers that run
+  inside AMIX against the protocol this firmware serves
+- [**amix-kerntools**](https://github.com/jusii/amix-kerntools) — the shared build harness that
+  assembles the AMIX kernel carrying those drivers
 - [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) — hardware/firmware limitations
-- [`clock-timings.md`](clock-timings.md) — how the clock table is loaded, what this fork's bench
-  card tuned, and the `SCT` / ZTop / mobotest paths that overwrite it
+- [`clock-timings.md`](clock-timings.md) — how the clock table is loaded, what card A tuned, what
+  does and does not transfer to a second card, and the `SCT` / ZTop / mobotest paths that overwrite
+  it
 - [`docker/README.md`](../docker/README.md) — building the firmware from source
 - [`AMIX_SCSI_design.md`](../z3660-firmware/Z-TURN/vitis_ide/Z3660_emu/AMIX_SCSI_design.md),
   [`AMIX_ethernet_driver_plan.md`](../z3660-drivers/amix/AMIX_ethernet_driver_plan.md) — design notes
