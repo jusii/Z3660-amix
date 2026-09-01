@@ -158,8 +158,17 @@ needed). FAILSAFE-protected; restore production afterwards.
 
 1. **Flash** the current runnable image:
    `z3660-firmware/Z-TURN/vitis_ide/Z3660_system/Alfa/sd_card/BOOT.BIN`
-   (12 745 956 B, crc32 `0x92E1473F`) via the usual deploy — serial `C` → `P`
-   (TFTP) → `curl -T BOOT.BIN tftp://a4000.alanara.fi:69/Z3660.bin` → `R`.
+   (12 745 956 B, crc32 `0x92E1473F`) via the usual deploy. **Beta 21 removed the
+   TFTP server**, so the route is HTTP and it is two hops, because the HTTP server
+   mounts volume `1:` only and the boot image lives on `0:`. Catch the boot menu on
+   the serial by spamming `C` at power-on, then:
+   `P` (starts the HTTP server) →
+   `curl -T BOOT.BIN "http://<board>/upload/staged.BIN?path=1:/hdf"` →
+   `E` (SD file manager) → `CRC 1:/hdf/staged.BIN` and check it against the host →
+   `COPY 1:/hdf/staged.BIN 0:/Z3660.bin` → `CRC 0:/Z3660.bin` and check again →
+   `R`. **CRC-gate both hops**; create `FAILSAFE.bin` (menu `J`) first. Nothing
+   pumps lwIP once the emulator is up, so an upload costs a power-cycle.
+   Full treatment, with measured throughput: `docs/http-vs-tftp-upload.md`.
 2. **Select the mode**: set `bootmode UAE_040_MMU` in `z3660cfg.txt` on the SD
    DATA partition (or via the config path you use). CPU is 68040, JIT off.
 3. **Boot a plain AmigaOS** (Kickstart + an AmigaOS/Workbench disk) — **not AMIX**.
