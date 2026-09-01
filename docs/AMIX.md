@@ -681,9 +681,11 @@ anyone who wants to push emulation fidelity further.
 
 ## Defects found in upstream beta 21 (candidates to report)
 
-The beta-21 resync turned up six upstream defects. All four are fixed or worked around on this
-branch; none has been reported upstream yet. They are recorded here so the reports can be written
-from the evidence rather than from memory.
+The beta-21 resync turned up six upstream defects. **Five** are fixed or worked around on this
+branch; the sixth (#4, the `isoN` slot/target mismatch) is documented rather than diverged from,
+though its out-of-bounds half *is* fixed. **One has since been reported and merged upstream** — #1,
+as PR #20 on 2026-08-19. The rest are recorded here so the reports can be written from the evidence
+rather than from memory.
 
 1. **Direct-DMA cache maintenance weakened to L1-only** (`Z3660/src/scsi/scsi.c`, piscsi READ and
    WRITE handlers). Beta 21 carries this fork's coherency comments verbatim — including the
@@ -694,6 +696,10 @@ from the evidence rather than from memory.
    can therefore put stale DRAM on the disk, and the read path can have an L2 writeback land on top
    of freshly DMA-ed bytes mid-transfer. This affects any direct-DMA (non-bounce) piscsi transfer,
    not only AMIX. **The single highest-severity finding of the resync.**
+   **Reported and merged upstream** as PR #20 (`fix/dma-cache-hierarchy`, commit `91ce038`, merged
+   `fcdb9d2`, 2026-08-19) — so this is the one entry in this list upstream has already fixed. This
+   branch has not yet merged upstream's tree back; see the upstream-base note in
+   [`port-ledger-beta21.md`](port-ledger-beta21.md).
 
 2. **`else` following `else`** (`Z3660_emu/src/main.cpp`, the emulator-dispatch block inside the
    `#else` arm of `#ifdef MUSASHI_EMULATOR`). Not valid C++. It compiles today only because

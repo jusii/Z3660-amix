@@ -20,6 +20,26 @@ This is the planning artefact for the beta-21 resync. It answers three questions
 
 The re-port itself is a separate exercise. Read this first.
 
+### Where the upstream base stands (added 2026-09-01)
+
+The replay this document planned was carried out; `amix-main-2` is its result. Its merge-base with
+`upstream/main` is **`1dddf79`** — the beta-21 commit named above — and it is now **11 commits
+behind** that branch:
+
+| Commits | What |
+|---|---|
+| `068f4b4`, `9ede2c8`, merged `f0c09ae` | **this fork's PR #21** (`fix/clmt-linkmap`) — uninstall the fast-seek link map when creating it fails, and widen it to 256 items |
+| `91ce038`, merged `fcdb9d2` | **this fork's PR #20** (`fix/dma-cache-hierarchy`) — whole-hierarchy cache maintenance at the direct-DMA sites, i.e. the §4g regression |
+| `efbfc1b`, `c823aeb`, merged `cb1d720`, `d440e30` | codewiz's RTG fixes (zero-pitch blit template, COMPLEMENT lines) |
+| `1a1336b` | ZTop.c compiles with gcc |
+| `25587f5` | an upstream merge commit |
+
+Merging `upstream/main` into `amix-main-2` is a separate exercise and is **not** done. Two
+consequences worth carrying into it: the interface verifications in §6 and §7 — that beta 21 drifted
+neither the ethernet register/frame contract nor the piscsi mailbox — were taken at `1dddf79` and are
+now eleven commits old; and upstream's copy of §4g is its own fix, so that hunk will merge rather
+than conflict.
+
 ---
 
 ## 1. Deriving the true fork commit set
@@ -422,6 +442,8 @@ Why the weakened form is wrong, restated from the original bug:
 **Disposition: RE-PORT the two call sites** (restore `Xil_DCacheInvalidateRange` / `Xil_DCacheFlushRange`); **DROP the comment blocks**, which are already present and correct. Everything else in `e37bb43` — the `main.cc` side — moves via §4a hunk 4.
 
 Worth noting for the maintainer relationship: this is a defect in beta 21 that affects any direct-DMA (non-bounce) piscsi transfer, not only Amix. It is a candidate to report upstream.
+
+**Reported and merged (2026-08-19).** It went upstream as PR #20 from `fix/dma-cache-hierarchy` — commit `91ce038`, merged as `fcdb9d2`. Upstream's tree now carries the whole-hierarchy calls; this branch has not yet taken that merge back (see *Where the upstream base stands*, above).
 
 ---
 
