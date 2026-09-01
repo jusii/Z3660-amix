@@ -69,10 +69,26 @@ python3 telnet_storm.py 192.168.2.39 30 0.4
 ./overnight.sh
 ```
 
-The host scripts need `amixsh.py` / `amixsync.py` (scripted telnet / FTP runners — from
-`grimoire-amix/tools/host-net/`, or any equivalent) and ssh to the serial-console host. Bench
-specifics are env vars with this project's defaults: `KVM_HOST`, `SERIAL`, `AMIX_HOST`,
-`AMIX_PASS`, `AMIX_PORT`, `AMIXSH`.
+### What the host scripts need from you
+
+Two small helpers, not shipped here because they are a few lines each and everyone's bench differs.
+Any equivalent pair works; the scripts only rely on the interface:
+
+* **A scripted-telnet runner**, invoked as `python3 "$AMIXSH" '<shell command>'`. It logs in to the
+  AMIX box, runs the single command it is given, and prints the output. It must **append
+  `; echo DONE_$?`** to that command — the scripts read the resulting `DONE_<status>` line as the
+  exit status. That detail is load-bearing in both directions: it is also why a command ending in
+  `&` becomes a Bourne syntax error on the box, which is the bug the reboot gate below exists to
+  stop repeating. Point `AMIXSH` at yours.
+* **An FTP push/pull runner**, invoked as `amixsync.py push <local> <remote>`. Used once, to
+  install the compiled `amixstress` on the AMIX root filesystem as `/amixstress` so it survives
+  reboots.
+
+Plus ssh access to the host whose serial console reads the firmware UART (`KVM_HOST`), since the
+wild-PC guard is read from the serial log and nowhere else.
+
+The remaining bench specifics are env vars with this project's defaults: `KVM_HOST`, `SERIAL`,
+`AMIX_HOST`, `AMIX_PASS`, `AMIX_PORT`.
 
 ## How the guard works
 
