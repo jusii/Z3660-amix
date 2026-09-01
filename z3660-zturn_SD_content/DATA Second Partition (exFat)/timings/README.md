@@ -31,12 +31,12 @@ invites you to do — copying this one over it reverts the adaptation, silently.
 in one 5 KB file on the SD and nowhere else, so keep a copy off the card and re-check it after any
 SD refresh or firmware update.
 
-The bench card this fork is developed on is one such case. Its file has the same **phases** as the
-firmware's own defaults at every index, and differs only in how the dividers realise the clock
-tree — which makes the customisation genuinely easy to miss:
+The bench card this fork is developed on ("card A") is one such case. Its file has the same
+**phases** as the firmware's own defaults at every index, and differs only in how the dividers
+realise the clock tree — which makes the customisation genuinely easy to miss:
 
-| index | field | firmware default | this fork's bench card |
-|-------|-------|-----------------:|-----------------------:|
+| index | field | firmware default | card A |
+|-------|-------|-----------------:|-------:|
 | 0 (50 MHz) | `bclk` / `cpuclk` / `clk90` `.divider` | 64 | **32** — 25.00 MHz instead of 12.50 |
 | 6 (80 MHz) | `global.multiplier` / `.divider` | 28 / 5 (VCO 1120) | **4 / 1** (VCO 800) |
 | | `pclk.divider` / `clken.divider` | 14 / 28 | **10 / 20** |
@@ -44,6 +44,18 @@ tree — which makes the customisation genuinely easy to miss:
 
 PCLK, AXICLK and CLKEN come out identical either way at index 6; the only net effect is the
 68060 bus-side clocks. The exact blocks to restore are in `docs/clock-timings.md` §4.
+
+**A tuned row belongs to one board.** Applied to a second Z3660 on 2026-09-01, card A's index-0
+(50 MHz) row worked but its index-6 (80 MHz) row did not — the programmed values were confirmed on
+that board's serial and 80 MHz still failed. `docs/clock-timings.md` §4.1.
+
+### What a stock table looks like when it fails on a real 68060
+
+Worth recognising, because it does not present as a clock problem: with the stock table a real 060
+fails **Kickstart's early chipset/RAM diagnostics** and never issues a single SCSI read — the
+signature is **no PISCSI activity at all** after `060 starting now`, plus an Amiga diagnostic
+colour screen (**green = chip RAM error**, **blue = custom chip error**). Restore the card's own
+tuned file before debugging the disk; the failure is upstream of it. `docs/clock-timings.md` §4.2.
 
 ### `SCT` at the debug console rewrites this file
 

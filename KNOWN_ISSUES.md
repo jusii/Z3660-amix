@@ -31,22 +31,42 @@ The frequency of the 060 can be selected between 50 and 100 MHz, in 5 Mhz steps.
 The 060 frequency and the CPLD frequency are noe decoupled, so when using an EMU, the 060 will get 50 MHz or less.
 
 <!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
-### Fork note (2026-08-24, measured): with a REAL 060 (`bootmode CPU`), only `cpufreq 100` works
+### Fork note (2026-08-24 / 2026-09-01, measured): with a REAL 060 (`bootmode CPU`), the working `cpufreq` is **per card**
 
-The "50 to 100 MHz in 5 MHz steps" range above is a **user-facing statement that does not
-hold on our A4000 + Z3660 when the 68060 is the real CPU**. Measured this date on metal, as a
-single-variable A/B on one preset (only `cpufreq` changed between the two boots):
+The "50 to 100 MHz in 5 MHz steps" range above is a **user-facing statement that does not hold
+uniformly when the 68060 is the real CPU**. Two physical Z3660 cards have now been measured, each
+as a single-variable sweep (only `cpufreq` changed between boots), and **they do not agree**:
 
-| `cpufreq` | Result |
-|-----------|--------|
-| **100**   | Boots KS 3.2.3 from reset through to the full Intuition desktop with a live mouse |
-| **50**    | **Nothing at all** — black HDMI output, zero serial output past the ARM banner, held 13 minutes |
+| Card | `cpufreq` | Result |
+|------|-----------|--------|
+| **A** — the fork's original bench card (A4000) | **100** | Boots KS 3.2.3 from reset through to the full Intuition desktop with a live mouse |
+| **A** | 50 | **Nothing at all** — black HDMI output, zero serial output past the ARM banner, held 13 minutes |
+| **B** — a second Z3660 (A4000D, socketed MC68LC060 rev 4, no FPU) | **50** | Boots AMIX 2.1 to a **multiuser login**, twice from cold power-on |
+| **B** | 70 | Green diagnostic screen (chip RAM error) |
+| **B** | 80 | Colour-screen stall at `arm_frequency` 667 and 867; blue diagnostic screen (custom chip error) at 1100 |
+
+The earlier conclusion here — *"treat 100 MHz as the only supported real-CPU frequency"* — is
+therefore **withdrawn**. What is measured is narrower and more useful: **the working frequency is a
+property of the individual board, not of this fork.** 50 and 100 MHz have each been observed to
+work, on *different* cards, and neither value worked on the other card. **Determine it per card**,
+and start from 50 and 100 rather than from the middle of the range.
+
+The fault is not the CPU and not the bus. On card B **DiagROM boots fine at 80 MHz on the real
+060**, so both reach 80; AmigaOS and AMIX fail identically there, and what they do that DiagROM
+never does is **Kickstart's early chipset/RAM init**. That is where it dies — which is why the
+symptom is an Amiga diagnostic colour screen (**green = chip RAM error, blue = custom chip error**)
+rather than a hang in a driver.
+
+Clock timings are part of the per-card story: `1:/timings/default_timings.txt` decides what a given
+`cpufreq` actually programs, and a tuned row is **not portable between cards**. Card A's 70/80/100
+rows were applied to card B verbatim and confirmed on the serial — 80 MHz still failed. Only the
+index-0 (50 MHz) row transferred. See [`docs/clock-timings.md`](docs/clock-timings.md).
 
 This corroborates [`z3660-firmware/CPLD/README.md`](z3660-firmware/CPLD/README.md), which says of
 the CPLD images that *"all firmware here is working only at 100 MHz. I have tried other
-frequencies, but only some 'magic' frequencies work"* — i.e. the CPLD README was right and the
-range above is optimistic for the real-CPU path. **Treat 100 MHz as the only supported real-CPU
-frequency on this fork's hardware** until some other value is demonstrated to boot.
+frequencies, but only some 'magic' frequencies work"* — i.e. the CPLD README was right that the
+range above is optimistic for the real-CPU path, and right that which frequencies work is a
+per-board property.
 
 Note also that the *code* does not implement the range this section states: `configure_clk()`
 clamps to `[CPUFREQ_MIN, CPUFREQ_MAX]` = `[50, 120]` (`config_file.h:333-334`) and then replaces
