@@ -210,8 +210,9 @@ A's but a different file (sha256 `f6b5683640e8b1eb…`), and the difference is n
   twice from cold power-on, with the tuned index-0 block above in place. With the *stock* table it
   does not boot at all (§4.2).
 * **Index 6 (80 MHz) did not.** Card A's index-6 block was applied to card B **verbatim** and the
-  programmed values confirmed on card B's serial — and 80 MHz still fails, as do 70 and 100. The
-  phases are right; the board is not.
+  programmed values confirmed on card B's serial — and 80 MHz still fails, as does 70. The phases
+  are right; the board is not. (100 was not separately tried on card B; with 70 dead there is
+  nothing to expect from it.)
 
 So §4's index-6 block is **card A's realisation of 80 MHz, not a fix for 80 MHz**. The
 bus-side phase margin it encodes belongs to one CPLD/carrier. Re-tuning 80 MHz for a different

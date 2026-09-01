@@ -45,11 +45,15 @@ as a single-variable sweep (only `cpufreq` changed between boots), and **they do
 | **B** | 70 | Green diagnostic screen (chip RAM error) |
 | **B** | 80 | Colour-screen stall at `arm_frequency` 667 and 867; blue diagnostic screen (custom chip error) at 1100 |
 
+(Card B was not separately booted at 100; its tuned 70/80/100 rows are card A's, and the board does
+not survive 70.)
+
 The earlier conclusion here — *"treat 100 MHz as the only supported real-CPU frequency"* — is
 therefore **withdrawn**. What is measured is narrower and more useful: **the working frequency is a
 property of the individual board, not of this fork.** 50 and 100 MHz have each been observed to
-work, on *different* cards, and neither value worked on the other card. **Determine it per card**,
-and start from 50 and 100 rather than from the middle of the range.
+work, on *different* cards — and 50, which boots card B twice, is the value that produced nothing
+at all on card A. **Determine it per card**, and start from 50 and 100 rather than from the middle
+of the range.
 
 The fault is not the CPU and not the bus. On card B **DiagROM boots fine at 80 MHz on the real
 060**, so both reach 80; AmigaOS and AMIX fail identically there, and what they do that DiagROM
