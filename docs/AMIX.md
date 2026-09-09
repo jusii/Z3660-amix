@@ -149,6 +149,18 @@ CPU-RAM board) and enables the **A3000-SCSI bootstrap**. The window is 16 MB unl
 - It is a *separate* switch from `bootmode` on purpose: you can run plain 030+PMMU AmigaOS
   (`bootmode UAE_030_MMU`, `amix_mode NO`) without the AMIX memory layout.
 
+> ⚠ **On a real-CPU preset (`bootmode CPU`), `amix_mode YES` silently disables SCSI boot — set it
+> `NO`.** The side effect above is not confined to the memory map: `config_file.c:1322` forces
+> `cpu_ram = 0`, and `main.c:1450` enables SCSI boot only when `scsiboot && cpu_ram`, otherwise
+> clearing `FPGA_AUTOCONFIG_BOOT_EN`. The preset then boots, loads the Kickstart, and cannot find
+> its disk — with **one serial line** as the only warning:
+> `CPURAM disabled -> SCSI boot disabled` (`main.c:1459`). An *emulated* bootmode is unaffected,
+> because there the CPU RAM and autoconfig are emulated in `cpu_emulator()` — which is why a
+> working pair of AMIX presets reads `amix_mode NO` on the real-060 one and `YES` on the emulated
+> one, and both are correct. If SCSI boot ever fails to find a disk, grep the serial for
+> `CPURAM disabled` before suspecting the disk, the RDB or the kernel.
+> See [docs/amix-firmware-facts.md](amix-firmware-facts.md#2--amix_mode-yes--bootmode-cpu-silently-disables-scsi-boot).
+
 ### `amix_ram N`  (integer, MiB)
 
 How much main RAM the AMIX memory contract presents. The firmware maps `N` MiB of Zynq DDR
@@ -516,6 +528,12 @@ is not an error message: it is executed letter by letter.
 *overwrite `z3660scsi.rom`*, *start the HTTP server*, and then `C` catches the autoboot
 countdown. `PSTAT`, `PROF`, `DEMU`, `DSCSI` and `SERV` all start with menu keys too.
 
+**Six of its keys copy firmware images over each other**, which is how a card loses its fallback:
+`M` copies `Z3660.bin` → `BOOT.BIN`, `B` copies `BOOT.BIN` → `FAILSAFE.bin`, and `N` / `J` / `K` /
+`L` cover the remaining pairs. A stray `DMS …` line on 2026-09-09 ran four `M` and three `B` and
+left all three volume-`0:` images identical — see
+[docs/amix-firmware-facts.md](amix-firmware-facts.md#4-the-boot-menu-is-a-single-keystroke-consumer-and-six-of-its-keys-copy-firmware-images).
+
 So: **reach the running console first, then type the word.** Sending it earlier is not safer —
 it is the one way to make it dangerous. The same applies to anything that emits an escape
 sequence: a bare ESC on the serial console spins core0 forever (`core0-loop-blocking-audit.md`
@@ -614,6 +632,13 @@ Emulation mode 4
 
 If you instead see `Emulation mode 1` or `[SD Init] FAIL`, the firmware fell back to the
 68040-JIT path — re-check that `BOOT.BIN` deployed and that `bootmode UAE_030_MMU` is active.
+
+**Which image ran is that `[SD Init]` line, not a CRC manifest.** The FSBL takes `0:/Z3660.bin`,
+then `0:/FAILSAFE.bin`, then `BOOT.BIN` itself, and names its choice —
+`[SD Init] Done (Z3660.BIN)` (`zynq_fsbl/main.c:455-477`). All three images report the same version
+string, so a manifest of their CRCs tells you what is *on the card*, never what *ran*; conflating
+the two cost a whole wrong hypothesis in the 2026-09-09 campaign. It also means deleting
+`Z3660.bin` only reverts to stock if the other two actually are stock.
 
 AMIX then prints the SVR4 banner and memory sizing, runs its rc scripts, and reaches a `login:`
 prompt on the HDMI console (log in as `root`). Once it is multi-user you can also reach it over the
@@ -766,6 +791,10 @@ binaries, used to compare real vs. emulated 030 throughput and to tune `service_
   inside AMIX against the protocol this firmware serves
 - [**amix-kerntools**](https://github.com/jusii/amix-kerntools) — the shared build harness that
   assembles the AMIX kernel carrying those drivers
+- [`amix-firmware-facts.md`](amix-firmware-facts.md) — six firmware-side facts established on
+  metal, each with its evidence and source reference: why `aen0` can never work here, the
+  `amix_mode` / SCSI-boot trap, identifying which image ran, the boot menu's image-copy keys, what
+  `autoconfig_rtg NO` actually does, and the intermittent real-060 pre-handoff stall
 - [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) — hardware/firmware limitations
 - [`clock-timings.md`](clock-timings.md) — how the clock table is loaded, what card A tuned, what
   does and does not transfer to a second card, and the `SCT` / ZTop / mobotest paths that overwrite

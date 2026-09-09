@@ -16,6 +16,23 @@ things most likely to bite:
 AMIX 2.1 boots reliably to a stable multiuser login shell. One rare demand-paging edge case under
 extreme sustained load is tracked but does not block normal use — details in
 [docs/AMIX.md](docs/AMIX.md#current-status).
+
+Two more that will be met early:
+
+* **`aen0` cannot work under this firmware — use `zen0`.** The stock `aen` driver hunts for a
+  Commodore A2065; this firmware presents every emulated board as manufacturer `0x144B` and has
+  A2065 emulation compiled out (`uae/include/sysconfig.h:79`), so no config key can satisfy the
+  probe. Other firmware builds *do* present an A2065 façade, so "`aen0` works on that box" does not
+  transfer across a firmware boundary.
+* **Intermittent pre-handoff stall on the real-060 path (`bootmode CPU`).** Roughly 1 boot in 5
+  (5 samples — an order of magnitude, not a rate) loads the Kickstart, maps the hdf and enumerates
+  the RDB, then stops without ever printing `060 starting now`: no further log output, grey screen.
+  **A power cycle cures it.** It is distinct from the older `Reset active (DOWN)` loop, where
+  `060 starting now` *does* print first. Localised to the `f_open` of `z3660_scsi.rom` at
+  `floppy/floppy.c:206`, which performs no useful work in the shipped image.
+
+Both, with the evidence and source references, are in
+**[docs/amix-firmware-facts.md](docs/amix-firmware-facts.md)**.
 <!-- fork:amix end -->
 
 ##Clock configuration
