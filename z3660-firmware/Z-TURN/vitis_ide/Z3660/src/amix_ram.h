@@ -55,8 +55,8 @@
  *  1. THE DEVICE WINDOW. With autoconfig_rtg NO (the shipped default and what
  *     every AMIX preset uses), reset_autoconfig() hard-maps the RTG/combo board
  *     at guest $10000000 -- Z3660_emu/src/cpu_emulator.cpp:224, then
- *     init_rtg_bank(0x100) -> uae_emulator.cpp:1009-1014 lays rtg_regs_bank +
- *     rtg_bank over banks 0x1000..0x1820. That window is the board base the
+ *     init_rtg_bank(0x100) -> uae_emulator.cpp:1019-1023 lays rtg_regs_bank +
+ *     rtg_bank over banks 0x1000..0x1800. That window is the board base the
  *     amix-z3660net driver binds to (Z3660_FIXED 0x10000000, amix-z3660net/
  *     src/z3660eth.h:16), with its rings at board+$07ED0000/$07EE0000. And
  *     reset_autoconfig() runs AFTER the RANGE_MAPs in uae_emulator(), so an
