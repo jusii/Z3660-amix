@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-15 — docs: the RTG-bank comment in amix_ram.h matched the code again (a1873d4)
+
+`amix_ram.h` described the RTG register/frame banks as `0x1000..0x1820` with stale line references; the
+code maps `0x1000..0x1800` (`uae_emulator.cpp`). Comment only. Recorded alongside: the ethernet RX loss
+cliff root cause (`RXBD_CNT 1`, a one-deep GEM RX descriptor ring; fix order after the demo = drain loop in
+the recv handler → `FRAME_MAX_BACKLOG` 64→32 → ring depth → the SI#692601 RX-reset workaround) lives in the
+workspace record tmp/2026-09-16-net-throughput/, no firmware change before 2026-09-19.
 ## 2026-08-28 — the card's timing table is hand-tuned, and three ways to lose it (7c57b6a, ad07033)
 
 - **`docs/clock-timings.md` (new).** There are three clock tables in the firmware and the file
