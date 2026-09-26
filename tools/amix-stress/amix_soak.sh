@@ -6,7 +6,8 @@
 # not assumed. FAIL HARD if the wild-PC guard latches (the firmware's "user PC went wild"
 # serial count rises), or if a reboot cycle cannot be proven.
 #
-#   Usage:  ./amix_soak.sh [cycles]            (default 50)
+#   Usage:  ./amix_soak.sh [cycles]            (default 50;  -h = help)
+#   Env:    AMIX_HOST AMIX_PASS KVM_HOST AMIXSH are REQUIRED (no defaults; see README).
 #   Prereq: amixstress installed on the AMIX root FS as /amixstress (survives reboots):
 #             amixsync.py push amixstress /amixstress   (then chmod 755 on the box)
 #   Needs:  amixsh.py (scripted-telnet runner) + ssh access to the serial-console host.
@@ -44,14 +45,30 @@
 # one -- is what may be quoted in docs/AMIX.md.
 # ---------------------------------------------------------------------------------------
 #
-# All bench specifics are env-overridable; defaults are this project's bench.
+# Bench specifics come from the environment. Hosts, credentials and the runner path have
+# NO defaults: the script refuses to start until they are set.
 set -u
+usage(){ cat <<'EOF'
+usage: amix_soak.sh [cycles]        (default 50)
+required env (no defaults):
+  AMIX_HOST   address of the AMIX box (telnet)
+  AMIX_PASS   AMIX login password, passed through to the $AMIXSH runner
+  KVM_HOST    ssh destination ([user@]host) whose serial console reads the firmware UART
+  AMIXSH      path to the scripted-telnet runner (see README)
+optional env:
+  AMIX_PORT (23)  SERIAL (/userdata/media/z3660-serial.log)  SOAK_LOG (/tmp/amix_soak.log)
+  STRESS (/amixstress)  REBOOT_EVERY (5)  DOWN_WAIT (120)  UP_WAIT (420)
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+missing=""
+for v in AMIX_HOST AMIX_PASS KVM_HOST AMIXSH; do [ -n "${!v:-}" ] || missing="$missing $v"; done
+if [ -n "$missing" ]; then echo "amix_soak.sh: required env not set:$missing" >&2; usage >&2; exit 64; fi
 LOG="${SOAK_LOG:-/tmp/amix_soak.log}"
-KVM_HOST="${KVM_HOST:-kvm1w.alanara.fi}"                              # host whose serial console reads the firmware UART
-KVM="ssh -o BatchMode=yes -o ConnectTimeout=8 root@$KVM_HOST"
+KVM="ssh -o BatchMode=yes -o ConnectTimeout=8 $KVM_HOST"               # host whose serial console reads the firmware UART
 SERIAL="${SERIAL:-/userdata/media/z3660-serial.log}"                 # firmware UART log on $KVM_HOST (carries [WILD] dumps)
-SH="${AMIXSH:-$HOME/Devel/Omat/Amiga/Amix/grimoire-amix/tools/host-net/amixsh.py}"  # scripted-telnet runner
-export AMIX_HOST="${AMIX_HOST:-192.168.2.39}" AMIX_PASS="${AMIX_PASS:-pass}" AMIX_PORT="${AMIX_PORT:-23}"
+SH="$AMIXSH"                                                         # scripted-telnet runner
+export AMIX_HOST AMIX_PASS AMIX_PORT="${AMIX_PORT:-23}"
 STRESS="${STRESS:-/amixstress}"                                      # persistent path on the AMIX root FS
 REBOOT_EVERY="${REBOOT_EVERY:-5}"                                    # reboot every Nth cycle (0 = never reboot)
 DOWN_WAIT="${DOWN_WAIT:-120}"                                        # s the box gets to STOP answering telnet after the shutdown

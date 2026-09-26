@@ -6,7 +6,11 @@
 # KVM-capture the console afterward for the ground truth.
 import socket, sys, time
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "192.168.2.39"
+USAGE = "usage: telnet_storm.py <amix-host> [count=30] [hold-seconds=0.4]"
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    print(USAGE, file=sys.stderr if len(sys.argv) < 2 else sys.stdout)
+    sys.exit(64 if len(sys.argv) < 2 else 0)
+HOST = sys.argv[1]
 PORT = 23
 N    = int(sys.argv[2]) if len(sys.argv) > 2 else 30
 HOLD = float(sys.argv[3]) if len(sys.argv) > 3 else 0.4   # let telnetd start+negotiate

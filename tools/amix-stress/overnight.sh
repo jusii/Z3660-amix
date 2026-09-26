@@ -6,16 +6,32 @@
 # wild-PC guard via the firmware serial log for ~3h. FAIL HARD if the guard ever latches or a
 # "User BUS ERROR" reaches the serial.
 #
-#   Usage:  ./overnight.sh
+#   Usage:  ./overnight.sh                     (-h = help)
 #   Prereq: gsoak.sh present on AMIX as /tmp/gsoak.sh and amixstress as /tmp/amixstress
 #           (push both with amixsync.py first). This script copies amixstress -> /amixstress.
 #
-# All bench specifics are env-overridable; defaults are this project's bench.
-KVM_HOST="${KVM_HOST:-kvm1w.alanara.fi}"
-KVM="ssh -o BatchMode=yes -o ConnectTimeout=8 root@$KVM_HOST"
+# Bench specifics come from the environment. Hosts, credentials and the runner path have
+# NO defaults: the script refuses to start until they are set.
+usage(){ cat <<'EOF'
+usage: overnight.sh
+required env (no defaults):
+  AMIX_HOST   address of the AMIX box (telnet)
+  AMIX_PASS   AMIX login password, passed through to the $AMIXSH runner
+  KVM_HOST    ssh destination ([user@]host) whose serial console reads the firmware UART
+  AMIXSH      path to the scripted-telnet runner (see README)
+optional env:
+  AMIX_PORT (23)  SERIAL (/userdata/media/z3660-serial.log)
+  OVERNIGHT_LOG (/tmp/amix_overnight.log)  MINUTES (180)
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+missing=""
+for v in AMIX_HOST AMIX_PASS KVM_HOST AMIXSH; do [ -n "${!v:-}" ] || missing="$missing $v"; done
+if [ -n "$missing" ]; then echo "overnight.sh: required env not set:$missing" >&2; usage >&2; exit 64; fi
+KVM="ssh -o BatchMode=yes -o ConnectTimeout=8 $KVM_HOST"
 SERIAL="${SERIAL:-/userdata/media/z3660-serial.log}"
-SH="${AMIXSH:-$HOME/Devel/Omat/Amiga/Amix/grimoire-amix/tools/host-net/amixsh.py}"
-export AMIX_HOST="${AMIX_HOST:-192.168.2.39}" AMIX_PASS="${AMIX_PASS:-pass}" AMIX_PORT="${AMIX_PORT:-23}"
+SH="$AMIXSH"
+export AMIX_HOST AMIX_PASS AMIX_PORT="${AMIX_PORT:-23}"
 LOG="${OVERNIGHT_LOG:-/tmp/amix_overnight.log}"
 MINUTES="${MINUTES:-180}"
 : > "$LOG"

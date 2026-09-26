@@ -54,12 +54,12 @@ N=20000 sh gsoak.sh &        # loops amixstress + fork/exec churn; logs every 25
 
 ```sh
 # reproduce: storm in.telnetd  ->  <host> <count> <hold-seconds>
-python3 telnet_storm.py 192.168.2.39 30 0.4
+python3 telnet_storm.py <amix-host> 30 0.4
 # (before the fix this crashes ~100% of in.telnetd at a constant wild PC; after, the AMIX
 #  console stays clean. "empty" responses under a storm are inetd loop-protection, not crashes —
 #  the ground truth is the firmware's serial wild-PC count.)
 
-# acceptance soak (env-overridable bench config; see headers):
+# acceptance soak (bench config from the environment; see below):
 ./amix_soak.sh 50
 # reboots every REBOOT_EVERY'th cycle (default 5), so 5 cycles = 1 proven reboot,
 # ~30 min on the box. The closing SOAK DONE line reports reboots_proven=N -- that
@@ -87,8 +87,22 @@ Any equivalent pair works; the scripts only rely on the interface:
 Plus ssh access to the host whose serial console reads the firmware UART (`KVM_HOST`), since the
 wild-PC guard is read from the serial log and nowhere else.
 
-The remaining bench specifics are env vars with this project's defaults: `KVM_HOST`, `SERIAL`,
-`AMIX_HOST`, `AMIX_PASS`, `AMIX_PORT`.
+### Environment contract (`amix_soak.sh`, `overnight.sh`)
+
+Hosts, credentials and the runner path have **no defaults**. Either script exits 64 with a
+usage message naming whatever is unset; `-h` prints the same usage.
+
+| Variable | Required | Meaning |
+|----------|----------|---------|
+| `AMIX_HOST` | yes | address of the AMIX box (telnet) |
+| `AMIX_PASS` | yes | AMIX login password, passed through to the `AMIXSH` runner |
+| `KVM_HOST` | yes | ssh destination (`[user@]host`) whose serial console reads the firmware UART |
+| `AMIXSH` | yes | path to the scripted-telnet runner |
+| `AMIX_PORT` | no (23) | telnet port |
+| `SERIAL` | no (`/userdata/media/z3660-serial.log`) | firmware UART log path on `KVM_HOST` |
+
+The remaining knobs (`REBOOT_EVERY`, `DOWN_WAIT`, `UP_WAIT`, `MINUTES`, log paths) are listed
+by `-h`. `telnet_storm.py` takes the AMIX host as its first argument, also without a default.
 
 ## How the guard works
 
