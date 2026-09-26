@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-15 — build: core0 no longer links with --gc-sections (9df5c2c)
+
+`--gc-sections` silently stripped the ZTop Info/checkbox code from core0. Dropped from the core0 link;
+this build ships as the golden `BOOT.BIN` F492BEC1 on the A4000T card.
+
 ## 2026-09-15 — docs: the RTG-bank comment in amix_ram.h matched the code again (a1873d4)
 
 `amix_ram.h` described the RTG register/frame banks as `0x1000..0x1820` with stale line references; the
@@ -7,6 +12,17 @@ code maps `0x1000..0x1800` (`uae_emulator.cpp`). Comment only. Recorded alongsid
 cliff root cause (`RXBD_CNT 1`, a one-deep GEM RX descriptor ring; fix order after the demo = drain loop in
 the recv handler → `FRAME_MAX_BACKLOG` 64→32 → ring depth → the SI#692601 RX-reset workaround) lives in the
 workspace record tmp/2026-09-16-net-throughput/, no firmware change before 2026-09-19.
+## 2026-09-12 — mobotest: [REG] custom-chip reachability probe, FPGA termination word per access (e03dfd6, 84d23ea)
+
+Under `enable_test`, a [REG] probe reads the custom-chip registers over the slot bus and every probe
+access prints the FPGA cycle-termination word, so a dead bus, a floating lane and a healthy read are
+told apart on the serial console. Backfilled at the 2026-09-26 consolidation review.
+
+## 2026-09-09 — docs: six firmware-side AMIX facts established on metal (5964167)
+
+`docs/amix-firmware-facts.md` (new), with pointers from `docs/AMIX.md` and `KNOWN_ISSUES.md`.
+Backfilled at the 2026-09-26 consolidation review.
+
 ## 2026-08-28 — the card's timing table is hand-tuned, and three ways to lose it (7c57b6a, ad07033)
 
 - **`docs/clock-timings.md` (new).** There are three clock tables in the firmware and the file
