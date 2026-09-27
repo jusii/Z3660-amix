@@ -113,6 +113,9 @@ held in reset** (`DiscreteSet(REG0, FPGA_RESET)` just before). It goes over the 
 
 Upstream's A4000D context works; the A4000T's bus is not available at that point.
 
+**Not the pin load.** The owner removed the parallel cable, and the hang did not change. So it is the CIA
+access itself, not the load on SEL.
+
 **Fix candidates.**
 - Bound the CIA accesses with a bus-availability timeout.
 - Move the first `monitor_switch()` call to after the Amiga bus is live.
