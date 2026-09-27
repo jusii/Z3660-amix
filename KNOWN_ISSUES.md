@@ -128,6 +128,20 @@ two-argument signatures. Core0 links `mobotest.c`'s versions, which take `int *t
 - With neither CTS nor SEL enabled, the function returns before touching the bus.
 - If the bus does not answer during FPGA reset, the call after `mobotest()` makes the switch.
 
+**After the fix, on the A4000T the boot-time switch has no effect (metal, 2026-09-27, firmware 719AF9B7).**
+- 5 cold boots with `monitor_switch 34` all reached Amix multiuser:
+  - 060 start at +31…+34 s, telnet at +71…+75 s;
+  - both calls logged `[MONSW] monitor switched to RTG`, the first at about +8–9 s during FPGA reset and the
+    second about 3 s later at the boot display;
+  - every CIA-B access was acknowledged.
+- But the monitor never switched: 12 frames per boot, plus a dense 38-frame capture at about 0.5 s intervals, all
+  stayed on the native output. At multiuser DDRA=0xc0, with SEL an input.
+- The reason: CIA-B is still held in reset at both calls. An 8520 in reset forces DDRA to 0 and ignores the writes,
+  and Kickstart's reset at the 060 start would clear any state anyway.
+- The `[MONSW]` line now appends a DDRA/PRA read-back to make this visible.
+- **On this board the monitor switch is an OS-side job:** Amix's RTG driver, or AmigaOS P96 SetSwitch.
+- Whether the A4000D behaves the same way has not been measured.
+
 **Consequence.** Firmware without this fix: keep `monitor_switch 0` on A4000T cards. An Amix-side switch, e.g.
 `cia_sel` via `/dev/mem`, works.
 
