@@ -116,12 +116,20 @@ Upstream's A4000D context works; the A4000T's bus is not available at that point
 **Not the pin load.** The owner removed the parallel cable, and the hang did not change. So it is the CIA
 access itself, not the load on SEL.
 
-**Fix candidates.**
-- Bound the CIA accesses with a bus-availability timeout.
-- Move the first `monitor_switch()` call to after the Amiga bus is live.
+**Root cause (found while fixing, 2026-09-27).** `main.c` declared the byte accessors with the core1 emulator's
+two-argument signatures. Core0 links `mobotest.c`'s versions, which take `int *timeout` and start with
+`*timeout=100000`, so every `monitor_switch()` access wrote through a garbage register pointer.
+- With `monitor_switch 0`, only the single DDRA read ran, and it happened to survive.
+- With SEL enabled, there were four such calls.
 
-**Consequence.** Until then, keep `monitor_switch 0` on A4000T cards. An Amix-side switch, e.g. `cia_sel` via
-`/dev/mem`, works.
+**Fixed in this fork:**
+- The prototypes now match `mobotest.c`.
+- All four CIA-B accesses pass a real `&timeout` and fail soft: they skip the switch and log one `[MONSW]` line.
+- With neither CTS nor SEL enabled, the function returns before touching the bus.
+- If the bus does not answer during FPGA reset, the call after `mobotest()` makes the switch.
+
+**Consequence.** Firmware without this fix: keep `monitor_switch 0` on A4000T cards. An Amix-side switch, e.g.
+`cia_sel` via `/dev/mem`, works.
 
 <!-- fork:amix end -->
 
