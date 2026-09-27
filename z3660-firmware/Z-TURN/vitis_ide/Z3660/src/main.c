@@ -940,7 +940,16 @@ void monitor_switch(int RTG)
       if(timeout==0)
          printf("[MONSW] CIA-B PRA write got no bus ack, monitor switch not confirmed\n");
       else
-         printf("[MONSW] monitor switched to %s (monitor_switch 0x%02X)\n",RTG?"RTG":"native",config.monitor_switch);
+      {
+         // Diagnostic read-back. On the A4000T, CIA-B is still held in reset here, so the writes are
+         // acknowledged but ignored and DDRA reads back 0x00.
+         int t1, t2;
+         uint32_t rb_ddra=arm_read_amiga_byte(CIAB_DDRA,&t1);
+         uint32_t rb_pra=arm_read_amiga_byte(CIAB_PRA,&t2);
+         printf("[MONSW] monitor switched to %s (monitor_switch 0x%02X); read-back DDRA=0x%02lX%s PRA=0x%02lX%s\n",
+                RTG?"RTG":"native",config.monitor_switch,
+                (unsigned long)(rb_ddra>>24),t1?"":"(no ack)",(unsigned long)(rb_pra>>24),t2?"":"(no ack)");
+      }
 //      }while((arm_read_amiga_byte(CIAB_PRA)&mask)!=(ciab&mask));
 //      ciab=arm_read_amiga_byte(CIAB_PRA);
 //      printf("ciab read 0x%08lX\n",ciab);
