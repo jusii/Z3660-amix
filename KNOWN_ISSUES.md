@@ -97,6 +97,29 @@ back from the serial log rather than trusting the config.
 
 This says nothing about emulated boot modes, where the 060 is a bus-parked passenger and the
 whole 50–100 range remains as documented above.
+
+### Fork note (2026-09-27, measured): `monitor_switch` other than 0 hangs the A4000T boot (real 060)
+
+**What happened.** Setting `monitor_switch 34` (SEL + SEL level: the owner's KVM input switch on DB25 pin 13; SEL low
+selects the RTG, measured) hung the firmware boot on an A4000T with a real 68LC060 in **4 of 4 cold boots**.
+
+**Where it hangs.** `monitor_switch(1)` (`Z3660/src/main.c:817`) is first called at `main.c:1579`, **while the FPGA is
+held in reset** (`DiscreteSet(REG0, FPGA_RESET)` just before). It goes over the ARM Amiga-bus path
+(`arm_read_amiga_byte`/`arm_write_amiga_byte`), which has **no timeout**:
+- With `monitor_switch 0`, only the CIA-B DDRA read runs, and the boot is fine.
+- With SEL enabled, it also writes DDRA and does a PRA read-modify-write:
+  - 3 boots never printed "Boot mode is NOT MOBOCPU…", so they were stuck in that call;
+  - 1 boot got through, switched the monitor to the RTG boot screen, then stopped later (after "READ_NBG_ARM()").
+
+Upstream's A4000D context works; the A4000T's bus is not available at that point.
+
+**Fix candidates.**
+- Bound the CIA accesses with a bus-availability timeout.
+- Move the first `monitor_switch()` call to after the Amiga bus is live.
+
+**Consequence.** Until then, keep `monitor_switch 0` on A4000T cards. An Amix-side switch, e.g. `cia_sel` via
+`/dev/mem`, works.
+
 <!-- fork:amix end -->
 
 ##SCSI SD emulation
