@@ -164,6 +164,22 @@ There is a bug in hunk relocation code that makes that one hdf grows upto fill t
  * v1.03 beta 14 FPGA/ARM versions<br>
  After beta 14, you can make a third partition in the SD with type 0x76 (like you do with pistorm/emu68). It will be automounted by the SCSI SD emulation. (beta 12 and beta 13 had a bug that made some hdfs to grow up, and it was fixed in beta 14).
  
+### Fork note (2026-09-28, observed once): core0 Data Abort during the Kickstart piscsi scan (real 060, A4000T)
+
+**Seen:** firmware 719AF9B7, preset 2, booting an Amix image.
+- 3 s after `060 starting now`, right after `[!!!PISCSI] Found no handler for file system UNI/1` and `res/118`:
+  - `[Core0] DataAbortHandler()`, DFSR 0x00001c06;
+  - instruction address 0x0121467c, word 0xE59237FC;
+  - "Write Fault to 0x00000000".
+- The firmware restarted itself (the banner again), started the 060 again, and then there was no boot I/O.
+- A cold power cycle booted cleanly. One sighting in about 15 boots that day.
+
+**Status:** not symbolised. The workspace `build/Z3660.elf` does not match the flashed image at that address. This is
+the same class as the 2026-08-24 core0 abort (`_free_r`), but at a different address.
+
+**Bench consequence:** the re-init prints fresh `[PISCSI] Map` lines. A boot-activity check must therefore treat a
+Data Abort, or a second banner in one power cycle, as a failed boot.
+
 ##DMA and Zorro III bus bastmer
  * v1.02 CPLD and FPGA/ARM versions<br>
 The CPLD firmware doesn't implement DMA accesses, so you can't use busmaster Zorro III boards (like the A4091).
