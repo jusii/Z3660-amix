@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-27 — core0: monitor_switch() no longer hangs the boot (faf546a, 1c2bba4, 2ded81c, 6ba94f8, 4647d3d, ab6d73b)
+
+main.c declared the Amiga-bus byte accessors with the core1 emulator's two-argument signatures, so
+core0's timeout-taking versions wrote through a garbage pointer on every monitor-switch access, and
+any monitor_switch other than 0 hung the A4000T at power-on. Accesses are now bounded and fail soft
+with a [MONSW] log line (with a DDRA/PRA read-back), and monitor_switch 0 touches no bus. On the A4000T
+the switch completes but has no effect, because CIA-B is still held in reset when the firmware writes
+it; the monitor switch there is an OS-side job. BOOT CRC32 719AF9B7; 5/5 acceptance boots; MG1–MG3.
+
 ## 2026-09-15 — build: core0 no longer links with --gc-sections (9df5c2c)
 
 `--gc-sections` silently stripped the ZTop Info/checkbox code from core0. Dropped from the core0 link;
