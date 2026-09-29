@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-29 — KNOWN_ISSUES
+
+A core0 Data Abort during the Kickstart piscsi scan (fork 719AF9B7, 1 in ~15 boots; the ARM restarts itself with no boot I/O), recorded for symbolisation.
+
 ## 2026-09-27 — core0: monitor_switch() no longer hangs the boot (faf546a, 1c2bba4, 2ded81c, 6ba94f8, 4647d3d, ab6d73b)
 
 main.c declared the Amiga-bus byte accessors with the core1 emulator's two-argument signatures, so
