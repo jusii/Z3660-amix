@@ -1611,6 +1611,64 @@ int main()
 
    //   video_reset();
 
+   // The FPGA latches the MAPROM/MAPROMEXT enables only while FPGA_RESET is held
+   // (z3660.v:374-409), so decide them before the final pulse below. Decided after
+   // it, a disable never reached the FPGA: kickstart 0 on a real CPU fetched an
+   // empty MAPROM window instead of the motherboard ROM.
+   shared->load_rom_addr=(uint32_t)0x00F80000;
+   shared->load_ext_rom_addr=(uint32_t)0x00F00000;
+
+   if(config.kickstart!=0 && (kickstart_pointer[config.kickstart]!=0))
+   {
+      shared->load_rom_emu=load_rom();
+      if(shared->load_rom_emu==1)
+      {
+         ENABLE_MAPROM_FPGA;
+      }
+      else
+      {
+         printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
+         DISABLE_MAPROM_FPGA;
+      }
+   }
+   else
+   {
+      shared->load_rom_emu=2;
+      printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
+      DISABLE_MAPROM_FPGA;
+   }
+   if(config.ext_kickstart!=0 && (ext_kickstart_pointer[config.ext_kickstart]!=0))
+   {
+      shared->load_romext_emu=load_romext();
+      if(shared->load_romext_emu==1)
+      {
+         ENABLE_MAPROMEXT_FPGA;
+      }
+      else
+      {
+         printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
+         DISABLE_MAPROMEXT_FPGA;
+      }
+   }
+   else
+   {
+      shared->load_romext_emu=2;
+      printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
+      DISABLE_MAPROMEXT_FPGA;
+   }
+   // Force to disable maprom
+   //   DISABLE_MAPROM_FPGA;
+   //   DISABLE_MAPROMEXT_FPGA;
+   //   shared->load_rom_emu=2;
+   //   shared->load_romext_emu=2;
+
+   if(emu==1)
+   {
+      // emulated modes keep both windows off in the FPGA, as before this move
+      DISABLE_MAPROM_FPGA;
+      DISABLE_MAPROMEXT_FPGA;
+   }
+
    DiscreteSet(REG0, FPGA_RESET);
    xc3_usleep(2500);
    monitor_switch(1); // 1=RTG
@@ -1731,53 +1789,6 @@ int main()
    shared->z3_enabled|=config.autoconfig_rtg?2:0;
    shared->z3_enabled|=config.autoconfig_ram?1:0;
    shared->z2_enabled|=!config.autoconfig_rtg && config.scsiboot?1:0;
-
-   shared->load_rom_addr=(uint32_t)0x00F80000;
-   shared->load_ext_rom_addr=(uint32_t)0x00F00000;
-
-   if(config.kickstart!=0 && (kickstart_pointer[config.kickstart]!=0))
-   {
-      shared->load_rom_emu=load_rom();
-      if(shared->load_rom_emu==1)
-      {
-         ENABLE_MAPROM_FPGA;
-      }
-      else
-      {
-         printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
-         DISABLE_MAPROM_FPGA;
-      }
-   }
-   else
-   {
-      shared->load_rom_emu=2;
-      printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
-      DISABLE_MAPROM_FPGA;
-   }
-   if(config.ext_kickstart!=0 && (ext_kickstart_pointer[config.ext_kickstart]!=0))
-   {
-      shared->load_romext_emu=load_romext();
-      if(shared->load_romext_emu==1)
-      {
-         ENABLE_MAPROMEXT_FPGA;
-      }
-      else
-      {
-         printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
-         DISABLE_MAPROMEXT_FPGA;
-      }
-   }
-   else
-   {
-      shared->load_romext_emu=2;
-      printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
-      DISABLE_MAPROMEXT_FPGA;
-   }
-   // Force to disable maprom
-   //   DISABLE_MAPROM_FPGA;
-   //   DISABLE_MAPROMEXT_FPGA;
-   //   shared->load_rom_emu=2;
-   //   shared->load_romext_emu=2;
 
 #ifndef DISABLE_SCSI
    piscsi_init();
