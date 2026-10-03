@@ -1,15 +1,20 @@
-Z3660 fork firmware 1.0 (for the K1 card)
+Z3660 fork firmware 1.0 (for the K1 card), layout A'
 
-image      Z3660.bin   13417468 B   crc32 C96EAD03
-           sha256 f267288cfea21d47d348f5b8fc108395ad7a01683d487a65d08bcfaffe02cbcd
+fat/BOOT.BIN     fork 1.0       13417468 B  crc32 C96EAD03
+                 sha256 f267288cfea21d47d348f5b8fc108395ad7a01683d487a65d08bcfaffe02cbcd
+fat/Z3660.bin    fork 1.0       (same file as BOOT.BIN)
+fat/FAILSAFE.bin stock 1.03 BETA 21 (upstream update_system_files/BOOT.BIN, byte-intact)
+                 12256524 B  crc32 C0ADE49A
+                 sha256 985c11e42592249ce4a71bac690cfb851e99498f01f2151d550c497028bda32f
+
 source     branch release-1.0-fw, commit ee13c09 (= amix-main-2 9ea9a4d + edc553d + ee13c09)
-             edc553d  core0: decide MAPROM/MAPROMEXT before the final FPGA reset pulse   (kickstart 0 on a real CPU)
-             ee13c09  core0: re-read a piscsi register value until two reads agree     (DI-1 register-value race)
+             edc553d  core0: decide MAPROM/MAPROMEXT before the final FPGA reset pulse   (kickstart 0, real CPU; shanshe/Z3660#23)
+             ee13c09  core0: re-read a piscsi register value until two reads agree     (register-value race; shanshe/Z3660#22)
 build      clean; core0 in the Vitis docker (gcc 12.2), core1 on the host (arm-none-eabi-gcc 14.2.1, WARP gate),
            make bootbin DDR 533; core0 ELF archived as BOOT-C96EAD03-core0.elf
 
-rollback   stock Z3660 1.03 BETA 21: upstream update_system_files/BOOT.BIN
-           12256524 B   crc32 C0ADE49A
-           sha256 985c11e42592249ce4a71bac690cfb851e99498f01f2151d550c497028bda32f
+boot       the FSBL in BOOT.BIN starts Z3660.bin; if it is missing or broken, FAILSAFE.bin, then BOOT.BIN.
+rollback   quick: delete Z3660.bin -> stock 1.03 BETA 21 (FAILSAFE.bin) under the fork's FSBL.
+           full stock: copy FAILSAFE.bin over BOOT.BIN, then delete Z3660.bin -> upstream's files exactly.
 
 CPLD (z3660.jed), z3660_scsi.rom and the config keys are unchanged by this release.
