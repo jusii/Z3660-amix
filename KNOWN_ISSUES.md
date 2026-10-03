@@ -182,8 +182,48 @@ the faulting access; DFAR ("Write Fault to 0x0") is meaningless. This is the sam
 **Second sighting 2026-10-03:** A4000T, same firmware and the same address, preset `kickstart 4`, k1r3-unatt + a blank
 disk. It aborted after the third "no handler" line; a clean boot of the same disks prints five. A cold cycle booted cleanly.
 
+**Third sighting 2026-10-03:** a bench-AmigaOS boot (no Amix partitions) on the diagnostic image F583F05B: the same
+DFSR 0x1c06, 3 s after `060 starting now`, PC 0x012148ac (`Xil_L2CacheFlush` in that build). So the Amix "no handler"
+lines are not required.
+
 **Bench consequence:** the re-init prints fresh `[PISCSI] Map` lines. A boot-activity check must therefore treat a
 Data Abort, or a second banner in one power cycle, as a failed boot.
+
+### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
+
+**Setup:** A4000T, Z3660 card 2, 68LC060 @80; the onboard 53C710 SCSI with board termination built; a ZuluSCSI at
+id 0 as the last device, termination on.
+
+**Through MAPROM (`kickstartN` + `kickstart N`), the plain A4000T 47.115 image boots:**
+- The 060's reset vectors come from the socket chips.
+- The A4000T ROM's `scsi.device 47.4` drives the onboard 710, finds the Zulu, and reaches the Workbench screen
+  +15 s after `060 starting now`.
+- After the boot scan, the 710's SXFER (the byte at `$DD0046`) reads `0x18`: offset 8, period code 1. **The ROM driver
+  negotiates synchronous transfers.** Any later driver for the 710 inherits a target already in sync mode.
+- DSA/TEMP/DSP all point into the Z3660 DDR (`$0800xxxx`).
+
+**From the sockets (`kickstart 0`, which needs the MAPROM latch-order fix):**
+- DiagROM boots on the real 060.
+- The A4000T 47.115 Kickstart does **not** boot. It is black from the first frame, with chips whose content was
+  verified correct by an ARM-side dump, and also with `ext_kickstart 0`.
+- Owner decision (2026-10-03): on the A4000T, Kickstart always comes from the Z3660. The socket question is parked
+  as a board-side issue (chip speed/type and a bus trace are the open leads).
+
+**Not yet proven:** that the 710's data DMA lands in the Z3660 DDR. That needs DNAD sampled during a transfer. The
+attempt stopped when the A4000T froze under read load (the known A4000T-only freeze under sustained I/O).
+
+### Fork note (2026-10-03, measured): core0 ARM bus reads can return the previous read's data (stale REG5)
+
+`arm_read_amiga_long()` (mobotest.c) polls REG5 until it is non-zero and then takes REG7.
+- If REG5 still holds the FPGA's write-state code `0x80000000`, the poll ends at once and returns REG7 from the
+  PREVIOUS read.
+- Seen in an ARM-side 512 KiB dump of the ROM sockets: in one boot 91% of the longwords equalled the read before.
+  In another, the first reads acked `0x1` and the data was good.
+- It is the same race as the emulator's `wait_read_ack()` (a 2026-09-30 note on branch `a4092-busdiag`). The
+  emulated CPU reading Kickstart from the sockets got a garbage reset vector ("CPU reset PC=3").
+- Fix idea for both paths: accept only a real termination (1 = TA, 2 = TEA, 3 = both), or wait for REG5 to leave
+  `0x80000000` before issuing the read. The diagnostic dump settles by re-reading until two reads agree; even that
+  lets two stale reads agree.
 
 ##DMA and Zorro III bus bastmer
  * v1.02 CPLD and FPGA/ARM versions<br>
