@@ -174,8 +174,13 @@ There is a bug in hunk relocation code that makes that one hdf grows upto fill t
 - The firmware restarted itself (the banner again), started the 060 again, and then there was no boot I/O.
 - A cold power cycle booted cleanly. One sighting in about 15 boots that day.
 
-**Status:** not symbolised. The workspace `build/Z3660.elf` does not match the flashed image at that address. This is
-the same class as the 2026-08-24 core0 abort (`_free_r`), but at a different address.
+**Status (2026-10-03, symbolised):** the archived `BOOT-719AF9B7-core0.elf` puts 0x0121467c in `Xil_L2CacheFlush()`,
+on the way-mask poll. DFSR 0x1c06 is an asynchronous external abort, so that PC is only where the abort was taken, not
+the faulting access; DFAR ("Write Fault to 0x0") is meaningless. This is the same signature as
+`docs/core0-async-data-abort-2026-08-25.md`.
+
+**Second sighting 2026-10-03:** A4000T, same firmware and the same address, preset `kickstart 4`, k1r3-unatt + a blank
+disk. It aborted after the third "no handler" line; a clean boot of the same disks prints five. A cold cycle booted cleanly.
 
 **Bench consequence:** the re-init prints fresh `[PISCSI] Map` lines. A boot-activity check must therefore treat a
 Data Abort, or a second banner in one power cycle, as a failed boot.
