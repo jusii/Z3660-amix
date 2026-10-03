@@ -549,6 +549,29 @@ int measures_thread(struct pt *pt)
    }
    PT_END(pt);
 }
+/* The FPGA raises the register-write event in the same clock as it starts the AXI write
+ * of the value to DDR (z3660.v), so the first read here can still return the register's
+ * previous value. Re-read, ~1 us apart, until two consecutive reads agree (at most 8
+ * re-reads; the last read wins). */
+static uint32_t piscsi_reg_value(uint32_t *address, int type, uint32_t first)
+{
+   uint32_t prev=first, v;
+   for(int i=0;i<8;i++)
+   {
+      dsb();
+      xc3_usleep(1);
+      if(type==OP_TYPE_LONGWORD)
+         v=swap32(*(volatile uint32_t *)address);
+      else if(type==OP_TYPE_WORD)
+         v=swap16(*(volatile uint16_t *)address);
+      else
+         v=*(volatile uint8_t *)address;
+      if(v==prev)
+         break;
+      prev=v;
+   }
+   return v;
+}
 int rtg_thread(struct pt *pt)
 //void rtg_loop(void)
 {
@@ -608,6 +631,7 @@ int rtg_thread(struct pt *pt)
                   {
                      zdata=*(uint8_t*)address;
                   }
+                  zdata=piscsi_reg_value(address,type,zdata);
 //                  printf("writex address 0x%08lX\n",zaddr);
                   if(zaddr<0x400 || zaddr>=0x600)
                      handle_piscsi_reg_write(zaddr, zdata, type);
