@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-04 — firmware 1.0 (release-1.0-fw); deferred R-16 KNOWN_ISSUES line (9ea9a4d..ff9e8fb)
+
+Firmware 1.0: MAPROM/MAPROMEXT decided before the final FPGA reset pulse (kickstart 0 works again on a real CPU)
+and the piscsi register value re-read until two reads agree; release MANIFEST and README with the card layout and
+rollback. Deferred R-16 line: KNOWN_ISSUES fork notes (A4000T ROM paths, the 710 left in SYNC by the A4000T ROM,
+stale-REG5 ARM reads, the core0 abort sightings).
+
 ## 2026-09-29 — KNOWN_ISSUES
 
 A core0 Data Abort during the Kickstart piscsi scan (fork 719AF9B7, 1 in ~15 boots; the ARM restarts itself with no boot I/O), recorded for symbolisation.
