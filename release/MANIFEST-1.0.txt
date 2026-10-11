@@ -8,6 +8,7 @@ fat/FAILSAFE.bin stock 1.03 BETA 21 (upstream update_system_files/BOOT.BIN, byte
                  sha256 985c11e42592249ce4a71bac690cfb851e99498f01f2151d550c497028bda32f
 
 source     branch release-1.0-fw, commit ee13c09 (= amix-main-2 9ea9a4d + edc553d + ee13c09)
+           tree e64eb78; published as branch release-1.0, commit 16165fa (same tree, squashed history)
              edc553d  core0: decide MAPROM/MAPROMEXT before the final FPGA reset pulse   (kickstart 0, real CPU; shanshe/Z3660#23)
              ee13c09  core0: re-read a piscsi register value until two reads agree     (register-value race; shanshe/Z3660#22)
 build      clean; core0 in the Vitis docker (gcc 12.2), core1 on the host (arm-none-eabi-gcc 14.2.1, WARP gate),
