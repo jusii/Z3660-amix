@@ -2,8 +2,7 @@
 
 **2026-08-24.** Investigation of the two anomalies BLIZZARD F0 raised on the first
 `bootmode CPU` boot this project has ever run (real 68060, KS 3.2.3, A4000 + Z3660).
-Evidence: `Amix/tmp/2026-08-24-blizzard-f0/` — serial `15-ARMB-boot.txt`, HDMI captures
-`16/18/19-HDMI-armB-*.jpg`, config delta `04-CONFIG-DELTA-armA.txt`.
+Evidence (held locally): the 2026-08-24 session's serial boot log, HDMI captures and config delta.
 
 Written pre-registration-style: the verdicts first, then what each rests on, then what is
 predicted of the changes made alongside it, so a later metal session can score this page

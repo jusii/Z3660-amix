@@ -178,7 +178,7 @@ trigger a rebuild. **Wipe `Z3660/build` and `Z3660_emu/build` when moving betwee
 The failure was confirmed pre-existing (it reproduced identically at `203f108`) and then vanished
 on a clean build of both commits — it was never a source defect and never related to this port.
 
-**The size gate is already exceeded, and not because of this work.** `CLAUDE.md` records "keep
+**The size gate is already exceeded, and not because of this work.** The project notes recorded "keep
 `BOOT.BIN` < ~12 MB or the SD write silently fails". Both builds above are ~12.08–12.09 MiB, i.e.
 the **pre-port baseline was already over**. This port adds 16 KiB to an overage inherited from beta
 21; it did not cause it. If the gate still binds on the current flash route (beta 21 removed TFTP —

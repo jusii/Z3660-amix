@@ -150,7 +150,7 @@ two distinct claims, and they have aged differently:
 
 | Claim | Status |
 |---|---|
-| "EVERY RAM region AmigaOS lists must lie INSIDE that one window, else the kernel … panics `vatosde()`" — i.e. **exactly one contiguous region** | **Stands.** Independently corroborated: the community report (asokero/tohtoris, 2026-08-12) that Amix picks the **largest contiguous block**; and `/stand/README` + `makeiblk`, where the kernel info block's default preferred load address `0xFFFFFFFF` means "auto-bind to the largest chunk of contiguous, non-CHIP memory" (`amix-kerntools/docs/piscsi-rig.md` §6). |
+| "EVERY RAM region AmigaOS lists must lie INSIDE that one window, else the kernel … panics `vatosde()`" — i.e. **exactly one contiguous region** | **Stands.** Independently corroborated: a community report (2026-08-12) that Amix picks the **largest contiguous block**; and `/stand/README` + `makeiblk`, where the kernel info block's default preferred load address `0xFFFFFFFF` means "auto-bind to the largest chunk of contiguous, non-CHIP memory" (`amix-kerntools/docs/piscsi-rig.md` §6). |
 | "`VSIZOFMEM = 16MB` … two adjacent banks COALESCE into a >16MB window (**also fatal**)" | **Contradicted for the size half.** The comment itself attributes the 16 MB to a `QUICK_KLUDGE` path for a **high-loaded** kernel — and *this* kernel does not relocate, it runs in place at `$08000000` ([`:1132-1135`](../z3660-firmware/Z-TURN/vitis_ide/Z3660_emu/src/uae/uae_emulator.cpp)). Against it: the emulated piscsi rig boots to multiuser on **32 MB at `0x08000000`** (`amix-kerntools/docs/piscsi-rig.md` §1, §6 — `Total Unix memory = 33552384`), and the community report has an A3000 running 48 MB with 32 MB stress-tested for months. |
 
 The kernel limit that *is* real is a different one: **~128 MB of total describable RAM**, past which
@@ -580,6 +580,6 @@ reading the AmigaOS memory list on the box before changing anything.
   Its `kernel-52550-hang.md` holds the disassembly and the six-run ablation.
 - `amix-z3660scsi/src/z3660.c:71,302` (`BOUNCE_THRESH`) and `amix-z3660net/src/z3660eth.h:36-43`
   (board-window offsets) — the two consumer-side contracts checked in §2.4.
-- Community report, 2026-08-12 (asokero/tohtoris, relayed): no kernel 16 MB fast-RAM limit; an A3000
+- A community report, 2026-08-12 (relayed): no kernel 16 MB fast-RAM limit; an A3000
   running 48 MB, 32 MB stress-tested for months; Amix picks the largest **contiguous** block.
   **Second-hand and unverified here** — used only where it agrees with in-tree or bench evidence.

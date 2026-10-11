@@ -1364,7 +1364,7 @@ static void chip_probe(void)
    v2=reg_rd(0xDFF01C,&raw,&to);
    sprintf(m,"[REG] INTENA  $DFF09A <- 0x0001 (CLR) ; INTENAR -> 0x%04X  TBE %s",v2,(v2&0x0001)?"STILL SET":"cleared ok"); reg_line(m);
 
-   /* 4. Paula serial: program 9600 (0x0175 as the A4000T station specified), read SERDATR and
+   /* 4. Paula serial: program 9600 (0x0175, as measured on the A4000T), read SERDATR and
     *    ADKCONR, send one 'A' with stop bit, re-read SERDATR after ~2 ms. TBE = bit 13, TSRE = bit 12,
     *    bit 11 = RXD line level. The 'A' is a real character on the DB25 for the serial-path check. */
    reg_wr(0xDFF032,0x0175,&to);

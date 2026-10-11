@@ -30,8 +30,8 @@ this build ships as the golden `BOOT.BIN` F492BEC1 on the A4000T card.
 `amix_ram.h` described the RTG register/frame banks as `0x1000..0x1820` with stale line references; the
 code maps `0x1000..0x1800` (`uae_emulator.cpp`). Comment only. Recorded alongside: the ethernet RX loss
 cliff root cause (`RXBD_CNT 1`, a one-deep GEM RX descriptor ring; fix order after the demo = drain loop in
-the recv handler → `FRAME_MAX_BACKLOG` 64→32 → ring depth → the SI#692601 RX-reset workaround) lives in the
-workspace record tmp/2026-09-16-net-throughput/, no firmware change before 2026-09-19.
+the recv handler → `FRAME_MAX_BACKLOG` 64→32 → ring depth → the SI#692601 RX-reset workaround) is in the
+locally held evidence, no firmware change before 2026-09-19.
 ## 2026-09-12 — mobotest: [REG] custom-chip reachability probe, FPGA termination word per access (e03dfd6, 84d23ea)
 
 Under `enable_test`, a [REG] probe reads the custom-chip registers over the slot bus and every probe
@@ -176,8 +176,8 @@ Backfilled at the 2026-09-26 consolidation review.
   disarmed symbol on that same image, the old matcher printed `no gate after the handler
   returns -- as designed`; the build failed only because the independent "names no `z3660_warp`
   symbol" test caught it. And the variable was never recorded anywhere — **all ten ELFs the
-  campaign archived were built by the host `arm-none-eabi-gcc` 14.2.1** while `CLAUDE.md`
-  documents the Vitis docker (gcc 12.2.0) as the build path; not one measured row is a docker
+  campaign archived were built by the host `arm-none-eabi-gcc` 14.2.1** while the project
+  notes documented the Vitis docker (gcc 12.2.0) as the build path; not one measured row is a docker
   build, and no manifest row, CRC or build log could have shown it. §0.18.5's `BOOT.BIN` row is
   corrected in two cells — the default variant's loops are **3 204 / 3 284 B**, not 2 100 /
   2 184, which are lean's, transcribed; the CRC, image size and `sizeof(regs)` were right, a
@@ -1777,7 +1777,7 @@ here is validated only as far as is possible without one). Four commits, unpushe
   generated via the WinUAE-4.4.0 gencpu flow, linked in (+291 KB), and the resulting
   **12.156 MiB image booted on real metal** (cap test 2026-08-09: `[SD Init] Done
   (Z3660.BIN)`, not FAILSAFE; production `59FAE8CA` restored after). The ~12 MiB gate in
-  CLAUDE.md/port-ledger is advisory, not a boot-load wall.
+  the project notes/port-ledger is advisory, not a boot-load wall.
 - **`6848894` — `UAE_040_MMU` is runnable.** `m68k_run_mmu040()` run loop, the
   `set_x_funcs()` 040 accessor arm (mmu_get/put, distinct from the 030 bank), `main.cpp`
   dispatch, and the six link-only compile bridges made faithful (the non-obvious ones —

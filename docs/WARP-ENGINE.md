@@ -3905,8 +3905,7 @@ shares, the coverage band, the armed band and the disarm penalty — every one p
 EEST**, A4000 + Z3660, piscsi-root installed AMIX, preset 7 (`amix_ram 128`, `service_cadence 4`,
 `arm_frequency 1100` — see the caveat at §0.4.1, `UAE_040_MMU`). Eight flashes, eight guest boots, forty-five scored
 dhrystone rows across nine arms, two `WARPTEST` gates, two `PROFZ`-fenced counter windows. Every
-number below is read off `Amix/tmp/2026-08-24-warp-r5-metal/MATRIX.md`, `MATRIX-SCORING.txt`,
-`R-VERDICT.txt` and `R5-VERDICT.txt`; the same numbers are reproduced a third time in
+number below is read off the session's scoring sheets and verdicts (evidence held locally); the same numbers are reproduced a third time in
 `docs/warp-gen2-prospectus.md` §§1.1–1.2 and 6.1, which prices them and does not score them —
 its own words, and §0's authority stands over it. **Where the two disagree, this section follows
 the evidence directory**, and the one place they diverge in substance is noted at §0.16.2.
@@ -4455,7 +4454,7 @@ hooked loop through the DISARMED symbol, the old matcher on that same gcc-12.2.0
 the independent "names no `z3660_warp` symbol" test caught it. The shape half of G-R6.6 was a
 false pass, on the one variant the property matters most for.
 
-> ### **AND THE VARIABLE WAS NEVER RECORDED ANYWHERE: every ELF this campaign archived — all ten — was built by the HOST `arm-none-eabi-gcc` 14.2.1, while `CLAUDE.md` documents the Vitis docker (gcc 12.2.0) as the build path.** Not one measured row in this document is a docker build. The first one ever made was the one that failed the gate, and there was no way to see that from a manifest row, a CRC or a build log. Gate output now names the producer of every ELF it reads, and `make gate` re-reads every core1 build directory at once instead of checking a variant only at the instant it is linked.
+> ### **AND THE VARIABLE WAS NEVER RECORDED ANYWHERE: every ELF this campaign archived — all ten — was built by the HOST `arm-none-eabi-gcc` 14.2.1, while the project notes documented the Vitis docker (gcc 12.2.0) as the build path.** Not one measured row in this document is a docker build. The first one ever made was the one that failed the gate, and there was no way to see that from a manifest row, a CRC or a build log. Gate output now names the producer of every ELF it reads, and `make gate` re-reads every core1 build directory at once instead of checking a variant only at the instant it is linked.
 
 **§0.18.5's `BOOT.BIN` row is wrong in two cells.** The default variant's loops are **3 204 /
 3 284 B**, not 2 100 / 2 184 — those are lean's, transcribed. The CRC, the image size and
@@ -5735,7 +5734,7 @@ Verification is the standing checklist: whole-range identity and trailer scan, s
 bullets, then land.
 
 **Public-fork hygiene applies to this document itself.** It is written for an outside reader: no
-workspace paths, no orchestrator-internal vocabulary, and the fork-boundary rule stands — keep
+local paths, no internal process vocabulary, and the fork-boundary rule stands — keep
 Amix-specific changes inside the fork boundary where possible so an upstream merge stays clean.
 GPL-3.0, full credit to sHaNsHe.
 
@@ -6010,5 +6009,5 @@ flown; selector clean both directions; console boot-path exact.
 `F294E75A` (fourth consecutive rollback, CRC-verified); the engine is preserved in-repo —
 buildable, gated by `tools/warp-gate.sh`, `WARPTEST`-proven — as `BOOT-lean.BIN` `9AECF99D`.
 Shipping a WARP-carrying lean requires layout control first, which is the same class of work §8
-of the prospectus already orders ahead of any reopening (the E-round). Orchestrator ruling,
+of the prospectus already orders ahead of any reopening (the E-round). Project decision,
 2026-08-24: the miss is accepted as scored.
