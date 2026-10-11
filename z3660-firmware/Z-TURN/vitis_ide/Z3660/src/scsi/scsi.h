@@ -87,8 +87,9 @@ typedef struct piscsi_dev_ {
     uint8_t pdt;    // SCSI peripheral device type: 0x00 = direct-access disk, 0x05 = read-only CD-ROM
     struct PartitionBlock *pb[16];
     struct RigidDiskBlock *rdb;
-    // Fast-seek link map table: [size][ncl,tcl]...[0], so N items cover
-    // (N - 2) / 2 fragments.  256 items = 127 fragments.
+    /* FatFs fast-seek link map table: [size][ncl,tcl]...[0], so N items cover
+     * (N - 2) / 2 fragments -- 127 here. A .hdf that outgrows it falls back to
+     * the generic cluster-chain walk (piscsi_map_drive). BSS only. */
     DWORD SeekTbl[256];
     uint32_t pb_addres[16];
 } PISCSI_DEV;
@@ -308,6 +309,14 @@ PISCSI_DEV *piscsi_get_dev(uint8_t index);
 
 void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type);
 uint32_t handle_piscsi_read(uint32_t addr, uint8_t type);
+
+/* piscsi service-rate / latency instrumentation (scsi.c, PISCSI_STATS).
+ * PSTAT toggles the periodic summary; PSTATR dumps cumulative totals + CLMT
+ * state per unit and resets. The core0-loop half of the same measurement lives
+ * in core0_stats.[ch] (PSTATC/PSTATZ). See docs/piscsi-service-path.md. */
+void piscsi_stats_toggle(void);
+void piscsi_stats_dump(void);
+int  piscsi_stats_reporting(void);   /* current state of the periodic report */
 
 void piscsi_find_filesystems(PISCSI_DEV *d);
 void piscsi_refresh_drives();

@@ -23,6 +23,7 @@
 //#include "custom.h"
 #include "events.h"
 #include "newcpu.h"
+#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: map_banks() invalidates the decoded-op cache */
 //#include "autoconf.h"
 //#include "savestate.h"
 //#include "ar.h"
@@ -3192,6 +3193,11 @@ static void map_banks2 (addrbank *bank, int start, int size, int realsize, int q
 		old = debug_bankchange (-1);
 #endif
 	flush_icache(3); /* Sure don't want to keep any old mappings around! */
+	/* CYBERSTORM C2 rung 1: and the decoded-op cache is exactly "an old mapping" in the
+	 * sense this line means -- its entries hold opcode words read through the bank map
+	 * that is being replaced on the next line. flush_icache() is a no-op macro without
+	 * the JIT, so upstream's own sentence has had nothing to act on until now. */
+	z3660_dopc_invalidate(Z3660_DOPC_INV_MAP);
 #ifdef NATMEM_OFFSET
 	//if (!quick)
 		//delete_shmmaps(start << 16, size << 16);
@@ -3774,89 +3780,65 @@ uae_u32 memory_get_wordi(uaecptr addr)
 		return swap16(*((uae_u16*)m));
 	}
 }
+/* CYBERSTORM C2 rung 2: the direct arms now call the direct_get_ / direct_put_ inlines
+ * in memory.h instead of open-coding `m = (uae_u8*)addr; swap32(*(uae_u32*)m)`. The
+ * accessor fast path performs the same access on its hit path, and one copy of the
+ * fork's identity-mapping assumption is the whole point -- upstream's commented-out
+ * baseaddr_direct_r arithmetic now lives in the comment above those inlines rather than
+ * being repeated here. Generated code is unchanged: swap32 IS __builtin_bswap32. */
 uae_u32 memory_get_long(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->lget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return swap32(*((uae_u32*)m));
+		return direct_get_long(addr);
 	}
 }
 uae_u32 memory_get_word(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->wget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return swap16(*((uae_u16*)m));
+		return direct_get_word(addr);
 	}
 }
 uae_u32 memory_get_byte(uaecptr addr)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_r) {
+	if (!addrbank_is_direct_r(ab)) {
 		return call_mem_get_func(ab->bget, addr);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_r + addr;
-		m = (uae_u8*)addr;
-		return *m;
+		return direct_get_byte(addr);
 	}
 }
 
 void memory_put_long(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->lput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*((uae_u32*)m)=swap32(v);
+		direct_put_long(addr, v);
 	}
 }
 void memory_put_word(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->wput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*((uae_u16*)m)=swap16(v);
+		direct_put_word(addr, v);
 	}
 }
 void memory_put_byte(uaecptr addr, uae_u32 v)
 {
 	addrbank *ab = &get_mem_bank(addr);
-	if (!ab->baseaddr_direct_w) {
+	if (!addrbank_is_direct_w(ab)) {
 		call_mem_put_func(ab->bput, addr, v);
 	} else {
-		uae_u8 *m;
-//		addr -= ab->startaccessmask;
-//		addr &= ab->mask;
-//		m = ab->baseaddr_direct_w + addr;
-		m = (uae_u8*)addr;
-		*m = (uae_u8)v;
+		direct_put_byte(addr, v);
 	}
 }
 //#endif

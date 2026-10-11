@@ -25,14 +25,14 @@ BSP_LIB := $(ROOT)/../design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp/ps7_
 INCLUDES:= -I$(SRCDIR) -I$(BSP_INC) -I$(LWIP_INC) -I$(SRCDIR)/mbedtls/include -I$(ROOT)/../design_1_wrapper/zynq_fsbl
 
 CFLAGS  := -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard -O3 -std=gnu99 -ftree-vectorize -mvectorize-with-neon-quad -ffast-math \
-           -ffunction-sections -fdata-sections -Wall -Wextra \
+           -Wall -Wextra \
            -MMD -MP -D__ARM_NEON__ # Automatic dependency generation
 #           -fno-builtin \
 
 ASFLAGS := $(CFLAGS)
 # Use Xilinx runtime spec and link against BSP libs; remove -nostdlib
 # Ensure linker uses the same FPU/ABI as objects to avoid VFP arg mismatches
-LDFLAGS := -T $(LDSCRIPT) -Wl,--gc-sections,-Map=$(BUILDDIR)/mapfile.txt -specs=$(SRCDIR)/Xilinx.spec -L$(BSP_LIB) \
+LDFLAGS := -T $(LDSCRIPT) -Wl,-Map=$(BUILDDIR)/mapfile.txt -specs=$(SRCDIR)/Xilinx.spec -L$(BSP_LIB) \
            -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard -ffast-math -flto
 # CRT0 and libraries from BSP
 # Link against lwIP and FatFs (xilffs) in addition to libxil and libm.

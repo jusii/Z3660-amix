@@ -10,8 +10,66 @@ SIZE    := $(CROSS_COMPILE)size
 
 ROOT    := $(abspath .)
 SRCDIR  := $(ROOT)/src
-BUILDDIR:= $(ROOT)/build
 LDSCRIPT:= $(SRCDIR)/lscript.ld
+
+# ---- Build variant (CYBERSTORM C3) -----------------------------------------
+# Z3660_LEAN=1 builds the LEAN (production) core1: the run-loop diagnostics are
+# compiled OUT rather than merely switched off at runtime, so the hot path carries
+# neither the instruments nor the predicates that gate them. See
+# src/uae/runloop_build.h for what that buys and why both variants exist.
+#
+# It builds into its OWN directory ON PURPOSE. The variant is selected by -D flags
+# and NOTHING tracks a -D as a dependency: sharing one build dir would let a
+# variant switch leave half the objects from the other one in place, and the link
+# would happily succeed. Separate dirs make that impossible instead of merely
+# unlikely, and let both BOOT.BINs exist at once for an A/B re-flash pair.
+#
+# Z3660_PROF=1 (CYBERSTORM C1) is the THIRD variant: the lean flags PLUS
+# -DZ3660_EMU_PROF=1, into build-prof. It is built on top of LEAN and not on top of the
+# default on purpose -- a profile of the diagnostic loop would be a map of a binary nobody
+# runs, and the C3 calibration priced the difference between the two loops at 9.1 % of
+# guest throughput, larger than several of the effects C2 is meant to rank. See
+# src/uae/z3660_prof.h.
+#
+# Z3660_Q2PROBE=1 is the FOURTH variant, and it is not a measuring instrument like the
+# other two -- it is a one-question experiment (Plan WARP ENGINE, M0, Q2: can a C++ throw
+# cross a frame of generated code?). It is the DEFAULT variant plus src/warp_q2probe.cpp,
+# which emits ARM instructions into the heap, executes them, and provokes an unwind
+# failure across them. It must never reach a card that is running anything. It builds
+# into build-q2probe and produces BOOT-q2probe.BIN, and the probe source is filtered out
+# of the source list for every other variant below -- so the other three images are
+# byte-identical whether this file exists or not.
+#
+# Z3660_WARP_ABLATE=1..5 is the FIFTH..NINTH variant, and it is an INSTRUMENT rather than an
+# image: the disarm-residual ablation kit (docs/WARP-ENGINE.md S0.14.1). Each level is the
+# LEAN build with exactly one layer of the WARP engine removed, so a metal session can
+# measure the same dhrystone against the same reference with one layer missing at a time and
+# read WHICH layer carries the -4.256 % disarm penalty. The truth table lives in
+# src/uae/z3660_warp_ablate.h, not here, so a level cannot mean two things in two places.
+#
+# NO ABLATION VARIANT MAY EVER BE LEFT ON A CARD. Level 0 -- the shipping lean -- must be
+# byte-identical to a build with the flag absent entirely, which is gate G-R5.10.
+Z3660_LEAN ?= 0
+Z3660_PROF ?= 0
+Z3660_Q2PROBE ?= 0
+Z3660_WARP_ABLATE ?= 0
+ifneq ($(Z3660_WARP_ABLATE),0)
+BUILDDIR    := $(ROOT)/build-abl$(Z3660_WARP_ABLATE)
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 \
+               -DZ3660_WARP_ABLATE=$(Z3660_WARP_ABLATE)
+else ifeq ($(Z3660_Q2PROBE),1)
+BUILDDIR    := $(ROOT)/build-q2probe
+VARIANT_DEFS:= -DZ3660_WARP_Q2_PROBE=1
+else ifeq ($(Z3660_PROF),1)
+BUILDDIR    := $(ROOT)/build-prof
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 -DZ3660_EMU_PROF=1
+else ifeq ($(Z3660_LEAN),1)
+BUILDDIR    := $(ROOT)/build-lean
+VARIANT_DEFS:= -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0
+else
+BUILDDIR    := $(ROOT)/build
+VARIANT_DEFS:=
+endif
 
 # Xilinx BSP include paths for Core 1 (ps7_cortexa9_1)
 BSP_CORE1_INC := $(ROOT)/../design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp/ps7_cortexa9_1/include
@@ -30,10 +88,16 @@ INCLUDES:= -I$(SRCDIR) \
            -I$(BSP_CORE1_INC) \
            -I$(BSP_CORE1_EXPORT_INC)
 
-CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -O3 -std=c++11 \
+# -MMD -MP: track HEADER dependencies. Until CYBERSTORM C1 nothing here did, so a header
+# edit left stale objects in every build dir and the link succeeded regardless -- the
+# reason `rm -rf build*` has been the standing advice. It generates .d files only and
+# cannot change a single byte of output. (-D flags remain untracked; that is what the
+# separate build directories are for.)
+CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 -MMD -MP \
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
-           -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY
+           -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY \
+           $(VARIANT_DEFS)
 #-Wall -Wextra -marm
 
 # Additional C++ flags
@@ -41,8 +105,10 @@ CXXFLAGS := $(CFLAGS)
 ASFLAGS := $(CFLAGS)
 LDFLAGS := $(CFLAGS) -T $(LDSCRIPT) -specs=$(SRCDIR)/Xilinx.spec \
            -Wl,-build-id=none,-Map=$(BUILDDIR)/mapfile.txt \
+           -Wl,--gc-sections \
            -flto -L$(BSP_CORE1_EXPORT_LIB) -L$(BSP_CORE1_LIB) -L$(BSP_CORE1_LIB)/cpu/cortexa9 -L$(dir $(BSP_CORE1_LIB))
-#-Wl,--gc-sections
+# --gc-sections: behavior-preserving dead-code strip (critical sections are KEEP'd in lscript.ld).
+# Shrinks Z3660_emu so BOOT.BIN clears the SD-write size threshold (~12MB) for TFTP deploy.
 #-nostdlib -specs=nosys.specs 
 
 # Sources (musashi/uae emulators)
@@ -55,6 +121,21 @@ CXX_SRCS := $(filter-out \
 	$(SRCDIR)/uae/jit/codegen_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm.cpp \
 	$(SRCDIR)/uae/jit/compemu_midfunc_arm2.cpp,$(CXX_SRCS))
+# The WARP Q2 unwind probe exists in exactly one variant. This filter is the first of the
+# two gates that keep it there; the second is the #if around the whole file (and around
+# its call site in main.cpp), so losing either one still ships nothing.
+ifneq ($(Z3660_Q2PROBE),1)
+CXX_SRCS := $(filter-out $(SRCDIR)/warp_q2probe.cpp,$(CXX_SRCS))
+endif
+# ABLATION LEVEL 5 -- the CLOSURE variant. The engine's whole translation unit leaves the
+# link: the emitter, the block table, the code-cache arena, the self-test and the ARM word
+# executor are not in the image at all. Everything outside it that still names the engine gets
+# the inline no-ops in z3660_warp.h. If A5's own disarmed row is not within the noise floor of
+# zero, the four named layers do not SPAN the cost -- which is a bigger finding than any of
+# them (S0.14.1, decision rule 4).
+ifeq ($(Z3660_WARP_ABLATE),5)
+CXX_SRCS := $(filter-out $(SRCDIR)/uae/z3660_warp.cpp,$(CXX_SRCS))
+endif
 S_SRCS := $(shell find $(SRCDIR) -type f -name "*.S")
 SRCS   := $(C_SRCS) $(CXX_SRCS) $(S_SRCS)
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(C_SRCS))
@@ -63,10 +144,45 @@ OBJS += $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CXX_SRCS)))
 OBJS += $(patsubst $(SRCDIR)/%.cxx,$(BUILDDIR)/%.o,$(filter %.cxx,$(CXX_SRCS)))
 OBJS += $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(S_SRCS))
 
+# THE OTHER HALF OF -MMD, AND WITHOUT IT THE FIRST HALF IS DECORATION.
+#
+# CFLAGS has carried -MMD -MP since CYBERSTORM C1 and the .d files have been written ever
+# since -- correctly, listing every header each object really reads. Nothing ever READ them.
+# So a header edit still left every object stale and the link still succeeded, which is the
+# exact hazard the -MMD comment above says was fixed.
+#
+# WARP round 4 walked into it: moving the arm flag into `struct regstruct` touched only
+# include/newcpu.h, `make lean` recompiled z3660_warp.cpp alone, and the image shipped a run
+# loop still reading the OLD gate -- provably, because the literal in m68k_run_mmu040's pool
+# still pointed at z3660_warp_gate. An objdump caught it; nothing in the build would have.
+-include $(OBJS:.o=.d)
+
 ELF := $(BUILDDIR)/Z3660_emu.elf
 BIN := $(BUILDDIR)/Z3660_emu.bin
 
-.PHONY: all clean size bin elf
+# THE DEFAULT GOAL, PINNED -- and this is not a style preference.
+#
+# GNU make takes .DEFAULT_GOAL from the first target of the first rule it READS, and an
+# `include` counts: the generated .d files below are rules, so once they exist the default
+# goal silently becomes whichever object file happens to sort first. A first build (no .d
+# files yet) makes `all`; every build after it made ONE object and stopped, printed
+# "'...m68kcpu.o' is up to date", and exited 0.
+#
+# The parent Makefile invokes this one with no goal ($(MAKE) -C Z3660_emu -j 4), so the
+# consequence was that `make bootbin` stopped rebuilding core1 entirely: bootgen happily
+# packed a MONTHS-OLD Z3660_emu.elf into a fresh-looking BOOT.BIN, with a green build log
+# and no warning anywhere. Found during CYBERSTORM C2 by disassembling the shipped lean
+# image and noticing z3660_knobs_sync() did not read a mailbox word that had just been
+# added to it.
+#
+# Pinning it costs one line and removes the entire class.
+.DEFAULT_GOAL := all
+
+# The generated header-dependency files (see -MMD above). Absent on a first build, which
+# is the one build that does not need them.
+-include $(OBJS:.o=.d)
+
+.PHONY: all clean clean-all size bin elf
 
 all: $(ELF) $(BIN)
 	@echo "Generated: $(ELF) and $(BIN)"
@@ -116,4 +232,13 @@ $(BIN): $(ELF)
 
 clean:
 	rm -rf $(BUILDDIR)
+
+# All three variants at once. `clean` above removes only the dir this invocation selected,
+# which is right for a rebuild of one variant and wrong when the other two also need to go
+# -- a -D is not a tracked dependency (headers now are, via -MMD), so the variants are
+# kept apart by directory and cleaned together by this target.
+clean-all:
+	rm -rf $(ROOT)/build $(ROOT)/build-lean $(ROOT)/build-prof $(ROOT)/build-q2probe \
+	       $(ROOT)/build-abl1 $(ROOT)/build-abl2 $(ROOT)/build-abl3 $(ROOT)/build-abl4 \
+	       $(ROOT)/build-abl5
 

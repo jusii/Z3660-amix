@@ -34,6 +34,7 @@
 #include "../main.h"
 #include "cpummu.h"
 #include "cpummu030.h"
+#include "z3660_prof.h"   // CYBERSTORM C1: profiling variant -- sampler + interpreter stage buckets
 #include "cputbl.h"
 #include "cpu_prefetch.h"
 #include "uae/uaestring.h"
@@ -79,6 +80,39 @@ extern "C" void reset_autoconfig(void);
 extern int ovl;
 void fill_prefetch_quick (void);
 void custom_reset_cpu(bool hardreset, bool keyboardreset);
+void hard_reboot(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // AMIX (emulated A3000 SCSI) active; gates the warm-reboot guard
+
+/* ---- Z3660 warm-reset real-chipset quiesce -------------------------------------
+ * A real Amiga RESET resets Paula/CIA; this emulated warm (guest) reset does NOT, so
+ * AMIX leaves chip interrupts enabled+latched and the rebooted Kickstart -- which has
+ * not re-installed its handlers yet -- drowns in an EXTER (level-6) interrupt it can
+ * never clear (the storm observed at Kickstart 0x00F81212, sampler s=1 msk=2 = a
+ * level>2 IRQ held permanently asserted; a cold boot never hits this because the chips
+ * start reset).  We run on Core1, the live bus master for the emulated 68k, so these
+ * chip accesses are timeout-bounded (ps_*->arm_*_amiga_* wait_*_ack) and do NOT hang
+ * -- unlike the abandoned Core0 attempt whose arm_read_amiga spun on an ack that never
+ * came in the reset window.  Disable+clear all real Paula interrupts and clear both CIA
+ * ICR latches, then force the injected IPL to 0: ipl_main_read() only re-samples the
+ * GPIO IPL lines when ipl_read>0, so bump it and re-sample (now de-asserted), then
+ * hard-zero the two globals intlev() max()es over (read_irq, a3000_scsi_irq). */
+extern "C" void ps_write_16(unsigned int address, unsigned int value);
+extern "C" unsigned int ps_read_8(unsigned int address);
+extern "C" void ipl_main_read(void);
+extern int read_irq;
+extern volatile int a3000_scsi_irq;
+extern int ipl_read;
+static void z3660_quiesce_real_chipset_on_reset(void)
+{
+   ps_write_16(0x00DFF09A, 0x7FFF);   /* INTENA: clear master + all enable bits */
+   ps_write_16(0x00DFF09C, 0x7FFF);   /* INTREQ: clear all pending bits         */
+   (void)ps_read_8(0x00BFED01);       /* CIA-A ICR: reading clears the latch    */
+   (void)ps_read_8(0x00BFDD00);       /* CIA-B ICR: reading clears the latch    */
+   ipl_read = 4;
+   for (int i = 0; i < 8; i++) ipl_main_read();   /* re-snapshot now-idle IPL lines */
+   read_irq = 0;
+   a3000_scsi_irq = 0;
+}
 #ifdef JIT
 #include "jit/compemu_arm.h"
 #include <signal.h>
@@ -146,7 +180,20 @@ struct cputbl_data
 };
 static struct cputbl_data cpudatatbl[65536];
 
-struct mmufixup mmufixup[1];
+/* Two elements: index 1 is driven by the imported 68030-MMU table (cpuemu_32.cpp
+ * MOVES/CAS2/double-(An) handlers), the m68k_run_mmu030 CATCH path below, and
+ * cpummu030.cpp's mmu030fixupreg(1)/mmu030fixupmod(...,1). Upstream WinUAE 4.4.0
+ * sizes this [2]; the fork had shrunk it to [1] (UB once MMU mode drives idx 1).
+ *
+ * EXPLICITLY initialised to "disarmed" (reg = -1), because the zero BSS state is
+ * not neutral: cpu_restore_fixup() reads `reg >= 0` as ARMED, so a cold slot means
+ * "A0 is armed, restore it to 0" and the first fault of the session destroys A0.
+ * Upstream relies on m68k_reset() alone for this (and this port had lost the
+ * mmufixup[1] half of that -- ISSUE-52 round-8); the static initialiser makes the
+ * cold state safe by construction, independent of when reset first runs. */
+struct mmufixup mmufixup[2] = { { -1, 0 }, { -1, 0 } };
+static_assert(sizeof(mmufixup) / sizeof(mmufixup[0]) >= 2,
+              "mmufixup must hold index 1 (MMU030_REG_FIXUP) used by cpuemu_32 + run-loop CATCH");
 
 static uae_u64 fake_srp_030, fake_crp_030;
 static uae_u32 fake_tt0_030, fake_tt1_030, fake_tc_030;
@@ -665,6 +712,54 @@ static void set_x_funcs (void)
          x_do_cycles_pre = do_cycles;
          x_do_cycles_post = do_cycles_post;
       }
+   } else if (currprefs.mmu_model == 68030) {
+      // UAE_030_MMU: route every CPU memory access through the 68030 MMU
+      // translating accessors (cpummu030.h inlines). The generated cpuemu_32
+      // table (op_smalltbl_32_ff) reaches memory via the *_mmu030_state inlines
+      // -> uae_mmu030_*, NOT via the read_data_030_* pointers. We still repoint
+      // read_data_030_*/write_data_030_* from their physical defaults to the
+      // translating uae_mmu030_* accessors for completeness (consumed only by the
+      // inactive mmu030c cache family). (Verbatim shape from WinUAE 4.4.0.)
+      x_prefetch = get_iword_mmu030;     // opcode fetch in m68k_run_mmu030
+      x_get_iword = get_iword_mmu030;
+      x_next_iword = next_iword_mmu030;
+      x_next_ilong = next_ilong_mmu030;
+      x_put_long = put_long_mmu030;
+      x_put_word = put_word_mmu030;
+      x_put_byte = put_byte_mmu030;
+      x_get_long = get_long_mmu030;
+      x_get_word = get_word_mmu030;
+      x_get_byte = get_byte_mmu030;
+      x_do_cycles = do_cycles;
+      x_do_cycles_pre = do_cycles;
+      x_do_cycles_post = do_cycles_post;
+      read_data_030_bget = uae_mmu030_get_byte;
+      read_data_030_wget = uae_mmu030_get_word;
+      read_data_030_lget = uae_mmu030_get_long;
+      write_data_030_bput = uae_mmu030_put_byte;
+      write_data_030_wput = uae_mmu030_put_word;
+      write_data_030_lput = uae_mmu030_put_long;
+   } else if (currprefs.mmu_model == 68040) {
+      // UAE_040_MMU: route every CPU memory access through the 68040 MMU
+      // accessors (cpummu.h) -- distinct from the 030 pointer bank above (the
+      // 68040 uses its own TTR + table-walk/descriptor format). The generated
+      // cpuemu_31 table (op_smalltbl_31_ff) fetches operands through these; the
+      // run loop m68k_run_mmu040 fetches opcodes via x_prefetch=get_iword_mmu040.
+      // With the MMU disabled (TC.E=0) these are transparent (TTR/identity) --
+      // the validatable build-ahead path today (no 68040 AMIX kernel yet).
+      x_prefetch = get_iword_mmu040;     // opcode fetch in m68k_run_mmu040
+      x_get_iword = get_iword_mmu040;
+      x_next_iword = next_iword_mmu040;
+      x_next_ilong = next_ilong_mmu040;
+      x_put_long = put_long_mmu040;
+      x_put_word = put_word_mmu040;
+      x_put_byte = put_byte_mmu040;
+      x_get_long = get_long_mmu040;
+      x_get_word = get_word_mmu040;
+      x_get_byte = get_byte_mmu040;
+      x_do_cycles = do_cycles;
+      x_do_cycles_pre = do_cycles;
+      x_do_cycles_post = do_cycles_post;
    } else {
       // 68020+ no ce
       set_x_ifetches();
@@ -732,6 +827,13 @@ static void set_x_funcs (void)
 
    set_x_cp_funcs();
 }
+
+#ifdef HOST_TEST_HARNESS
+/* Exposes the static set_x_funcs() to the Layer-1 host MMU test harness so it can
+ * wire the x_* memory accessors after build_cpufunctbl(). Never compiled into the
+ * firmware (HOST_TEST_HARNESS is only defined by test/host/Makefile). */
+extern "C" void harness_set_x_funcs(void) { set_x_funcs(); }
+#endif
 
 bool can_cpu_tracer (void)
 {
@@ -846,18 +948,28 @@ uae_u32 REGPARAM2 op_illg_1 (uae_u32 opcode)
 }
 
 // generic+direct, generic+direct+jit, more compatible, cycle-exact
-static const struct cputbl *cputbls[5][4] =
+// UAE_030_MMU: the 68030 MMU instruction table (op_smalltbl_32_ff), generated by
+// WinUAE 4.4.0 gencpu (id 32) and living in cpuemu_32.cpp / cpustbl_mmu030.cpp.
+extern const struct cputbl op_smalltbl_32_ff[];
+// UAE_040_MMU: the 68040 MMU instruction table (op_smalltbl_31_ff), generated by
+// WinUAE gencpu (id 31) and living in cpuemu_31.cpp / cpustbl_mmu040.cpp. Linked
+// in (cputbls[4][4]) so it is retained past --gc-sections; the run loop and the
+// set_x_funcs 040 accessor arm are NOT wired yet (that is the next MMU-040 step).
+extern const struct cputbl op_smalltbl_31_ff[];
+
+// Column 4 (mode 4) is the MMU table; selected when currprefs.mmu_model is set.
+static const struct cputbl *cputbls[5][5] =
 {
-   // 68000
-   { op_smalltbl_5, op_smalltbl_45, op_smalltbl_12, op_smalltbl_14 },
+   // 68000  { direct,         jit,           compatible,    cycle-exact,   MMU }
+   { op_smalltbl_5, op_smalltbl_45, op_smalltbl_12, op_smalltbl_14, NULL },
    // 68010
-   { op_smalltbl_4, op_smalltbl_44, op_smalltbl_11, op_smalltbl_13 },
+   { op_smalltbl_4, op_smalltbl_44, op_smalltbl_11, op_smalltbl_13, NULL },
    // 68020
-   { op_smalltbl_3, op_smalltbl_43, NULL, NULL },
-   // 68030
-   { op_smalltbl_2, op_smalltbl_42, NULL, NULL },
-   // 68040
-   { op_smalltbl_1, op_smalltbl_41, NULL, NULL },
+   { op_smalltbl_3, op_smalltbl_43, NULL, NULL, NULL },
+   // 68030  (MMU column = op_smalltbl_32_ff)
+   { op_smalltbl_2, op_smalltbl_42, NULL, NULL, op_smalltbl_32_ff },
+   // 68040  (MMU column = op_smalltbl_31_ff)
+   { op_smalltbl_1, op_smalltbl_41, NULL, NULL, op_smalltbl_31_ff },
 };
 
 void build_cpufunctbl (void)
@@ -868,7 +980,12 @@ void build_cpufunctbl (void)
    int lvl, mode;
 
    if (!currprefs.cachesize) {
-      if (currprefs.cpu_cycle_exact) {
+      if (currprefs.mmu_model == 68030 || currprefs.mmu_model == 68040) {
+         mode = 4;   // UAE_030_MMU: op_smalltbl_32_ff / UAE_040_MMU: op_smalltbl_31_ff
+                     // (indirect, fault-restartable). Only the 030 and 040 rows of
+                     // cputbls carry a mode-4 table; any other mmu_model must fall
+                     // through, not index a NULL cell.
+      } else if (currprefs.cpu_cycle_exact) {
          mode = 3;
       } else if (currprefs.cpu_compatible && currprefs.cpu_model < 68020) {
          mode = 2;
@@ -996,6 +1113,12 @@ void build_cpufunctbl (void)
       write_log(_T(" 24-bit"));
    }
    write_log(_T("\n"));
+
+   /* CYBERSTORM C2 rung 1. Every decoded-op cache entry holds a RESOLVED cpufunctbl[]
+    * pointer, and the loop above has just rebuilt that table -- so a surviving entry
+    * would dispatch the previous mode's implementation of its opcode. That is a wrong
+    * instruction rather than a stale word, and it is reachable from any mode change. */
+   z3660_dopc_invalidate(Z3660_DOPC_INV_TABLE);
 
    set_cpu_caches (true);
 //   target_cpu_speed();
@@ -1489,8 +1612,17 @@ static int iack_cycle(int nr)
 {
    int vector;
 
-   // non-autovectored
-   vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
+   // The autovector IACK is an FC=7 (CPU-space) access on real HW; the 68030 MMU NEVER
+   // translates it. iack_cycle runs in Exception_normal BEFORE the supervisor-mode switch,
+   // so x_get_byte() here would walk the *current* (user) page tables when an interrupt is
+   // taken while a user task runs (e.g. AMIX init) -> bus error at 0x00FFFFFx. Under the real
+   // 030 PMMU use the bare physical bank accessor (get_byte) so the autovector read bypasses
+   // the user MMU; in supervisor/identity context get_byte_mmu030 reaches this same bank, so
+   // the value matches. Every other emulator mode keeps the upstream x_get_byte path verbatim.
+   if (currprefs.mmu_model == 68030)
+      vector = get_byte(0x00fffff1 | ((nr - 24) << 1));
+   else
+      vector = x_get_byte(0x00fffff1 | ((nr - 24) << 1));
    if (currprefs.cpu_compatible)
       x_do_cycles(4 * CYCLE_UNIT / 2);
    return vector;
@@ -1774,8 +1906,104 @@ static void add_approximate_exception_cycles(int nr)
    x_do_cycles(cycles);
 }
 
+/* ---------------------------------------------------------------------------
+ * AMIX-040 exception trace (bounded, self-arming, one boot's worth).
+ *
+ * Static analysis of the unix-040 kernel (see UAE_040_MMU_gate.md 8.9) put the
+ * page_sub/page_free panics at BOOT-STACK EXHAUSTION: `pstack` is 8000 bytes
+ * (.data+0x4 .. .data+0x1f44 => VA 0x080F45C0..0x080F6500) and both panics landed
+ * with ~92% of it consumed. Nested unresolved faults are the obvious way to eat a
+ * boot stack deterministically -- each 68040 access-error frame alone is 60 bytes --
+ * but WHICH fault repeats cannot be read out of the binary. This prints it.
+ *
+ * Arms itself when the AMIX 040 MMU comes up (amix_mmu_on, mmu_model 68040) and
+ * stops after AMIX_XTRACE_MAX lines, so it costs one comparison per exception for
+ * the rest of the boot and cannot flood. Interrupt vectors are skipped -- ISRs fire
+ * throughout and are not the fault chain. a7 is included precisely so the stack
+ * march is visible: a repeating fault shows as the same vec/fa with a7 stepping
+ * down toward 0x080F45C0.
+ *
+ * 030 is untouched (mmu_model gate), and so is any non-AMIX 040 boot.
+ * ------------------------------------------------------------------------- */
+extern "C" { extern volatile int amix_mmu_on; }
+#define AMIX_XTRACE_MAX 64
+#define AMIX_XINT_FIRST 12                       /* interrupts logged in full before summarising */
+static int amix_xtrace_n = 0, amix_xint_logged = 0, amix_xint_sums = 0;
+static int amix_rte_probe_n = 0;   /* ISSUE-52 RTE frame probe, capped */
+static int amix_urte_probe_n = 0;  /* ISSUE-52 user-transition RTE probe (syscall-return capture), capped */
+static int amix_ustep_n = 0;       /* ISSUE-52 round-5: single-step the first user instructions (icode), capped */
+static uae_u32 amix_int_n[8], amix_int_minsp[8], amix_int_total = 0;
+static uae_u32 amix_xt_minsp = 0xFFFFFFFFu;
+static int amix_xt_init = 0;
+
+static void amix_xint_summary(const char *why)
+{
+   z3660_printf("[XI-SUM] %s total=%lu minSP=%08lX (pstack 080F45C0..080F6500)\r\n",
+                why, (unsigned long)amix_int_total, (unsigned long)amix_xt_minsp);
+   for (int i = 0; i < 8; i++) {
+      if (!amix_int_n[i]) continue;
+      z3660_printf("[XI-SUM]   lvl%d n=%-8lu minSP=%08lX\r\n",
+                   i, (unsigned long)amix_int_n[i], (unsigned long)amix_int_minsp[i]);
+   }
+}
+
+static void amix_xtrace(int nr)
+{
+   if (!amix_mmu_on || currprefs.mmu_model != 68040) return;
+   if (!amix_xt_init) { amix_xt_init = 1; for (int i = 0; i < 8; i++) amix_int_minsp[i] = 0xFFFFFFFFu; }
+
+   uae_u32 sp = m68k_areg(regs, 7);
+   if (sp < amix_xt_minsp) amix_xt_minsp = sp;
+
+   /* INTERRUPTS. The first trace deliberately skipped these, and that is precisely what
+    * hid the answer: XT01 arrived with pstack already ~92% consumed and no non-interrupt
+    * exception before it, so whatever ate ~7 KB did it here or in ordinary execution.
+    * Counted per level with a stack high-water mark, first few logged in full, then
+    * summarised periodically -- a storm cannot hide and cannot flood the serial. */
+   if (nr >= 24 && nr < 32) {
+      int lvl = nr - 24;
+      amix_int_n[lvl]++; amix_int_total++;
+      if (sp < amix_int_minsp[lvl]) amix_int_minsp[lvl] = sp;
+      if (amix_xint_logged < AMIX_XINT_FIRST) {
+         amix_xint_logged++;
+         z3660_printf("[XI%02d] lvl=%d vec=%-2d pc=%08lX sr=%04lX a7=%08lX vbr=%08lX vec@=%08lX\r\n",
+                      amix_xint_logged, lvl, nr, (unsigned long)m68k_getpc(),
+                      (unsigned long)regs.sr, (unsigned long)sp, (unsigned long)regs.vbr,
+                      (unsigned long)x_get_long(regs.vbr + 4 * nr));
+      } else if ((amix_int_total & 0x3FFFu) == 0 && amix_xint_sums < 8) {
+         amix_xint_sums++;
+         amix_xint_summary("periodic");
+      }
+      return;
+   }
+
+   if (amix_xtrace_n >= AMIX_XTRACE_MAX) return;
+   amix_xtrace_n++;
+   if (amix_xtrace_n == 1) amix_xint_summary("at first non-interrupt exception");
+   z3660_printf("[XT%02d] vec=%-2d ipc=%08lX pc=%08lX fa=%08lX ssw=%04lX sr=%04lX a7=%08lX vbr=%08lX\r\n",
+                amix_xtrace_n, nr,
+                (unsigned long)regs.instruction_pc, (unsigned long)m68k_getpc(),
+                (unsigned long)regs.mmu_fault_addr, (unsigned long)(regs.mmu_ssw & 0xffff),
+                (unsigned long)regs.sr, (unsigned long)sp, (unsigned long)regs.vbr);
+   if (nr == 3 || nr == 2) {
+      /* For vector 3 the interesting number is the ODD address that caused it -- which is
+       * often the exception VECTOR itself: Exception_normal() raises exception 3 through
+       * exception3_notinstruction() when the longword at vbr + 4*nr is odd. So an odd
+       * vector-table entry for some EARLIER exception presents here as vec=3 at an even pc. */
+      z3660_printf("[XT%02d]   fault=%08lX addr=%08lX vec3@=%08lX\r\n", amix_xtrace_n,
+                   (unsigned long)last_fault_for_exception_3,
+                   (unsigned long)last_addr_for_exception_3,
+                   (unsigned long)x_get_long(regs.vbr + 4 * 3));
+   }
+   if (amix_xtrace_n == AMIX_XTRACE_MAX) {
+      amix_xint_summary("at trace close");
+      z3660_printf("[XT] %d exceptions traced -- trace closed\r\n", AMIX_XTRACE_MAX);
+   }
+}
+
 static void Exception_normal (int nr)
 {
+   amix_xtrace(nr);
    uae_u32 newpc;
    uae_u32 currpc = m68k_getpc();
    uae_u32 nextpc;
@@ -1833,10 +2061,43 @@ static void Exception_normal (int nr)
       nextpc = exception_pc (nr);
       if (nr == 2 || nr == 3) {
          int i;
-         if (currprefs.cpu_model >= 68040) {
-            if (nr == 2) {
+         // NOTE the `== 68030`: this arm is the 68030 PMMU's frame $A/$B builder and reads
+         // 030-only state (mmu030_state[], the 030-shaped regs.mmu_ssw). It used to test a
+         // bare `currprefs.mmu_model`, which is TRUTHY for mmu_model == 68040 -- so under
+         // UAE_040_MMU every 68040 bus error was handed an 030 frame built from state the
+         // 040 table walk never maintains, and control never reached the cpu_model >= 68040
+         // arm below. The 68040's own access-error frame is built there now.
+         if (currprefs.mmu_model == 68030 && nr == 2) {
+            // UAE_030_MMU: a real 68030 data/instruction bus fault from the page-fault
+            // engine. mmu030_page_fault() already computed regs.mmu_ssw (with DF set and
+            // the real RW/SIZE/FC) and regs.mmu_fault_addr; stack them VERBATIM so that
+            // m68k_do_rte_mmu030() re-performs the faulted access on RTE (it is gated on
+            // ssw & MMU030_SSW_DF). Frame A (short) if the instruction's LAST write
+            // faulted, else frame B (long). Restores the WinUAE 4.4.0 mmu_model branch the
+            // fork dropped: without it the nr==2 path below synthesizes an SSW with no DF
+            // and a stale fault address, so demand paging never resumes (AMIX won't boot).
+            int frameformat = (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) ? 0xa : 0xb;
+            Exception_build_stack_frame(regs.instruction_pc, currpc, regs.mmu_ssw, nr, frameformat);
+            used_exception_build_stack_frame = true;
+         } else if (currprefs.cpu_model >= 68040) {
+            if (nr == 2 && currprefs.mmu_model == 68040) {
+               // UAE_040_MMU: a real 68040 access error out of the 040 table walk.
+               // mmu_bus_error() has already computed the whole fault record -- SSW (TM=FC,
+               // SIZE, RW, ATC, plus CM/LK/TT for MOVEM/locked/MOVES), the fault address,
+               // the effective address, and the pending write-back (wb3_status/wb3_data,
+               // and wb2_status/wb2_address for a MOVE16 line). Stack it as the genuine
+               // format $7 access-error frame so the guest kernel's write-back handler can
+               // complete the store the 68040 does NOT re-run on rte.
+               Exception_build_stack_frame(regs.mmu_effective_addr, currpc, regs.mmu_ssw, nr, 0x07);
+               used_exception_build_stack_frame = true;
+            } else if (nr == 2) {
 
                   // 68040 bus error (not really, some garbage?)
+                  // MMU-OFF 040 modes only (UAE_040 / UAEJIT_040): there is no 040 fault
+                  // record to stack, so this synthesized frame is left exactly as it was.
+                  // (A 68060 MMU would land here too, but mmu_model 68060 is unreachable --
+                  // cpuemu_33 is not built and no BOOTMODE selects it. A future 060 lane
+                  // needs its own arm here, not this one and not the 68030 one above.)
                   for (i = 0 ; i < 18 ; i++) {
                      m68k_areg (regs, 7) -= 2;
                      x_put_word (m68k_areg (regs, 7), 0);
@@ -2107,6 +2368,15 @@ void m68k_reset_newcpu(bool hardreset)
 
    regs.pissoff = 0;
 
+   /* UAE_030_MMU: a 68030 CPU reset zeroes the E-bits of TC/TT (translation off).
+    * The firmware otherwise never resets the real MMU engine, so after AMIX enables
+    * it a warm reset (this fn is the boot AND the n040RSTI GPIO reset path) would run
+    * the reset-vector fetch (get_long(4) below) through the previous session's stale
+    * page tables. mmu030_reset clears mmu030.enabled + TC E-bit (hardreset>=0) and,
+    * for a full reset, SRP/CRP/TT/ATC (hardreset>0). Must precede the get_long(4). */
+   if (currprefs.mmu_model == 68030)
+      mmu030_reset(hardreset ? 1 : 0);
+
    regs.halted = 0;
 //   gui_data.cpu_halted = 0;
 //   gui_led (LED_CPU, 0, -1);
@@ -2136,6 +2406,22 @@ void m68k_reset_newcpu(bool hardreset)
    regs.s = 1;
    v = get_long (4);
    printf("Read PC from address 4 : 0x%08X\n",v);
+#ifndef HOST_TEST_HARNESS
+   /* AMIX warm-reboot guard: on `reboot`/`uadmin`, AMIX has cleared the overlay so $0-$8 is chip RAM,
+    * not the Kickstart ROM, and the emulator does not restore it on a 68k reset -> get_long(4) returns
+    * garbage (e.g. 0xFFFFFFFF) instead of the Kickstart reset PC. Letting the 68k run from a garbage PC
+    * scribbles the Z3660 PISCSI registers (the "Unhandled register write" flood) and only ends when a
+    * Data Abort triggers hard_reboot() anyway. So detect the invalid vector (a valid reset PC lives in
+    * the Kickstart ROM, $F00000-$1000000) and do that clean reboot immediately -- no flood, no garbage
+    * execution. The cold-boot vector (Kickstart ROM overlaid at 0 on the real bus) is always valid, so
+    * this never false-fires on a normal boot. Gated on a3000_amix_mode so it engages ONLY under AMIX --
+    * other CPU modes/configs are untouched. (A true in-place warm restart would need the overlay/030-MMU
+    * state fully reset so get_long could fetch the ROM vector at $0/$4 without faulting -- not done here.) */
+   if (a3000_amix_mode && (v < 0x00F00000 || v >= 0x01000000)) {
+      printf("[Core1] Invalid reset vector 0x%08X (AMIX warm reboot, overlay not restored) -> clean reboot\n", v);
+      hard_reboot();
+   }
+#endif
    m68k_areg (regs, 7) = get_long (0);
 
    m68k_setpc_normal(v);
@@ -2157,12 +2443,57 @@ void m68k_reset_newcpu(bool hardreset)
    regs.caar = regs.cacr = 0;
    regs.itt0 = regs.itt1 = regs.dtt0 = regs.dtt1 = 0;
    regs.tcr = regs.mmusr = regs.urp = regs.srp = 0;
+   // The registers above are cleared, but on the 68040 path clearing them is only half a
+   // reset: regs.mmu_enabled, the page geometry (mmu_pagesize_8k and the masks/shifts), the
+   // mmu_ttr_enabled/_ins/_data flags and the ATC all live OUTSIDE regs and are only ever
+   // recomputed by mmu_set_tc() and mmu_tt_modified(). This is the same shape as the
+   // MOVEC->TC and mmu_op bugs: the register is stored, the side-effect function is never
+   // called -- third instance.
+   //
+   // Left unapplied, a guest WARM RESET carries the previous session's MMU state into the
+   // Kickstart ROM that runs next: mmu_ttr_enabled_ins stays true while itt0 is now zero, so
+   // mmu_match_ttr_ins() finds no match; regs.mmu_enabled stays true, so the accessor walks
+   // the tables anyway; and srp/urp are now zero, so the walk reads descriptors from address
+   // 0. That is precisely the metal signature of cycle 2 -- an ATC fault on an instruction
+   // fetch of kernel text that ITT0 covers (vec=2 fa=0800ABEA ssw=0546, TM=6), address
+   // specific because the stale ATC still had valid entries for the handlers that did fetch
+   // fine -- and it is why cycles 2 and 3 wedged in early KS before the strap while cycle 1
+   // ran for 2:20.
+   //
+   // 68030 is untouched: the guard is on mmu_model, and the 030 PMMU keeps its state in
+   // mmu030.* which mmu030_reset() already handles.
+   if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) {
+      mmu_tt_modified();        // recompute mmu_ttr_enabled/_ins/_data from the now-zero TTRs
+      mmu_set_tc(0);            // clears regs.mmu_enabled + page geometry, and flushes the ATC
+   }
+   // AMIX: a guest reset means the AMIX kernel is gone and the Kickstart ROM runs next, so
+   // the emulated A3000 SCSI must return to ROM-load timing. amix_mmu_on is latched when the
+   // kernel brings its MMU up (cpummu030.cpp on 030, mmu_set_tc() on 040) and was never
+   // cleared, so every cycle after the first ran the ROM's kernel load under AMIX-RUNTIME
+   // pacing -- paced completions, per-access pump suppressed -- instead of the immediate
+   // completion regime the code comments call "the proven kernel-load behavior". This makes
+   // every cycle start in the state cycle 1 starts in, which is the metal-proven one; the
+   // kernel re-latches the flag as soon as it enables its MMU again.
+   amix_mmu_on = 0;
    if (currprefs.cpu_model == 68020) {
       regs.cacr |= 8;
       set_cpu_caches (false);
    }
 
+   // BOTH fixup slots, as upstream (amiberry src/newcpu.cpp:3703-3704 / WinUAE
+   // m68k_reset2). The port kept only slot 0, and on the 68040 path nothing else
+   // ever clears slot 1: cpuemu_31 arms slot 0 only (388 sites, zero for slot 1),
+   // and cpu_restore_fixup() -- which m68k_run_mmu040's CATCH calls on every fault
+   // -- treats the BSS-zero slot as "A0 armed, restore 0". So the FIRST bus fault
+   // of an AMIX-040 boot wrote 0 into A0. That fault is the icode copyout's
+   // first-touch write (lcolloop's `moves.l d1,(a1)+`, DFC=1), whose source pointer
+   // IS A0: the copy resumed reading from guest address 0 and filled proc 1's text
+   // page with low memory (0x4AFC0000, the pseudo-ExecBase, the KS ROM vector
+   // stubs) -- ISSUE-52's garbage user PC and the ISSUE-10 signature both.
+   // The 68030 path never showed it: m68k_run_mmu030's CATCH clears both slots on
+   // its first fault, harmlessly, long before anything reads them.
    mmufixup[0].reg = -1;
+   mmufixup[1].reg = -1;
    if (currprefs.cpu_model >= 68040) {
       set_cpu_caches(false);
    }
@@ -2416,27 +2747,40 @@ static bool mmu_op30fake_pflush (uaecptr pc, uae_u32 opcode, uae_u16 next, uaecp
 bool mmu_op30 (uaecptr pc, uae_u32 opcode, uae_u16 extra, uaecptr extraa)
 {
    int type = extra >> 13;
-   bool fline = false;
+   /* tri-state: 0 ok, 1 = F-line, -1 = MMU config exception only (no F-line).
+    * Backport of WinUAE a333766b. mmu_op30_pmove returns the int; the other
+    * handlers still return bool (0/1). */
+   int fline = 0;
 
    switch (type)
    {
    case 0:
    case 2:
    case 3:
-      fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
+      // UAE_030_MMU: real PMOVE actually loads TC/SRP/CRP/TT into the engine.
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pmove (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pmove (pc, opcode, extra, extraa);
       break;
    case 1:
-      fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_pflush (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_pflush (pc, opcode, extra, extraa);
       break;
    case 4:
-      fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
+      if (currprefs.mmu_model)
+         fline = mmu_op30_ptest (pc, opcode, extra, extraa);
+      else
+         fline = mmu_op30fake_ptest (pc, opcode, extra, extraa);
       break;
    }
-   if (fline) {
+   if (fline > 0) {
       m68k_setpc(pc);
       op_illg(opcode);
    }
-   return fline;
+   return fline != 0;
 }
 
 /* check if an address matches a ttr */
@@ -2479,8 +2823,32 @@ static int fake_mmu_match_ttr(uaecptr addr, bool super, bool data)
 }
 
 // 68040+ MMU instructions only
+// 68040+ MMU instructions (PFLUSH / PFLUSHN / PFLUSHA / PFLUSHAN / PTEST / PLPA).
 void mmu_op (uae_u32 opcode, uae_u32 extra)
 {
+   // RESTORED from WinUAE/Amiberry (this fork had dropped these three lines, the same way it
+   // dropped the mmu_model branch in Exception_normal). Without them EVERY 68040 MMU
+   // instruction fell through into the "fake" path below -- the one meant for configs with
+   // NO MMU model -- so under UAE_040_MMU:
+   //   PFLUSH/PFLUSHA  = a complete no-op. regs.mmusr was cleared and nothing else happened;
+   //                     the real ATC (mmu_atc_array) and the MMU_DPAGECACHE shortcut arrays
+   //                     kept serving translations the guest had just invalidated.
+   //   PTEST           = fabricated. It consulted fake_mmu_match_ttr() only, never walked the
+   //                     guest's tables, and reported an MMUSR built from the address.
+   // Both sit squarely on AMIX's VM-init path: the kernel edits page tables and PFLUSHes, and
+   // its 040 fault classifier (amix-040-060-port src/getfault040.s) PTESTs to decide how to
+   // resolve a fault. Stale translations plus a fabricated MMUSR is how the 68040 kernel died
+   // in page_sub/page_free (metal, images 6FDBDA40 and D910C41A).
+   //
+   // cpuemu_31.cpp's six F5xx handlers call mmu_op(opcode, 0) -- byte-identical to Amiberry's,
+   // which is the bench-proven core; the divergence was here, not in the generated table.
+   // The 68030 does not come through this function at all (cpuemu_32 calls mmu_op30()), and
+   // the fake path below still runs verbatim for every mmu_model == 0 configuration, so
+   // UAE_030_MMU, UAE_040 and UAEJIT_040 are all untouched.
+   if (currprefs.mmu_model) {
+      mmu_op_real (opcode, extra);
+      return;
+   }
    if ((opcode & 0xFE0) == 0x0500) {
       /* PFLUSH */
       regs.mmusr = 0;
@@ -2527,20 +2895,356 @@ int pissoff_int=1024;
 int set_special_var=1;
 void z3660_tasks(void);
 extern "C" void ipl_main_read(void);
+extern "C" { extern volatile int a3000_amix_mode; }   // A3000 SCSI WD33C93 int-countdown pump
+extern "C" { extern volatile uae_u32 amix_tick; }     // TEMP: ~guest-instruction counter for INT2 latency
+extern "C" void a3000_scsi_hsync(void);
+// a3000_scsi.cpp gates AMIX completion delivery on the guest's CPU interrupt mask so a SCSI INT2 is
+// taken at most once per command at an instruction boundary OUTSIDE the level-2 ISR — never while
+// a3091intr is mid-flight issuing the next autonomous command (which would ack/lose the new completion).
+extern "C" int amix_cpu_intmask(void) { return (int)regs.intmask; }
+// ===== AMIX sleep-channel trace (TEMP — remove before commit) =====
+// Walk the AMIX 030 supervisor page tables (srp_030) to read a kernel SCN1 VA. DT-aware.
+extern uae_u64 srp_030;
+static uae_u32 amix_kget2(uae_u32 va){
+   uae_u32 idx[3]={(va>>30)&3,(va>>17)&0x1FFF,(va>>11)&0x3F};
+   uae_u32 tbl=(uae_u32)srp_030&0xFFFFFFF0u; int dt=(int)((srp_030>>32)&3);
+   for(int l=0;l<3;l++){ int ds=(dt==3)?8:4; uae_u32 da=tbl+idx[l]*ds;
+      uae_u32 d0=get_long(da), aw=(ds==8)?get_long(da+4):d0;
+      if((d0&3)==0) return 0xDEADBEEFu;
+      if(l==2||(d0&3)==1) return get_long((aw&0xFFFFF800u)|(va&0x7FF));
+      tbl=aw&0xFFFFFFF0u; dt=(int)(d0&3); }
+   return 0xDEADBEEFu;
+}
+// expose guest CPU PC / frame so a3000_scsi.cpp can record WHO reads WD_SCSI_STATUS (TEMP)
+extern "C" uae_u32 amix_cpu_pc(void){ return (uae_u32)regs.instruction_pc; }
+extern "C" uae_u32 amix_cpu_a6(void){ return (uae_u32)m68k_areg(regs,6); }
+extern "C" uae_u32 amix_cpu_kread(uae_u32 va){ return amix_kget2(va); }
+static uae_u32 amix_slpchan[8], amix_slpcaller[8]; static int amix_slphead=0;
+static uae_u32 amix_slpstk[8][6];   // TEMP: kernel call-stack (6 return addrs via a6 chain) per sleep -> trace init's block path
+static uae_u32 amix_swapconf_n=0, amix_swapadd_n=0, amix_swap_openres=0xdead, amix_swap_sizeres=0xdead, amix_swap_devsz=0, amix_lookupname_n=0, amix_lookup_res=0xdead;  // TEMP: swap-config flow trace
+static uae_u32 amix_ih_n=0, amix_ih_div=0, amix_ih_fdone=0, amix_ih_fhead=0, amix_ih_ftick=0, amix_ih_ldone=0, amix_ih_lhead=0;  // TEMP: ihandle FIFO-divergence (completed buf a0 vs ddtab.HEAD a3)
+static uae_u32 amix_bb_n=0, amix_bb_stk[8]={0}, amix_bb_parent=0;  // TEMP: buf_breakup caller chain (who re-reads init text 179456-179468)
+static uae_u32 amix_oss_chan[16]={0}, amix_oss_caller[16]={0}, amix_oss_tick[16]={0}, amix_oss_stk[16][4]={{0}}; static int amix_oss_valid[16]={0};  // TEMP: outstanding-sleep table (sleep adds, wakeprocs removes) -> the sleep never-woken = init terminal block
+static uae_u32 amix_donebuf[16], amix_donetick[16], amix_donecaller[16]; static int amix_donehead=0;  // TEMP: biodone(bp) buf+tick+caller ring
+static uae_u32 amix_selflink=0, amix_biodone_last=0, amix_biodone_same=0, amix_biodone_maxsame=0;  // TEMP: detect Q1 self-link (bp->av_forw==bp) + repeated same-buf biodone (the write loop)
+static uae_u32 amix_stuckbuf=0, amix_stucktick=0;                                // TEMP: last buf_breakup biowait target
+static uae_u32 amix_pageinbuf=0, amix_pageintick=0;                              // TEMP: last ufs_getapage(0x07082398) biowait buf = the stranded page-in
+static uae_u32 amix_a3091_istate[8]={0,0,0,0,0,0,0,0};                           // TEMP: (unused now) istate histogram
+static uae_u32 amix_issue_buf[16], amix_issue_unit[16], amix_issue_tick[16]; static int amix_issue_h=0;  // TEMP: bufs startany ISSUES (a3) + unit (a4)
+static uae_u32 amix_disp_csr[16], amix_disp_act[16], amix_disp_tick[16]; static int amix_disp_h=0;  // TEMP: a3091intr@0xd142 dispatch (d2=csr, d0=action)
+static uae_u32 amix_disp_acthist[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};  // TEMP: count per dispatched action (action 1 = badhardware = the strand)
+static uae_u32 amix_badhw_n=0, amix_badhw_tick=0;  // TEMP: a3091 badhardware(0x700cf46) hits = completion dispatched with NO biodone
+static int amix_ddcrit=0; static uae_u32 amix_ddstrat_n=0, amix_preempt_n=0, amix_preempt_tick=0;  // TEMP: a3091intr ENTERED during ddstrategy's IPL2 splbio window = the IPL-preemption strand
+static uae_u32 amix_dds_buf[16], amix_dds_valid[16], amix_dds_path[16], amix_dds_tick[16]; static int amix_dds_h=0, amix_dds_cur=-1;  // TEMP: ddstrategy(buf) fate: sdvalid + dispatch path (0=pending 1=startio/dispatch 2=append-no-kick 3=sdvalid-REJECT)
+static uae_u32 amix_dds_reject_n=0, amix_dds_reject_buf=0;  // TEMP: count of sdvalid rejects (ddstrategy drops buf with NO enqueue + NO biodone)
+// PARENT-COMPLETION ACCOUNTING (verdict's experiment): the page-in process biowaits a parent buf woken when a per-parent
+// child-count hits 0. If a child completes WITHOUT decrementing its parent (b_iodone not yet wired = the synchronous-DMA
+// race), the count never hits 0 -> parent never biodone'd -> biowait forever.
+static uae_u32 amix_gio_par[16], amix_gio_cnt[16], amix_gio_child[16]; static int amix_gio_h=0;  // gen_iodone@0x703d940: parent (child->+0x50), count AFTER decrement, child
+static uae_u32 amix_pbio_buf[16]; static int amix_pbio_h=0;          // biodone no-callback (parent/standalone) @0x703ce34: buf set B_DONE+wakeprocs
+static uae_u32 amix_gio_n=0, amix_gio_orphan_n=0, amix_pbio_n=0, amix_cbio_n=0;  // counts: gen_iodone calls, orphan(child->+0x50==0), parent-biodones, child(callback)-biodones
+static uae_u32 amix_bw_buf[8]; static int amix_bw_h=0;               // biowait@0x703cd2c entry: buf a2 (what the page-in process blocks on)
+extern "C" { extern volatile uae_u32 amix_scmd_unit[16],amix_scmd_lba[16],amix_scmd_n[16],amix_scmd_w[16]; extern volatile int amix_scmd_head; }
+extern "C" void a3000_scsi_dumpstate(void);
+extern "C" void a3000_scsi_dumpqueue(void);
+extern "C" { extern volatile uae_u32 amix_wcmd_cmd[16],amix_wcmd_dest[16],amix_wcmd_ph[16]; extern volatile int amix_wcmd_head; }
+extern "C" { extern volatile uae_u32 amix_compl_tick[16],amix_compl_istate[16],amix_compl_csr[16],amix_compl_unit[16],amix_compl_head[16]; extern volatile int amix_compl_h; }
+// ===== STRAND TRACE (TEMP) — per-buf lifecycle to locate where the stranded page-in completion is lost =====
+// stage: 1=ddstrategy entered, 2=startany issued, 3=a3091intr HBA-complete, 4=biodone. ddstrategy(1) RESETS (handles buf-addr reuse).
+// After the strand the system goes idle (no new I/O), so the stranded buf's entry survives = its final stage shows where it stopped.
+#define AMIX_STRK_N 96
+static uae_u32 strk_buf[AMIX_STRK_N]={0}, strk_stg[AMIX_STRK_N]={0};
+static uae_u32 strk_t1[AMIX_STRK_N]={0},strk_t2[AMIX_STRK_N]={0},strk_t3[AMIX_STRK_N]={0},strk_t4[AMIX_STRK_N]={0};
+static uae_u32 strk_ca2=0,strk_ca2_4=0,strk_ca2_1c=0,strk_ca2_20=0;   // a3091intr COMPLETE: resolve a2 = cmd-node vs buf (one sample)
+static uae_u32 amix_done_lba[16]={0}, amix_done_fn[16]={0};   // biodone: buf b_blkno(+0x28) + the TRUE completion fn (iodone's caller, 1 frame up)
+static uae_u32 amix_d16e_n=0;   // a3091intr COMPLETE-arm ENTRY (0x700d16e, the jmp target) hit count — tests jmp-target hook visibility
+static uae_u32 amix_bd_total=0, amix_bd_haveiod=0, amix_bd_shouldcb=0;   // biodone: total, with b_iodone(+48)!=0, with b_iodone&&B_CALL(bit29) [should take callback]
+static uae_u32 amix_bd_iodr[12]={0}, amix_bd_flr[12]={0}, amix_bd_bufr[12]={0}; static int amix_bd_h=0;   // ring of biodones that HAVE a b_iodone
+static uae_u32 amix_pio_su_buf=0, amix_pio_su_iod=0, amix_pio_su_gp=0, amix_pio_su_fl=0, amix_pio_su_n=0;   // ufs_getapage: buf at pageio_setup return (0x70822d8)
+static uae_u32 amix_pio_wt_buf=0, amix_pio_wt_iod=0, amix_pio_wt_gp=0, amix_pio_wt_fl=0, amix_pio_wt_n=0;   // ufs_getapage: buf right before biowait (0x7082390) — stale-at-setup vs set-by-strategy
+static uae_u32 amix_app_n=0, amix_app_drained_n=0, amix_app_ot=0, amix_app_otf=0, amix_app_buf=0, amix_app_tick=0;   // ddstrategy APPEND: count appends onto an already-DRAINED (B_DONE) tail = the IPL2-bypass strand
+static int strk_idx(uae_u32 b){ if(!b) return -1; unsigned h=(b>>4)%AMIX_STRK_N; for(unsigned i=0;i<AMIX_STRK_N;i++){ unsigned j=(h+i)%AMIX_STRK_N; if(strk_buf[j]==b) return (int)j; if(strk_buf[j]==0){ strk_buf[j]=b; return (int)j; } } return -1; }
+static void strk_mk(uae_u32 b,int s,uae_u32 t){ int j=strk_idx(b); if(j<0) return; if(s==1){ strk_stg[j]=1; strk_t1[j]=t; strk_t2[j]=strk_t3[j]=strk_t4[j]=0; } else { if((uae_u32)s>strk_stg[j]) strk_stg[j]=(uae_u32)s; if(s==2)strk_t2[j]=t; else if(s==3)strk_t3[j]=t; else if(s==4)strk_t4[j]=t; } }
 static inline void check_uae_int_request(void)
 {
    z3660_tasks();
    ipl_main_read();
+   // A3000 SCSI WD33C93 interrupt-delay pump: advances the status countdown on a fixed cadence in
+   // EVERY CPU run loop (including the MMU-off loop the Kickstart ROM uses to load the kernel), so the
+   // SELECT and SRV_REQ INT2s stay spaced for AMIX's step-by-step sd open WITHOUT stalling the boot load.
+   if(a3000_amix_mode){ amix_tick++; static int scsi_hctr=0; if(++scsi_hctr>=256){ scsi_hctr=0; a3000_scsi_hsync(); } }
+   // ===== AMIX sleep-channel + PC sampler (TEMP) — gated behind debug_emu (DEMU) so it is OFF by
+   // default; this per-instruction PC sampling (~40 compares + guest reads) was a real AMIX perf
+   // drain. Turn DEMU on to re-arm it for a3091 work; the dumps need a moment to re-accumulate. =====
+   if(a3000_amix_mode && shared->debug_emu){
+      uae_u32 ipc=(uae_u32)regs.instruction_pc;
+      if(ipc==0x0700BED8u){ amix_ddcrit=1; amix_ddstrat_n++; }   // ddstrategy: just did move.w #$2200,sr (IPL2 splbio) -> enter critical
+      if(ipc==0x0700BF04u){ amix_ddcrit=0; }                       // ddstrategy: move.w d2,sr (splx) -> leave critical
+      if(ipc==0x0700D0E0u && amix_ddcrit){ amix_preempt_n++; amix_preempt_tick=amix_tick; }  // a3091intr ENTERED while ddstrategy holds IPL2 = IPL-preemption violation
+      if(ipc==0x0700D142u){   // a3091intr: d0 = atab[istate*9+itab[csr]] = the dispatched ACTION (just set @0xd13e); d2 = csr
+         int h=amix_disp_h&15; uae_u32 act=(uae_u32)(m68k_dreg(regs,0)&0xff);
+         amix_disp_csr[h]=(uae_u32)(m68k_dreg(regs,2)&0xff); amix_disp_act[h]=act; amix_disp_tick[h]=amix_tick; amix_disp_h++;
+         if(act<16) amix_disp_acthist[act]++;
+      }
+      if(ipc==0x0700D16Eu) amix_d16e_n++;   // a3091intr COMPLETE-arm entry (the jmp target) — does a jmp-target PC-hook fire? (0x700d17e never did)
+      if(ipc==0x070822D8u){ uae_u32 b=(uae_u32)m68k_areg(regs,0); amix_pio_su_buf=b; amix_pio_su_iod=amix_kget2(b+0x48u); amix_pio_su_gp=amix_kget2(b+0x50u); amix_pio_su_fl=amix_kget2(b+0x0u); amix_pio_su_n++; }   // ufs_getapage: pageio_setup just returned buf=a0
+      if(ipc==0x07082390u){ uae_u32 b=(uae_u32)m68k_areg(regs,2); amix_pio_wt_buf=b; amix_pio_wt_iod=amix_kget2(b+0x48u); amix_pio_wt_gp=amix_kget2(b+0x50u); amix_pio_wt_fl=amix_kget2(b+0x0u); amix_pio_wt_n++; }   // ufs_getapage: about to biowait(a2)
+      if(ipc==0x0700CF46u){ amix_badhw_n++; amix_badhw_tick=amix_tick; }   // badhardware: a completion that biodones NOTHING
+      if(ipc==0x0700BE9Au){   // ddstrategy: d0 = sdvalid() result (tst.b d0 next), a2 = buf. Records EVERY ddstrategy call's fate.
+         int h=amix_dds_h&15; amix_dds_buf[h]=(uae_u32)m68k_areg(regs,2);
+         uae_u32 v=(uae_u32)(m68k_dreg(regs,0)&0xff); amix_dds_valid[h]=v; amix_dds_path[h]=v?0:3; amix_dds_tick[h]=amix_tick;
+         amix_dds_cur=h; amix_dds_h++; strk_mk((uae_u32)m68k_areg(regs,2),1,amix_tick);   // STRK stage1: ddstrategy entered (resets buf entry)
+         if(!v){ amix_dds_reject_n++; amix_dds_reject_buf=(uae_u32)m68k_areg(regs,2); }   // sdvalid REJECT: dropped with no enqueue, no biodone
+      }
+      if(ipc==0x0700BEFCu && amix_dds_cur>=0){ amix_dds_path[amix_dds_cur]=1; }   // startio: DDTAB was empty -> dispatched
+      if(ipc==0x0700BEE4u){   // ddstrategy APPEND (a0=old TAIL, a2=buf): DDTAB non-empty -> appended, relies on in-flight completion to re-kick
+         if(amix_dds_cur>=0) amix_dds_path[amix_dds_cur]=2;
+         amix_app_n++;
+         uae_u32 ot=(uae_u32)m68k_areg(regs,0), otf=amix_kget2(ot);
+         if(otf&2u){ amix_app_drained_n++; amix_app_ot=ot; amix_app_otf=otf; amix_app_buf=(uae_u32)m68k_areg(regs,2); amix_app_tick=amix_tick; }   // appended onto an ALREADY-DRAINED (B_DONE) tail = the IPL2-bypass strand
+      }
+      // --- PARENT-COMPLETION accounting (verdict's experiment) ---
+      if(ipc==0x0703D8D6u){   // gen_iodone entry: a0 = child buf; child->+0x50 = parent (0 = orphan = lost decrement)
+         amix_gio_n++; if(amix_kget2((uae_u32)m68k_areg(regs,0)+0x50u)==0) amix_gio_orphan_n++;
+      }
+      if(ipc==0x0703D940u){   // gen_iodone: just did subq.l #1,$54(a2); a2 = parent, a0 = child. Count AFTER decrement.
+         int h=amix_gio_h&15; amix_gio_par[h]=(uae_u32)m68k_areg(regs,2); amix_gio_child[h]=(uae_u32)m68k_areg(regs,0);
+         amix_gio_cnt[h]=amix_kget2((uae_u32)m68k_areg(regs,2)+0x54u); amix_gio_h++;
+      }
+      if(ipc==0x0703CE28u){ amix_cbio_n++; }   // biodone: child path (b_iodone callback = gen_iodone) -> decrements a parent
+      if(ipc==0x0703CE34u){   // biodone: no-callback path -> set B_DONE + (if sync) wakeprocs. This is a parent/standalone buf.
+         amix_pbio_n++; int h=amix_pbio_h&15; amix_pbio_buf[h]=(uae_u32)m68k_areg(regs,2); amix_pbio_h++;
+      }
+      if(ipc==0x0703CD34u){   // biowait entry: just did movea.l $8(a6),a2 -> a2 = the buf the page-in process blocks on
+         int h=amix_bw_h&7; amix_bw_buf[h]=(uae_u32)m68k_areg(regs,2); amix_bw_h++;
+      }
+      if(ipc==0x070485F4u){   // sleep(chan,pri): just after 'link.w a6,#0', so caller=(a6+4), chan=(a6+8)
+         uae_u32 a6=(uae_u32)m68k_areg(regs,6);
+         uae_u32 caller=amix_kget2(a6+4);
+         if((caller<0x07059000u||caller>=0x0705A000u) && caller!=0x0703D9F0u){   // skip swapper/sched idle (0x07059xxx) AND buf_breakup (0x0703D9F0) so init's blocking sleep is retained
+            uae_u32 chan=amix_kget2((uae_u32)m68k_areg(regs,7)+4);   // REAL sleep chan (sleep's 1st arg on the stack, a7+4 before its link executes)
+            int sh=amix_slphead&7;
+            amix_slpcaller[sh]=caller;
+            amix_slpchan[sh]=chan;
+            // walk the kernel call stack (a6 frame chain) -> 6 return addrs, to trace init's syscall->sleep path
+            { uae_u32 fp=a6; for(int L=0;L<6;L++){ if(fp<0x07000000u||fp>=0x42000000u){ amix_slpstk[sh][L]=0; continue; }
+                 amix_slpstk[sh][L]=amix_kget2(fp+4); uae_u32 nf=amix_kget2(fp); if(nf<=fp||nf==0) { for(int M=L+1;M<6;M++) amix_slpstk[sh][M]=0; break; } fp=nf; } }
+            amix_slphead++;
+            // outstanding-sleep table: slot by chan, else free, else oldest
+            { int slot=-1; for(int j=0;j<16;j++) if(amix_oss_valid[j]&&amix_oss_chan[j]==chan){slot=j;break;}
+              if(slot<0) for(int j=0;j<16;j++) if(!amix_oss_valid[j]){slot=j;break;}
+              if(slot<0){ uae_u32 mt=0xffffffffu; for(int j=0;j<16;j++) if(amix_oss_tick[j]<=mt){mt=amix_oss_tick[j];slot=j;} }
+              amix_oss_chan[slot]=chan; amix_oss_caller[slot]=caller; amix_oss_tick[slot]=amix_tick; amix_oss_valid[slot]=1;
+              for(int L=0;L<4;L++) amix_oss_stk[slot][L]=amix_slpstk[sh][L]; }
+            if(caller==0x07082398u){ amix_pageinbuf=chan; amix_pageintick=amix_tick; }   // ufs_getapage page-in buf = the stranded read
+         }
+      }
+      if(ipc==0x0703D14Eu){   // buf_breakup entry: a6 not yet linked; arg parent=$c(a7)+? walk RETURN chain via a7 then a6 after link is later. Use a7: ret@a7, caller frame.
+         amix_bb_n++; amix_bb_parent=amix_kget2((uae_u32)m68k_areg(regs,7)+0xc);   // 2nd arg (the parent buf) at a7+0xc (ret@a7, arg1@a7+4=strategy, arg2@a7+8?, parent@a7+c)
+         uae_u32 ra=amix_kget2((uae_u32)m68k_areg(regs,7)); amix_bb_stk[0]=ra;     // immediate caller (gen_strategy)
+         uae_u32 fp=(uae_u32)m68k_areg(regs,6);
+         for(int L=1;L<8;L++){ if(fp<0x07000000u||fp>=0x42000000u){amix_bb_stk[L]=0;continue;} amix_bb_stk[L]=amix_kget2(fp+4); uae_u32 nf=amix_kget2(fp); if(nf<=fp||nf==0){for(int M=L+1;M<8;M++)amix_bb_stk[M]=0;break;} fp=nf; }
+      }
+      // --- SWAP-CONFIG flow trace ---
+      if(ipc==0x070B3FFAu) amix_swapconf_n++;                          // swapconf entry
+      if(ipc==0x070B4028u){ amix_lookupname_n++; amix_lookup_res=(uae_u32)m68k_dreg(regs,0); }   // after lookupname(swap path): d0=result
+      if(ipc==0x070B3114u) amix_swapadd_n++;                           // swapadd entry
+      if(ipc==0x070B3152u) amix_swap_openres=(uae_u32)m68k_dreg(regs,6);   // after VOP_OPEN (spec_open): d6=open result
+      if(ipc==0x070B318Eu){ amix_swap_sizeres=(uae_u32)m68k_dreg(regs,6); amix_swap_devsz=amix_kget2((uae_u32)m68k_areg(regs,6)-0x4cu); }  // after size VOP: d6=result, -0x4c(a6)=devsize
+      if(ipc==0x070488B6u){   // wakeprocs(chan,flag): at entry a7+4 = chan (1st arg, before link). Clear outstanding sleeps on this chan.
+         uae_u32 wc=amix_kget2((uae_u32)m68k_areg(regs,7)+4);
+         for(int j=0;j<16;j++) if(amix_oss_valid[j]&&amix_oss_chan[j]==wc) amix_oss_valid[j]=0;
+      }
+      if(ipc==0x0700BFE8u){   // ihandle: a0 = cmd_node ($8(a6)); REAL completed buf = cmd_node->4; a3 = ddtab.HEAD (the buf ihandle WILL biodone). Bug if completed!=HEAD.
+         uae_u32 cmdnode=(uae_u32)m68k_areg(regs,0), head=(uae_u32)m68k_areg(regs,3);
+         uae_u32 donebuf=amix_kget2(cmdnode+4u);   // CORRECTED: cmd_node->4 = the buf the HBA actually completed
+         amix_ih_n++; amix_ih_ldone=donebuf; amix_ih_lhead=head;
+         if(donebuf!=head){ amix_ih_div++; if(!amix_ih_fdone){ amix_ih_fdone=donebuf; amix_ih_fhead=head; amix_ih_ftick=amix_tick; } }
+      }
+      if(ipc==0x0700D034u){   // startany: a3 = the sc(=bp) it is about to issue, a4 = its unit (regs reliable)
+         int hh=amix_issue_h&15;
+         amix_issue_buf[hh]=(uae_u32)m68k_areg(regs,3); amix_issue_unit[hh]=(uae_u32)m68k_areg(regs,4);
+         amix_issue_tick[hh]=amix_tick; amix_issue_h++; strk_mk((uae_u32)m68k_areg(regs,3),2,amix_tick);   // STRK stage2: startany issue (a3=sc/buf)
+      }
+      if(ipc==0x0700D17Eu){   // a3091intr d16e COMPLETE handler: a2 = curunit->head (buf being biodone'd), a3 = curunitp
+         int hh=amix_compl_h&15;
+         amix_compl_head[hh]=(uae_u32)m68k_areg(regs,2); amix_compl_unit[hh]=(uae_u32)m68k_areg(regs,3);
+         amix_compl_istate[hh]=1; amix_compl_csr[hh]=0x16; amix_compl_tick[hh]=amix_tick; amix_compl_h++;
+         { uae_u32 a2c=(uae_u32)m68k_areg(regs,2);   // STRK: resolve a2 (cmd-node vs buf) + mark stage3 for BOTH a2 and a2->4 (the real buf gets marked)
+           if(!strk_ca2){ strk_ca2=a2c; strk_ca2_4=amix_kget2(a2c+4); strk_ca2_1c=amix_kget2(a2c+0x1c); strk_ca2_20=amix_kget2(a2c+0x20); }
+           strk_mk(a2c,3,amix_tick); strk_mk(amix_kget2(a2c+4),3,amix_tick); }
+      }
+      if(ipc==0x0703CE18u){   // biodone: after 'movea.l $8(a6),a2', a2 = bp (the completing buf); 4(a6) = caller
+         uae_u32 bp=(uae_u32)m68k_areg(regs,2); strk_mk(bp,4,amix_tick);   // STRK stage4: biodone
+         amix_donebuf[amix_donehead&15]=bp;
+         amix_donetick[amix_donehead&15]=amix_tick;
+         amix_donecaller[amix_donehead&15]=amix_kget2((uae_u32)m68k_areg(regs,6)+4);
+         amix_done_lba[amix_donehead&15]=amix_kget2(bp+0x28u);   // b_blkno
+         amix_done_fn[amix_donehead&15]=amix_kget2(amix_kget2((uae_u32)m68k_areg(regs,6))+4u);   // saved-a6 = iodone's frame; +4 = iodone's caller = the REAL completion fn
+         amix_donehead++;
+         { uae_u32 iod=amix_kget2(bp+0x48u), fl=amix_kget2(bp+0x0u);   // b_iodone(+0x48), flags(+0); biodone callback needs iod!=0 && (fl&bit29=B_CALL)
+           amix_bd_total++;
+           if(iod){ amix_bd_haveiod++; int h=amix_bd_h%12; amix_bd_iodr[h]=iod; amix_bd_flr[h]=fl; amix_bd_bufr[h]=bp; amix_bd_h++;
+              if(fl&0x20000000u) amix_bd_shouldcb++; } }
+         { uae_u32 avf=amix_kget2(bp+0xcu); if(bp && avf==bp) amix_selflink++; }   // bp->av_forw(+0xc)==bp = Q1 SELF-LINK
+         if(bp==amix_biodone_last){ amix_biodone_same++; if(amix_biodone_same>amix_biodone_maxsame) amix_biodone_maxsame=amix_biodone_same; }
+         else { amix_biodone_same=0; amix_biodone_last=bp; }
+      }
+      if(ipc==0x0703D1DCu || ipc==0x0703D22Cu){   // buf_breakup 'jsr sleep': a2 = the chunk buf it biowaits on
+         amix_stuckbuf=(uae_u32)m68k_areg(regs,2);
+         amix_stucktick=amix_tick;
+      }
+      static uae_u32 pcc=0; if(shared->debug_emu && (++pcc & 0x3FFFFF)==0){   // [PC]/[SLP] trace behind the DEMU toggle
+         z3660_printf("[PC] %08lX s=%d msk=%d\r\n",(unsigned long)ipc,(int)regs.s,(int)regs.intmask);
+         // when idling in swtch (0x070b90xx), dump the last sleep callers/chans + last SCSI commands
+         if(ipc>=0x070B9000u && ipc<0x070B9300u){
+            for(int k=0;k<8;k++){ int i=(amix_slphead-8+k)&7;
+               z3660_printf("[SLP] caller=%08lX chan=%08lX  stk: %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+                  (unsigned long)amix_slpcaller[i],(unsigned long)amix_slpchan[i],
+                  (unsigned long)amix_slpstk[i][0],(unsigned long)amix_slpstk[i][1],(unsigned long)amix_slpstk[i][2],
+                  (unsigned long)amix_slpstk[i][3],(unsigned long)amix_slpstk[i][4],(unsigned long)amix_slpstk[i][5]); }
+            z3660_printf("[SWAP] swapconf=%lu lookupname=%lu(res=%ld) swapadd=%lu openVOPres=%ld sizeVOPres=%ld devsz=%lu(=%lu blks)\r\n",
+               (unsigned long)amix_swapconf_n,(unsigned long)amix_lookupname_n,(long)(int32_t)amix_lookup_res,(unsigned long)amix_swapadd_n,
+               (long)(int32_t)amix_swap_openres,(long)(int32_t)amix_swap_sizeres,(unsigned long)amix_swap_devsz,(unsigned long)(amix_swap_devsz>>9));
+            z3660_printf("[IHANDLE] calls=%lu  FIFO-divergences(completed!=ddtab.HEAD)=%lu  first: completed=%08lX head=%08lX @tick=%lu  last: completed=%08lX head=%08lX\r\n",
+               (unsigned long)amix_ih_n,(unsigned long)amix_ih_div,(unsigned long)amix_ih_fdone,(unsigned long)amix_ih_fhead,(unsigned long)amix_ih_ftick,(unsigned long)amix_ih_ldone,(unsigned long)amix_ih_lhead);
+            z3660_printf("[OSS] outstanding sleeps (never woken = the terminal block; oldest tick = init's block):\r\n");
+            for(int j=0;j<16;j++) if(amix_oss_valid[j])
+               z3660_printf("  chan=%08lX caller=%08lX tick=%lu  stk: %08lX %08lX %08lX %08lX\r\n",
+                  (unsigned long)amix_oss_chan[j],(unsigned long)amix_oss_caller[j],(unsigned long)amix_oss_tick[j],
+                  (unsigned long)amix_oss_stk[j][0],(unsigned long)amix_oss_stk[j][1],(unsigned long)amix_oss_stk[j][2],(unsigned long)amix_oss_stk[j][3]);
+            z3660_printf("[BBREAK] buf_breakup calls=%lu parent=%08lX  caller-chain: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+               (unsigned long)amix_bb_n,(unsigned long)amix_bb_parent,(unsigned long)amix_bb_stk[0],(unsigned long)amix_bb_stk[1],(unsigned long)amix_bb_stk[2],(unsigned long)amix_bb_stk[3],
+               (unsigned long)amix_bb_stk[4],(unsigned long)amix_bb_stk[5],(unsigned long)amix_bb_stk[6],(unsigned long)amix_bb_stk[7]);
+            { int donefound=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_stuckbuf && amix_stuckbuf){ donefound=(int)amix_donetick[k]; } }
+              z3660_printf("[STUCKBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)  tick_now=%lu\r\n",
+                 (unsigned long)amix_stuckbuf,(unsigned long)amix_stucktick, donefound>=0?"YES":"NO", donefound,(unsigned long)amix_tick);
+              for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15;
+                 z3660_printf("[DONE] buf=%08lX tick=%lu by=%08lX\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_donetick[i],(unsigned long)amix_donecaller[i]); } }
+            { int pf=-1; for(int k=0;k<16;k++){ if(amix_donebuf[k]==amix_pageinbuf && amix_pageinbuf){ pf=(int)amix_donetick[k]; } }
+              z3660_printf("[PGINBUF] buf=%08lX slept@tick=%lu  biodone'd=%s (tick=%d)\r\n",
+                 (unsigned long)amix_pageinbuf,(unsigned long)amix_pageintick, pf>=0?"YES":"NO", pf); }
+            for(int k=0;k<16;k++){ int i=(amix_issue_h-16+k)&15;
+               z3660_printf("[ISSUE] buf=%08lX unit=%08lX tick=%lu\r\n",(unsigned long)amix_issue_buf[i],(unsigned long)amix_issue_unit[i],(unsigned long)amix_issue_tick[i]); }
+            { int iss=0,cmp=0; for(int k=0;k<16;k++){ if(amix_pageinbuf){ if(amix_issue_buf[k]==amix_pageinbuf) iss=1; if(amix_compl_head[k]==amix_pageinbuf) cmp=1; } }
+              z3660_printf("[PGINTRK] pageinbuf=%08lX in_issue=%d in_compl=%d\r\n",(unsigned long)amix_pageinbuf,iss,cmp); }
+            // [STRK] CORRECTED lifecycle: resolve a3091intr a2 (cmd-node vs buf) + the stranded buf's furthest stage
+            z3660_printf("[STRK] complete a2=%08lX ->4=%08lX ->1c=%08lX ->20=%08lX  (if cmd-node: ->4=buf ->1c=lun ->20=tgt)\r\n",
+               (unsigned long)strk_ca2,(unsigned long)strk_ca2_4,(unsigned long)strk_ca2_1c,(unsigned long)strk_ca2_20);
+            { uae_u32 cand[3]={amix_pageinbuf,amix_stuckbuf,amix_bb_parent}; const char* nm[3]={"pagein","stuckchunk","bbparent"};
+              for(int c=0;c<3;c++){ uae_u32 sb=cand[c]; if(!sb) continue; int sj=-1; for(int i=0;i<AMIX_STRK_N;i++) if(strk_buf[i]==sb){sj=i;break;}
+                if(sj>=0) z3660_printf("[STRK] %s buf=%08lX stage=%lu t1=%lu t2=%lu t3=%lu t4=%lu  (1=ddstrat 2=issue 3=HBAcompl 4=biodone)\r\n",
+                   nm[c],(unsigned long)sb,(unsigned long)strk_stg[sj],(unsigned long)strk_t1[sj],(unsigned long)strk_t2[sj],(unsigned long)strk_t3[sj],(unsigned long)strk_t4[sj]);
+                else z3660_printf("[STRK] %s buf=%08lX NOT-IN-TABLE\r\n",nm[c],(unsigned long)sb); } }
+            // [STRK-SLP] for each recent sleep chan in buf-range: LIVE B_DONE (buf+0 bit1) + [STRK] stage. DECISIVE:
+            //   B_DONE=1 while still slept-on => LOST WAKEUP (or re-fault); B_DONE=0 => lost completion. gencnt>0 => gen-layer child strand.
+            { uae_u32 seen[8]={0}; int ns=0;
+              for(int s=0;s<8;s++){ uae_u32 sb=amix_slpchan[s]; if(sb<0x40000000u||sb>=0x42000000u) continue;
+                int dup=0; for(int q=0;q<ns;q++) if(seen[q]==sb) dup=1; if(dup) continue; if(ns<8) seen[ns++]=sb;
+                int sj=-1; for(int i=0;i<AMIX_STRK_N;i++) if(strk_buf[i]==sb){sj=i;break;}
+                uae_u32 f0=amix_kget2(sb), gp=amix_kget2(sb+0x50), gc=amix_kget2(sb+0x54);
+                z3660_printf("[STRK-SLP] buf=%08lX caller=%08lX B_DONE=%d stage=%ld t1=%lu t4=%lu genpar=%08lX gencnt=%ld\r\n",
+                  (unsigned long)sb,(unsigned long)amix_slpcaller[s],(f0&2)?1:0,(sj>=0?(long)strk_stg[sj]:-1L),
+                  (unsigned long)(sj>=0?strk_t1[sj]:0),(unsigned long)(sj>=0?strk_t4[sj]:0),(unsigned long)gp,(long)(int32_t)gc); } }
+            // [DONE-FN] for each biodone: buf, b_blkno, and the TRUE completion fn (iodone's caller). The fn that repeatedly biodones the wrong buf is the bug site.
+            z3660_printf("[D16E] a3091intr COMPLETE-arm-entry(0x700d16e) hits=%lu  ([DISPACT] COMPLETE=139ish; 0 here => jmp-target PC-hooks are blind)\r\n",(unsigned long)amix_d16e_n);
+            // [BIODONE] do gen children reach biodone with b_iodone(+0x48)+B_CALL(bit29) set? should_callback>0 but cbio(0x703ce28)=0 => the cbio HOOK is blind (children DO callback, guest fine). should_callback==0 => children never biodone'd with the callback (wrong-buf OR cleared flag = the bug). gen_iodone=0x0703D8CC.
+            z3660_printf("[BIODONE] total=%lu have_b_iodone=%lu should_callback(iod&&bit29)=%lu  cbio_hook(0x703ce28)=%lu  gen_iodone=0x0703D8CC\r\n",
+               (unsigned long)amix_bd_total,(unsigned long)amix_bd_haveiod,(unsigned long)amix_bd_shouldcb,(unsigned long)amix_cbio_n);
+            for(int k=0;k<12;k++){ int i=(amix_bd_h-12+k); while(i<0)i+=12; i%=12; if(amix_bd_bufr[i])
+               z3660_printf("[BD] buf=%08lX b_iodone=%08lX flags=%08lX B_CALL=%d\r\n",(unsigned long)amix_bd_bufr[i],(unsigned long)amix_bd_iodr[i],(unsigned long)amix_bd_flr[i],(amix_bd_flr[i]&0x20000000u)?1:0); }
+            // [PIOSU]/[PIOWT] does ufs_getapage's buf have b_iodone(gen_iodone=0703D8CC)+genparent AT pageio_setup return (stale) vs only at biowait (set by the strategy)?
+            z3660_printf("[PIOSU] pageio_setup-ret buf=%08lX b_iodone=%08lX genparent=%08lX flags=%08lX B_CALL=%d n=%lu\r\n",
+               (unsigned long)amix_pio_su_buf,(unsigned long)amix_pio_su_iod,(unsigned long)amix_pio_su_gp,(unsigned long)amix_pio_su_fl,(amix_pio_su_fl&0x20000000u)?1:0,(unsigned long)amix_pio_su_n);
+            z3660_printf("[PIOWT] pre-biowait    buf=%08lX b_iodone=%08lX genparent=%08lX flags=%08lX B_CALL=%d n=%lu\r\n",
+               (unsigned long)amix_pio_wt_buf,(unsigned long)amix_pio_wt_iod,(unsigned long)amix_pio_wt_gp,(unsigned long)amix_pio_wt_fl,(amix_pio_wt_fl&0x20000000u)?1:0,(unsigned long)amix_pio_wt_n);
+            for(int k=0;k<16;k++){ int i=(amix_donehead-16+k)&15; if(!amix_donebuf[i]) continue;
+               z3660_printf("[DONE-FN] buf=%08lX lba=%lu fn=%08lX (iodone-ret=%08lX)\r\n",(unsigned long)amix_donebuf[i],(unsigned long)amix_done_lba[i],(unsigned long)amix_done_fn[i],(unsigned long)amix_donecaller[i]); }
+            { uae_u32 seen2[8]={0}; int n2=0;
+              for(int s=0;s<8;s++){ uae_u32 sb=amix_slpchan[s]; if(sb<0x40000000u||sb>=0x42000000u) continue;
+                int dup=0; for(int q=0;q<n2;q++) if(seen2[q]==sb) dup=1; if(dup) continue; if(n2<8) seen2[n2++]=sb;
+                uae_u32 lba=amix_kget2(sb+0x28u); int dl=0; for(int k=0;k<16;k++) if(amix_done_lba[k]==lba && lba) dl=1;
+                z3660_printf("[STRK-LBA] strandbuf=%08lX lba=%lu thatLBA_biodone'd=%d\r\n",(unsigned long)sb,(unsigned long)lba,dl); } }
+            // [APPEND] does any ddstrategy append land on an ALREADY-DRAINED tail? (>0 => the IPL2-bypass strand) + the stranded TAIL's live linkage
+            z3660_printf("[APPEND] total=%lu onto-DRAINED-tail=%lu  last: old_tail=%08lX flags=%08lX buf=%08lX @tick=%lu\r\n",
+               (unsigned long)amix_app_n,(unsigned long)amix_app_drained_n,(unsigned long)amix_app_ot,(unsigned long)amix_app_otf,(unsigned long)amix_app_buf,(unsigned long)amix_app_tick);
+            { uae_u32 tail=amix_kget2(0x070EA8E0u);   // ddtab[tgt6].TAIL (runtime ddtab6=0x070EA8D8, +8=TAIL)
+              z3660_printf("[DDLINK] ddtab6 HEAD=%08lX TAIL=%08lX  TAIL->0(flags)=%08lX B_DONE=%d  TAIL->0xc(next)=%08lX\r\n",
+                 (unsigned long)amix_kget2(0x070EA8DCu),(unsigned long)tail,(unsigned long)amix_kget2(tail),(amix_kget2(tail)&2)?1:0,(unsigned long)amix_kget2(tail+0xcu)); }
+            { int n=0; for(int i=0;i<AMIX_STRK_N&&n<8;i++) if(strk_buf[i]&&strk_stg[i]==3){ z3660_printf("[STRK] s3-only(HBAcompl,NO-biodone) buf=%08lX t1=%lu t3=%lu\r\n",(unsigned long)strk_buf[i],(unsigned long)strk_t1[i],(unsigned long)strk_t3[i]); n++; } }
+            { int n=0; for(int i=0;i<AMIX_STRK_N&&n<8;i++) if(strk_buf[i]&&strk_stg[i]==1){ z3660_printf("[STRK] s1-only(ddstrat,NO-compl) buf=%08lX t1=%lu\r\n",(unsigned long)strk_buf[i],(unsigned long)strk_t1[i]); n++; } }
+            z3660_printf("[LOOP] selflink(bp->av_forw==bp)=%lu maxsame_biodone=%lu last=%08lX\r\n",
+               (unsigned long)amix_selflink,(unsigned long)amix_biodone_maxsame,(unsigned long)amix_biodone_last);
+            // Dump raw buf headers (bufs live at 0x40xxxxxx = MMU section 1, so amix_kget2 reads them reliably).
+            // Reverse-engineer: b_flags (B_DONE/B_READ/B_BUSY/B_ERROR), b_forw/av_forw (0x40xxxxxx links), b_blkno (=an [SDMA] lba).
+            { uae_u32 b=amix_pageinbuf; z3660_printf("[BUFHDR] pagein  %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
+            { uae_u32 b=amix_donebuf[(amix_donehead-1)&15]; z3660_printf("[BUFHDR] lastdone %08lX:",(unsigned long)b);
+              for(int o=0;o<24;o++) z3660_printf(" %08lX",(unsigned long)(b?amix_kget2(b+o*4):0)); z3660_printf("\r\n"); }
+            for(int k=0;k<16;k++){ int i=(amix_scmd_head-16+k)&15;
+               z3660_printf("[SDMA] %c unit=%lu lba=%lu n=%lu\r\n",amix_scmd_w[i]?'W':'R',
+                  (unsigned long)amix_scmd_unit[i],(unsigned long)amix_scmd_lba[i],(unsigned long)amix_scmd_n[i]); }
+            z3660_printf("[PREEMPT] a3091intr-during-ddstrategy-IPL2 = %lu (last@%lu)  ddstrategy_n=%lu  ddcrit=%d\r\n",
+               (unsigned long)amix_preempt_n,(unsigned long)amix_preempt_tick,(unsigned long)amix_ddstrat_n,amix_ddcrit);
+            z3660_printf("[DDSREJ] sdvalid_reject_n=%lu reject_buf=%08lX   (ddstrategy drops buf with NO enqueue + NO biodone)\r\n",
+               (unsigned long)amix_dds_reject_n,(unsigned long)amix_dds_reject_buf);
+            for(int k=0;k<16;k++){ int i=(amix_dds_h-16+k)&15; const char*pn= amix_dds_path[i]==1?"startio":amix_dds_path[i]==2?"APPEND":amix_dds_path[i]==3?"REJECT":"pending";
+               z3660_printf("[DDS] buf=%08lX valid=%lu path=%s tick=%lu%s%s\r\n",(unsigned long)amix_dds_buf[i],(unsigned long)amix_dds_valid[i],pn,(unsigned long)amix_dds_tick[i],
+                  (amix_dds_buf[i]==amix_pageinbuf&&amix_pageinbuf)?" <==PAGEINBUF":"",(amix_dds_buf[i]==amix_stuckbuf&&amix_stuckbuf)?" <==STUCKBUF":""); }
+            // --- PARENT-COMPLETION accounting dump (verdict's experiment) ---
+            z3660_printf("[GIOCNT] gen_iodone=%lu orphan(child->+0x50==0)=%lu  child-biodone(callback)=%lu  parent-biodone(wakeprocs)=%lu\r\n",
+               (unsigned long)amix_gio_n,(unsigned long)amix_gio_orphan_n,(unsigned long)amix_cbio_n,(unsigned long)amix_pbio_n);
+            for(int k=0;k<16;k++){ int i=(amix_gio_h-16+k)&15; if(!amix_gio_par[i]) continue;
+               z3660_printf("[GIO] parent=%08lX cnt_after=%ld child=%08lX%s\r\n",(unsigned long)amix_gio_par[i],(long)(int32_t)amix_gio_cnt[i],(unsigned long)amix_gio_child[i],
+                  (amix_gio_par[i]==amix_pageinbuf&&amix_pageinbuf)?" <==PAGEINBUF":""); }
+            // For each buf the page-in process blocks on (biowait ring), dump its completion state + whether it was ever
+            // gen_iodone-parent'd / parent-biodone'd. cnt fields: +0x02(word,pageio cnt) +0x54(long,gen cnt); flags long@+0x00,
+            // B_DONE = bit1 of byte@+0x03; b_iodone@+0x48; pageio-parent@+0x4c; gen-parent@+0x50.
+            for(int k=0;k<8;k++){ int i=(amix_bw_h-8+k)&7; uae_u32 b=amix_bw_buf[i]; if(!b) continue;
+               uae_u32 f0=amix_kget2(b), iod=amix_kget2(b+0x48), pp=amix_kget2(b+0x4c), gp=amix_kget2(b+0x50), gc=amix_kget2(b+0x54), pc2=amix_kget2(b+0x00);
+               int bdone=(f0&0x2)?1:0;   // B_DONE = bit1 of the +0x00 long
+               int waspar=0,wasbio=0; for(int j=0;j<16;j++) if(amix_gio_par[j]==b) waspar=1; for(int j=0;j<16;j++) if(amix_pbio_buf[j]==b) wasbio=1;
+               z3660_printf("[PARENT] buf=%08lX flags=%08lX B_DONE=%d b_iodone=%08lX pageioparent(+4c)=%08lX genparent(+50)=%08lX gencnt(+54)=%ld  was_gioparent=%d was_parentbiodone=%d\r\n",
+                  (unsigned long)b,(unsigned long)f0,bdone,(unsigned long)iod,(unsigned long)pp,(unsigned long)gp,(long)(int32_t)gc,waspar,wasbio); (void)pc2; }
+            // --- 030-PMMU demand-paging FAULT tracker (re-fault detector) ---
+            { extern volatile uae_u32 amix_ftot,amix_fsamemax,amix_fsameva,amix_fring_va[16],amix_fring_pc[16],amix_fring_rw[16],amix_fhva[16],amix_fhcnt[16],amix_fhpc[16]; extern volatile int amix_fring_h;
+              z3660_printf("[FAULT] total=%lu  max_consecutive_same_VA=%lu @VA=%08lX\r\n",(unsigned long)amix_ftot,(unsigned long)amix_fsamemax,(unsigned long)amix_fsameva);
+              z3660_printf("[FAULT] last-16 fault VAs (the recent fault sequence -> re-fault if same VA repeats):\r\n");
+              for(int k=0;k<16;k++){ int i=(amix_fring_h-16+k)&15; if(!amix_fring_va[i]&&!amix_fring_pc[i]) continue;
+                 z3660_printf("   va=%08lX pc=%08lX %c\r\n",(unsigned long)amix_fring_va[i],(unsigned long)amix_fring_pc[i],amix_fring_rw[i]?'R':'W'); }
+              z3660_printf("[FAULT] top faulting VAs by count:\r\n");
+              for(int k=0;k<16;k++){ if(amix_fhcnt[k]>1) z3660_printf("   va=%08lX cnt=%lu pc=%08lX\r\n",(unsigned long)amix_fhva[k],(unsigned long)amix_fhcnt[k],(unsigned long)amix_fhpc[k]); } }
+            z3660_printf("[DISPACT] hist: a0(COMPLETE)=%lu a1(BADHW)=%lu a2=%lu a3=%lu a4=%lu a5=%lu a6=%lu a7(DISC)=%lu a8=%lu a9=%lu  badhw_n=%lu@%lu\r\n",
+               (unsigned long)amix_disp_acthist[0],(unsigned long)amix_disp_acthist[1],(unsigned long)amix_disp_acthist[2],
+               (unsigned long)amix_disp_acthist[3],(unsigned long)amix_disp_acthist[4],(unsigned long)amix_disp_acthist[5],
+               (unsigned long)amix_disp_acthist[6],(unsigned long)amix_disp_acthist[7],(unsigned long)amix_disp_acthist[8],
+               (unsigned long)amix_disp_acthist[9],(unsigned long)amix_badhw_n,(unsigned long)amix_badhw_tick);
+            for(int k=0;k<16;k++){ int i=(amix_disp_h-16+k)&15;
+               z3660_printf("[DISP] csr=%02lX act=%lu tick=%lu\r\n",(unsigned long)amix_disp_csr[i],(unsigned long)amix_disp_act[i],(unsigned long)amix_disp_tick[i]); }
+            a3000_scsi_dumpstate();   // why isn't the SCSI INT2 firing at the stall?
+            a3000_scsi_dumpqueue();   // dump the guest a3091 queue (istate/curunitp/units6 chain) directly
+            for(int k=0;k<16;k++){ int i=(amix_wcmd_head-16+k)&15;
+               z3660_printf("[WCMD] cmd=%02lX dest=%lu ph=%02lX\r\n",(unsigned long)amix_wcmd_cmd[i],
+                  (unsigned long)amix_wcmd_dest[i],(unsigned long)amix_wcmd_ph[i]); }
+         }
+      }
+   }
 #if INT_IPL_ON_THIS_CORE == 0
    if(shared->int_available)
    {
       shared->int_available=0;
       read_irq=shared->irq;
-      if(read_irq>regs.intmask || read_irq==7)
+      // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); gate on
+      // the effective level so a freshly-asserted SCSI INT2 latches SPCFLAG_DOINT.
+      int eff_irq=intlev();
+      if(eff_irq>regs.intmask || eff_irq==7)
          set_special(SPCFLAG_DOINT);
    }
 #else
-   if(read_irq>regs.intmask || read_irq==7)
+   // intlev() OR-s in the emulated A3000 SCSI level-2 (a3000_scsi_irq); must gate on
+   // the effective level, not the bare physical read_irq, or the SCSI INT2 never latches.
+   int eff_irq=intlev();
+   if(eff_irq>regs.intmask || eff_irq==7)
    {
       set_special(SPCFLAG_DOINT);
       if(pissoff_int!=0)
@@ -2561,6 +3265,7 @@ static inline void check_uae_int_request(void)
       addrbank *ab;
 
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       ovl=1;
       m68k_reset_newcpu(1);
@@ -2793,8 +3498,20 @@ void doint(void)
       set_special (SPCFLAG_DOINT);
 }
 
+/* CYBERSTORM C3: run-loop knob resync (defined with the perf block further down).
+ * Called from do_specialties() only -- i.e. only when regs.spcflags != 0 -- so it is
+ * free on the per-instruction path. See the comment on z3660_knobs_poll(). */
+static void z3660_knobs_poll(void);
+
 static int do_specialties (int cycles)
 {
+   z3660_knobs_poll();   /* SERV / PERFS / PROBES reach the run loops from here */
+#if Z3660_EMU_PROF
+   /* CYBERSTORM C1: and so do the profiler commands, for exactly the same reason -- this
+    * function runs only when regs.spcflags != 0, so a serial PROFDUMP costs nothing per
+    * emulated instruction and still arrives within an interrupt period. */
+   z3660_prof_poll_cmd();
+#endif
 
    if (regs.spcflags & SPCFLAG_MODE_CHANGE)
       return 1;
@@ -3793,6 +4510,1735 @@ static void m68k_run_2_020(void)
    }
 }
 
+// UAE_030_MMU run loop. Fetches opcodes through the MMU (x_prefetch =
+// get_iword_mmu030) and dispatches the fault-restartable cpuemu_32 handlers
+// (op_smalltbl_32_ff). Adapted from WinUAE 4.4.0 m68k_run_mmu030 for the Z3660
+// (non-cycle-exact, non-compatible). On a page fault the cpummu030 engine THROWs;
+// we restore flags, build the 030 bus-error frame via Exception() and resume.
+// Instruction-START pc, saved each instruction before any handler runs. Several cpuemu_32 write handlers
+// (MOVES and regular (An)+/-(An) moves) advance the pc and overwrite regs.instruction_pc BEFORE the
+// faulting store; on a demand-page fault the CATCH below must build the 030 bus-error frame with the
+// instruction-START pc so the RTE/re-run restarts the whole instruction. Read-side and prefetch faults
+// already leave regs.instruction_pc at the start, so restoring it is a no-op there (no regression).
+uaecptr mmu030_insn_start_pc;   // not static: m68k_do_rte_mmu030() re-points it before its retry-access
+
+// ===== wip-030-mmu-buserror: catch the corruptor of the AMIX user-PC wild-jump =====
+// Symptom: under a fork/exec storm a freshly-exec'd USER process (AMIX user base 0x80000000;
+// e.g. in.telnetd entry 0x80001520) has its PC silently set to a kernel/low-region address
+// (observed CONSTANT 0x080012A0); the next instruction fetch faults and AMIX prints
+// "User BUS ERROR at <pc>, PC:<pc> FAULT:6". The corruption is UPSTREAM of the fault -- some
+// already-retired instruction (rts/jmp/jsr/rte/movem) wrote the bad value into the user PC.
+// Catch it: ring-buffer the last AMIX_RRING retired instructions and, the instant we are about
+// to fetch from a wild USER pc, dump the ring + register file ONCE. AMIX-gated, ~5 stores/insn,
+// one-shot serial -> negligible timing shift (and the bug repros ~100% under the storm anyway).
+extern "C" { extern volatile int amix_mmu_on; }
+// RTE-frame ring captured in cpummu030.cpp's m68k_do_rte_mmu030 (see there).
+extern "C" {
+extern volatile uae_u32 amix_rte_a7[16], amix_rte_pc[16], amix_rte_oc[16], amix_rte_fault[16];
+extern volatile uae_u32 amix_rte_ssw[16], amix_rte_frame[16], amix_rte_h;
+extern volatile int amix_wild_rte_pending; extern volatile uae_u32 amix_wild_rte_pc;
+}
+#define AMIX_RRING 32
+static uae_u32 amix_rring_pc[AMIX_RRING];   // retired instruction's start PC
+static uae_u16 amix_rring_op[AMIX_RRING];   // its opcode word
+static uae_u32 amix_rring_npc[AMIX_RRING];  // PC after it retired (= branch target for control transfers)
+static uae_u8  amix_rring_s[AMIX_RRING];    // supervisor flag at retire
+static uae_u32 amix_rring_h = 0;            // ring head (next slot to write)
+static int     amix_wild_latched = 0;       // one-shot dump guard
+
+static void amix_dump_wild(uae_u32 wildpc)
+{
+   z3660_printf("\r\n[WILD] AMIX user PC went wild: PC=%08lX  (user-mode ifetch below user-base 0x80000000 -> jumped into kernel/low region)\r\n",
+                (unsigned long)wildpc);
+   z3660_printf("[WILD] D0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[0],(unsigned long)regs.regs[1],(unsigned long)regs.regs[2],(unsigned long)regs.regs[3],
+      (unsigned long)regs.regs[4],(unsigned long)regs.regs[5],(unsigned long)regs.regs[6],(unsigned long)regs.regs[7]);
+   z3660_printf("[WILD] A0-7: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX\r\n",
+      (unsigned long)regs.regs[8],(unsigned long)regs.regs[9],(unsigned long)regs.regs[10],(unsigned long)regs.regs[11],
+      (unsigned long)regs.regs[12],(unsigned long)regs.regs[13],(unsigned long)regs.regs[14],(unsigned long)regs.regs[15]);
+   z3660_printf("[WILD] usp=%08lX isp=%08lX  s=%d intmask=%d sfc=%lu dfc=%lu vbr=%08lX\r\n",
+      (unsigned long)regs.usp,(unsigned long)regs.isp,(int)regs.s,(int)regs.intmask,
+      (unsigned long)regs.sfc,(unsigned long)regs.dfc,(unsigned long)regs.vbr);
+   z3660_printf("[WILD] last %d retired insns (oldest first):  startpc   op    -> nextpc    [s]\r\n", AMIX_RRING);
+   for (int i = 0; i < AMIX_RRING; i++) {
+      uae_u32 idx = (amix_rring_h + (uae_u32)i) & (AMIX_RRING - 1);
+      if (amix_rring_pc[idx] == 0 && amix_rring_npc[idx] == 0) continue;   // unused slot
+      z3660_printf("[WILD]  %08lX  %04X  -> %08lX  [%d]%s\r\n",
+         (unsigned long)amix_rring_pc[idx], (unsigned)amix_rring_op[idx], (unsigned long)amix_rring_npc[idx],
+         (int)amix_rring_s[idx], (amix_rring_npc[idx] == wildpc) ? "   <== CORRUPTOR" : "");
+   }
+   z3660_printf("[WILD] last 16 RTE-frame resumes (oldest first):  a7        pc        frame oc        ssw   fault\r\n");
+   for (int i = 0; i < 16; i++) {
+      uae_u32 idx = (amix_rte_h + (uae_u32)i) & 15;
+      if (amix_rte_a7[idx] == 0 && amix_rte_pc[idx] == 0) continue;
+      z3660_printf("[WILD]  %08lX  %08lX  %04lX  %08lX  %04lX  %08lX%s\r\n",
+         (unsigned long)amix_rte_a7[idx], (unsigned long)amix_rte_pc[idx], (unsigned long)amix_rte_frame[idx],
+         (unsigned long)amix_rte_oc[idx], (unsigned long)amix_rte_ssw[idx], (unsigned long)amix_rte_fault[idx],
+         (amix_rte_pc[idx] == wildpc) ? "   <== popped the wild PC" : "");
+   }
+   z3660_printf("[WILD] (one-shot latched; resets on reboot)\r\n\r\n");
+}
+
+// ===== perf investigation (wip-emu-030-perf): instruction-rate benchmark + tunable poll cadence =====
+#include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
+#include "runloop_build.h"   // Z3660_EMU_PROBES / Z3660_EMU_PERF: which instruments this binary carries
+
+/* CYBERSTORM C1: the per-instruction sample tick, spelled once so the two run loops
+ * cannot drift in what they record.
+ *
+ * Placed at the TAIL and not before the fetch, deliberately. At the tail the instruction
+ * that just executed still owns regs.instruction_pc (040) / mmu030_insn_start_pc (030),
+ * so a deadline that expired *during* a long instruction is attributed to that
+ * instruction rather than to the next one. Before the fetch it would be off by one on
+ * exactly the instructions that matter most -- the slow ones.
+ *
+ * Expands to NOTHING outside the profiling build: no tick, and so no predicate either,
+ * which is the same rule runloop_build.h established for the other two instruments. */
+/* CYBERSTORM C2-prep: the tail is now SUB-BUCKETED, and these three macros are where.
+ *
+ * The C2 map measured the run-loop tail at 20.01 % of guest time and 110.8 ARM cycles
+ * per instruction -- for what ought to be a PC advance and a cheap event test -- and had
+ * to leave it alone, because a fifth of the profile with no internal breakdown cannot be
+ * attacked without guessing which part of it to attack. So the tail's three identifiable
+ * pieces get their own bucket ids and whatever is left stays in id 8 (TAILADV).
+ *
+ * The sampler hook is bucketed FIRST among them and deliberately: it is the profiler's
+ * own cost, it fires on every instruction, and in v1 it was charged to LOOP -- so no v1
+ * capture could see it at all and the tail's 110.8 cycles never included it. Separating
+ * it means a reader can subtract the instrument instead of ranking it.
+ *
+ * All three expand to NOTHING outside the profiling build -- not to a false predicate, to
+ * nothing -- so the default and lean loops are textually what they were. That is the same
+ * rule runloop_build.h set for the other two instruments, and it is checked by objdump
+ * rather than trusted. */
+#if Z3660_EMU_PROF
+#define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)                      \
+   do {                                                                       \
+      uae_u16 z3660_f_ = (uae_u16)((regs.s ? Z3660_PROF_F_SUPER : 0)          \
+                                 | (regs.mmu_enabled ? Z3660_PROF_F_MMU : 0)  \
+                                 | (amix_mmu_on ? Z3660_PROF_F_AMIX : 0)      \
+                                 | ((is040) ? Z3660_PROF_F_CPU040 : 0));      \
+      z3660_prof_enter(Z3660_PROF_B_TAILSAMP);                                \
+      z3660_prof_count(Z3660_PROF_C_INSNS);                                   \
+      if (regs.s) z3660_prof_count(Z3660_PROF_C_INSNS_SUPER);                 \
+      z3660_prof_tick((uae_u32)(pcexpr), (uae_u16)(opexpr), z3660_f_);        \
+      z3660_prof_exit();                                                      \
+   } while (0)
+/* The interrupt poll, cadence gate and all. */
+#define Z3660_PROF_TAIL_POLL()                                                \
+   do {                                                                       \
+      z3660_prof_enter(Z3660_PROF_B_TAILPOLL);                                \
+      Z3660_RUNLOOP_TAIL();                                                   \
+      z3660_prof_exit();                                                      \
+   } while (0)
+/* The same poll for the 040 loop, over a NAMED counter instead of a hidden one. WARP's
+ * cadence feed has to advance the very counter this poll gates on -- see Q10 and
+ * z3660_warp_cadence_feed() below -- and a `static int` inside a macro expansion is
+ * reachable from nowhere. Nothing else about it changes: same PERF arm, same test, same
+ * order. */
+#define Z3660_PROF_TAIL_POLL_040()                                            \
+   do {                                                                       \
+      z3660_prof_enter(Z3660_PROF_B_TAILPOLL);                                \
+      Z3660_RUNLOOP_TAIL_040();                                               \
+      z3660_prof_exit();                                                      \
+   } while (0)
+/* do_specialties(): trace, STOP, mode change. Kept behind the spcflags gate rather than
+ * bracketed unconditionally, because it is entered rarely and two transitions per
+ * instruction to measure a bucket that is usually empty would cost more than it reports.
+ *
+ * The macro CONTAINS A RETURN, which is worth flagging rather than hiding: the run loop
+ * returns when do_specialties() says the mode changed, and the profiling arm has to close
+ * TAILSPEC and then TAILADV on the way out. The non-profiling arm is textually the code
+ * that was here before this macro existed. */
+#define Z3660_PROF_TAIL_SPECIALTIES(cyc)                                      \
+   if (regs.spcflags) {                                                       \
+      int z3660_spec_;                                                        \
+      z3660_prof_enter(Z3660_PROF_B_TAILSPEC);                                \
+      z3660_spec_ = do_specialties(cyc);                                      \
+      z3660_prof_exit();                                                      \
+      if (z3660_spec_) {                                                      \
+         z3660_prof_exit();                                                   \
+         return;                                                              \
+      }                                                                       \
+   }
+#else
+#define Z3660_PROF_RUNLOOP_SAMPLE(pcexpr, opexpr, is040)  do { } while (0)
+#define Z3660_PROF_TAIL_POLL()   Z3660_RUNLOOP_TAIL()
+#define Z3660_PROF_TAIL_POLL_040()  Z3660_RUNLOOP_TAIL_040()
+#define Z3660_PROF_TAIL_SPECIALTIES(cyc)                                      \
+   if (regs.spcflags) {                                                       \
+      if (do_specialties(cyc)) {                                              \
+         return;                                                              \
+      }                                                                       \
+   }
+#endif
+static int     z3660_service_cadence = 1; // instructions between check_uae_int_request() polls; synced from shared->service_cadence
+/* The 040 loop's own service counter, named rather than hidden inside the tail macro's
+ * expansion. It is the SAME counter the loop has always had -- one per loop, so the two
+ * loops cannot silently couple their poll phase across a mode change -- lifted to file
+ * scope for exactly one reason: WARP's cadence feed must advance it by the number of guest
+ * instructions a block retired (Q10, FROZEN), and a function-local static is reachable from
+ * nowhere. The 030 loop keeps its own, still inside Z3660_RUNLOOP_TAIL(). */
+static int     z3660_serv_ctr_040    = 0;
+#if Z3660_EMU_PERF
+static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
+#endif
+
+/* ===== CYBERSTORM C3: run-loop overhead knobs =========================================
+ *
+ * WHY. C0STAT on the 040 AMIX metal runs reports ~64% of the CORE0 cooperative loop
+ * going to things that are not the mailbox service, and core1 hard-spins inside every
+ * mailbox round trip -- so overhead on either core is guest throughput not delivered.
+ * Before anything is optimised, the overhead has to be SWITCHABLE, so a metal session
+ * can measure the delta instead of arguing about it.
+ *
+ * These two knobs are core1's half. Both default to 1 = EXACTLY today's behaviour, so a
+ * config with neither key, and a board whose SHARED mailbox has never been written, run
+ * the loops they have always run.
+ *
+ *   z3660_perf_on     the per-instruction perf accumulator + its ~1 Hz [PERF] tick.
+ *   z3660_probes_on   the ISSUE-52-era run-loop diagnostic probes ([ROMENT] [RTE] [URTE]
+ *                     [USTEP] [IDCMP] on 040; the wild-PC detector + retired-instruction
+ *                     ring on 030). ISSUE-52 is closed, but the instruments stay: this
+ *                     GATES them, it does not delete them.
+ *
+ * COSTS, read out of the generated ARM for m68k_run_mmu040() rather than estimated
+ * (arm-none-eabi, -O3, the shipped flags). Each gate is an address load, a value load,
+ * a compare and a branch that is perfectly predicted because the flag does not change:
+ *
+ *   gate                     costs   skips when taken
+ *   ROMENT (pre-fetch)         4       44 instructions
+ *   post-fetch probe group     3       11 on the straight line, more in user mode
+ *                                      (the [USTEP]/[IDCMP] arms are out of line)
+ *   perf accumulator           4       11 (the 64-bit read-modify-write and its test)
+ *
+ * So the DEFAULT path (everything on) grows by 11 ARM instructions per emulated
+ * instruction, and switching all three off removes substantially more than that. The
+ * point of the switches is that the metal now measures this instead of us guessing it.
+ *
+ * THE LEAN BUILD. Everything above is the cost of being able to switch at RUNTIME. The
+ * 2026-08-22 metal calibration priced that: rung F (all three switched off) bought +9.1 %,
+ * but defaults-on was -3.6 % against the old hard-wired build, because the hard-wired
+ * build never paid a predicate. -DZ3660_EMU_PROBES=0 -DZ3660_EMU_PERF=0 (`make lean`)
+ * compiles both instruments out, and the predicates go with them -- so the lean loop has
+ * neither the instrument nor its test, which is strictly less than either the old
+ * hard-wired build or rung F. Defaults are 1: the shipped diagnostic build keeps the
+ * instruments one flash away. The contract lives in runloop_build.h.
+ * ==================================================================================== */
+#if Z3660_EMU_PERF
+static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical behaviour)
+#endif
+#if Z3660_EMU_PROBES
+static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
+#endif
+
+/* CYBERSTORM C2 rung 0: iterations of a recognised block idiom per run-loop pass.
+ * 0 == the recognizer never fires (pure passthrough). Compiled into EVERY variant, unlike
+ * the two instruments above: this is an optimisation, not a diagnostic, and the lean
+ * production image is the one that most wants it. The knob exists so a metal session can
+ * A/B it on a live guest without reflashing -- and so the state-equivalence corpus in the
+ * host harness has an off state to compare against. See z3660_blk.h for the encoding. */
+#include "z3660_blk.h"
+static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
+
+/* CYBERSTORM C2 rung 1: the decoded-op cache. Same shape of switch as rung 0 and for the
+ * same reasons -- compiled into EVERY variant because it is an optimisation and not a
+ * diagnostic, and switchable at runtime so a metal session can A/B it on a live guest
+ * without reflashing, and so the host harness has an off state to compare against.
+ * z3660_dopc.h carries the geometry, the encoding and the invalidation contract. */
+#include "z3660_dopc.h"
+static unsigned z3660_dopc_on = Z3660_DOPC_DEFAULT;
+
+/* WARP ENGINE: the 68040 MMU block engine (docs/WARP-ENGINE.md, z3660_warp.h). Compiled
+ * into EVERY variant, like rungs 0/1/2 and unlike the two instruments, because it is an
+ * optimisation and not a diagnostic -- and switchable at runtime so a metal session can A/B
+ * it on a live guest without reflashing, and so the host harness has an off state to compare
+ * against. The arm flag itself lives in z3660_warp.cpp; the run loop reads it directly.
+ *
+ * Z3660_WARP_ENGINE opens the half of the header core0 must never see -- the block table,
+ * the context struct and the inlined fast path. core0's debug console and config parser
+ * include the same file for the sentinel values and the resolver alone, and the guard is
+ * what keeps that split a compiler-enforced fact rather than a convention. */
+#define Z3660_WARP_ENGINE 1
+#include "z3660_warp.h"
+
+#ifdef HOST_TEST_HARNESS
+/* MUTATION M-7, and it is in no firmware binary. Armed, the cadence feed is given 1 per
+ * block instead of the number of guest instructions the block retired -- which is the exact
+ * defect Q10's contract exists to forbid, and its symptom on metal is a MISSED INTERRUPT
+ * rather than a slow number. The corpus has to be able to show that it catches it; rung 1b's
+ * attribution test once passed a mutation that bypassed the whole attribution, which is how
+ * this lane learned to write the arm rather than assume it. */
+static int z3660_warp_cadence_mutant = 0;
+extern "C" void z3660_warp_set_cadence_mutant(int on) { z3660_warp_cadence_mutant = on ? 1 : 0; }
+extern "C" int  z3660_warp_serv_ctr(void) { return z3660_serv_ctr_040; }
+#endif
+
+/* THE CADENCE FEED (Q10, FROZEN, and it is the one item in the plan with cross-repo reach).
+ *
+ * A block must feed the service-cadence counter with the number of guest instructions it
+ * RETIRED. If it does not, one pump tick stops being 256 x service_cadence GUEST
+ * instructions and every latency statement in docs/AMIX.md silently changes meaning -- the
+ * A3000-SCSI interrupt-delay pump rides on this poll, at cadence 8 its bootstrap already
+ * hangs, and a network flood at cadence 16+ has panicked AMIX.
+ *
+ * IT FEEDS n-1, NOT n, and that is not an off-by-one. The pass's own tail supplies the last
+ * tick, so an interpreted pass and a block that retired exactly one instruction advance the
+ * counter identically -- which is what makes the two arms comparable at all.
+ *
+ * IT POLLS ONCE PER CROSSING, NOT ONCE PER BLOCK. Firing a single poll where interpretation
+ * would have fired three would stretch the pump tick by the block length, silently. The loop
+ * is the interpreted behaviour written out, so the timebase is preserved BY CONSTRUCTION
+ * rather than by argument -- rung 0's own standard -- and it costs a handful of instructions
+ * amortised over a whole block.
+ *
+ * It lives here rather than in z3660_warp.cpp because the counter, the cadence and the poll
+ * all live here, and a second file reaching into the run loop's state is how two copies of
+ * one rule come to disagree. Round 1 always calls it with 0. */
+extern "C" void z3660_warp_cadence_feed(unsigned insns)
+{
+   unsigned i;
+
+#ifdef HOST_TEST_HARNESS
+   if (z3660_warp_cadence_mutant && insns != 0u) insns = 1u;   /* M-7; never shipped */
+#endif
+   for (i = 1; i < insns; i++) {
+      if (++z3660_serv_ctr_040 >= z3660_service_cadence) {
+         z3660_serv_ctr_040 = 0;
+         check_uae_int_request();
+      }
+   }
+}
+
+#if Z3660_EMU_PERF
+/* One copy of the [PERF] rate decision, so the tick and the harness read-back cannot
+ * disagree about it -- a read-back that recomputes the answer proves nothing about the
+ * code that prints the line. See z3660_perf_tick() for why this is not COUNTS_PER_SECOND. */
+static uint32_t z3660_perf_wall_hz(uint32_t *clksrc)
+{
+   return z3660_prof_pick_wall_hz(shared ? (uint32_t)shared->arm_wall_hz : 0u,
+                                  (uint32_t)COUNTS_PER_SECOND, clksrc);
+}
+#endif
+
+/* Resample every run-loop knob from the cross-core mailbox. Not static: the host harness
+ * calls it directly rather than waiting for a resync point. */
+extern "C" void z3660_knobs_sync(void)
+{
+   int c = (int)shared->service_cadence; if(c < 1) c = 1; z3660_service_cadence = c;   // SERV
+#if Z3660_EMU_PERF
+   z3660_perf_on   = shared->perf_stats ? 1 : 0;                                       // PERFS
+#endif
+#if Z3660_EMU_PROBES
+   z3660_probes_on = shared->emu_probes ? 1 : 0;                                       // PROBES
+#endif
+   z3660_blk_chunk = z3660_blk_resolve_chunk((unsigned)shared->blk_chunk);             // BLK
+   {                                                                                   // DOPC
+      unsigned d = z3660_dopc_resolve((unsigned)shared->dopc_on);
+      if (d != z3660_dopc_on) { z3660_dopc_on = d; z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB); }
+   }
+   {                                                                                   // DFAST
+      /* CYBERSTORM C2 rung 2. Only on a CHANGE, because arming rebuilds two 1 KB tables
+       * and this runs at every resync point. Unlike DOPC there is nothing to invalidate:
+       * the fast path holds no state of its own -- disarming just makes every verdict
+       * SLOW, and the original accessor is what runs. */
+      unsigned f = z3660_dfast_resolve((unsigned)shared->dfast_on);
+      if ((int)f != z3660_dfast_armed()) z3660_dfast_arm((int)f);
+   }
+   {                                                                                   // WARP
+      /* ON A CHANGE ONLY -- z3660_warp_arm() discards the whole code cache
+       * unconditionally, and this runs at every resync point, so calling it every time
+       * would throw the engine's work away sixty times a second.
+       *
+       * CORE1 PRINTS THE BANNER, not core0. The console can only write a mailbox word;
+       * this is the line that says the EMULATOR armed. It is not the attestation, though,
+       * and the difference matters: two cores share one unlocked UART and an arm banner
+       * arrives spliced, so every capture reads its arm state from a COUNTER --
+       * z3660_warp_entered(), compiled into every variant including the lean one the wall
+       * clock comes from. The banner is for a human watching the serial line. */
+      /* THE SELF-TEST REQUEST, CONSUMED BEFORE IT IS ACTED ON. z3660_prof.cpp's prof_ctl
+       * pattern verbatim and for the same reason -- the test takes a visible amount of time,
+       * so the word is cleared first and a request that arrives twice runs twice rather than
+       * looping. It is a SECOND MAGIC on the same mailbox word and it CANNOT ARM: the
+       * resolver below is unchanged and only Z3660_WARP_ARM resolves to 1 (Q9). */
+      if ((unsigned)shared->warp_on == Z3660_WARP_SELFTEST) {
+         shared->warp_on = Z3660_WARP_OFF;
+#if !Z3660_WARP_ABL_NO_SELFTEST
+         z3660_warp_selftest();
+#endif
+      }
+      unsigned w = z3660_warp_resolve((unsigned)shared->warp_on);
+      if ((int)w != z3660_warp_armed()) {
+         z3660_warp_arm((unsigned)shared->warp_on);
+         /* AND THE RUN LOOP MUST BE RE-SELECTED, because since 0.17.1 there are two of
+          * them and the disarmed one has no hook COMPILED IN -- so a transition cannot be
+          * observed by any test on the dispatch path, for the simple reason that there is
+          * no test on the dispatch path any more. SPCFLAG_MODE_CHANGE is UAE's own flag
+          * for "the run function changed": do_specialties() returns 1 on it a few lines
+          * below (it is what called us), the loop returns, and m68k_go re-enters through
+          * m68k_run_mmu040()'s selector. THIS IS THE ONLY PATH by which the arm state can
+          * move while a run loop is executing -- core0 writes the mailbox, this resync
+          * reads it -- so it is the only place that needs the flag. */
+         set_special(SPCFLAG_MODE_CHANGE);
+         if (w)
+            z3660_printf("\r\n[WARP] ENGINE ARMED -- guest basic blocks are compiled and "
+                         "executed as ARM code.\r\n"
+                         "[WARP] M1 round 2: generation one compiles MOVE/MOVEA, "
+                         "register ALU, Bcc and DBcc; everything else bails.\r\n"
+                         "[WARP] Read the arm state back from the counter, never from this "
+                         "line. docs/WARP-ENGINE.md\r\n\r\n");
+         else
+            z3660_printf("\r\n[WARP] engine DISARMED -- the interpreter is the whole "
+                         "machine again; the code cache was discarded on the way out.\r\n"
+                         "[WARP] this boot executed %lu block(s) in total.\r\n\r\n",
+                         (unsigned long)z3660_warp_entered());
+      }
+   }
+}
+
+/* Read-back + direct set for the host harness and the serial console. The setter takes a
+ * RAW mailbox value and runs it through the same resolution rule, so a console `BLK 9999`
+ * and a mailbox word of 9999 cannot mean two different things. */
+extern "C" unsigned z3660_blk_get(void) { return z3660_blk_chunk; }
+extern "C" unsigned z3660_blk_set(unsigned requested)
+{
+   z3660_blk_chunk = z3660_blk_resolve_chunk(requested);
+   return z3660_blk_chunk;
+}
+
+/* Same pair for the decoded-op cache. Setting it ALWAYS invalidates, even when the
+ * resolved state does not change: the cheap thing to get wrong here is to turn the cache
+ * off, let the guest rewrite a page while nothing is watching, and turn it back on with
+ * the pre-rewrite decodes still stamped live. Invalidating on every set removes the
+ * question rather than answering it. */
+extern "C" unsigned z3660_dopc_get(void) { return z3660_dopc_on; }
+extern "C" unsigned z3660_dopc_set(unsigned requested)
+{
+   z3660_dopc_on = z3660_dopc_resolve(requested);
+   z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB);
+   return z3660_dopc_on;
+}
+
+/* Read-back for the harness (and any future serial dump).
+ *
+ * On the lean build an instrument that is COMPILED OUT reports 0 whatever the mailbox
+ * says, because that is the truth about the loop: the switch has nothing left to switch.
+ * Reporting the mailbox bit instead would let a metal session believe an instrument is
+ * armed when the binary does not contain it. service_cadence is NOT an instrument -- it
+ * is a functional knob, it survives in both variants, and it is read back as-is. */
+extern "C" void z3660_knobs_get(int *perf_on, int *probes_on, int *cadence)
+{
+#if Z3660_EMU_PERF
+   if(perf_on)   *perf_on   = z3660_perf_on;
+#else
+   if(perf_on)   *perf_on   = 0;
+#endif
+#if Z3660_EMU_PROBES
+   if(probes_on) *probes_on = z3660_probes_on;
+#else
+   if(probes_on) *probes_on = 0;
+#endif
+   if(cadence)   *cadence   = z3660_service_cadence;
+}
+#if Z3660_EMU_PERF
+extern "C" uae_u64 z3660_perf_count_get(void) { return z3660_perf_count; }
+#else
+extern "C" uae_u64 z3660_perf_count_get(void) { return 0; }   /* no accumulator to report */
+#endif
+
+/* Read-back of the clock the [PERF] line divides by -- the harness's only way to assert
+ * that the ~1 Hz window and the kIPS numerator come from the RETUNED rate and not from
+ * the frozen BSP constant. Same "compiled out reports 0" rule as z3660_knobs_get(): on a
+ * lean build there is no [PERF] line, so there is no rate to report. */
+extern "C" void z3660_perf_clock_get(uae_u32 *wall_hz, int *clk_cfg)
+{
+#if Z3660_EMU_PERF
+   uint32_t src = Z3660_PROF_CLK_BSP;
+   uint32_t hz  = z3660_perf_wall_hz(&src);
+   if(wall_hz) *wall_hz = (uae_u32)hz;
+   if(clk_cfg) *clk_cfg = (src == Z3660_PROF_CLK_CFG) ? 1 : 0;
+#else
+   if(wall_hz) *wall_hz = 0;
+   if(clk_cfg) *clk_cfg = 0;
+#endif
+}
+
+/* Knob resync point that survives perf_stats OFF.
+ *
+ * z3660_perf_tick() -- which is where the SERV knob has always been picked up -- only
+ * runs while the perf accumulator runs. With perf_stats off it does not, so SERV/PERFS/
+ * PROBES would stop reaching the loop and could never be turned back on. This hook lives
+ * in do_specialties(), which the run loops call ONLY when regs.spcflags != 0: it
+ * therefore costs exactly zero instructions on the per-instruction path, at either
+ * setting. Under a running guest spcflags fires on every interrupt (60 Hz and up), so
+ * a knob turned on the serial console reaches the loop in well under a second. */
+static void z3660_knobs_poll(void)
+{
+   static int n = 0;
+   if((++n & 0x3F) != 0) return;
+   z3660_knobs_sync();
+}
+
+#if Z3660_EMU_PERF
+/* [PERF] instructions per second, against the clock the board is ACTUALLY running.
+ *
+ * This line was low by 1.65x for the whole life of the instrument, and the C2 map had to
+ * carry a `CLOCK-CORRECTION.txt` to undo it before any number in the map could be read.
+ * The cause is the same one z3660_prof.h documents for the profiler: COUNTS_PER_SECOND is
+ * a COMPILE-TIME BSP constant baked at the 666.67 MHz default, while `arm_frequency` is a
+ * config key that ps7_init_custom() applies to the PLL at boot -- 1100 MHz on the bench
+ * board. It appears TWICE here and both uses were wrong in the same direction, which is
+ * why the error was a clean scale factor rather than noise: once as the ~1 Hz window
+ * length (so the "second" was really 1.65 s) and once as the numerator of the rate.
+ *
+ * The fix is the path the profiler already publishes and already tests: core0 writes the
+ * retuned global-timer rate to SHARED.arm_wall_hz (main.c), and z3660_prof_pick_wall_hz()
+ * -- a rule, in a header, with host coverage of every branch -- decides whether to
+ * believe it. Below 1 MHz means "no core0 ever wrote it" (an older image, or the host
+ * harness), and then the BSP constant takes over.
+ *
+ * The line SAYS WHICH IT USED. The old text said "uncalibrated, use as relative", which
+ * was true and useless: two sessions on differently-clocked boards produced numbers that
+ * were not comparable and nothing said so. `clk=cfg` is a calibrated kIPS; `clk=bsp` is
+ * the old caveat, now stated only when it actually applies. */
+static void z3660_perf_tick(void)         // called ~every 1M instructions from the run loop
+{
+   z3660_knobs_sync();                    // pick up the runtime knobs (SERV / PERFS / PROBES)
+   static uae_u64 lastcnt = 0; static XTime last = 0;
+   uint32_t clksrc = Z3660_PROF_CLK_BSP;
+   uint32_t wallhz = z3660_perf_wall_hz(&clksrc);
+   XTime now; XTime_GetTime(&now);
+   XTime el = now - last;
+   if(el >= (XTime)wallhz){                      // ~1 Hz window, in REAL timer ticks
+      if(shared->perf_report && last != 0){
+         uae_u64 di = z3660_perf_count - lastcnt;
+         uint32_t kips = (uint32_t)(di * (uae_u64)wallhz / (uae_u64)el / 1000u);
+         z3660_printf("[PERF] ~%lu kIPS (clk=%s wall_hz=%lu) cadence=%d\r\n",
+                      (unsigned long)kips,
+                      clksrc == Z3660_PROF_CLK_CFG ? "cfg" : "bsp (UNCALIBRATED)",
+                      (unsigned long)wallhz, z3660_service_cadence);
+      }
+      lastcnt = z3660_perf_count; last = now;    // keep the window fresh even when reporting is off
+   }
+}
+#endif /* Z3660_EMU_PERF */
+
+/* The accumulator half of the tail. On the DEFAULT build this is exactly what the loops
+ * have always run, plus the `if (z3660_perf_on)` predicate the runtime switch needs. On
+ * the LEAN build it expands to NOTHING -- not to a predicate that is always false, to
+ * nothing -- which is the whole point: the lean loop does not test a switch it does not
+ * have. */
+#if Z3660_EMU_PERF
+#define Z3660_RUNLOOP_PERF()                                                  \
+      if (z3660_perf_on) {                                                    \
+         z3660_perf_count++;                                                  \
+         if((z3660_perf_count & 0xFFFFFu) == 0) z3660_perf_tick();            \
+      }
+#else
+#define Z3660_RUNLOOP_PERF()   /* lean build: no accumulator, and so no predicate either */
+#endif
+
+/* The per-instruction tail both MMU run loops share, so the two cannot drift.
+ *
+ * A macro, not an inline function, precisely so each loop keeps its OWN serv_ctr -- that
+ * is what the two loops have today, and sharing one would silently couple their poll
+ * phase across a mode change.
+ *
+ * The service-cadence poll is NOT part of the instrumentation and survives in both build
+ * variants: it is functional (interrupt detection, and -- see docs/AMIX.md -- the A3000
+ * SCSI interrupt-delay pump rides on it), not diagnostic. */
+#define Z3660_RUNLOOP_TAIL()                                                  \
+   do {                                                                       \
+      Z3660_RUNLOOP_PERF()                                                    \
+      { static int serv_ctr = 0;                                               \
+        if(++serv_ctr >= z3660_service_cadence){ serv_ctr = 0; check_uae_int_request(); } } \
+   } while(0)
+
+/* The 040 loop's tail: identical in every respect except that its counter has a name, so
+ * WARP's cadence feed can advance it. See z3660_serv_ctr_040 above and Q10. */
+#define Z3660_RUNLOOP_TAIL_040()                                              \
+   do {                                                                       \
+      Z3660_RUNLOOP_PERF()                                                    \
+      { if(++z3660_serv_ctr_040 >= z3660_service_cadence){ z3660_serv_ctr_040 = 0; check_uae_int_request(); } } \
+   } while(0)
+
+/* ====================================================================================
+ * CYBERSTORM C2 RUNG 0 -- THE BLOCK-IDIOM FAST PATH
+ *
+ * WHAT THE MEASUREMENT SAID. The C2 map (amix-040-060-port/docs/C2-ATTACK-MAP.md §9.7)
+ * put a family of tight kernel block loops at 33.63 % of an AMIX boot, 25.11 % of a raw
+ * disk read and 10.57 % of dhrystone. `bzero` alone is 22.07 % of boot and it is two
+ * instructions at one PC:
+ *
+ *     0800032c   20c9   MOVE.L A1,(A0)+
+ *     0800032e   51c9   DBF    D1,-4
+ *
+ * Costed from the map's per-event table those two pay 850.5 ARM cycles per four bytes, of
+ * which the guest store is 162.7. Kernel zero-fill runs at 5.17 MB/s and 80.9 % of the
+ * price is interpreter machinery around a four-byte write.
+ *
+ * WHAT THIS DOES, AND -- MORE IMPORTANTLY -- WHAT IT DOES NOT.
+ *
+ * It recognises the loop at dispatch time and runs many iterations inside one pass of the
+ * run loop, so the opcode fetch, the dispatch, the tail, the sampler and the interrupt
+ * poll are paid once per CHUNK instead of once per guest instruction.
+ *
+ * IT DOES NOT REPLACE THE GUEST STORE. There is no `memset` here, no host block move, no
+ * direct pointer into guest memory. Every iteration calls `put_long_mmu040()` -- the exact
+ * function `op_20c8_31_ff` calls, with the same arguments in the same order -- so TTR
+ * matching, the data page cache, the ATC, the M and U descriptor bits, protection checks,
+ * bank dispatch and device side effects are preserved BY CONSTRUCTION rather than by
+ * argument. Three reasons, in order of weight:
+ *
+ *   1. It is the difference between a change whose correctness is *proved* and one whose
+ *      correctness is *reasoned about*. Risk 1 in the map's own ordering is fault
+ *      semantics, and this repository has paid for the general lesson: a page-crossing
+ *      DMA that clipped an unrelated frame stayed invisible until it ate an ELF header.
+ *   2. The arithmetic does not need it. The map pre-registers an 80 % reclaim, and 80 %
+ *      is what you get when the store stays and the machinery goes: 162.7 of 850.5 cycles
+ *      is 19.1 %. The pre-registered gain is exactly the gain of the safe design.
+ *   3. A host-pointer fast path could not be TESTED here. board_stubs.cpp leaves every
+ *      bank's `baseaddr` NULL on purpose (harness decision #6), so a `memset` over a
+ *      direct pointer would ship having never executed in the harness -- and the harness
+ *      is the whole evidence base for this change.
+ *
+ * SO WHAT IS ACTUALLY SAVED: FETCHOP, FETCHEX, HANDLER's dispatch, TAILADV, TAILPOLL,
+ * TAILSAMP and LOOP, once per chunk instead of once per instruction, twice over (the MOVE
+ * and the DBcc are both gone).
+ *
+ * ---------------------------------------------------------------------------------
+ * THE 68040 WRITE-BACK CONTRACT, which is the whole of the fault-semantics risk
+ * ---------------------------------------------------------------------------------
+ *
+ * `op_20c8_31_ff` is NOT instruction-restart. Read it: it increments the destination
+ * register, sets the flags, advances the pc to the DBcc, sets `regs.instruction_pc` to
+ * the DBcc, clears `mmu_restart`, DISARMS mmufixup -- and only then performs the store.
+ * A fault in that store is a 68040 write-back fault on an instruction that has already
+ * completed architecturally; the kernel's wb040.s replays the store and RTEs to the
+ * DBcc. Getting this backwards is what ISSUE-52 round 8 was, and it cost a boot.
+ *
+ * So the fast path does not "restart"; it reproduces that state exactly, and it does so
+ * by hoisting the loop-invariant half OUT of the loop rather than by re-deriving it:
+ * flags, pc, instruction_pc and mmu_restart are all constant across every iteration of a
+ * bzero, so they are set once before the first store and are correct at every store. What
+ * is left inside the loop is the post-increment, the store, and the DBcc's decrement --
+ * in the generated handler's order, so that at the instant of any store the machine holds
+ * exactly the state the interpreted path would hold.
+ *
+ * A fault therefore needs no unwinding and no fixup: the register file is already right,
+ * the run loop's CATCH sees `mmu_restart == false`, does not rewind, and raises. The
+ * harness compares this state byte-for-byte against the interpreted path (recognizer off)
+ * for a fill that faults on an unmapped second page.
+ *
+ * AND THEN THE HONEST PART, because two of the statements above are currently DEAD and a
+ * reader is entitled to know which. The device gate below only fast-paths a page whose
+ * data-page-cache entry a successful access has already established, and a chunk never
+ * leaves that page -- so a store inside a chunk cannot fault, and the two things that
+ * would only ever be read by a fault handler are unobservable:
+ *
+ *   - `mmu_restart = false` is overwritten by the run loop at the top of the next pass.
+ *   - the post-increment happening BEFORE the store rather than after is invisible,
+ *     because nothing can look at the machine between the two.
+ *
+ * Mutation testing says so rather than reasoning saying so: inverting either one leaves
+ * the whole 1594-assertion corpus green, while fifteen other deliberate defects in this
+ * function do not. They are written correctly anyway, and they stay, because the property
+ * that makes them dead is a property of TODAY'S gate. Widen the gate to translate cold
+ * pages itself, or hoist the store out of `put_long_mmu040`, and a mid-chunk fault becomes
+ * reachable in the same edit -- at which point these two lines are the difference between
+ * a page fault and a corrupted file system, and nobody will be looking at them.
+ *
+ * ---------------------------------------------------------------------------------
+ * THE DEVICE GATE -- z3660_blk_probe()
+ * ---------------------------------------------------------------------------------
+ *
+ * The map asks for a non-RAM destination to fall back to the slow path. With the store
+ * unchanged that is not a correctness question -- but it is a LATENCY question, and a
+ * sharp one: a burst of 256 writes to an emulated device with no interrupt poll between
+ * them is exactly how a core0 mailbox round trip would deadlock. So the destination bank
+ * is checked, once per chunk, and anything that is not plain RAM declines.
+ *
+ * The gate is STRICTLY NON-FAULTING and it never computes an address that is used for a
+ * store. It reads the TTR registers (a pure predicate) and the already-populated data
+ * page cache; on a cold entry it simply declines, the interpreter runs one ordinary
+ * instruction, and the entry that instruction populates lets the next pass through. That
+ * costs one interpreted instruction per page -- 0.1 % of a 1024-longword fill -- and buys
+ * a gate that cannot itself raise, cannot set an M or U bit the interpreted path would
+ * not have set, and cannot move a fault by one instruction.
+ *
+ * It also makes the page-boundary rule fall out of the same mechanism instead of being a
+ * second one: the gate's verdict is valid for one page, so the chunk is bounded by the
+ * page, so the fill stops at every boundary and re-validates. The map asks for exactly
+ * that ("chunk at the page boundary and never fast-path across one") and here it is not a
+ * rule bolted on but the reach of the evidence the gate collected.
+ *
+ * ---------------------------------------------------------------------------------
+ * YIELD GRANULARITY: ONE CHUNK
+ * ---------------------------------------------------------------------------------
+ *
+ * The fast path performs at most one chunk and then RETURNS TO THE RUN LOOP, leaving the
+ * pc on the head instruction if iterations remain. The tail therefore runs -- cycle
+ * accounting, sampler, `check_uae_int_request()` at its configured cadence,
+ * `do_specialties()` -- once per chunk, and the state at every chunk boundary is a state
+ * the interpreted path itself passes through, so an interrupt taken there is
+ * indistinguishable from one taken between two guest instructions.
+ *
+ * The chunk cap is the knob (z3660_blk.h): 256 iterations is a ~42 us window at 1.1 GHz,
+ * inside the 64 us of one 15.6 kHz hsync, which is the tightest cadence anything on this
+ * poll depends on (docs/AMIX.md's A3000-SCSI interrupt-delay pump).
+ *
+ * ---------------------------------------------------------------------------------
+ * WHY THE TRIGGER IS AN OPCODE PAIR AND NEVER A PC
+ * ---------------------------------------------------------------------------------
+ *
+ * The map is explicit: keyed on the opcode pair, never on a PC or a symbol. It must fire
+ * for any kernel that generates the same loop and it must not need to know it is looking
+ * at `bzero`. Hence the masked families below -- register fields are free, everything
+ * else is pinned -- and the DBcc's displacement is checked to actually target the head,
+ * which is what makes "these two opcodes" into "this is a loop".
+ *
+ * The cost of a miss is real and is worth naming: a `MOVE.L An,(Ay)+` that is NOT part of
+ * a loop pays two extra instruction-stream fetches before the recognizer gives up. That
+ * mode is rare in 68k code -- register saves use `-(SP)`, not `(An)+` -- and the masked
+ * compares that precede the fetches reject everything else for three ALU operations.
+ * ==================================================================================== */
+
+/* Opcode families. Masked, never literal (see above). Verified against the generated
+ * 68040-MMU dispatch table (cpustbl_mmu040.cpp): the register fields, and for CPUSHL the
+ * CACHE field, are the entries' don't-care bits. */
+#define Z3660_BLK_IS_MOVE_AN_INC(op)  (((op) & 0xF1F8u) == 0x20C8u) /* MOVE.L An,(Ay)+     */
+#define Z3660_BLK_IS_MOVE_INC_INC(op) (((op) & 0xF1F8u) == 0x20D8u) /* MOVE.L (Ax)+,(Ay)+  */
+#define Z3660_BLK_IS_DBF(op)          (((op) & 0xFFF8u) == 0x51C8u) /* DBF/DBRA Dn (cc=F)  */
+#define Z3660_BLK_IS_CPUSHL(op)       (((op) & 0xFF38u) == 0xF428u) /* CPUSHL <cache>,(An) */
+#define Z3660_BLK_IS_ADDA_W_IMM(op)   (((op) & 0xF1FFu) == 0xD0FCu) /* ADDA.W #imm,An      */
+
+/* The generated handlers' cycle returns, so the emulated-time accounting a chunk hands to
+ * adjust_cycles() is the sum of what the collapsed instructions would each have returned.
+ * Delivered in one lump instead of interleaved, which is exact for do_cycles_cpu_fastest()
+ * (a pure accumulator on this board) and bounded by the chunk cap for anything else. */
+#define Z3660_BLK_CYC_MOVE   ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_20c8 */
+#define Z3660_BLK_CYC_MOVE2  ((2 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_20d8 */
+#define Z3660_BLK_CYC_CPUSHL ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_f428 */
+#define Z3660_BLK_CYC_ADDA   ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* op_d0fc */
+#define Z3660_BLK_CYC_DBF_T  ((1 * 4 * CYCLE_UNIT / 2) * 4)                    /* branched */
+#define Z3660_BLK_CYC_DBF_F  ((1 * 4 * CYCLE_UNIT / 2 + 6 * CYCLE_UNIT / 2) * 4) /* fell through */
+
+/* Resolve a data address the way the ordinary accessor would, WITHOUT performing anything
+ * that can fault or that changes MMU state, and report whether it lands in plain RAM.
+ *
+ * Returns 1 and sets *gran (the address mask inside which the verdict stays valid) when
+ * the answer is "plain RAM, and here is how far that holds"; 0 for every other case,
+ * including "I could not tell". Declining is always safe: the interpreter runs the
+ * instruction.
+ *
+ * The three arms mirror mmu_put_long()/mmu_get_long()'s own address resolution and are
+ * kept in that order for that reason. The write-protected TTR window and the MMU-off
+ * write-once case both RAISE on the ordinary path, so they decline here rather than being
+ * modelled -- the ordinary path is then free to raise them exactly as it always has. */
+static int z3660_blk_probe(uaecptr addr, int write, uae_u32 *gran)
+{
+   uae_u32 phys;
+   uae_u32 g = 0xFFFFu;      /* bankindex() is addr >> 16: a bank verdict holds for 64 KB */
+
+   if (mmu_ttr_enabled) {
+      int res = mmu_match_ttr(addr, regs.s != 0, true);
+      if (res != TTR_NO_MATCH) {
+         if (write && res != TTR_OK_MATCH) return 0;   /* NO_WRITE: let the store raise */
+         phys = addr;
+         *gran = g;
+         return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+      }
+      /* TTR_NO_MATCH falls through to the MMU, exactly as the accessors do. */
+   }
+   if (!regs.mmu_enabled) {
+      if (write && (regs.tcr & MMU_TCR_DWO)) return 0; /* write-once: let the store raise */
+      phys = addr;
+      *gran = g;
+      return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+   }
+#if MMU_DPAGECACHE
+   {
+      uae_u32 idx1 = ((addr & mmu_pagemaski) >> mmu_pageshift1m) | regs.s;
+      uae_u32 idx2 = idx1 & (MMUFASTCACHE_ENTRIES - 1);
+      const struct mmufastcache *e = write ? &atc_data_cache_write[idx2]
+                                           : &atc_data_cache_read[idx2];
+      if (e->log != idx1)
+         return 0;           /* cold: decline, and let the ordinary access warm it */
+      phys = e->phys | (addr & mmu_pagemask);
+      if (mmu_pagemask < g) g = mmu_pagemask;
+      *gran = g;
+      return (get_mem_bank(phys).flags & ABFLAG_RAM) ? 1 : 0;
+   }
+#else
+   (void)phys;
+   return 0;                 /* no page cache to read: never fast-path under translation */
+#endif
+}
+
+/* Longwords from `addr` to the end of its granule. `addr` is longword-aligned and the
+ * granule is a power-of-two-sized aligned window, so this is never zero. */
+static uae_u32 z3660_blk_room(uaecptr addr, uae_u32 gran)
+{
+   return ((gran + 1u) - (addr & gran)) >> 2;
+}
+
+/* The recognizer. Returns 1 if it serviced a chunk (the caller must NOT dispatch, and
+ * takes the emulated cycle count from *cycp); 0 to dispatch normally.
+ *
+ * `op` is the already-fetched opcode and the pc still stands on it.
+ *
+ * *shapep IS THE DECODED-OP CACHE'S IDIOM VERDICT (C2 rung 1), and its contract is the
+ * reason this function has a third argument at all. The caller arrives with *shapep = 1
+ * and this function may only clear it when it has POSITIVELY ESTABLISHED, from the
+ * instruction words alone, that the code at this pc is not an idiom head. Every decline
+ * that depends on anything else -- the trace bits, the chunk cap, the destination's
+ * alignment, the device gate, the privilege state -- must leave it set.
+ *
+ * The asymmetry is deliberate and it is what makes caching the verdict safe. A cached
+ * TRUE costs one wasted recognizer test on a later hit; a cached FALSE would lose the
+ * fast path at that pc until the next invalidation, and rung 0 is worth 43.6 % of an
+ * AMIX boot. So the cheap error is the one this is biased towards, and the expensive one
+ * is unreachable: the words the verdict is computed from are the same words the entry
+ * caches, and anything that changes them invalidates the entry. */
+/* always_inline, AND IT IS A CONSEQUENCE OF THE RUN LOOP BEING INSTANTIATED TWICE
+ * (docs/WARP-ENGINE.md S0.17.1). Until round 6 this function had exactly ONE caller, so
+ * -Os inlined it under -finline-functions-called-once at no size cost, and every image
+ * whose disarmed row this campaign has measured -- 7A5EC595, 5E2592EF, 459E51A3, BBED0509
+ * -- carries it inlined in the run loop. Splitting the loop into a hooked and an unhooked
+ * instantiation gave it TWO callers, the heuristic flipped, and the first build of the fix
+ * put a call and a return on rung 0's recognizer path in both loops.
+ *
+ * That is the ambient -Os re-decision S0.15.3 measured at ~460 function bodies per change,
+ * landing on the one path this round is trying to hold still: the fix's whole verification
+ * is an A/B against A4's MEASURED 8 140, and an A4 row is only a target if the image being
+ * compared to it has A4's loop. So the inline is restored by construction rather than left
+ * to a heuristic whose input this round deliberately changed. The price is one more copy of
+ * the body, in the loop that also carries the hook. */
+static __attribute__((always_inline)) inline int z3660_blk_run(uae_u16 op, int *cycp, int *shapep)
+{
+   unsigned cap = z3660_blk_chunk;
+   uaecptr pc;
+   uae_u32 n, count, chunk;
+   uae_u16 opdb;
+   int dnreg, dn, idiom_len;
+   uae_s16 disp;
+
+   /* OFF is a PURE PASSTHROUGH and this is the line that makes it one: nothing has been
+    * examined, no state read, no fetch issued. The state-equivalence corpus compares
+    * against this path, so it has to be the untouched interpreter and not a second
+    * implementation that agrees with it. */
+   if (!cap) return 0;
+
+   /* Head discrimination first: three masked compares reject the entire rest of the
+    * instruction set before anything more expensive happens.
+    *
+    * This one test is a function of the opcode alone, so a failure here is the STATIC
+    * verdict the decoded-op cache wants and it is recorded as such. It is also the
+    * overwhelmingly common case -- almost every instruction in the stream reaches this
+    * line and leaves -- which is exactly why caching the answer is worth doing: metal
+    * measured rung 0 costing dhrystone ~1 % for precisely these three compares, paid on
+    * every dispatch and repaid only inside the idiom stream. */
+   if (Z3660_BLK_IS_MOVE_AN_INC(op) || Z3660_BLK_IS_MOVE_INC_INC(op))
+      idiom_len = 6;                                   /* MOVE + DBF + displacement */
+   else if (Z3660_BLK_IS_CPUSHL(op))
+      idiom_len = 10;                                  /* CPUSHL + ADDA.W #imm + DBF + disp */
+   else
+      { *shapep = 0; return 0; }
+
+   /* Trace has to see every instruction, and STOP/mode-change handling is per-instruction
+    * business the fast path is not entitled to skip. */
+   if (regs.t0 || regs.t1) return 0;
+
+   pc = (uaecptr)regs.instruction_pc;
+
+   /* The idiom's own words must lie inside ONE guest instruction page. Reading past the
+    * opcode is the recognizer's only speculative act, and this is what keeps it from
+    * faulting somewhere the interpreted path would not have: the page holding `pc` was
+    * just fetched successfully, so every word inside it is reachable. MMU off is exempt --
+    * the accessors are transparent there and an instruction fetch cannot fault. */
+   if (regs.mmu_enabled && ((pc ^ (pc + (uae_u32)idiom_len - 1u)) & mmu_pagemaski) != 0)
+      return 0;
+
+   /* Everything from here to the end of the shape test reads the instruction stream, so
+    * every failure in it is STATIC -- a property of the words at this pc, which is
+    * exactly what the decoded-op cache is allowed to remember. The one exception is the
+    * user-mode CPUSHL test at the bottom, which is a property of the machine and is
+    * marked as such. */
+   if (idiom_len == 6) {
+      opdb = (uae_u16)get_iword_mmu040(2);
+      if (!Z3660_BLK_IS_DBF(opdb)) { *shapep = 0; return 0; }
+      disp = (uae_s16)get_iword_mmu040(4);
+      /* A DBcc's displacement is relative to its own extension word, so the target is
+       * (pc+2) + 2 + disp. "This is a two-instruction loop" == that target is the head. */
+      if ((uae_u32)(pc + 4u + (uae_u32)(uae_s32)disp) != pc) { *shapep = 0; return 0; }
+   } else {
+      uae_u16 opadd = (uae_u16)get_iword_mmu040(2);
+      if (!Z3660_BLK_IS_ADDA_W_IMM(opadd)) { *shapep = 0; return 0; }
+      /* The ADDA must advance the register the CPUSHL is walking, or this is not the
+       * cache-flush loop and the collapse would step the wrong pointer. */
+      if ((int)((opadd >> 9) & 7) != (int)(op & 7)) { *shapep = 0; return 0; }
+      opdb = (uae_u16)get_iword_mmu040(6);
+      if (!Z3660_BLK_IS_DBF(opdb)) { *shapep = 0; return 0; }
+      disp = (uae_s16)get_iword_mmu040(8);
+      if ((uae_u32)(pc + 8u + (uae_u32)(uae_s32)disp) != pc) { *shapep = 0; return 0; }
+      /* CPUSHL is privileged: in user mode op_f428_31_ff raises Exception(8), which is a
+       * per-instruction event and not ours to collapse. NOT a static verdict: the same
+       * words are a perfectly good idiom head the next time this pc runs in supervisor
+       * mode, and a kernel that maps one page into both is not this core's business. */
+      if (!regs.s) return 0;
+   }
+
+   /* DBF decrements only the low word and branches while it is not -1, so from Dn.w == n
+    * the body runs n+1 more times and Dn.w ends at 0xFFFF with the high half untouched.
+    * n == 0 is one more iteration, not zero: that is the boundary the corpus pins. */
+   dnreg = (int)(opdb & 7);
+   dn    = (int)m68k_dreg(regs, dnreg);
+   n     = (uae_u32)dn & 0xFFFFu;
+   count = n + 1u;
+
+   chunk = count;
+   if (chunk > cap) chunk = cap;
+
+   if (idiom_len == 6) {
+      int dstreg = (int)((op >> 9) & 7);
+      uaecptr dsta = (uaecptr)m68k_areg(regs, dstreg);
+      uae_u32 gdst;
+      int i;
+      int cyc;
+
+      /* Misaligned block moves are not a thing kernels do, and refusing them removes the
+       * split-access case entirely -- a longword straddling a page boundary is two
+       * accesses the fast path would have to reason about separately. */
+      if (dsta & 3u) return 0;
+      if (!z3660_blk_probe(dsta, 1, &gdst)) return 0;
+      {
+         uae_u32 room = z3660_blk_room(dsta, gdst);
+         if (chunk > room) chunk = room;
+      }
+
+      if (Z3660_BLK_IS_MOVE_AN_INC(op)) {
+         /* ---- STAGE A: bzero. `MOVE.L An,(Ay)+` / `DBF Dn,-4` ---------------------
+          * Source is an address register and never changes, so both the stored value and
+          * the flags it sets are loop invariants. */
+         uae_s32 src = (uae_s32)m68k_areg(regs, (int)(op & 7));
+
+         /* op_20c8_31_ff's pre-store state, hoisted: identical at every iteration. */
+         CLEAR_CZNV();
+         SET_ZFLG(src == 0);
+         SET_NFLG(src < 0);
+         m68k_setpci(pc + 2);              /* the handler leaves the pc on the DBcc */
+         regs.instruction_pc = pc + 2;
+         mmu_restart = false;              /* a 68040 write-back fault, not a restart */
+         mmufixup[0].reg = -1;             /* the handler disarms before its store */
+
+         for (i = 0; i < (int)chunk; i++) {
+            /* Post-increment BEFORE the store, exactly as the generated handler does, so
+             * a faulting store leaves Ay already advanced -- which is what wb040.s's
+             * replay expects and what the harness compares against. */
+            m68k_areg(regs, dstreg) = (uae_u32)dsta + 4u;
+            put_long_mmu040(dsta, (uae_u32)src);
+            dsta += 4;
+            /* ...then the DBcc's decrement. Not before: a fault above must leave Dn
+             * un-decremented, because the DBcc has not run yet. */
+            dn = (int)m68k_dreg(regs, dnreg);
+            m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu) | (((uae_u32)dn - 1u) & 0xFFFFu);
+         }
+         cyc = (int)chunk * (Z3660_BLK_CYC_MOVE + Z3660_BLK_CYC_DBF_T);
+         if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+         *cycp = cyc;
+         Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 2u * chunk);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES, 4u * chunk);
+      } else {
+         /* ---- STAGE B: mcpy. `MOVE.L (Ax)+,(Ay)+` / `DBF Dn,-4` ------------------- */
+         int srcreg = (int)(op & 7);
+         uaecptr srca = (uaecptr)m68k_areg(regs, srcreg);
+         uae_u32 gsrc;
+         uae_s32 src = 0;
+
+         if (srca & 3u) return 0;
+         if (!z3660_blk_probe(srca, 0, &gsrc)) return 0;
+         {
+            uae_u32 room = z3660_blk_room(srca, gsrc);
+            if (chunk > room) chunk = room;
+         }
+
+         m68k_setpci(pc + 2);
+         regs.instruction_pc = pc + 2;
+         mmu_restart = false;
+         mmufixup[0].reg = -1;
+
+         for (i = 0; i < (int)chunk; i++) {
+            /* op_20d8_31_ff's order: read the source, advance BOTH pointers, set the
+             * flags from what was read, THEN store. A fault in the read leaves both
+             * pointers un-advanced; a fault in the store leaves both advanced and the
+             * flags already set. Both are reproduced here by doing the same thing. */
+            src = (uae_s32)get_long_mmu040(srca);
+            m68k_areg(regs, srcreg) = (uae_u32)srca + 4u;
+            m68k_areg(regs, dstreg) = (uae_u32)dsta + 4u;
+            CLEAR_CZNV();
+            SET_ZFLG(src == 0);
+            SET_NFLG(src < 0);
+            put_long_mmu040(dsta, (uae_u32)src);
+            srca += 4;
+            dsta += 4;
+            dn = (int)m68k_dreg(regs, dnreg);
+            m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu) | (((uae_u32)dn - 1u) & 0xFFFFu);
+         }
+         cyc = (int)chunk * (Z3660_BLK_CYC_MOVE2 + Z3660_BLK_CYC_DBF_T);
+         if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+         *cycp = cyc;
+         Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 2u * chunk);
+         Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES, 4u * chunk);
+      }
+
+      /* Where the DBcc left the pc: back at the head if it branched, past the whole idiom
+       * if Dn.w reached -1 and it fell through. */
+      m68k_setpci((chunk == count) ? pc + 6u : pc);
+      return 1;
+   }
+
+   /* ---- STAGE C: the 68040 cache-flush loop ------------------------------------------
+    * `CPUSHL <cache>,(An)` / `ADDA.W #n,An` / `DBF Dn,-8`.
+    *
+    * The map's line about this one is the right one: it is a cache-maintenance loop and
+    * there is no cache to maintain. Everything op_f428_31_ff does to the machine --
+    * flush_cpu_caches_040(), flush_mmu040(), flush_icache() -- is a function of the
+    * OPCODE alone. flush_mmu040 discards its address argument outright; flush_cpu_caches
+    * _040 acts only at scope==3 (all), which this line-scope family never is; flush_icache
+    * is a no-op macro without the JIT. Every one of them is therefore idempotent, so
+    * performing them ONCE for the whole run is not an approximation of doing them N times,
+    * it is the same operation. That is what makes 7.79 % of an AMIX boot collapse into a
+    * few ARM instructions, and it is asserted in the harness rather than trusted here.
+    *
+    * No memory is touched, so there is no device gate, no page bound and nothing that can
+    * fault: the chunk cap alone bounds it, and it bounds it only for interrupt latency. */
+   {
+      int areg = (int)(op & 7);
+      uae_s16 step = (uae_s16)get_iword_mmu040(4);
+      int cyc;
+
+      flush_cpu_caches_040(op);
+      /* `opcode & 3` is upstream's own two-bit register decode here; reproduced verbatim
+       * because flush_mmu040() ignores the argument entirely and a "corrected" one would
+       * be a silent divergence from the interpreted path for no gain. */
+      flush_mmu040(m68k_areg(regs, op & 3), (op >> 6) & 3);
+      if (op & 0x80)
+         flush_icache((op >> 6) & 3);
+
+      m68k_areg(regs, areg) = (uae_u32)((uae_s32)m68k_areg(regs, areg)
+                                        + (uae_s32)step * (uae_s32)chunk);
+      dn = (int)m68k_dreg(regs, dnreg);
+      m68k_dreg(regs, dnreg) = ((uae_u32)dn & ~0xFFFFu)
+                             | (((uae_u32)dn - chunk) & 0xFFFFu);
+      m68k_setpci((chunk == count) ? pc + 10u : pc);
+
+      cyc = (int)chunk * (Z3660_BLK_CYC_CPUSHL + Z3660_BLK_CYC_ADDA + Z3660_BLK_CYC_DBF_T);
+      if (chunk == count) cyc += Z3660_BLK_CYC_DBF_F - Z3660_BLK_CYC_DBF_T;
+      *cycp = cyc;
+      Z3660_PROF_CNT(Z3660_PROF_C_BLK_HIT);
+      Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_INSNS, 3u * chunk);
+      Z3660_PROF_CNT_ADD(Z3660_PROF_C_BLK_BYTES,
+                         (uae_u32)((step < 0 ? -(uae_s32)step : (uae_s32)step) * (uae_s32)chunk));
+      return 1;
+   }
+}
+
+/* CYBERSTORM C2 rung 1d: the recognizer's own bucket, spelled as a wrapper rather than as
+ * an ENTER/EXIT pair around the call site, because the call site is the right operand of
+ * an `&&`. Restructuring that into an `if` to make room for two statements would change
+ * the LEAN source -- and the whole macro idiom in z3660_prof.h exists so the non-profiling
+ * expansion is textually the original code. Here it is exactly `z3660_blk_run(...)`.
+ *
+ * WHAT LANDS IN THE BUCKET. On a DECLINE -- map SS19.4's "recognizer's residual test", and
+ * the overwhelmingly common case -- it is the three masked head compares and the return.
+ * On a FIRE it is the whole serviced chunk, because a bracket cannot know which it will be
+ * until the call returns. BLK_HIT and BLK_INSNS separate the two in the same dump, and
+ * z3660_blk.h's objection to bucketing the fast path is answered by where the bracket
+ * sits: it is per CALL, so a chunk of 256 guest instructions pays two transitions in
+ * total, not 512. */
+#if Z3660_EMU_PROF
+static __inline__ int z3660_prof_blk_run(uae_u16 op, int *cycp, int *shapep)
+{
+   int r;
+   z3660_prof_enter(Z3660_PROF_B_BLKREC);
+   r = z3660_blk_run(op, cycp, shapep);
+   z3660_prof_exit();
+   return r;
+}
+#define Z3660_PROF_BLK_RUN(op, cycp, shapep) z3660_prof_blk_run((op), (cycp), (shapep))
+#else
+#define Z3660_PROF_BLK_RUN(op, cycp, shapep) z3660_blk_run((op), (cycp), (shapep))
+#endif
+
+/* ====================================================================================
+ * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
+ *
+ * WHAT IT REPLACES. Every pass of the run loop currently pays, before it has executed
+ * anything: an indirect call through `x_prefetch`, a TTR predicate, a one-entry
+ * instruction-page-cache compare, a physical read of guest DRAM through the board's bank
+ * dispatch, an indexed load out of a 65 536-entry (256 KB) handler table, and rung 0's
+ * recognizer test. The map prices the fetch half of that at 78.2 ARM cycles per opcode
+ * word and 85.2 per extension word -- 28.65 % of the interpreter, its largest rung.
+ *
+ * A hit replaces all of it with a generation compare, up to four tag compares out of one
+ * cache line, and three loads out of the same line.
+ *
+ * WHY THE HIT PATH IS THE DESIGN AND NOT AN AFTERTHOUGHT. The map pre-registers the
+ * failure mode by name: **"a high hit rate with a low speedup"**, which is what happens
+ * when the tag check and the validity check cost as much as the fetch they replace. At a
+ * 96.6-98.5 % tier-0 ipagecache hit rate, what this has to beat is an already-fast path.
+ * Hence: the whole set is contiguous with the four tags in its first 32-byte line, so a
+ * way scan is one line and not four; validity is ONE per-set generation compare rather
+ * than a per-entry stamp, because every invalidation here is whole-cache and four
+ * per-entry stamps could never disagree; and replacement is round-robin, decided at FILL
+ * time, so a hit performs no stores at all beyond arming the extension-word window.
+ *
+ * THE IDIOM VERDICT RIDES IN THE ENTRY. This is the integration that makes rung 1 pay for
+ * rung 0's overhead rather than adding to it. Metal 2026-08-22 measured rung 0 at boot
+ * -43.6 % and dhrystone -1 %: the recognizer's three masked compares are paid on every
+ * dispatch and repaid only inside the idiom stream, so a workload with no block idiom in
+ * its hot loop pays and never collects. The entry therefore carries the recognizer's
+ * STATIC shape verdict, and on a hit that says "not an idiom" the run loop does not call
+ * the recognizer at all. See z3660_blk_run()'s *shapep contract for why the bit is
+ * conservative-true and why that makes both error directions cheap.
+ *
+ * ONE EXTENSION WORD, AND WHY ONLY ONE. The map asks the entry to hold "the instruction's
+ * extension words". The generated handlers fetch their own -- cpuemu_31 calls
+ * get_iword_mmu040(N) about 920 times -- so the only place to answer them is inside
+ * uae_mmu040_get_iword(), through the address-keyed window in z3660_dopc.h. At 16 bytes
+ * per entry there is room for exactly one word, and the measurement says one is most of
+ * the prize: 1.5983 fetches per guest instruction is one opcode plus 0.5983 extension
+ * words, so a single slot covers the great majority of a bucket worth 11.31 %. The
+ * remainder -- second and later extension words, and the 32-bit displacements that go
+ * through get_ilong -- still fetch, and DOPC_EXT is what says how much was reached.
+ *
+ * THE SLOT IS FILLED BY A REAL FETCH ON THE MISS PATH, not by a guess, and the read is
+ * bounded by the same argument rung 0's recognizer uses for its own lookahead: the page
+ * holding `pc` was just fetched successfully, so every word inside it is reachable, and
+ * the granule test refuses anything that would leave it. With the MMU off the granule is
+ * the 64 KB bank window instead, which is the same guarantee one level down -- a
+ * speculative word from a bank the opcode did not come from could have a device side
+ * effect, and this never issues one.
+ *
+ * ------------------------------------------------------------------------------------
+ * COHERENCE -- the whole risk surface, and it is asymmetric
+ * ------------------------------------------------------------------------------------
+ *
+ * A cache that invalidates too eagerly is slower. One that invalidates too little
+ * executes instructions the guest has already overwritten, and that is a working system
+ * that goes wrong hours later with no symptom at the point of the bug. So this one
+ * follows the map's instruction literally: **invalidate everything on any event that
+ * could plausibly matter, measure the hit rate, and only then narrow it.** Whole-cache
+ * invalidation is affordable as the DEFAULT policy here because it is O(1) -- one
+ * generation increment -- rather than a walk.
+ *
+ * RUNG 1b DID THE "AND ONLY THEN NARROW IT" HALF, MEASURED IT ON METAL, AND RUNG 1c PUT
+ * MOST OF IT BACK. The list of EVENTS below never changed and does not change now: every
+ * one of them arrives here and every one of them invalidates the whole cache. What rung 1b
+ * added -- an empty-cache short-circuit and a page-presence filter on PFLUSH -- was sound
+ * and did what it was designed to do, and it still lost: +7.08 pp of hit rate bought
+ * -1.05 pp of speedup, because the misses it removed were RE-WARM misses that were still
+ * hot in the page cache, i.e. the cheap ones, while its marks were paid on every fill.
+ * z3660_dopc.h carries the decomposition and the numbers.
+ *
+ * ONE NARROWING SURVIVED and it is not in this file: MOVEC to CACR that changes no
+ * retained bit, decided at its own call site in newcpu_common.cpp for one compare and
+ * nothing on the fill or hit path. It removed ~93 % of the invalidations rung 1b removed.
+ *
+ * Note what could never have been narrowed here at all, because it is the shape of the
+ * whole problem: CPUSHL and the DMA arm both carry an address, and both of those addresses
+ * are PHYSICAL while every tag here is logical. See z3660_dopc.h.
+ *
+ * The events, and why each one is in the list:
+ *
+ *   mmu_flush_cache()   The single choke point for the 68040's own instruction-cache and
+ *                       ATC maintenance: flush_mmu040() (every CPUSHL/CPUSHP/CPUSHA and
+ *                       CINV), mmu_flush_atc_page()/_all() (every PFLUSH form), and
+ *                       mmu_set_tc() and mmu_reset() through the latter. It is also
+ *                       where upstream flushes its own (compiled-out) instruction cache,
+ *                       so this cache is invalidated by exactly the operations the
+ *                       architecture already requires a guest to perform before executing
+ *                       code it has written. That is what makes self-modifying code safe
+ *                       without a per-store check: on a 68040 the guest MUST maintain the
+ *                       caches itself, and AMIX does -- the CPUSHL loop alone is 7.79 %
+ *                       of a boot. Note the rung 0 interaction the map flags: stage C
+ *                       collapses that loop into one flush, and one flush is exactly what
+ *                       has to reach here, which it does because the fast path calls
+ *                       flush_mmu040() itself.
+ *
+ *   MOVEC to URP/SRP    A root-pointer change is a change of address space. The ATC
+ *                       deliberately does NOT flush on this (see newcpu_common.cpp: that
+ *                       matches silicon, where PFLUSH is the sole ATC coherence point).
+ *                       This cache is not silicon and has no such contract to keep, so it
+ *                       takes the conservative rule the map asks for. MOVEC to CACR joins
+ *                       it, because that write is what enables and disables the caches
+ *                       whose semantics this one is standing in for.
+ *
+ *   build_cpufunctbl()  The entries hold RESOLVED HANDLER POINTERS out of cpufunctbl[],
+ *                       and a mode change rebuilds that table. A cached pointer into the
+ *                       previous table is a wrong implementation, not a stale word.
+ *
+ *   DMA into guest RAM  THIS ONE IS SPECIFIC TO THIS BOARD and it is not hypothetical.
+ *                       core0 reads disk sectors straight into guest DRAM (scsi.c's
+ *                       f_read into the mapped address) and the interpreter never sees
+ *                       those bytes go past -- so an AMIX text pagein, or an AmigaOS
+ *                       loader reusing a buffer, replaces instruction bytes underneath
+ *                       this cache. core1's own side of that mailbox already knows: it
+ *                       spins until core0 is done and then invalidates its L1 over the
+ *                       exact range (Z3660_emu/src/main.cpp). That is the precise moment
+ *                       the write becomes observable to this core, it is core1-local, and
+ *                       it needs no cooperation from a core0 that may be older than this
+ *                       change -- which a SHARED epoch word would have needed, and would
+ *                       have failed DANGEROUSLY when it did not get it.
+ *
+ *   map_banks()         The emulator's own memory map moving under a cached opcode.
+ *
+ * WHAT IS DELIBERATELY *NOT* IN THE LIST: an ordinary guest store. Checking every write
+ * against the cache would cost more than the cache saves, and the 68040 architecture does
+ * not require it -- the guest is responsible for cache maintenance and the list above is
+ * what that maintenance looks like from in here. `test_dopc_coherence` in the host
+ * harness pins each arm, including the negative: a write with no flush is NOT required to
+ * be visible, and the test says so rather than leaving it to be discovered.
+ * ==================================================================================== */
+
+/* One set: four ways, 64 bytes, with the four tags, the generation stamp and the
+ * replacement cursor packed into the first 32-byte Cortex-A9 line so a way scan touches
+ * one line. Sizes are asserted in the harness -- a set that grows past 64 bytes silently
+ * doubles the hit path's line traffic and nothing else would notice. */
+struct z3660_dopc_set {
+   uae_u32     tag[Z3660_DOPC_WAYS];      /* Z3660_DOPC_KEY(pc, regs.s), or TAG_EMPTY   */
+   uae_u32     stamp;                     /* == z3660_dopc_gen while this set is live   */
+   uae_u32     victim;                    /* round-robin cursor, advanced only on fill  */
+   cpuop_func *handler[Z3660_DOPC_WAYS];  /* the resolved cpufunctbl[] entry            */
+   uae_u16     opcode[Z3660_DOPC_WAYS];
+   uae_u16     ext0[Z3660_DOPC_WAYS];     /* the instruction word at pc + 2             */
+   uae_u8      meta[Z3660_DOPC_WAYS];     /* Z3660_DOPC_M_*                             */
+   uae_u8      pad[4];
+};
+
+static struct z3660_dopc_set z3660_dopc_tab[Z3660_DOPC_SETS] __attribute__((aligned(32)));
+
+/* THE SIZE IS A COMPILE-TIME GUARANTEE ON THE TARGET, not a runtime hope. 64 bytes per
+ * set is two Cortex-A9 cache lines with all four tags, the stamp and the cursor inside
+ * the first, which is the property the hit path is designed around -- a set that grew
+ * would double its line traffic and nothing would fail. Guarded on 32-bit pointers only,
+ * because the host harness builds the same source on x86-64 where a handler pointer is
+ * eight bytes and the set is legitimately 80; the harness asserts the field arithmetic
+ * instead, and this line is what refuses the build that would actually ship. */
+typedef char z3660_dopc_set_is_one_pair_of_lines[
+   (sizeof(void *) != 4 || sizeof(struct z3660_dopc_set) == Z3660_DOPC_SET_BYTES) ? 1 : -1];
+typedef char z3660_dopc_table_is_64k[
+   (sizeof(void *) != 4 || sizeof(z3660_dopc_tab) == Z3660_DOPC_BYTES) ? 1 : -1];
+
+/* Generation 0 is RESERVED and never live, so a zeroed table (BSS at power-on, and the
+ * memset on wrap below) is entirely stale rather than entirely valid. */
+static uae_u32 z3660_dopc_gen = 1;
+
+/* The extension-word window (z3660_dopc.h). C linkage: cpummu.h's single out-of-line
+ * uae_mmu040_get_iword() reads it from other translation units. */
+extern "C" {
+unsigned int   z3660_dopc_ext_pc  = Z3660_DOPC_NO_PC;
+unsigned short z3660_dopc_ext_val = 0;
+}
+
+/* Count the request. Bounds-checked because the alternative to a bad `cause` is a silent
+ * increment of whatever counter follows the block, and a corrupted neighbour is a worse
+ * failure than a lost one -- an out-of-range cause lands on the aggregate instead, where
+ * the sum identity will show it.
+ *
+ * Defined ahead of z3660_dopc_do_invalidate() because the WRAP cause is raised from
+ * inside it -- see the wrap arm below. */
+static __inline__ void z3660_dopc_count_cause(int cause)
+{
+   if ((unsigned)cause < (unsigned)Z3660_DOPC_INV_COUNT)
+      Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_BASE + cause);
+}
+
+/* The work, separated from the cause counting above it. */
+static void z3660_dopc_do_invalidate(void)
+{
+   /* The window came out of an entry, so it dies with the entries. Doing this FIRST
+    * matters: a handler that invalidates and then reads its own extension word must get
+    * a real fetch, and the ordering here is the only thing that guarantees it. It is also
+    * ahead of the switch test below, because the window is armed by a HIT rather than by
+    * the switch, and "an invalidation request always leaves the window disarmed" is worth
+    * one store. */
+   z3660_dopc_ext_pc = Z3660_DOPC_NO_PC;
+
+   /* THE SWITCH REACHES THE INVALIDATION PATH TOO (rung 1b, kept by 1c). With the cache
+    * off nothing is filled and no lookup consults the table, so nothing in it can reach
+    * the guest and there is nothing to invalidate; moving the generation anyway is pure
+    * bookkeeping that also destroys the measurement. Rung 1 had no test here and metal
+    * read DOPC_INVAL 164 311 and 2 951 874 in its two cache-off arms while the docs
+    * claimed zero -- which is what made a cache-off arm useless as a baseline.
+    *
+    * The safety argument is the ON transition, not this line: z3660_dopc_set() and the
+    * knob resync both store z3660_dopc_on BEFORE they invalidate, so coming back on always
+    * performs the invalidation that kills whatever went stale while the cache was off.
+    * The IV_ counters deliberately do NOT follow the switch -- they count what the guest
+    * asked for, which is exactly what an off arm exists to measure. */
+   if (!z3660_dopc_on)
+      return;
+
+   if (++z3660_dopc_gen == 0) {
+      /* 2^32 invalidations later. Every stamp must be made unequal to the generation we
+       * are about to resume at, and zeroing does that for generation 1 -- so this is a
+       * real clear and not a wrap that silently revalidates the whole table.
+       *
+       * THE WRAP RAISES ITS OWN CAUSE, and until this line it did not. INV_WRAP has
+       * existed since rung 1b and has never had a firmware call site: the memset was done
+       * silently here while the counter could only be incremented by a caller typing the
+       * id out, which no board code does. IV_WRAP therefore read zero on every metal
+       * capture no matter how many wraps a boot performed -- a counter that could not mean
+       * what its name says. It is not an unreachable arm either: at the 3 k/s invalidation
+       * rate a dhrystone run measures, 2^32 requests is on the order of a fortnight's
+       * uptime.
+       *
+       * It is raised HERE rather than by recursing through z3660_dopc_invalidate(): a
+       * nested call would bump the generation a second time and re-enter this branch. The
+       * wrap is an event of the PERFORMING path, not a request -- so it adds to sum(IV_*)
+       * without adding to DOPC_INVAL, and z3660_prof.cpp subtracts it back out to keep the
+       * request identity exact. */
+      z3660_dopc_count_cause(Z3660_DOPC_INV_WRAP);
+      memset(z3660_dopc_tab, 0, sizeof z3660_dopc_tab);
+      z3660_dopc_gen = 1;
+   }
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_INVAL);
+}
+
+extern "C" void z3660_dopc_invalidate(int cause)
+{
+   z3660_dopc_count_cause(cause);
+   z3660_dopc_do_invalidate();
+   /* WARP ENGINE: the code cache joins this choke point rather than inventing its own call
+    * sites, for the property the choke point exists to provide -- a new upstream cause
+    * inherits the whole-cache invalidation automatically and has to be opted OUT of it
+    * rather than into it. It is a CONSUMER of the guest's invalidation demand, not a cause,
+    * so nothing above it moves: sum(IV_*) - IV_WRAP == DOPC_INVAL is untouched, and WARP's
+    * own WARP_DISC reconciles against the same stream. Disarmed it returns immediately --
+    * nothing was compiled, so there is nothing to discard. */
+#if !Z3660_WARP_ABL_NO_ENGINE
+   z3660_warp_invalidate(cause);
+#endif
+}
+
+/* Rung 1c: the CACR call site proved its request inert, so nothing is invalidated and
+ * nothing in the IV_ block would ever have seen it. This is the counter that keeps that
+ * narrowing visible -- see z3660_dopc.h for why a call-site narrowing has to bring one.
+ *
+ * It lives here rather than at the call site because every counter this cache owns lives
+ * here: a second file reaching into the prof id space is how an id gets used twice. */
+extern "C" void z3660_dopc_cacr_skipped(void)
+{
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_IV_CACR_SKIP);
+}
+
+/* The DMA arm. Takes the range core0 wrote and STILL invalidates everything, and the
+ * reason is not conservatism for its own sake: the range is a guest PHYSICAL address (it
+ * is a DMA descriptor) while every tag in this cache is a guest LOGICAL pc. Comparing
+ * them would be comparing two different numbers -- the host corpus demonstrates it, since
+ * dopc_m_dma() flushes DOPC_PCODE for an entry tagged at DOPC_VCODE and a range test
+ * would skip it. Narrowing this needs a physical index, which is a later rung with its
+ * own evidence -- and IV_DMA is what says whether it would be worth building. */
+extern "C" void z3660_dopc_invalidate_dma(unsigned int addr, unsigned int len)
+{
+   (void)addr; (void)len;
+   z3660_dopc_invalidate(Z3660_DOPC_INV_DMA);
+}
+
+extern "C" unsigned int z3660_dopc_generation(void) { return z3660_dopc_gen; }
+/* Harness only: drive the counter to the wrap boundary without performing 2^32
+ * invalidations. Nothing on the board calls it. */
+extern "C" void z3660_dopc_force_generation(unsigned int gen) { z3660_dopc_gen = gen; }
+/* Harness only: the geometry as the COMPILER laid it out, not as the header meant it. */
+extern "C" unsigned z3660_dopc_set_bytes(void)   { return (unsigned)sizeof(struct z3660_dopc_set); }
+extern "C" unsigned z3660_dopc_table_bytes(void) { return (unsigned)sizeof(z3660_dopc_tab); }
+/* Harness only: is (pc, space) cached, and as what? Counts nothing and arms nothing, so a
+ * test can ask without perturbing the thing it is asking about. */
+extern "C" int z3660_dopc_peek(unsigned int pc, int super)
+{
+   const struct z3660_dopc_set *s;
+   uae_u32 key;
+   unsigned w;
+
+   if (!z3660_dopc_on || (pc & 1u)) return -1;
+   s = &z3660_dopc_tab[Z3660_DOPC_INDEX(pc)];
+   if (s->stamp != z3660_dopc_gen) return -1;
+   key = Z3660_DOPC_KEY(pc, super);
+   for (w = 0; w < Z3660_DOPC_WAYS; w++)
+      if (s->tag[w] == key) return (int)s->opcode[w];
+   return -1;
+}
+
+/* THE HIT PATH. Returns the set and the way, or NULL.
+ *
+ * always_inline is not decoration: the firmware builds at -Os, where gcc would happily
+ * leave this out of line and charge the hot loop a call to save the space -- which is the
+ * exact trade this rung exists to refuse. */
+static __inline__ __attribute__((always_inline))
+struct z3660_dopc_set *z3660_dopc_find(uaecptr pc, int *wayp)
+{
+   struct z3660_dopc_set *s;
+   uae_u32 key;
+
+   if (!z3660_dopc_on) return NULL;   /* OFF is a pure passthrough: nothing is read */
+   /* An odd pc cannot be encoded, because the tag reuses bit 0 for the address space and
+    * an odd pc would collide with the supervisor entry of the instruction before it.
+    * Nothing can execute at an odd pc on a 68040, so this is never taken on a running
+    * guest -- but "never taken" and "cannot happen" are different claims. */
+   if (pc & 1u) { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   s = &z3660_dopc_tab[Z3660_DOPC_INDEX(pc)];
+   if (s->stamp != z3660_dopc_gen) { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   key = Z3660_DOPC_KEY(pc, regs.s);
+   if      (s->tag[0] == key) *wayp = 0;
+   else if (s->tag[1] == key) *wayp = 1;
+   else if (s->tag[2] == key) *wayp = 2;
+   else if (s->tag[3] == key) *wayp = 3;
+   else { Z3660_PROF_CNT(Z3660_PROF_C_DOPC_MISS); return NULL; }
+
+   /* C2 v3.1 SS25.2 -- the way histogram. The map declined to build way prediction and
+    * asked for the one measurement its 5-15 % reclaim band turns on instead: where the
+    * hits actually land. The decision rule is pre-registered in z3660_prof.h beside the
+    * counter ids, written before any histogram existed.
+    *
+    * It rides HERE and not on a separate arm because the way is already in a register on
+    * the only path that has one -- the hit. A miss has no way, so there is nothing to
+    * attribute and nothing is added to that arm. Lean and default expand this to
+    * nothing, exactly like every other Z3660_PROF_CNT on this path. */
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_WAY_BASE + *wayp);
+   Z3660_PROF_CNT(Z3660_PROF_C_DOPC_HIT);
+   return s;
+}
+
+/* Is the word at pc+2 reachable without issuing an access the opcode fetch did not
+ * already prove safe? With the MMU on the granule is the guest page whose translation the
+ * opcode fetch just used; with it off, the 64 KB bank window, because a bank boundary is
+ * where a speculative read could acquire a device side effect. A 4 KB or 8 KB page lies
+ * entirely inside one 64 KB bank, so the MMU-on test implies the MMU-off one. */
+static __inline__ int z3660_dopc_ext_reachable(uaecptr pc)
+{
+   uae_u32 gran = regs.mmu_enabled ? mmu_pagemaski : 0xFFFF0000u;
+   return ((((uae_u32)pc) ^ (((uae_u32)pc) + 3u)) & gran) == 0;
+}
+
+/* THE FILL. noinline on purpose: this runs on the miss path only, and inlining it would
+ * grow the run loop's instruction footprint for code that executes one pass in ten. */
+static __attribute__((noinline))
+void z3660_dopc_fill(uaecptr pc, uae_u16 op, int shape, int have_ext0, uae_u16 ext0)
+{
+   struct z3660_dopc_set *s;
+   uae_u32 key, empty;
+   unsigned idx, w;
+
+   if (!z3660_dopc_on || (pc & 1u)) return;
+
+   idx   = Z3660_DOPC_INDEX(pc);
+   s     = &z3660_dopc_tab[idx];
+   key   = Z3660_DOPC_KEY(pc, regs.s);
+   empty = Z3660_DOPC_TAG_EMPTY(idx);
+
+   /* A set from an older generation is reclaimed here rather than by a sweep. This is the
+    * whole reason invalidation can be O(1): the cost of clearing a set is paid by the
+    * first fill that wants it, and a set nothing touches again is never cleared at all. */
+   if (s->stamp != z3660_dopc_gen) {
+      s->stamp  = z3660_dopc_gen;
+      s->tag[0] = s->tag[1] = s->tag[2] = s->tag[3] = empty;
+      s->victim = 0;
+   }
+
+   for (w = 0; w < Z3660_DOPC_WAYS; w++)
+      if (s->tag[w] == empty || s->tag[w] == key) break;
+   if (w == Z3660_DOPC_WAYS) {
+      w = s->victim;
+      s->victim = (s->victim + 1u) & (Z3660_DOPC_WAYS - 1u);
+   }
+
+   s->opcode[w]  = op;
+   s->handler[w] = cpufunctbl[op];
+   s->ext0[w]    = ext0;
+   s->meta[w]    = (uae_u8)((shape     ? Z3660_DOPC_M_IDIOM : 0u)
+                          | (have_ext0 ? Z3660_DOPC_M_EXT0  : 0u));
+
+   /* NOTHING ELSE IS PUBLISHED HERE, and rung 1c is why that is worth a line. Rung 1b
+    * marked a page-presence filter at this point -- two hashed bit-sets and a flag store,
+    * on EVERY fill -- so that a page-scoped PFLUSH could be skipped. The filter was
+    * correct and it skipped what it promised, but PFLUSH is only 6-9 % of the guest's
+    * invalidation requests and the misses it saved were re-warm misses still hot in the
+    * page cache, so the marks cost more than the skips returned (z3660_dopc.h). The fill
+    * path is the wrong place to pay for a minority cause: it runs on every miss.
+    *
+    * The tag LAST. Everything above is dead until this line makes the way findable, so
+    * there is no window in which a lookup can see a half-built entry -- which matters
+    * because z3660_dopc_fill() can be reached from inside a chunk the fast path is
+    * servicing, and will matter more the first time anything here becomes reentrant. */
+   s->tag[w] = key;
+}
+
+// UAE_040_MMU run loop. Fetches opcodes through the 68040 MMU accessors
+// (x_prefetch = get_iword_mmu040, set in set_x_funcs) and dispatches the
+// generated cpuemu_31 handlers (op_smalltbl_31_ff, cputbls[4][4]). Adapted from
+// WinUAE 4.4.0 m68k_run_mmu040: the 68040 uses FULL instruction restart
+// (regs.instruction_pc + the mmu_restart flag the cpuemu_31 handlers manage),
+// so this loop is far simpler than m68k_run_mmu030's 030 sub-access-replay path.
+// On a fault the CATCH restores flags, rewinds pc to the instruction start and
+// re-raises via Exception().
+// BUILD-AHEAD SCOPE: with the MMU disabled (TC.E=0) the *_mmu040 accessors are
+// transparent (TTR/identity), so no page faults occur -- that MMU-off path is
+// what is validatable today (there is no 68040 AMIX kernel yet). The faithful
+// 68040 bus-error STACK FRAME (format $7) that Exception() must build on a real
+// 040 page fault is the separate, still-parked bus-error-frame task; this loop
+// only provides the correct restart/dispatch structure around it.
+//
+// NOT static: the host harness drives THIS entry point rather than a transcription of
+// it, so a vector exercises the genuine loop body and, above all, the genuine CATCH.
+// ISSUE-52 round-8 hid from a hand-copied CATCH for exactly that reason -- a copy
+// and the original can drift, and the defect lived in the state the real CATCH
+// consumes. Harness stepping arms SPCFLAG_MODE_CHANGE so do_specialties() returns 1
+// after each instruction and the loop returns. The FIRMWARE now sets that flag too,
+// but only at a WARP arm/disarm transition and for the same reason the harness does:
+// to make the loop return so the variant below can be re-selected (0.17.1).
+// THE LOOP IS INSTANTIATED TWICE AND SELECTED ONCE (docs/WARP-ENGINE.md 0.17.1).
+//
+// The body lives in newcpu_mmu040_body.h and is included below with the WARP hook compiled
+// IN and compiled OUT. The disarmed image therefore runs a loop that does not contain a
+// gate, rather than a loop with a cheap one -- which is the shape the A3/A4/A5 ablation
+// variants measured at 8 064 / 8 140 / 8 163 against a hooked lean of 7 903 (0.16.2), and
+// 1.967 pp of the 3.445 pp dormant tax is exactly that difference.
+//
+// SELECTION IS ONCE PER RUN-LOOP ENTRY, NOT PER PASS AND NOT PER DISPATCH. m68k_go already
+// re-picks run_func on every return from a run loop; z3660_knobs_poll()'s WARP block sets
+// SPCFLAG_MODE_CHANGE on an arm/disarm transition, so do_specialties() returns 1 in the same
+// call, this loop returns, and m68k_go comes back through the selector below. That mailbox
+// resync is the ONLY path by which the arm state can move while a loop is running.
+//
+// AND NO INDIRECT BRANCH IS ADDED TO ANY HOT PATH, which is the A9-specific half of the
+// choice: this core has a one-target BTB against a 1 867-target interpreter dispatch (1.6),
+// so a per-pass call through a function pointer would buy a saved compare with a second
+// mispredicting indirect branch. The disarmed pass pays ZERO instructions here -- there is
+// nothing there to pay for.
+#define Z3660_RUNLOOP_NAME m68k_run_mmu040_nowarp
+#define Z3660_RUNLOOP_WARP 0
+#include "newcpu_mmu040_body.h"
+#undef Z3660_RUNLOOP_NAME
+#undef Z3660_RUNLOOP_WARP
+
+// THE ABLATION KIT'S L-HOOK LAYER, IN ITS POST-FIX MEANING (0.14.1 -> 0.17.3 G-R6.10). The
+// layer it used to remove is gone from the disarmed image by construction, so at levels 3+
+// what "no hook" now means is that the hooked loop is not built at all and the engine cannot
+// be reached from the run loop. The A0'->A3 and A3->A4 edges are predicted to collapse into
+// the noise floor as a result, which makes the kit the fix's own verifier.
+#if !Z3660_WARP_ABL_NO_HOOK
+#define Z3660_RUNLOOP_NAME m68k_run_mmu040_warp
+#define Z3660_RUNLOOP_WARP 1
+#include "newcpu_mmu040_body.h"
+#undef Z3660_RUNLOOP_NAME
+#undef Z3660_RUNLOOP_WARP
+#endif
+
+// THE SELECTOR, AND IT KEEPS THE EXPORTED NAME ON PURPOSE. m68k_go's run_func table and the
+// host harness's twenty call sites both go through this one door, so the arm state decides
+// which loop runs in exactly one place. The alternative -- naming the plain body
+// m68k_run_mmu040 and teaching each caller which variant it wants -- has one failure mode and
+// it is the one 0.13.5 named: an armed test that silently runs the disarmed loop reports
+// CAUGHT-shaped silence.
+void m68k_run_mmu040(void)
+{
+#if !Z3660_WARP_ABL_NO_HOOK
+   if (z3660_warp_on) {
+      m68k_run_mmu040_warp();
+      return;
+   }
+#endif
+   m68k_run_mmu040_nowarp();
+}
+
+static void m68k_run_mmu030(void)
+{
+   struct flag_struct f;
+   int halt = 0;
+
+   mmu030_opcode_stageb = -1;
+   mmu030_fake_prefetch = -1;
+   Z3660_PROF_LOOP_RESET();   // C1: see m68k_run_mmu040
+   while (!halt) {
+      TRY(prb) {
+         for (;;) {
+            int cnt;
+#if Z3660_EMU_PROF
+            /* Declared ahead of `insretry:` on purpose: the sub-access replay path jumps
+             * back to that label, and a variable declared after it would be jumped over. */
+            uae_u16 z3660_prof_op = 0;
+#endif
+insretry:
+            regs.instruction_pc = m68k_getpc();
+            mmu030_insn_start_pc = regs.instruction_pc;   // snapshot before any handler can mis-advance it
+#if Z3660_EMU_PROBES
+            // wip-030-mmu-buserror: about to fetch from a wild USER pc (user mode + PC below the AMIX
+            // user base 0x80000000 = jumped into the kernel/low region). Dump the corruptor once,
+            // BEFORE the fetch faults, so the retired-insn ring still holds the instruction that did it.
+            // CYBERSTORM C3: one gate for the whole detector pair, including the volatile
+            // amix_wild_rte_pending clear (a store on every instruction). With PROBES off the
+            // flag simply stays set until the next re-arm; it drives nothing else.
+            if (z3660_probes_on) {
+            if (amix_mmu_on && !regs.s && regs.instruction_pc < 0x80000000u && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild((uae_u32)regs.instruction_pc);
+            }
+            // RTE-source detector (any target mode): an RTE popped a wild PC -> dump at the source.
+            if (amix_wild_rte_pending && !amix_wild_latched) {
+               amix_wild_latched = 1;
+               amix_dump_wild(amix_wild_rte_pc);
+            }
+            amix_wild_rte_pending = 0;
+            }
+#endif /* Z3660_EMU_PROBES */
+            f = regs.ccrflags;
+
+            mmu030_state[0] = mmu030_state[1] = mmu030_state[2] = 0;
+            mmu030_opcode = -1;
+            if (mmu030_opcode_stageb < 0) {
+               Z3660_PROF_MARK_OPFETCH();   // C1: the OPCODE fetch, not an extension word
+               regs.opcode = x_prefetch(0);
+            } else {
+               regs.opcode = mmu030_opcode_stageb;
+               mmu030_opcode_stageb = -1;
+            }
+            mmu030_opcode = regs.opcode;
+            mmu030_idx_done = 0;
+#if Z3660_EMU_PROF
+            z3660_prof_op = (uae_u16)mmu030_opcode;   // C1: see m68k_run_mmu040
+#endif
+
+            cnt = 50;
+            for (;;) {
+               regs.opcode = regs.irc = mmu030_opcode;
+               mmu030_idx = 0;
+               mmu030_retry = false;
+
+               count_instr(regs.opcode);
+               do_cycles(cpu_cycles);
+               Z3660_PROF_ENTER(Z3660_PROF_B_HANDLER);
+               cpu_cycles = (*cpufunctbl[regs.opcode])(regs.opcode);
+               Z3660_PROF_EXIT();
+
+               cnt--; // don't loop forever if things go wrong
+               if (!mmu030_retry)
+                  break;
+               if (cnt < 0) {
+                  cpu_halt(CPU_HALT_CPU_STUCK);
+                  break;
+               }
+               if (mmu030_retry && mmu030_opcode == -1)
+                  goto insretry;
+               // FIX (wip-030-mmu-buserror): a continuation resume — m68k_do_rte_mmu030 replaying a
+               // faulted instruction from its 030 bus-error frame (frame $A/$B), or a sub-access
+               // continue — re-runs the instruction at its OWN pc, which m68k_setpci(pc) has just set.
+               // Re-snapshot the instruction-start pc here so that if the RESUMED instruction faults
+               // AGAIN (e.g. MOVEM.L <regs>,-(SP) crossing into the next not-yet-resident user-stack
+               // page) the CATCH below builds the new bus-error frame from the resumed instruction's
+               // pc — NOT the stale outer-loop pc (the kernel's RTE epilogue). With the stale pc, the
+               // rebuilt frame carried a kernel pc; the next RTE then resumed the user process there in
+               // user mode -> wild PC -> "User BUS ERROR" (cron/in.telnetd etc.). For the common
+               // same-pc sub-access continue this is a no-op (m68k_getpc() == the current snapshot).
+               regs.instruction_pc = mmu030_insn_start_pc = m68k_getpc();
+            }
+
+            // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the
+            // PC it left behind = branch target for control transfers) so the wild-PC detector above
+            // can show what corrupted the user PC. AMIX-gated; mmu030_opcode still holds the opcode here.
+            // CYBERSTORM C3: this is the 030 loop's heaviest per-instruction probe -- five stores
+            // and a getpc() on EVERY instruction of an AMIX-030 boot -- so it gets the probe gate.
+#if Z3660_EMU_PROBES
+            if (z3660_probes_on && amix_mmu_on) {
+               uae_u32 h = amix_rring_h & (AMIX_RRING - 1);
+               amix_rring_pc[h]  = (uae_u32)mmu030_insn_start_pc;
+               amix_rring_op[h]  = (uae_u16)mmu030_opcode;
+               amix_rring_npc[h] = (uae_u32)m68k_getpc();
+               amix_rring_s[h]   = (uae_u8)regs.s;
+               amix_rring_h++;
+            }
+#endif /* Z3660_EMU_PROBES */
+
+            mmu030_opcode = -1;
+            // perf investigation: instruction-rate benchmark + tunable IPL/cross-core poll cadence.
+            // do_specialties() stays per-instruction (STOP/trace/mode-change correctness, and its
+            // STOP loop polls internally); only check_uae_int_request (which DETECTS interrupts) is
+            // throttled to every z3660_service_cadence instructions -> max ~N-instruction int latency.
+            // C2-prep: same tail split as the 040 loop -- spelled through the same three
+            // macros so the two loops cannot drift in what they attribute where.
+            Z3660_PROF_ENTER(Z3660_PROF_B_TAIL);
+            cpu_cycles = adjust_cycles(cpu_cycles);
+            Z3660_PROF_RUNLOOP_SAMPLE(mmu030_insn_start_pc, z3660_prof_op, 0);
+            Z3660_PROF_TAIL_POLL();
+            Z3660_PROF_TAIL_SPECIALTIES(cpu_cycles);
+            Z3660_PROF_EXIT();
+         }
+      } CATCH(prb) {
+         Z3660_PROF_UNWOUND();
+         Z3660_PROF_CNT(Z3660_PROF_C_FAULTS);
+         bool lastwrite_norestart = false;
+         if (mmu030_opcode == -1) {
+            // fault during opcode prefetch
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else if (mmu030_state[1] & MMU030_STATEFLAG1_LASTWRITE) {
+            // Frame-$A (last-write) fault. Distinguish by whether the instruction's handler already
+            // ADVANCED the PC past itself before the faulting store (2026-06-15 gated fix, audit-refined):
+            //  * Handler ADVANCED the PC (regs.instruction_pc != insn-start): every RMW + plain-store
+            //    handler does `regs.instruction_pc = m68k_getpci()` before the put. The single buffered
+            //    store is replayed by m68k_do_rte_mmu030 and execution resumes at the NEXT instruction --
+            //    do NOT restart. Re-executing would re-READ a just-replayed value and DOUBLE a
+            //    read-modify-write: this is the addq #1,abs (ttymon counter 0->2 -> getty SIGBUS) AND
+            //    the addq #1,(a0)+ / bset #n,(a0)+ etc. case (audit "rmw-with-an"/"misaligned", HIGH).
+            //    Any (An)+/-(An) the handler applied STAYS applied (correct; no rollback) -- the store
+            //    replays to the saved fault address.
+            //  * Handler did NOT advance the PC (== insn-start): the fork's MOVES (An)/(An)+ move
+            //    handlers leave PC at the start. These RESTART the whole instruction, so roll the
+            //    auto-modified An back to its pre-increment value first -- else the re-run writes the
+            //    source longword to dest+size, DUPLICATING it (init icode copyout -> execve EFAULT ->
+            //    hang at 0x80800010). Guard the 2nd rollback against a same-register dual-autoinc move
+            //    (move (a0)+,(a0)+): mmufixup[0] holds the TRUE pre-instruction value (audit
+            //    "an-moves-regular", MEDIUM). The MOVES opcode (0x0Exx) is forced to restart belt-and-
+            //    suspenders in case a MOVES variant advances the PC.
+            if (regs.instruction_pc != mmu030_insn_start_pc
+                  && (mmu030_opcode & 0xFF00) != 0x0E00 /* never no-restart a MOVES */) {
+               lastwrite_norestart = true;   // PC already past the insn: replay-only, do not re-execute
+            } else {
+               if (mmufixup[0].reg >= 0)
+                  m68k_areg(regs, mmufixup[0].reg & 7) = mmufixup[0].value;
+               if (mmufixup[1].reg >= 0
+                     && (mmufixup[0].reg < 0 || (mmufixup[1].reg & 7) != (mmufixup[0].reg & 7)))
+                  m68k_areg(regs, mmufixup[1].reg & 7) = mmufixup[1].value;
+            }
+            mmufixup[0].reg = -1;
+            mmufixup[1].reg = -1;
+         } else {
+            regs.ccrflags = f;
+            cpu_restore_fixup();
+         }
+         // Frame-$B / prefetch / read faults RESTART the whole instruction -> rebuild the bus-error
+         // frame from the instruction-START pc. Same for a MOVES / (An)+ LASTWRITE write (case 1 above:
+         // rolled-back An + restart). ONLY a no-(An) same-address RMW LASTWRITE (case 2) keeps the
+         // handler-advanced PC so RTE resumes at the NEXT instruction (rewinding re-executed the RMW
+         // -> the addq 0->2 double that crashed ttymon/getty).
+         if (!lastwrite_norestart)
+            regs.instruction_pc = mmu030_insn_start_pc;
+         m68k_setpci(regs.instruction_pc);
+         TRY(prb2) {
+            Exception(prb);
+         } CATCH(prb2) {
+            // Fault while building the bus-error frame == double fault.
+            halt = CPU_HALT_BUS_ERROR_DOUBLE_FAULT;
+         } ENDTRY
+      } ENDTRY
+   }
+   cpu_halt(halt);
+}
+
 static int in_m68k_go = 0;
 
 static bool cpu_hardreset, cpu_keyboardreset;
@@ -4001,7 +6447,10 @@ void m68k_go (int may_quit)
          }
       }
 
-      run_func = currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
+      run_func =
+         currprefs.mmu_model == 68040 ? m68k_run_mmu040 :   // UAE_040_MMU
+         currprefs.mmu_model == 68030 ? m68k_run_mmu030 :   // UAE_030_MMU
+         currprefs.cpu_cycle_exact && currprefs.cpu_model <= 68010 ? m68k_run_1_ce :
          currprefs.cpu_compatible && currprefs.cpu_model <= 68010 ? m68k_run_1 :
 #ifdef JIT
          currprefs.cpu_model >= 68020 && currprefs.cachesize ? m68k_run_jit :
@@ -4093,6 +6542,15 @@ uae_u8 *restore_cpu (uae_u8 *src)
       regs.tcr = restore_u32 ();
       regs.urp = restore_u32 ();
       regs.srp = restore_u32 ();
+      /* CYBERSTORM C2 rung 2 found this hole rather than made it: every OTHER writer of
+       * the four TT registers calls mmu_tt_modified() to recompute mmu_ttr_enabled /
+       * _ins / _data from them, and this one never did -- so a restore left the three
+       * flags describing the PREVIOUS machine's TTRs. That is a pre-existing defect of
+       * the accessors' own TTR guard; rung 2's verdict tables are derived in the same
+       * function from the same registers, so closing it keeps both correct at once.
+       * Savestates are not used on the board, which is why nothing has ever noticed. */
+      if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060)
+         mmu_tt_modified ();
    }
    if (flags & 0x80000000) {
       int khz = restore_u32 ();
@@ -4630,6 +7088,40 @@ bool cpureset (void)
       custom_reset_cpu(false, false);
       return false;
    }
+
+   if (currprefs.mmu_model != 68030) {
+      /* Non-AMIX modes: verbatim upstream reset/jmp-(ax) path (merge-base 159b3b5).
+       * The full clean reset below is needed only for the real 030 PMMU (UAE_030_MMU),
+       * whose stale page tables / AMIX-cleared overlay would otherwise wreck a warm
+       * reboot.  Every other emulator mode keeps the original Z3660 behaviour. */
+      pc = m68k_getpc () + 2;
+      ab = &get_mem_bank (pc);
+      if (ab->check (pc, 2)) {
+         write_log (_T("CPU reset PC=%x\n"), pc - 2);
+         ins = get_word (pc);
+         custom_reset_cpu(false, false);
+         m68k_setpc_normal (ksboot);
+         cpu_emulator_reset_core0();
+         reset_autoconfig();
+         if ((ins & ~7) == 0x4ed0) {
+            int reg = ins & 7;
+            uae_u32 addr = m68k_areg (regs, reg);
+            if (addr < 0x80000)
+               addr += 0xf80000;
+            write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
+            m68k_setpc_normal (addr +2 - 2);
+            return false;
+         }
+      }
+      write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
+      custom_reset_cpu(false, false);
+      m68k_setpc_normal (ksboot);
+      cpu_emulator_reset_core0();
+      reset_autoconfig();
+      return false;
+   }
+
+   /* AMIX / UAE_030_MMU: full clean reset (overlay restore + m68k_reset_newcpu). */
    pc = m68k_getpc () + 2;
 
     ab = &get_mem_bank (pc);
@@ -4638,29 +7130,31 @@ bool cpureset (void)
       write_log (_T("CPU reset PC=%x\n"), pc - 2);
 
       ins = get_word (pc);
+      (void)ins; /* reset/jmp PC-hack removed below: do a full clean reset instead */
       custom_reset_cpu(false, false);
+      z3660_quiesce_real_chipset_on_reset();
       m68k_setpc_normal (ksboot);
       cpu_emulator_reset_core0();
+      /* The old reset/jmp PC-hack left the 68k mid-vector (0xF80002) with stale
+       * SR/SSP/MMU, so AMIX's warm (uadmin) reboot never actually restarted
+       * Kickstart -- only the EXTER storm (now fixed) had masked it.  Do the same
+       * full CPU reset the cold-boot and n040RSTI paths use: overlay ROM at 0
+       * (ovl=1, which AMIX had cleared) so get_long(4) returns the real reset
+       * vector, then m68k_reset_newcpu(1) sets PC=0xF800D2, SSP, SR(intmask=7),
+       * and resets MMU/caches. */
+      ovl = 1;
+      m68k_reset_newcpu(1);
       reset_autoconfig();
-      // did memory disappear under us?
-//      if (ab == &get_mem_bank (pc))
-//         return false;
-      // it did
-      if ((ins & ~7) == 0x4ed0) {
-         int reg = ins & 7;
-         uae_u32 addr = m68k_areg (regs, reg);
-         if (addr < 0x80000)
-            addr += 0xf80000;
-         write_log (_T("reset/jmp (ax) combination at %08x emulated -> %x\n"), pc, addr+2);
-         m68k_setpc_normal (addr +2 - 2);
-//         reset_loop_counter++;
-//         if(reset_loop_counter>=5)
-//         {
-//        	 printf("Emulator reset loop detected -> Hard reboot\n");
-//        	 hard_reboot();
-//         }
-         return false;
-      }
+      /* Pre-compensate for the caller's trailing m68k_incpc(2): the RESET opcode
+       * handler (op_4e70_*) does `cpureset(); m68k_incpc(2);`, unconditionally
+       * advancing PC by 2 after we return.  Leave PC at (reset PC - 2) so the +2
+       * restores Kickstart's entry 0xF800D2.  (The n040RSTI path has no trailing
+       * +2, hence it doesn't need this.) */
+      m68k_setpc_normal (m68k_getpc () - 2);
+      fill_prefetch_quick ();
+      set_cycles (start_cycles);
+      regs.stopped = false;
+      return false;
    }
 
    // the best we can do, jump directly to ROM entrypoint
@@ -4669,9 +7163,17 @@ bool cpureset (void)
 
    write_log (_T("CPU Reset PC=%x, invalid memory -> %x.\n"), pc, ksboot + 2);
    custom_reset_cpu(false, false);
+   z3660_quiesce_real_chipset_on_reset();
    m68k_setpc_normal (ksboot);
    cpu_emulator_reset_core0();
+   /* full clean reset, same as the main branch (see comments there) */
+   ovl = 1;
+   m68k_reset_newcpu(1);
    reset_autoconfig();
+   m68k_setpc_normal (m68k_getpc () - 2);
+   fill_prefetch_quick ();
+   set_cycles (start_cycles);
+   regs.stopped = false;
    return false;
 }
 

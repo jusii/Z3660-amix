@@ -18,6 +18,10 @@ z3660-firmware/Z-TURN/vivado/z3660.srcs/sources_1/bd/design_1/ip/*_imp_*/
 
 # Vitis/SDK generated outputs
 z3660-firmware/Z-TURN/vitis_ide/**/build/
+z3660-firmware/Z-TURN/vitis_ide/**/build-lean/
+z3660-firmware/Z-TURN/vitis_ide/**/build-prof/
+z3660-firmware/Z-TURN/vitis_ide/**/build-q2probe/
+z3660-firmware/Z-TURN/vitis_ide/**/build-abl*/
 z3660-firmware/Z-TURN/vitis_ide/**/*.o
 z3660-firmware/Z-TURN/vitis_ide/**/*.d
 z3660-firmware/Z-TURN/vitis_ide/**/*.a
@@ -34,3 +38,21 @@ z3660-firmware/z3660_vivado/z3660/z3660.sdk/z3660/Debug/
 z3660-firmware/z3660_vivado/z3660/z3660.sdk/z3660/Release/
 /.project
 .DS_Store
+
+# Docker build environment — host-staged Xilinx installer (not redistributable)
+docker/xilinx/
+
+# Local AMIX hdf working copies + scratch (large, machine-local — survive reboot but never commit)
+/tmp/
+/hdf/
+/adf/
+
+# AI-agent / assistant config — kept local, never published
+/.claude/
+/CLAUDE.md
+
+# Local AMIX debug-session investigations — kept local, never published
+/docs/investigations/
+
+# Untracked benchmark archive (rebuilt on demand by tools/amix-bench)
+/tools/amix-bench.tar

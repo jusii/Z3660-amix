@@ -29,6 +29,13 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+/* Build this JIT translation unit (and its #included ARM emitters codegen_arm.cpp /
+ * compemu_midfunc_arm*.cpp) at -O3. The firmware is globally -Os/-flto for BOOT.BIN size,
+ * but -Os miscompiles the hand-emitted ARM codegen -> generated blocks ARM-fault
+ * ([Core1] Undefined Exception at JIT-init; [Core1] Prefetch Abort at runtime). -O3 here
+ * restores the codegen the JIT was written for while the rest of the build stays -Os. */
+#pragma GCC optimize("O3")
+
 #include <math.h>
 
 #include "sysdeps.h"
@@ -2174,8 +2181,39 @@ STATIC_INLINE void create_popalls(void)
 
    // no need to further write into popallspace
    //TODO vm_protect(popallspace, POPALLSPACE_SIZE, VM_PAGE_READ | VM_PAGE_EXECUTE);
-   // No need to flush. Initialized and not modified
-   // flush_cpu_icache((void *)popallspace, (void *)target);
+   // popallspace was just written above. With D-cache + I-cache enabled on Core1 and the
+   // firmware built -Os/-flto (the AMIX size change), the first pushall_call_handler() can
+   // fetch STALE I-cache lines for these trampolines -> ARM Undefined Instruction -> reboot
+   // (the "[Core1] Undefined Exception" seen entering any UAEJIT mode). Flush the whole
+   // generated popall region so I-cache is coherent before it is executed.
+   flush_cpu_icache((void *)popallspace, (void *)get_target());
+}
+
+/* WARP ENGINE: hand the block engine the code cache's own arena.
+ *
+ * create_popalls() above has already malloc'd POPALLSPACE_SIZE + MAX_JIT_CACHE * 1024 --
+ * 32 MB + 2 KB -- and it is reached from build_comp(), which build_cpufunctbl() calls
+ * unconditionally under #ifdef JIT. That happens on EVERY boot of EVERY image, MMU modes
+ * included: the serial line `Cache_Alloc of 33556480 at 0x........` is it. Under the MMU
+ * alloc_cache() then returns early on cache_size == 0, so `compiled_code` stays NULL and the
+ * 32 MB behind the trampolines is allocated, zeroed, executable and entirely unused.
+ *
+ * So WARP costs no new heap and its arena's allocation is PROVEN on this card every boot
+ * rather than assumed. The accessor lives here, beside the allocation, rather than in the
+ * engine -- the knowledge of what that malloc contains belongs to the file that made it.
+ *
+ * IT REFUSES IF THE CLASSIC JIT OWNS THE ARENA (`compiled_code != NULL`, i.e. the UAEJIT_*
+ * bootmodes, where cachesize is non-zero). Two engines bump-allocating one arena is a
+ * wild-write generator, and refusing here makes that impossible rather than merely
+ * unlikely. */
+uae_u8 *z3660_warp_cache_arena(unsigned *bytes)
+{
+   if (popallspace == NULL || compiled_code != NULL) {
+      if (bytes) *bytes = 0;
+      return NULL;
+   }
+   if (bytes) *bytes = (unsigned)(MAX_JIT_CACHE * 1024);
+   return popallspace + POPALLSPACE_SIZE;
 }
 
 STATIC_INLINE void reset_lists(void)

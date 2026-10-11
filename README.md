@@ -1,5 +1,84 @@
 # Z3660 by sHaNsHe (Double H Tech)
 
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+> ## This fork — Amiga UNIX (AMIX) support
+>
+> This is an **Amix-interoperability fork** of [shanshe/Z3660](https://github.com/shanshe/Z3660)
+> (GPL-3.0, full credit to sHaNsHe). It adds a **real 68030 PMMU emulator** and an **emulated
+> A3000 mainboard SCSI** so a Z3660 + Z-turn can boot **Amiga UNIX (AMIX) 2.1**. If you don't run
+> AMIX, nothing changes — the additions default to off and upstream behaviour is unchanged.
+>
+> **What's new in this fork** (full reference: **[docs/AMIX.md](docs/AMIX.md)**):
+> - **68030 PMMU emulation** — new `bootmode UAE_030_MMU` (a 68030 interpreter *with* a working PMMU).
+> - **Emulated A3000 SCSI** — AMIX's kernel bootstrap path (SuperDMAC + WD33C93).
+> - **New config knobs** — `amix_mode` (AMIX memory contract) and `service_cadence` (emulator
+>   throughput vs. interrupt latency), plus `DEMU`/`DSCSI` runtime debug gating and the
+>   `perf_stats`/`emu_probes`/`core0_stats` run-loop overhead switches (all default to the
+>   unchanged behaviour).
+> - **Guest-side AMIX drivers** — the SCSI and ethernet drivers that run *inside* AMIX against the
+>   protocol this firmware serves have their own repos:
+>   **[amix-z3660scsi](https://github.com/jusii/amix-z3660scsi)** and
+>   **[amix-z3660net](https://github.com/jusii/amix-z3660net)**. The kernel that carries them is
+>   assembled with the shared build harness in
+>   **[amix-kerntools](https://github.com/jusii/amix-kerntools)**.
+>
+> ### Quick start — try a pre-built firmware
+> 1. Download `BOOT.BIN` from this repo's **Releases** (no build needed), or build it yourself —
+>    see *Build it yourself* below.
+> 2. Copy it to the SD card's FAT32 boot partition; use the layout in
+>    [`z3660-zturn_SD_content/`](z3660-zturn_SD_content/) for the rest.
+> 3. **You supply your own Kickstart ROM(s) and disk image** — Amiga OS ROMs and AMIX itself are
+>    copyrighted and are not included.
+>
+> ### Build it yourself
+> A dockerised toolchain builds the firmware and the Amiga-side drivers — see
+> **[docker/README.md](docker/README.md)**. (Drivers build with no AMD account; the full firmware
+> build needs you to download AMD/Xilinx Vitis 2023.2 yourself — it is staged outside the repo and
+> never committed.)
+>
+> Three firmware images come out of the one tree. `make bootbin` gives the usual **`BOOT.BIN`**,
+> with the emulator's run-loop diagnostics compiled in and switchable at runtime; `make lean` gives
+> **`BOOT-lean.BIN`**, the production image with those diagnostics — and their per-instruction
+> predicates — compiled out; and `make profile` gives **`BOOT-prof.BIN`**, the lean image plus an
+> interpreter profiler (a wall-clock guest-PC sampler and per-stage ARM cycle attribution). The
+> profiling image is a measuring instrument, not a production one — it costs measured time to run.
+> Every build also drops a CRC-stamped copy of its image, plus the matching core1 emulator ELF,
+> in `sd_card/archive/` (untracked), so a rebuild never destroys the image you are comparing
+> against, and a flown image's disassembly stays readable after the build directory has moved on.
+> Details in
+> **[docs/AMIX.md](docs/AMIX.md)** and **[docs/profiler.md](docs/profiler.md)**.
+>
+> A fourth target, `make q2probe`, builds **`BOOT-q2probe.BIN`** — a throwaway experiment image
+> that answers one open design question about generated code and prints its verdict on serial
+> before emulation starts. It is compiled out of all three images above (their CRCs are
+> unchanged whether it exists in the tree or not), and it is meant to be booted once, not left
+> on a card. See **[docs/WARP-ENGINE.md](docs/WARP-ENGINE.md)**.
+>
+> ### Running AMIX
+> Needs an **A3000-variant Kickstart** (A4000 ROMs can't boot AMIX) and an **AMIX disk image** placed
+> on the **SCSI id it was installed on** (id 6 for the usual A3000 install — see the note in
+> docs/AMIX.md). AMIX 2.1 **boots to a stable multiuser login shell**; full setup, the SCSI-id rule
+> and current status are in **[docs/AMIX.md](docs/AMIX.md)**.
+>
+> ### Branches
+> - **`amix-main-2` — the branch of record.** The Amix work rebuilt on upstream firmware
+>   **v1.03 beta 21**. Upstream rewrote its history, so there was no merge base and the resync had
+>   to be a guided replay rather than a merge;
+>   **[docs/port-ledger-beta21.md](docs/port-ledger-beta21.md)** is the analysis behind it.
+> - **`amix-main`** — the superseded pre-beta-21 line, kept for reference. It shares no ancestry
+>   with `amix-main-2`. Documents dated before the resync describe that tree and say so.
+>
+> ### The fork's own documents
+> - **[docs/AMIX.md](docs/AMIX.md)** — the AMIX reference: boot modes, the new config keys, how the
+>   A3000-SCSI bootstrap works, current status, and the upstream defects this resync turned up.
+> - **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — limitations, including the fork note on the real-CPU
+>   `cpufreq` ceiling being a per-card property.
+> - **[CHANGELOG.md](CHANGELOG.md)** — this fork's history and its measurements. (Upstream's own
+>   history is the separate **CHANGES.md**, which the text below points you at.)
+> - **[docs/](docs/)** — the engineering references: clock timings, the piscsi service path, the
+>   HTTP/TFTP deploy route, the WARP decoded-op-cache engine, the interpreter profiler.
+<!-- fork:amix end -->
+
 <br>Z3660 is an Amiga 4000 CPU accelerator board based on A3660 and Z-turn FPGA board.
 <br>
 <br>Compared to A3660, Z3660 has some key differences:

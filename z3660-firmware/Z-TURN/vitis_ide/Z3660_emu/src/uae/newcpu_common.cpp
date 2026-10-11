@@ -63,6 +63,7 @@ int m68k_move2c (int regno, uae_u32 *regp)
 		case 2:
 			{
 				uae_u32 cacr_mask = 0;
+				uae_u32 cacr_was  = regs.cacr;
 				if (currprefs.cpu_model == 68020)
 					cacr_mask = 0x0000000f;
 				else if (currprefs.cpu_model == 68030)
@@ -71,17 +72,105 @@ int m68k_move2c (int regno, uae_u32 *regp)
 					cacr_mask = 0x80008000;
 				regs.cacr = *regp & cacr_mask;
 				set_cpu_caches (false);
+				/* CYBERSTORM C2 rung 1. CACR is the register that enables and disables
+				 * the very caches the decoded-op cache is standing in for -- on the
+				 * 68040 it carries the instruction- and data-cache enables, and
+				 * uae_mmu040_getc_iword() consults bit 15 directly. A guest that turns
+				 * the instruction cache off has asked for its contents to stop being
+				 * authoritative, so honour that here as well.
+				 *
+				 * RUNG 1b narrows it to writes that CHANGE the register, and gives it its
+				 * own cause id so AMIX's rate of it is finally visible on its own rather
+				 * than summed into URP/SRP. The argument is exact rather than statistical:
+				 * on a 68040 the retained bits are the two cache ENABLES and nothing else
+				 * (cacr_mask 0x80008000 -- the 68040 has no clear-cache bits in CACR; it
+				 * uses CINV/CPUSH instructions, which arrive at mmu_flush_cache()). If
+				 * neither enable moved, the machine's cache configuration is bit-identical
+				 * and nothing a cached decode depends on has changed.
+				 *
+				 * THIS IS THE ARM RUNG 1c KEPT, and the only narrowing left in the
+				 * firmware. Metal 2026-08-23 reverted rung 1b's other two (the empty-cache
+				 * short-circuit and the PFLUSH page filter) because both charged the fill
+				 * path for a minority cause; this one charges one compare at one call site
+				 * and removed ~93 % of the invalidations the whole rung removed -- about
+				 * 41 000 of the 44 247 that went away on the dhrystone capture.
+				 *
+				 * Comparing the whole masked register, not just bit 15, keeps that true on
+				 * the 020/030 masks as well -- where the retained bits DO include
+				 * clear-cache bits, so any write that asks for a clear differs from the
+				 * previous value and still invalidates.
+				 *
+				 * cacr_mask == 0 is the case that WOULD turn this narrowing into a silent
+				 * regression: the ladder above leaves it 0 for every CPU it does not
+				 * model, so regs.cacr is pinned at 0 there and "did it change?" would
+				 * answer NO for every write the guest makes. A register the emulator does
+				 * not model is one whose write it cannot prove inert, so that arm keeps
+				 * the rung-1 behaviour outright.
+				 *
+				 * IT IS UNREACHABLE TODAY, and saying so is worth more than pretending
+				 * otherwise: movec_illg() above returns illegal for every model this
+				 * ladder does not name -- the 68060 included -- so `case 2:` is reached
+				 * only on the 68020/030/040, and all three have a mask. This is a
+				 * TRIPWIRE for the one-line change that would otherwise break the
+				 * narrowing quietly: teaching movec_illg() about the 68060 without
+				 * teaching the ladder here. The host corpus has no fixture for it,
+				 * deliberately -- a test that cannot reach a branch should not claim to.
+				 *
+				 * THE ELSE ARM IS RUNG 1c'S INSTRUMENT FIX, and it is not tidiness. This
+				 * narrowing decides HERE, before z3660_dopc_invalidate() -- so an inert
+				 * write never reaches IV_CACR and is not a "skipped request" but a request
+				 * that is never counted at all. The 2026-08-23 verdict measured a 54.8 %
+				 * fall in invalidations while `sum(IV_*) - DOPC_INVAL` could only account
+				 * for 7.3 % of it, and had to reconstruct the rest across two sessions'
+				 * captures. One increment on the path that used to cost a whole-cache
+				 * invalidation makes the yield readable from a single dump. */
+				if (cacr_mask == 0 || regs.cacr != cacr_was)
+					z3660_dopc_invalidate(Z3660_DOPC_INV_CACR);
+				else
+					z3660_dopc_cacr_skipped();
 			}
 			break;
 		/* 68040 only */
 		case 3:
+			// MOVEC to TC. Storing regs.tcr is NOT enough on a 68040: this write is what
+			// turns translation on, and every quantity derived from it lives behind
+			// mmu_set_tc() -- regs.mmu_enabled (which every *_mmu040 accessor tests before
+			// it will translate at all), the page size and its masks/shifts, the ATC flush,
+			// and the default cache modes. Without the call the guest's MMU never actually
+			// engages: the kernel builds its tables, writes TC with E=1, believes it is now
+			// running in virtual space -- and the emulator keeps every access transparent,
+			// so the first kernel VA touched lands at whatever that number happens to be as
+			// a PHYSICAL address. On this board VAs at 0x40000000+ fall in the Z3 expansion
+			// window (slow_bank, no RAM), which is how the AMIX 68040 kernel reached
+			// "PANIC: page_sub" and then a wild pc at 0x40080000 (metal, image 6FDBDA40).
+			//
+			// The 68030 path never comes through here: it enables its PMMU with PMOVE to TC,
+			// handled in cpummu030.cpp (which is also where the "68030 MMU enabled" line is
+			// printed). That is why UAE_030_MMU was unaffected and this stayed hidden.
 			regs.tcr = *regp & 0xc000;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060)
+				regs.tcr = mmu_set_tc((uae_u16)regs.tcr);
 			break;
 
-		case 4: regs.itt0 = *regp & 0xffffe364; break;
-		case 5: regs.itt1 = *regp & 0xffffe364; break;
-		case 6: regs.dtt0 = *regp & 0xffffe364; break;
-		case 7: regs.dtt1 = *regp & 0xffffe364; break;
+		// Transparent translation registers. mmu_tt_modified() recomputes mmu_ttr_enabled /
+		// _ins / _data, which are what the accessors test before consulting a TTR at all --
+		// so without it a guest's transparent windows are stored but never honoured.
+		case 4:
+			regs.itt0 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 5:
+			regs.itt1 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 6:
+			regs.dtt0 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
+		case 7:
+			regs.dtt1 = *regp & 0xffffe364;
+			if (currprefs.mmu_model == 68040 || currprefs.mmu_model == 68060) mmu_tt_modified();
+			break;
 
 		case 0x800: regs.usp = *regp; break;
 		case 0x801: regs.vbr = *regp; break;
@@ -91,8 +180,31 @@ int m68k_move2c (int regno, uae_u32 *regp)
 			/* 68040 only */
 		case 0x805: regs.mmusr = *regp; break;
 	  /* 68040 stores all bits */
-		case 0x806: regs.urp = *regp & 0xffffffff; break;
-		case 0x807: regs.srp = *regp & 0xffffffff; break;
+		// URP/SRP: store only, NO implicit ATC flush -- deliberate, and it matches silicon.
+		// A 68040 ATC entry is tagged by address + supervisor bit (see mmu_tagmask); there is
+		// no ASID and no root-pointer tag, so changing URP/SRP cannot invalidate anything by
+		// itself -- on real hardware either, which is exactly why the architecture makes the
+		// OS responsible for PFLUSH after a root-pointer change. This core's ATC model has the
+		// same shape, so adding a flush here would diverge from hardware and mask kernel bugs.
+		//
+		// THE CONTRACT: PFLUSH is the sole ATC coherence point in this core, as on silicon.
+		// That contract was vacuous until 2026-08-20, because mmu_op() dropped upstream's
+		// dispatch to mmu_op_real() and every PFLUSH was a no-op (see newcpu.cpp). With PFLUSH
+		// real the contract holds, and this site is correct as it stands. Re-examined and left
+		// unchanged on purpose -- do not "fix" it without evidence that AMIX omits a PFLUSH
+		// the 68040 UM requires.
+		/* CYBERSTORM C2 rung 1 rides along, and it is important that it does NOT change
+		 * the paragraph above. The ATC's silicon-faithful "no implicit flush" contract
+		 * stands untouched. The decoded-op cache is an emulator-internal structure with
+		 * no silicon counterpart and therefore no such contract to keep, and it is tagged
+		 * by guest VIRTUAL address -- so a root-pointer change is precisely the event
+		 * after which its tags may mean something different. The map asks for
+		 * invalidation "on any MMU root or TC change"; TC arrives through mmu_set_tc(),
+		 * and this is where the root arrives. Conservative by construction: the worst
+		 * case is a cold cache after a context switch, which the DOPC_INVAL counter will
+		 * price if it turns out to matter. */
+		case 0x806: regs.urp = *regp & 0xffffffff; z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT); break;
+		case 0x807: regs.srp = *regp & 0xffffffff; z3660_dopc_invalidate(Z3660_DOPC_INV_ROOT); break;
 		default:
 			op_illg (0x4E7B);
 			return 0;
@@ -1070,38 +1182,75 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		x_put_long(m68k_areg(regs, 7), oldpc);
 		break;
 	case 0x7: // access error stack frame (68040)
-
+		// MC68040 UM Table 8-3. Offsets below are from the FINAL sp (the common tail adds
+		// sr/pc/format at $00/$02/$06), pushed here highest-offset first:
+		//   $08 EA  $0C SSW  $0E WB3S  $10 WB2S  $12 WB1S  $14 FA
+		//   $18 WB3A $1C WB3D $20 WB2A $24 WB2D $28 WB1A $2C WB1D/PD0 $30 PD1 $34 PD2 $38 PD3
+		// Cross-checked against the AMIX 68040 kernel's own empirically-dumped offsets in
+		// src/wb040.s (WB3S@+78 WB3A@+88 WB3D@+92 / WB2S@+80 WB2A@+96 WB2D@+100 /
+		// WB1S@+82 WB1A@+104 WB1D@+108, relative to its trap frame = these + 64).
+		//
+		// The CONTENTS are load-bearing, not just the format nibble: the 68040 does not
+		// re-run a faulted WRITE on rte, so the kernel's write-back handler completes the
+		// pending store itself from WBxS/WBxA/WBxD (`moves.<size> WBxD -> (WBxA)` with
+		// DFC = WBxS & 7). WBxS: bit7 = valid, bits 6-5 = SIZE, bits 2-0 = FC -- exactly
+		// mmu_bus_error()'s `0x80 | (ssw & 0x7f)`. These were all stacked as ZERO before,
+		// so every write-back was silently dropped and the store lost.
 		for (i = 3; i >= 0; i--) {
-			// WB1D/PD0,PD1,PD2,PD3
+			// PD3,PD2,PD1,PD0(==WB1D): MOVE16 push data. Only consumed when WB2S marks a
+			// cache-line write-back, so a stale line from an earlier MOVE16 is inert.
 			m68k_areg(regs, 7) -= 4;
-			x_put_long(m68k_areg(regs, 7), 0);
+			x_put_long(m68k_areg(regs, 7), mmu040_move16[i]);
 		}
 
+		// WB1 is never populated by this core (it models no store buffer, so only the
+		// faulting access can be pending). WB1S = 0 = "not valid" is the truthful report,
+		// and the kernel's replay loop skips the slot.
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), 0); // WB1A
+		// WB2D is unused on the 68040: the only WB2 case is a MOVE16 line write-back,
+		// whose data travels in PD0-PD3 above, not here.
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), 0); // WB2D
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0); // WB2A
+		x_put_long(m68k_areg(regs, 7), regs.wb2_address); // WB2A (MOVE16 write only)
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0); // WB3D
+		x_put_long(m68k_areg(regs, 7), regs.wb3_data); // WB3D = the pending store's data
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // WB3A
+		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // WB3A = its address
 
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // FA
 
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), 0); // WB1S: always invalid here
+		// Stacking a write-back status CONSUMES it (upstream WinUAE/Amiberry clear both
+		// here, and this port dropped the two lines). The guest owns the pending store the
+		// moment the frame carries it: AMIX's wb040.s replays a slot on WBxS bit 7 alone
+		// (`moves.<size> WBxD -> (WBxA)`, DFC = WBxS & 7). Left armed, the valid bit
+		// outlives the frame that delivered it.
+		//
+		// mmu_bus_error() recomputes both status words on every fault IT handles, which is
+		// why MMU faults hid this. The fault classes that reach Exception(2) WITHOUT it --
+		// hardware/physical bus errors via hardware_exception2 / exception2_read /
+		// exception2_fetch*, which under this non-cpu_compatible config THROW straight to
+		// the run loop's CATCH -- then stack the PREVIOUS write fault's still-valid WB3S
+		// and its stale WB3D against the CURRENT fault's address as WB3A. The guest duly
+		// performs that store: a fabricated stray write, of a stale datum, into the page
+		// that just faulted, with no instruction behind it. Under AMIX-040 that lands in
+		// pages being demand-paged in (proc 1's text among them) and is the ISSUE-10
+		// "write-back-fabricated value" signature.
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb2_status); // WB2S
+		regs.wb2_status = 0;
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb3_status); // WB3S
+		regs.wb3_status = 0;
 
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), ssw);
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
+		x_put_long(m68k_areg(regs, 7), oldpc); // EA (caller passes regs.mmu_effective_addr)
 		break;
 	case 0x8: // bus/address error (68010)
 	{
@@ -1142,27 +1291,57 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		x_put_long(m68k_areg(regs, 7), oldpc);
 		break;
 	case 0xB: // long bus cycle fault stack frame (68020, 68030)
-		// Store state information to internal register space
-		for (i = 0; i < 1; i++) {
-			m68k_areg(regs, 7) -= 4;
-			x_put_long(m68k_areg(regs, 7), 0);
+		// Store state information to internal register space.
+		// NOTE (UAE_030_MMU): this is a SIMPLIFIED 030 frame. The fault address (0x10),
+		// SSW (0x0a) and opcode (0x14) ARE stored, which is enough for m68k_do_rte_mmu030
+		// to resume a SIMPLE aligned single data access (verified by the host harness'
+		// demand-paged read/write tests). The internal pipeline/sub-access fields below
+		// (mmu030_state[], idx word at 0x36, mmu030_ad[], stage B/C) are still written as
+		// 0 — so a fault PART-WAY through a MOVEM / unaligned / RMW resumes by restarting
+		// the whole access rather than continuing mid-instruction. That is correct for
+		// idempotent RAM but not bit-exact; faithful partial-resume needs the full WinUAE
+		// 4.4.0 frame storage. Extend + add a MOVEM-cross-page harness test before relying
+		// on it for those cases.
+		// Per-access data value array (mmu030_ad[]): storing these (not 0) is what lets
+		// m68k_do_rte_mmu030 RESUME a fault that hit PART-WAY through a non-idempotent
+		// instruction (MOVEM list, (An)+/-(An), RMW) instead of restarting it with a wrong
+		// effective address -> the SIGSEGV that survived the c8b9398 ifetch-resume fix.
+		// A write fault's pending value lives in regs.wb3_data and must be folded into the
+		// array slot first (upstream WinUAE newcpu_common.cpp:1508-1516).
+		if (!(ssw & MMU030_SSW_RW)) {
+			mmu030_ad[mmu030_idx_done].val = regs.wb3_data;
 		}
-		while (i < 9) {
+		for (i = 0; i < mmu030_idx_done + 1; i++) {
+			m68k_areg(regs, 7) -= 4;
+			x_put_long(m68k_areg(regs, 7), mmu030_ad[i].val);
+		}
+		while (i < MAX_MMU030_ACCESS) {
 			uae_u32 v = 0;
 			m68k_areg(regs, 7) -= 4;
+			if (mmu030_state[1] & MMU030_STATEFLAG1_FMOVEM) {
+				if (i == MAX_MMU030_ACCESS - 2)
+					v = mmu030_fmovem_store[0];
+				else if (i == MAX_MMU030_ACCESS - 1)
+					v = mmu030_fmovem_store[1];
+			}
 			x_put_long(m68k_areg(regs, 7), v);
 			i++;
 		}
-		// version & internal information (We store index here)
+		// version & internal information: idx / idx_done / wb2 status (offset 0x36).
+		// The reader derives idxsize, idxsize_done and regs.wb2_status from this word;
+		// 0 here forced idx_done=0 = "single access", defeating mid-instruction resume.
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
-		// 3* internal registers
+		x_put_word(m68k_areg(regs, 7),
+			(mmu030_idx & 0xf) | ((mmu030_idx_done & 0xf) << 4) | (regs.wb2_status << 8));
+		// 3* internal registers = mmu030_state[2..0] (offsets 0x34, 0x32, 0x30).
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), mmu030_state[2] | (regs.wb3_status << 8));
+		// 0x32: use the fault-time saved copy (mmu030_page_fault:1870 sets
+		// regs.wb2_address = mmu030_state[1]) rather than the live global, matching WinUAE.
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), regs.wb2_address);   // = mmu030_state[1]
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		x_put_word(m68k_areg(regs, 7), mmu030_state[0]);
 		// data input buffer = fault address
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr);
@@ -1171,15 +1350,28 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 			uae_u32 ps = 0;
 			ps |= (7 << 8);
 			ps |= (7 << 11);
+			// "fault during opcode prefetch" sentinel (upstream WinUAE newcpu_common.cpp:1555).
+			// m68k_do_rte_mmu030 decodes this bit to restore mmu030_opcode = -1, which is what
+			// makes m68k_run_mmu030 take `goto insretry` and RE-FETCH the opcode through the MMU
+			// from the freshly mapped page after the OS handles a demand-paging ifetch fault.
+			// Without it the RTE resume re-dispatched the stale frame opcode (regs.irc = the
+			// kernel's return-to-user RTE, 0x4E73) in user mode -> Exception(8) -> SIGILL at the
+			// entry of every first-touch text page: AMIX init died at libc _rt_boot+0.
+			if (mmu030_opcode == -1)
+				ps |= 0x80000000;
 			m68k_areg(regs, 7) -= 4;
 			x_put_long(m68k_areg(regs, 7), ps);
 		}
-		// stage b address
+		// stage b address: for an INSTRUCTION (prefetch) fault the faulting fetch address lives here, and the
+		// 030 bus-error handler reads THIS field (the SSW marks an instruction fault: FB set / DF clear), not
+		// the 0x10 data-cycle fault address. Writing 0 made AMIX report "User BUS ERROR at 0" the first time it
+		// demand-paged a TEXT page (the dynamic linker /usr/lib/libc.so.1 _rt_boot entry at 0xC100F348 — init is
+		// dynamically linked). Data faults (DF set) read 0x10, so keep 0 there (the proven path).
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
-		// 2xinternal
+		x_put_long(m68k_areg(regs, 7), (ssw & MMU030_SSW_DF) ? 0 : regs.mmu_fault_addr);
+		// get_disp_ea_020 displacement store, word 1 (offset 0x20)
 		m68k_areg(regs, 7) -= 4;
-		x_put_long(m68k_areg(regs, 7), 0);
+		x_put_long(m68k_areg(regs, 7), mmu030_disp_store[1]);
 		/* fall through */
 		/* no break */
 	case 0xA:
@@ -1187,7 +1379,7 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		// used when instruction's last write causes bus fault
 		m68k_areg(regs, 7) -= 4;
 		if (format == 0xb) {
-			  x_put_long(m68k_areg(regs, 7), 0); // 28 0x1c
+			  x_put_long(m68k_areg(regs, 7), mmu030_disp_store[0]); // get_disp_ea_020 store word 0, 0x1c
 		  } else {
 			  uae_u32 ps = 0;
 			ps |= (7 << 8);
@@ -1195,14 +1387,21 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 			x_put_long(m68k_areg(regs, 7), ps); // 28 0x1c
 		}
 		m68k_areg(regs, 7) -= 4;
-		// Data output buffer = value that was going to be written
-		x_put_long(m68k_areg(regs, 7), 0); // 24 0x18
+		// Data output buffer = value that was going to be written. For a 68030 MMU
+		// frame A (last-write fault) m68k_do_rte_mmu030 re-issues this value, so it
+		// must be the real pending write (regs.wb3_data = mmu030_data_buffer_out,
+		// saved by mmu030_page_fault); 0 here made every resumed store write 0.
+		x_put_long(m68k_areg(regs, 7), regs.wb3_data); // 24 0x18
 		m68k_areg(regs, 7) -= 4;
-		if (format == 0xb) {
-			x_put_long(m68k_areg(regs, 7), 0);  // Internal register (opcode storage) 20 0x14
-		} else {
-			x_put_long(m68k_areg(regs, 7), regs.irc);  // Internal register (opcode storage)  20 0x14
-		}
+		// Internal register (opcode storage) 20 0x14. m68k_do_rte_mmu030 reads this
+		// back as the opcode to re-dispatch on resume; storing 0 for frame B made the
+		// CPU resume into opcode $0000 (ORI.B) instead of the faulting instruction.
+		// For frame B DATA faults mmu030_opcode == regs.irc (the in-flight instruction);
+		// for frame B PREFETCH faults mmu030_opcode is -1 and the slot is ignored by the
+		// reader once ps bit 31 is set (the slot becomes 0xFFFF, never dispatched).
+		// regs.irc would be the PREVIOUS instruction there -- the stale-opcode trap.
+		// Upstream reference: WinUAE newcpu_common.cpp:1585-1589.
+		x_put_long(m68k_areg(regs, 7), format == 0xb ? (uae_u32)(mmu030_opcode & 0xffff) : regs.irc);
 		m68k_areg(regs, 7) -= 4;
 		x_put_long(m68k_areg(regs, 7), regs.mmu_fault_addr); // data cycle fault address 16 0x10
 		m68k_areg(regs, 7) -= 2;
@@ -1212,7 +1411,13 @@ void Exception_build_stack_frame(uae_u32 oldpc, uae_u32 currpc, uae_u32 ssw, int
 		m68k_areg(regs, 7) -= 2;
 		x_put_word(m68k_areg(regs, 7), ssw); // 10 0x0a
 		m68k_areg(regs, 7) -= 2;
-		x_put_word(m68k_areg(regs, 7), 0);
+		// 0x08 = internal register holding mmu030_state[1]. m68k_do_rte_mmu030 reads it back
+		// (cpummu030.cpp:2958 -> 2980) and clears mmu030_retry iff LASTWRITE is set (3177). Storing 0
+		// dropped LASTWRITE -> retry stayed true -> the run loop re-dispatched the faulting RMW
+		// (addq.l #1,abs) -> the count++ double-apply (0->2 -> ttymon NULL-table -> getty SIGBUS).
+		// Store the fault-time state[1] (= regs.wb2_address, set in page_fault:1931), matching the 0xB
+		// path's 0x32 slot (line 1191) and upstream WinUAE.  (2026-06-15 RMW-write-fault fix, EDIT 1/3)
+		x_put_word(m68k_areg(regs, 7), regs.wb2_address);  // = mmu030_state[1]  (frame-$A 0x08)
 		break;
 	default:
 		write_log(_T("Unknown exception stack frame format: %X\n"), format);

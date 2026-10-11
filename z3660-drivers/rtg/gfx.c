@@ -2098,15 +2098,7 @@ void BlitTemplate (__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), 
       zz_template_addr = b->MemorySize;
    }
 
-   /* BytesPerRow is the offset from one template line to the next, not a
-    * size, and P96 does pass 0: the template is then a single line that
-    * repeats down the whole rectangle. BytesPerRow * h is 0 bytes for that,
-    * leaving the board to blit whatever the previous op left in the template
-    * buffer. Copy the one line the blit actually reads instead. */
-   uint32_t row_bytes = ((uint32_t)t->XOffset + (uint32_t)w + 7) / 8;
-   uint32_t template_bytes =
-      t->BytesPerRow ? (uint32_t)t->BytesPerRow * (uint32_t)h : row_bytes;
-   memcpy((uint8_t*)(((uint32_t)b->MemoryBase)+zz_template_addr), t->Memory, template_bytes);
+   memcpy((uint8_t*)(((uint32_t)b->MemoryBase)+zz_template_addr), t->Memory, t->BytesPerRow * h);
 
    if (b->CardFlags & CARDFLAG_ZORRO_3) {
       gfxdata->x[0] = x;
@@ -2220,16 +2212,6 @@ void DrawLine(__REGA0(struct BoardInfo *b), __REGA1(struct RenderInfo *r), __REG
    (void)format;
    if (!b || !l || !r)
       return;
-
-   /* Line does not expose the RastPort's FRST_DOT state, so an accelerated
-    * COMPLEMENT line cannot tell a fresh Draw from a connected Draw. Processing
-    * a shared vertex twice is observable with XOR. Keep every other mode on the
-    * fast path and let Picasso96 preserve exact join ownership for COMPLEMENT. */
-   if (l->DrawMode & COMPLEMENT) {
-      if (b->DrawLineDefault)
-         b->DrawLineDefault(b, r, l, mask, format);
-      return;
-   }
 
    uint16_t colormode = mnt_colormode(format);
    if (colormode == MNTVA_COLOR_NO_USE) {

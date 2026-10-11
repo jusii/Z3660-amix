@@ -1,0 +1,18 @@
+/* Z3660 command-line boot image -- PROFILING variant (CYBERSTORM C1).
+ *
+ * Identical to system_cli.bif except for the core1 ELF: Z3660_emu/build-prof/ instead of
+ * Z3660_emu/build/. Core0 (Z3660.elf), the FSBL and the bitstream are shared -- the
+ * profiling variant changes core1's run loop and accessors only, so rebuilding core0 for
+ * it would be noise. Produced by `make profile` -> sd_card/BOOT-prof.BIN.
+ *
+ * This image is a MEASURING INSTRUMENT, not a production one. It carries the lean run
+ * loop plus a wall-clock guest-PC sampler and per-stage ARM cycle attribution, and it
+ * costs measured time to run. BOOT-lean.BIN is what goes back on the card afterwards.
+ */
+the_ROM_image:
+{
+  [bootloader] design_1_wrapper/zynq_fsbl/fsbl.elf
+  design_1_wrapper/hw/design_1_wrapper.bit
+  Z3660/build/Z3660.elf
+  Z3660_emu/build-prof/Z3660_emu.elf
+}

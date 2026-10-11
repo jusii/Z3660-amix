@@ -35,6 +35,7 @@
 #include "../mpg/libmpeg_arm/mpeg2dec_arm_comm_arm.h"
 #include "xtime_l.h"
 #include "usb_proxy.h"
+#include "../core0_stats.h"
 
 extern arm_decoder_shared_arm_t *bridge_state_arm;
 extern uint32_t fifo_read_index;
@@ -432,24 +433,35 @@ void other_tasks(void)
 //   static int debug_call_count = 0;
 //   debug_call_count++;
 //   if (debug_call_count % 2 == 0)
+   /* Nested C0STAT spans (core0_stats.h). The MPEG decode is the only thing in
+    * here that runs on EVERY iteration, so it is on the critical path of every
+    * one of the ten cross-core round trips a 2 KB guest READ costs; the other two
+    * are rare but each reaches hardware that can wait. All three are inside the
+    * enclosing C0T_OTHER stamp -- reported as OTHER>* rows. */
    {
 //      printf("[RTG DEBUG] Calling pl_mpeg_arm_decode_progressive #%d\n", debug_call_count);
       int pl_mpeg_arm_decode_progressive(void);
+      C0_SPAN(sp);
       pl_mpeg_arm_decode_progressive();
+      C0_SPAN_END(sp,C0T_OT_MPEG);
    }
 
    if(idle_task_count++> idle_task_count_max)
    {
+      C0_SPAN(sp);
       idle_task_count=0;
       ethernet_task();
+      C0_SPAN_END(sp,C0T_OT_ETHTASK);
    }
 
    if(audio_request_init) {
+      C0_SPAN(sp);
       audio_debug_timer(0);
       audio_silence();
       audio_init_i2s();
       audio_request_init = 0;
       audio_debug_timer(1);
+      C0_SPAN_END(sp,C0T_OT_AUDIO);
    }
 
    if(interrupt_enabled_ethernet && ethernet_get_backlog()>0)
@@ -537,6 +549,29 @@ int measures_thread(struct pt *pt)
    }
    PT_END(pt);
 }
+/* The FPGA raises the register-write event in the same clock as it starts the AXI write
+ * of the value to DDR (z3660.v), so the first read here can still return the register's
+ * previous value. Re-read, ~1 us apart, until two consecutive reads agree (at most 8
+ * re-reads; the last read wins). */
+static uint32_t piscsi_reg_value(uint32_t *address, int type, uint32_t first)
+{
+   uint32_t prev=first, v;
+   for(int i=0;i<8;i++)
+   {
+      dsb();
+      xc3_usleep(1);
+      if(type==OP_TYPE_LONGWORD)
+         v=swap32(*(volatile uint32_t *)address);
+      else if(type==OP_TYPE_WORD)
+         v=swap16(*(volatile uint16_t *)address);
+      else
+         v=*(volatile uint8_t *)address;
+      if(v==prev)
+         break;
+      prev=v;
+   }
+   return v;
+}
 int rtg_thread(struct pt *pt)
 //void rtg_loop(void)
 {
@@ -596,6 +631,7 @@ int rtg_thread(struct pt *pt)
                   {
                      zdata=*(uint8_t*)address;
                   }
+                  zdata=piscsi_reg_value(address,type,zdata);
 //                  printf("writex address 0x%08lX\n",zaddr);
                   if(zaddr<0x400 || zaddr>=0x600)
                      handle_piscsi_reg_write(zaddr, zdata, type);
@@ -831,11 +867,8 @@ uint32_t read_rtg_register(uint32_t zaddr)
          data=env_file_vars_temp[preset_selected].cpufreq;
          break;
       case REG_ZZ_EMULATION_USED:
-         data=   env_file_vars_temp[preset_selected].boot_mode==UAEJIT_030
-              || env_file_vars_temp[preset_selected].boot_mode==UAE_030
-              || env_file_vars_temp[preset_selected].boot_mode==UAEJIT_040
-              || env_file_vars_temp[preset_selected].boot_mode==UAE_040
-              || env_file_vars_temp[preset_selected].boot_mode==MUSASHI;
+         // closed real-CPU list; see boot_mode_is_emulated() in config_file.h
+         data=boot_mode_is_emulated(env_file_vars_temp[preset_selected].boot_mode);
          break;
       case REG_ZZ_SCSIBOOT_EN:
          data=env_file_vars_temp[preset_selected].scsiboot==YES;

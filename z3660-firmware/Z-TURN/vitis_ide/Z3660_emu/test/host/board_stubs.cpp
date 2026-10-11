@@ -1,0 +1,302 @@
+/* Board-seam stubs for the Layer-1 host MMU harness.
+ *
+ * Replaces the Z3660 board environment (Xilinx BSP, FPGA/Zorro bridge, chipset,
+ * IPL, board printf/task-pump) with a deterministic flat-RAM machine on x86-64.
+ *
+ * Memory model (decision #6): one malloc'd buffer indexed by uae_u32, accessed
+ * big-endian (68k order). Every memory bank points here via lget/wget (NOT
+ * baseaddr_direct), so memory_get and memory_put never dereference a guest
+ * address as a host pointer: no uaecptr-to-void* round-trip that would diverge
+ * under 64-bit pointers. */
+
+#include "sysconfig.h"
+#include "sysdeps.h"
+#include "options.h"
+#include "memory.h"
+#include "newcpu.h"
+#include "harness.h"
+#include "uae/z3660_warp.h"   /* the WARP OFF sentinel core0 publishes every boot */
+#include "main.h"      /* SHARED struct (harness-safe; newcpu.cpp pulls it via ../main.h) */
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
+#include <cstring>
+#include <sys/mman.h>   /* the C2 rung-2 identity window: see harness_direct_init() */
+
+/* Older glibc headers know the kernel flag but do not define it. 0x100000 since 4.17. */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+/* ---- Emulator config globals (normally in uae_emulator.cpp, excluded) ---- */
+struct uae_prefs currprefs, changed_prefs;
+
+/* Cross-core SHARED struct (defined in main.cc on target, excluded here) + the
+ * emulator-debug gate accessor (main.cc). Inert in the harness: debug_emu / amix_mode
+ * zero, z3660_dbg_emu()==0, so the [PC]/[RTE-B-IF]/fixup traces stay off. */
+SHARED _harness_shared;
+SHARED *shared = &_harness_shared;
+extern "C" int z3660_dbg_emu(void){ return 0; }
+
+/* =====================================================================
+ *  Flat-RAM machine
+ * ===================================================================== */
+static uae_u8 *g_ram = NULL;
+
+uae_u8 *hram_base(void) { return g_ram; }
+
+void hram_poke32(uae_u32 a, uae_u32 v){ a&=HRAM_MASK; g_ram[a]=v>>24; g_ram[a+1]=v>>16; g_ram[a+2]=v>>8; g_ram[a+3]=v; }
+void hram_poke16(uae_u32 a, uae_u16 v){ a&=HRAM_MASK; g_ram[a]=v>>8; g_ram[a+1]=(uae_u8)v; }
+void hram_poke8 (uae_u32 a, uae_u8  v){ a&=HRAM_MASK; g_ram[a]=v; }
+uae_u32 hram_peek32(uae_u32 a){ a&=HRAM_MASK; return ((uae_u32)g_ram[a]<<24)|((uae_u32)g_ram[a+1]<<16)|((uae_u32)g_ram[a+2]<<8)|g_ram[a+3]; }
+uae_u16 hram_peek16(uae_u32 a){ a&=HRAM_MASK; return (uae_u16)(((uae_u16)g_ram[a]<<8)|g_ram[a+1]); }
+uae_u8  hram_peek8 (uae_u32 a){ a&=HRAM_MASK; return g_ram[a]; }
+
+/* ---- Bank accessors: big-endian into the flat buffer ---- */
+static uae_u32 REGPARAM2 hram_lget(uaecptr a){ return hram_peek32(a); }
+static uae_u32 REGPARAM2 hram_wget(uaecptr a){ return hram_peek16(a); }
+static uae_u32 REGPARAM2 hram_bget(uaecptr a){ return hram_peek8(a); }
+static void REGPARAM2 hram_lput(uaecptr a, uae_u32 v){ hram_poke32(a, v); }
+static void REGPARAM2 hram_wput(uaecptr a, uae_u32 v){ hram_poke16(a, (uae_u16)v); }
+static void REGPARAM2 hram_bput(uaecptr a, uae_u32 v){ hram_poke8 (a, (uae_u8)v); }
+
+/* baseaddr and baseaddr_direct_* left NULL (trailing fields zero-init) so
+ * memory_get and memory_put take the lget/wget path, not the direct-pointer one. */
+addrbank hram_bank = {
+	hram_lget, hram_wget, hram_bget,
+	hram_lput, hram_wput, hram_bput,
+	NULL, NULL, NULL, _T("hram"), _T("Harness RAM"),
+	hram_lget, hram_wget,
+	ABFLAG_RAM, 0, 0
+};
+
+void harness_mem_reset(void){ if (g_ram) memset(g_ram, 0, HRAM_SIZE); }
+
+/* =====================================================================
+ *  THE IDENTITY WINDOW (C2 rung 2) -- see harness.h for why it exists.
+ *
+ *  One mmap at a FIXED host address equal to the guest address it serves, so that inside
+ *  it `(uae_u8 *)guest_addr` is a valid host pointer and the board's direct-bank model is
+ *  literally true rather than approximated. Without it the accessor fast path declines in
+ *  every test and its whole hit case is untested.
+ * ===================================================================== */
+static uae_u8 *g_direct = NULL;
+
+int harness_direct_ok(void) { return g_direct != NULL; }
+void harness_direct_reset(void) { if (g_direct) memset(g_direct, 0, HDIRECT_SIZE); }
+
+void hdirect_poke32(uae_u32 a, uae_u32 v)
+{
+	uae_u8 *m = (uae_u8 *)(uintptr_t)a;
+	m[0]=(uae_u8)(v>>24); m[1]=(uae_u8)(v>>16); m[2]=(uae_u8)(v>>8); m[3]=(uae_u8)v;
+}
+uae_u32 hdirect_peek32(uae_u32 a)
+{
+	const uae_u8 *m = (const uae_u8 *)(uintptr_t)a;
+	return ((uae_u32)m[0]<<24)|((uae_u32)m[1]<<16)|((uae_u32)m[2]<<8)|m[3];
+}
+
+/* The NON-direct twin: same storage, reached through the bank's function pointers, and
+ * counting every call. A "device" for the purposes of the decline test. */
+unsigned long hdirect_io_hits = 0;
+static uae_u32 REGPARAM2 hdio_lget(uaecptr a){ hdirect_io_hits++; return hdirect_peek32(a); }
+static uae_u32 REGPARAM2 hdio_wget(uaecptr a){ hdirect_io_hits++; const uae_u8 *m=(const uae_u8*)(uintptr_t)a; return (uae_u32)((m[0]<<8)|m[1]); }
+static uae_u32 REGPARAM2 hdio_bget(uaecptr a){ hdirect_io_hits++; return *(const uae_u8*)(uintptr_t)a; }
+static void REGPARAM2 hdio_lput(uaecptr a, uae_u32 v){ hdirect_io_hits++; hdirect_poke32(a, v); }
+static void REGPARAM2 hdio_wput(uaecptr a, uae_u32 v){ hdirect_io_hits++; uae_u8 *m=(uae_u8*)(uintptr_t)a; m[0]=(uae_u8)(v>>8); m[1]=(uae_u8)v; }
+static void REGPARAM2 hdio_bput(uaecptr a, uae_u32 v){ hdirect_io_hits++; *(uae_u8*)(uintptr_t)a = (uae_u8)v; }
+
+/* baseaddr_direct_r/_w are the LAST two pointer fields; set non-NULL to make this bank
+ * direct. The VALUE is never dereferenced by the fork's identity formula -- only its
+ * non-NULL-ness is tested -- but pointing it at the window keeps it honest. */
+static addrbank hdirect_bank = {
+	hdio_lget, hdio_wget, hdio_bget,      /* never called while the bank is direct */
+	hdio_lput, hdio_wput, hdio_bput,
+	NULL, NULL, NULL, _T("hdirect"), _T("Harness identity window"),
+	hdio_lget, hdio_wget,
+	ABFLAG_RAM, 0, 0
+};
+static addrbank hdirect_io_bank = {
+	hdio_lget, hdio_wget, hdio_bget,
+	hdio_lput, hdio_wput, hdio_bput,
+	NULL, NULL, NULL, _T("hdirectio"), _T("Harness identity window (device)"),
+	hdio_lget, hdio_wget,
+	ABFLAG_IO, 0, 0
+};
+
+void harness_direct_map(int direct)
+{
+	addrbank *b = direct ? &hdirect_bank : &hdirect_io_bank;
+	unsigned i;
+	if (!g_direct) return;
+	for (i = 0; i < (HDIRECT_SIZE >> 16); i++)
+		mem_banks[(HDIRECT_BASE >> 16) + i] = b;
+}
+
+static void harness_direct_init(void)
+{
+	if (g_direct) return;
+	void *p = mmap((void *)(uintptr_t)HDIRECT_BASE, HDIRECT_SIZE,
+	               PROT_READ | PROT_WRITE,
+	               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED || (uintptr_t)p != (uintptr_t)HDIRECT_BASE) {
+		/* NOT fatal, and NOT silent: harness_direct_ok() stays 0 and the tests that
+		 * need the window fail with a message naming this. A skipped test that reports
+		 * PASS is worse than a failing one. */
+		if (p != MAP_FAILED) munmap(p, HDIRECT_SIZE);
+		fprintf(stderr, "[harness] WARNING: could not map the identity window at %08x -- "
+		                "the C2 rung-2 fast-path tests will FAIL rather than be skipped\n",
+		        (unsigned)HDIRECT_BASE);
+		return;
+	}
+	g_direct = (uae_u8 *)p;
+	/* Point the two banks' direct pointers at the window. Done here rather than in the
+	 * initialisers because HDIRECT_BASE has to survive being a pointer, and a static
+	 * initialiser casting an integer constant to uae_u8* is not portable C++. */
+	hdirect_bank.baseaddr_direct_r = g_direct;
+	hdirect_bank.baseaddr_direct_w = g_direct;
+	hdirect_io_bank.baseaddr_direct_r = NULL;
+	hdirect_io_bank.baseaddr_direct_w = NULL;
+}
+
+/* The firmware's power-on state for the cross-core knobs, reproduced here.
+ *
+ * On the board core0's config parser ALWAYS publishes these (resolve_amix_ram /
+ * resolve_overhead_switches), so core1 never sees the zeroed struct. In the harness
+ * SHARED is a plain BSS global, so without this the harness would run with every knob
+ * off and quietly stop covering the default path -- which is the path that has to stay
+ * byte-identical. Tests that want an off state set it explicitly. */
+void harness_shared_defaults(void)
+{
+	_harness_shared.service_cadence = 1;   /* poll every instruction */
+	_harness_shared.perf_stats      = 1;   /* per-instruction perf accounting ON */
+	_harness_shared.emu_probes      = 1;   /* run-loop diagnostic probes ON */
+	_harness_shared.perf_report     = 0;   /* [PERF] serial line OFF (as debug_console_init) */
+	/* WARP ENGINE: core0's UNCONDITIONAL per-boot publish, reproduced here because that is
+	 * what this function is for -- it is the boot state, not a convenience. The mailbox is
+	 * DDR that survives a warm reset, so an arm written by the console in one boot is still
+	 * sitting there in the next one; config_file.c therefore writes the OFF sentinel every
+	 * boot from both config-resolve paths, and the corpus's anti-vacuity check shows what
+	 * deleting that publish would cost. */
+	_harness_shared.warp_on         = Z3660_WARP_OFF;
+}
+
+void harness_mem_init(void)
+{
+	harness_shared_defaults();
+	if (!g_ram) {
+		g_ram = (uae_u8 *)calloc(1, HRAM_SIZE);
+		if (!g_ram) { fprintf(stderr, "[harness] OOM allocating %u bytes RAM\n", HRAM_SIZE); abort(); }
+	}
+	/* Point every 64KB bank slot at the flat RAM (whole 32-bit space resolves). */
+	for (unsigned i = 0; i < MEMORY_BANKS; i++)
+		mem_banks[i] = &hram_bank;
+	/* ...then hand the identity window's slots to the direct bank, so the board's
+	 * direct-bank model is exercised by default rather than only when a test asks. */
+	harness_direct_init();
+	harness_direct_map(1);
+}
+
+/* =====================================================================
+ *  do_get_mem_* / do_put_mem_*  (normally in uae_emulator.cpp, excluded)
+ *  Route through memory_get and memory_put exactly as the real board does: the
+ *  arg is a guest address disguised as a pointer (get_real_address returns
+ *  (u8*)addr in this fork).
+ * ===================================================================== */
+uae_u32  do_get_mem_long(uae_u32 *a){ return memory_get_long((uaecptr)(uintptr_t)a); }
+uint16_t do_get_mem_word(uint16_t *a){ return (uint16_t)memory_get_word((uaecptr)(uintptr_t)a); }
+uint8_t  do_get_mem_byte(uint8_t  *a){ return (uint8_t) memory_get_byte((uaecptr)(uintptr_t)a); }
+void do_put_mem_long(uae_u32 *a, uae_u32 v){ memory_put_long((uaecptr)(uintptr_t)a, v); }
+void do_put_mem_word(uint16_t *a, uint16_t v){ memory_put_word((uaecptr)(uintptr_t)a, v); }
+void do_put_mem_byte(uint8_t  *a, uint8_t  v){ memory_put_byte((uaecptr)(uintptr_t)a, v); }
+
+/* =====================================================================
+ *  Board bridge (normally in cpu_emulator.cpp, excluded) -> flat buffer
+ * ===================================================================== */
+extern "C" unsigned int ps_read_8 (unsigned int a){ return hram_peek8(a); }
+extern "C" unsigned int ps_read_16(unsigned int a){ return hram_peek16(a); }
+extern "C" unsigned int ps_read_32(unsigned int a){ return hram_peek32(a); }
+extern "C" void ps_write_8 (unsigned int a, unsigned int v){ hram_poke8 (a, (uae_u8)v); }
+extern "C" void ps_write_16(unsigned int a, unsigned int v){ hram_poke16(a, (uae_u16)v); }
+extern "C" void ps_write_32(unsigned int a, unsigned int v){ hram_poke32(a, v); }
+extern "C" unsigned int test_read_8 (unsigned int a){ return hram_peek8(a); }
+extern "C" unsigned int test_read_16(unsigned int a){ return hram_peek16(a); }
+extern "C" unsigned int test_read_32(unsigned int a){ return hram_peek32(a); }
+extern "C" void test_write_8 (unsigned int a, unsigned int v){ hram_poke8 (a, (uae_u8)v); }
+extern "C" void test_write_16(unsigned int a, unsigned int v){ hram_poke16(a, (uae_u16)v); }
+extern "C" void test_write_32(unsigned int a, unsigned int v){ hram_poke32(a, v); }
+
+/* =====================================================================
+ *  Misc board seams (chipset / IPL / reset / debug) — inert on host
+ * ===================================================================== */
+extern "C" int  intlev(void){ return -1; }            /* no pending interrupt */
+/* The run loop's interrupt poll passes through here, so counting it is how the harness
+ * measures YIELD GRANULARITY -- how often the block-idiom fast path (CYBERSTORM C2) hands
+ * control back to the tail. A claim like "the poll still runs at its normal cadence" is
+ * otherwise unfalsifiable; this makes it a number. */
+unsigned long harness_ipl_polls = 0;
+extern "C" void ipl_main_read(void){ harness_ipl_polls++; }
+extern "C" void cpu_emulator_reset_core0(void){ }
+extern "C" void z3660_printf(const TCHAR *fmt, ...){ va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); }
+void z3660_tasks(void){ }
+void do_cycles_ce(int){ }
+bool is_cycle_ce(uaecptr){ return false; }
+extern "C" void reset_autoconfig(void){ }
+
+/* Host backing for newcpu.cpp's renamed usleep (firmware defines this in
+ * cpu_emulator.cpp, which the harness excludes). */
+extern "C" void usleep2(unsigned long useconds){ usleep(useconds); }
+
+/* Board signal variables (defined in cpu_emulator.cpp on target) */
+int ovl = 0;
+int read_irq = 0;
+volatile int read_reset = 1;
+
+/* Default/dummy bank referenced by memory.cpp. Inert reads/writes. */
+static uae_u32 REGPARAM2 dmmy_lget(uaecptr){ return 0; }
+static uae_u32 REGPARAM2 dmmy_wget(uaecptr){ return 0; }
+static uae_u32 REGPARAM2 dmmy_bget(uaecptr){ return 0; }
+static void REGPARAM2 dmmy_lput(uaecptr, uae_u32){ }
+static void REGPARAM2 dmmy_wput(uaecptr, uae_u32){ }
+static void REGPARAM2 dmmy_bput(uaecptr, uae_u32){ }
+addrbank dmmy_bank = {
+	dmmy_lget, dmmy_wget, dmmy_bget,
+	dmmy_lput, dmmy_wput, dmmy_bput,
+	NULL, NULL, NULL, _T("dmmy"), _T("Dummy"),
+	dmmy_lget, dmmy_wget,
+	ABFLAG_NONE, 0, 0
+};
+
+/* =====================================================================
+ *  A3000-SCSI emulation seams — referenced by the portable MMU core
+ *  (newcpu.cpp INT2 completion pump + cpummu030.cpp AMIX gate) but
+ *  defined in a3000_scsi.cpp / main.cc, which this harness excludes.
+ *  Stubbed inert so the MMU harness links on the A3000-SCSI base.
+ * ===================================================================== */
+extern "C" {
+volatile int a3000_amix_mode = 0;          /* AMIX (A3000 SCSI) mode — off for MMU tests */
+/* Arms the get_real_address() guest-$07xxxxxx -> host-$09xxxxxx redirect (memory.h).
+ * Defined in uae_emulator.cpp on the board; that file is not in the harness build, so
+ * it is stubbed here. Off, so the harness's flat buffer stays 1:1 as every MMU test
+ * assumes. amix_ram_test covers the size logic that decides this flag on the board. */
+volatile int a3000mem_alias = 0;
+volatile int amix_mmu_on = 0;
+/* "the guest is the 68030 AMIX kernel image" — set only by a3000_scsi_init() (not linked
+ * here). Stubbed so test_amix_mmu040_latch can assert the 040 latch never touches it. */
+volatile int amix_kimage_030 = 0;
+volatile uae_u32 amix_compl_tick[16], amix_compl_istate[16], amix_compl_csr[16],
+                 amix_compl_unit[16], amix_compl_head[16];
+volatile int amix_compl_h = 0;
+volatile uae_u32 amix_scmd_unit[16], amix_scmd_lba[16], amix_scmd_n[16], amix_scmd_w[16];
+volatile int amix_scmd_head = 0;
+volatile uae_u32 amix_wcmd_cmd[16], amix_wcmd_dest[16], amix_wcmd_ph[16];
+volatile int amix_wcmd_head = 0;
+void a3000_scsi_hsync(void){ }
+void a3000_scsi_dumpstate(void){ }
+void a3000_scsi_dumpqueue(void){ }
+}
+/* plain C++ linkage (defined in a3000_scsi.cpp / main.cc on target) */
+volatile uae_u32 amix_tick = 0;
+volatile int a3000_scsi_irq = 0;
+int ipl_read = 0;

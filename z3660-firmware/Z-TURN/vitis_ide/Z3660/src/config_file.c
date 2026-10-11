@@ -11,13 +11,25 @@
 #include <string.h>
 #include "xil_exception.h"
 #include "config_file.h"
+#include "amix_ram.h"
+#include "overhead_switches.h"   /* the single copy of the perf_stats/emu_probes/core0_stats rule */
+#include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (CYBERSTORM C1) */
+/* WARP ENGINE: the OFF sentinel this file publishes unconditionally on every boot. Included
+ * directly rather than mirrored, for debug_console.c's reason -- a mirrored copy is only a
+ * second place for the sentinel to drift away from the one core1 tests against. */
+#include "../../Z3660_emu/src/uae/z3660_warp.h"
+#include "core0_stats.h"         /* core0_stats_set_enabled() -- the core0_stats key */
 #include "main.h"
 #include "ARM_ztop/checkbox.h"
 CONFIG config,default_config,temp_config;
 extern SHARED *shared;
 extern uint8_t EmacPsMAC[6];
 
-const char *config_item_names[CONFITEM_NUM] = {
+/* Deliberately UNSIZED: the completeness tripwire just below compares the
+ * initializer count against CONFITEM_NUM, and an explicit [CONFITEM_NUM]
+ * dimension would silently pad a missing name with NULL and make the check
+ * vacuous. */
+const char *config_item_names[] = {
       "NONE",
       "bootmode",
       "kickstart",
@@ -145,7 +157,21 @@ const char *config_item_names[CONFITEM_NUM] = {
       "test_range6",
       "test_range7",
       "arm_frequency",
+      "amix_mode",
+      "service_cadence",
+      "amix_ram",
+      "perf_stats",
+      "emu_probes",
+      "core0_stats",
+      "prof_hz",
+      "prof_buckets",
 };
+/* Tripwire: config_item_names[] is indexed by CONFITEM, so a new enum entry with
+ * no matching string silently shifts every key after it -- the parser would then
+ * assign the wrong config field for the whole rest of the file, with no error.
+ * Compile-time check, spelled without _Static_assert so it holds under -std=gnu99. */
+typedef char z3660_confitem_names_complete[
+   (sizeof(config_item_names)/sizeof(config_item_names[0]) == CONFITEM_NUM) ? 1 : -1];
 const char *bootmode_names[BOOTMODE_NUM] = {
       "MOBOCPU",
       "CPU",
@@ -154,6 +180,8 @@ const char *bootmode_names[BOOTMODE_NUM] = {
       "UAEJIT_030",
       "UAE_040",
       "UAEJIT_040",
+      "UAE_030_MMU",
+      "UAE_040_MMU",
 };
 const char *yesno_names[YESNO_NUM] = {
       "NO",
@@ -196,6 +224,163 @@ void print_line(FIL *fil, char* line_in, ...)
    sprintf(line,line_in, args);
    f_write(fil, line, strlen(line),&NumBytesWritten);
 }
+/* Resolve, validate and publish the AMIX main-RAM window size.
+ *
+ * Called from BOTH config paths (no-preset and preset) once the whole file is
+ * parsed, so config.amix_ram is always a usable MiB value by the time core1 is
+ * dispatched. The bounds and the fallback live in amix_ram.h -- core1 re-runs
+ * exactly the same classification on the mailbox value before it builds the map,
+ * so a corrupted or stale shared->amix_ram cannot produce a bad bank range.
+ *
+ * A refused value is NOT truncated to the bound. It falls back to the default and
+ * shouts, because the operator must not end up on a 128 MiB machine believing it
+ * is a 512 MiB one -- especially when the failure mode at the top of the range is
+ * the guest producing no console output whatsoever.
+ *
+ * The resolved value is always published to the mailbox (so core1 can never read a
+ * stale one), but it only MEANS anything under amix_mode -- core1 consults it solely
+ * inside its amix_mode arm, so every non-AMIX config is bit-for-bit unaffected. */
+/* CYBERSTORM C3: resolve and publish the three run-loop overhead switches.
+ *
+ * Called from BOTH config paths (no-preset and preset) once the whole file is parsed,
+ * exactly like resolve_amix_ram(), so the values are settled before core1 is dispatched.
+ *
+ * -1 (no key in the file) resolves to 1 = ON = the behaviour this firmware has always
+ * had. That is the whole contract of this feature: a config that does not mention these
+ * keys must produce the loops it produced before they existed.
+ *
+ * perf_stats/emu_probes are published to the cross-core mailbox unconditionally, so core1
+ * can never read a stale value left by a previous boot; core1 re-reads them from there
+ * (z3660_knobs_sync in newcpu.cpp) rather than caching anything across a reset.
+ * core0_stats is core0's own, so it is applied directly.
+ *
+ * NOTE these are DIAGNOSTIC-COST switches, not functional ones. Turning any of them off
+ * removes measurement and tracing, never emulation: the guest sees the same machine, it
+ * just gets more of the ARM's time. That is what makes them safe to sweep on metal. */
+static void resolve_overhead_switches(int verbose)
+{
+   config.perf_stats  = z3660_ovh_resolve(config.perf_stats);    /* overhead_switches.h */
+   config.emu_probes  = z3660_ovh_resolve(config.emu_probes);
+   config.core0_stats = z3660_ovh_resolve(config.core0_stats);
+
+   shared->perf_stats = config.perf_stats;   /* always published, so core1 never reads a stale mailbox */
+   shared->emu_probes = config.emu_probes;
+   core0_stats_set_enabled(config.core0_stats);   /* core0's own -- applied, not published */
+
+   /* Silent when everything is at the historical default; loud the moment an
+    * instrument is off, so a serial log always says which run it was. */
+   if(verbose && !(z3660_ovh_is_default(config.perf_stats)
+                && z3660_ovh_is_default(config.emu_probes)
+                && z3660_ovh_is_default(config.core0_stats)))
+      printf("[CFG] run-loop overhead: perf_stats %s, emu_probes %s, core0_stats %s "
+             "(diagnostics only -- emulation is unaffected)\n",
+             yesno_names[config.perf_stats],
+             yesno_names[config.emu_probes],
+             yesno_names[config.core0_stats]);
+}
+
+/* CYBERSTORM C1: resolve the profiler keys and publish them to the cross-core mailbox.
+ *
+ * Published UNCONDITIONALLY, exactly like perf_stats/emu_probes above and for the same
+ * reason: the mailbox is DDR that survives a warm reset, so a boot that leaves prof_ctl
+ * alone would let core1 act on the previous boot's command. Writing it every time makes
+ * "no profile requested" an explicit instruction rather than the absence of one.
+ *
+ * The buckets ride the ARM command's argument field rather than a mailbox word of their
+ * own. That is not a byte count -- SHARED is hand-maintained in two headers that a beta
+ * resync has already mis-merged once (docs/piscsi-service-path.md 5), so every field NOT
+ * added is one fewer chance to alias something. The command word already has a 16-bit
+ * argument and this is what it is for.
+ *
+ * On a non-profiling core1 the whole thing is inert: the stub poll_cmd never reads it. */
+static void resolve_prof_config(int verbose)
+{
+   config.prof_hz      = z3660_prof_cfg_hz(config.prof_hz);            /* prof_config.h */
+   config.prof_buckets = z3660_prof_cfg_buckets(config.prof_buckets);
+
+   shared->prof_hz  = (uint32_t)config.prof_hz;
+   shared->prof_ctl = config.prof_hz
+       ? Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM, config.prof_buckets ? 1 : 0)
+       : Z3660_PROF_CFG_CTL_NONE;
+
+   if(verbose && !z3660_prof_cfg_is_default(config.prof_hz, config.prof_buckets))
+      printf("[CFG] profiler: prof_hz %d, prof_buckets %s "
+             "(PROFILING build only -- the default and lean images ignore this)\n",
+             config.prof_hz, yesno_names[config.prof_buckets]);
+}
+
+/* WARP ENGINE: DISARM THE BLOCK ENGINE, ON EVERY BOOT, UNCONDITIONALLY.
+ *
+ * THE MAILBOX IS DDR THAT SURVIVES A WARM RESET -- resolve_prof_config() above says so about
+ * prof_ctl, and the consequence is the same one: a boot that leaves this field alone would
+ * let core1 act on the PREVIOUS boot's arm. For a switch between two proven machines
+ * (blk_chunk / dopc_on / dfast_on, which are deliberately NOT published here) that is
+ * harmless. For an engine that is not shipped behaviour until the M5 gate it would mean an
+ * unproven emulator coming up after a reset nobody connected to a console. Writing the
+ * sentinel every time makes "not armed" an explicit instruction rather than the absence of
+ * one.
+ *
+ * DELIBERATELY NOT A CONFIG KEY, and this function takes no argument for that reason: there
+ * is nothing to parse, nothing to resolve, and no way to ask for the armed state from a
+ * file. The console command WARP is the only way in, and it lasts one boot.
+ *
+ * Called from BOTH config paths, exactly like resolve_amix_ram() and
+ * resolve_overhead_switches(), so the value is settled before core1 is dispatched. */
+static void publish_warp_default(void)
+{
+   shared->warp_on = Z3660_WARP_OFF;
+}
+
+static void resolve_amix_ram(int verbose)
+{
+   int requested = config.amix_ram;
+   int status    = amix_ram_classify(requested);
+
+   config.amix_ram = amix_ram_resolve(requested);
+   shared->amix_ram = config.amix_ram;   /* always published, so core1 never reads a stale mailbox */
+
+   if(!config.amix_mode)
+   {
+      /* Not an AMIX boot: the key is inert. Say so rather than silently ignoring
+       * a line someone deliberately wrote. */
+      if(verbose && requested != -1)
+         printf("[CFG] amix_ram %d ignored: amix_mode is NO (no AMIX memory contract)\n", requested);
+      return;
+   }
+
+   if(amix_ram_is_refused(status))
+   {
+      printf("\n");
+      printf("[CFG] **************** amix_ram %d %s\n", requested, amix_ram_status_text(status));
+      printf("[CFG] **************** valid range is %d..%d MiB; falling back to %d MiB\n",
+             AMIX_RAM_MB_MIN, AMIX_RAM_MB_MAX, AMIX_RAM_MB_DEFAULT);
+      printf("[CFG] **************** the AMIX window starts at guest $%08lX and must stop below\n",
+             (unsigned long)AMIX_RAM_GUEST_BASE);
+      printf("[CFG] **************** guest $%08lX, where the RTG/ethernet combo board lives\n",
+             (unsigned long)(AMIX_RAM_BOARD_BANK << AMIX_RAM_BANK_SHIFT));
+      printf("\n");
+   }
+   else if(status == AMIX_RAM_EXPERIMENTAL)
+   {
+      printf("[CFG] amix_ram %d MiB -- %s\n", config.amix_ram, amix_ram_status_text(status));
+      printf("[CFG] amix_ram: %d MiB is the recommended cap for a shipping config\n",
+             AMIX_RAM_MB_SHIP_MAX);
+      if(config.boot_mode==UAE_030_MMU)
+         printf("[CFG] amix_ram: the 2KB-page 68030 kernel has the LOWER ceiling of the two -- "
+                "this size is 68040-line territory\n");
+   }
+   else if(verbose)
+   {
+      printf("[CFG] amix_ram %d MiB (guest $%08lX..$%08lX)\n",
+             config.amix_ram,
+             (unsigned long)AMIX_RAM_GUEST_BASE,
+             (unsigned long)(AMIX_RAM_GUEST_BASE + amix_ram_bytes(config.amix_ram) - 1));
+   }
+
+   if(amix_ram_hides_a3000mem(config.amix_ram))
+      printf("[CFG] amix_ram %d MiB > %d: a3000mem (guest $07000000) is dropped -- its host backing "
+             "is inside the window\n", config.amix_ram, AMIX_RAM_A3000MEM_MB);
+}
 void load_default_config(void)
 {
    config.boot_mode=UAEJIT_040;
@@ -213,6 +398,14 @@ void load_default_config(void)
    config.autoconfig_ram=0;
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
+   config.amix_mode=-1;
+   config.amix_ram=-1;
+   config.service_cadence=-1;
+   config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
+   config.emu_probes=Z3660_OVH_UNSET;
+   config.core0_stats=Z3660_OVH_UNSET;
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -263,11 +456,12 @@ void write_config_file(char *filename)
    print_line(&fil,"\n");
    print_line(&fil,"##General Configuration\n");
    print_line(&fil,"\n");
-   print_line(&fil,"# Select boot mode:  \"MOBOCPU\" for Mother Board CPU, \"CPU\" for 060 CPU, \"MUSASHI\" \"UAE\" or \"UAEJIT\" for emulator\n");
+   print_line(&fil,"# Select boot mode:  \"MOBOCPU\" for Mother Board CPU, \"CPU\" for 060 CPU, \"MUSASHI\" \"UAE\" or \"UAEJIT\" for emulator, \"UAE_030_MMU\" for 68030 with real MMU (AMIX)\n");
    print_line(&fil,"#bootmode MOBOCPU\n");
    print_line(&fil,"#bootmode CPU\n");
    print_line(&fil,"#bootmode MUSASHI\n");
    print_line(&fil,"#bootmode UAE\n");
+   print_line(&fil,"#bootmode UAE_030_MMU\n");
    print_line(&fil,"bootmode UAEJIT\n");
    print_line(&fil,"\n");
    print_line(&fil,"# Select 060 CPU frequency in MHz\n");
@@ -326,6 +520,25 @@ void write_config_file(char *filename)
    print_line(&fil,"# (YES or NO, in capitals)\n");
    print_line(&fil,"#cpu_ram NO\n");
    print_line(&fil,"cpu_ram YES\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# AMIX memory contract (16MB cap, A3000-SCSI emulation, no $08 CPU RAM board)\n");
+   print_line(&fil,"# Default when omitted: YES iff bootmode UAE_030_MMU, else NO\n");
+   print_line(&fil,"# (YES or NO, in capitals)\n");
+   print_line(&fil,"amix_mode NO\n");
+   print_line(&fil,"#amix_mode YES\n");
+   print_line(&fil,"#service_cadence 8\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# AMIX main-RAM window size in MiB (only meaningful with amix_mode YES)\n");
+   print_line(&fil,"# Default 16. Valid 1..128; a larger value would collide with the combo board\n");
+   print_line(&fil,"# window at guest $10000000 and is REFUSED (falls back to 16), never truncated.\n");
+   print_line(&fil,"#amix_ram 16\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# Run-loop overhead switches (diagnostics only; emulation is unaffected).\n");
+   print_line(&fil,"# All default YES = the behaviour this firmware has always had. Set NO to buy\n");
+   print_line(&fil,"# the ARM time back and measure what the guest gains. See docs/AMIX.md.\n");
+   print_line(&fil,"#perf_stats YES     # core1: per-instruction instruction-rate accounting\n");
+   print_line(&fil,"#emu_probes YES     # core1: run-loop diagnostic probes (ROMENT/RTE/URTE/USTEP)\n");
+   print_line(&fil,"#core0_stats YES    # core0: C0STAT per-task span stamping\n");
    print_line(&fil,"\n");
    print_line(&fil,"# MOUNT SD 0x76 partition\n");
    print_line(&fil,"# (YES or NO, in capitals)\n");
@@ -627,6 +840,14 @@ retry:
    config.autoconfig_ram=0;
    config.autoconfig_rtg=0;
    config.cpu_ram=1;
+   config.amix_mode=-1;
+   config.amix_ram=-1;
+   config.service_cadence=-1;
+   config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
+   config.emu_probes=Z3660_OVH_UNSET;
+   config.core0_stats=Z3660_OVH_UNSET;
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -778,6 +999,10 @@ retry:
       case CONFITEM_ISO18:
       case CONFITEM_ISO19: {
          int index=item-CONFITEM_ISO0;
+         if(index>=7){ // cd_target[] is 7 deep: iso7..iso19 would write past it into adf_num/hdf[0]
+            printf("[CFG] iso%d ignored -- CD-capable slots are iso0..iso6 (cd_target[7])\n", index);
+            break;
+         }
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          sprintf(config.hdf[index],"%s%s", DEFAULT_ROOT, cur_cmd);
          if(verbose) printf("[CFG] iso%d file %s\n", index, config.hdf[index]);
@@ -827,6 +1052,64 @@ retry:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.cpu_ram=get_yesno_type(cur_cmd);
          if(verbose) printf("[CFG] CPU RAM %s.\n", yesno_names[config.cpu_ram]);
+         break;
+
+      case CONFITEM_AMIX_MODE:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.amix_mode=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] AMIX mode %s.\n", yesno_names[config.amix_mode]);
+         break;
+
+      case CONFITEM_SERVICE_CADENCE:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.service_cadence=get_int_type(cur_cmd);
+         if(verbose) printf("[CFG] service_cadence %d\n", config.service_cadence);
+         break;
+
+      /* CYBERSTORM C3 run-loop overhead switches. All three default to YES = what the
+       * firmware has always done, so a config file without these lines is unchanged.
+       * They exist so a metal calibration session can subtract one overhead at a time
+       * and measure what the guest actually gains. See docs/AMIX.md. */
+      case CONFITEM_PERF_STATS:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.perf_stats=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] perf_stats %s.\n", yesno_names[config.perf_stats]);
+         break;
+
+      case CONFITEM_EMU_PROBES:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.emu_probes=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] emu_probes %s.\n", yesno_names[config.emu_probes]);
+         break;
+
+      case CONFITEM_CORE0_STATS:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.core0_stats=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] core0_stats %s.\n", yesno_names[config.core0_stats]);
+         break;
+
+      /* CYBERSTORM C1 profiler arming. Both default to OFF -- see prof_config.h for why
+       * that is the SAME "an absent key changes nothing" rule as the C3 switches above
+       * and not its opposite. These exist for the one profile the serial console cannot
+       * take: the boot itself. Config file only, not per preset. */
+      case CONFITEM_PROF_HZ:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.prof_hz=get_int_type(cur_cmd);
+         if(verbose) printf("[CFG] prof_hz %d\n", config.prof_hz);
+         break;
+
+      case CONFITEM_PROF_BUCKETS:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.prof_buckets=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] prof_buckets %s.\n", yesno_names[config.prof_buckets]);
+         break;
+
+      case CONFITEM_AMIX_RAM:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.amix_ram=get_int_type(cur_cmd);
+         /* Validation is deferred to resolve_amix_ram(), which runs once the whole
+          * file is parsed -- the advisory text depends on amix_mode and boot_mode,
+          * and those lines may come after this one. */
          break;
 
       case CONFITEM_MOUNT_SD_0x76:
@@ -1027,7 +1310,24 @@ load_successful:;
    f_umount(Path);
    if(verbose) printf("Config file read OK\n");
 
+   // default_config is the preset template: keep amix_mode as the parsed value (incl.
+   // -1 = "unset") so each preset resolves its own default against ITS own boot_mode
+   // (in read_env_files). Resolve the ACTIVE config (no-preset path) separately below.
    memcpy(&default_config,&config,sizeof(CONFIG));
+
+   // no-preset path: resolve the amix_mode default (-1 = unset) now that the whole
+   // config file is parsed, so config.amix_mode is always 0/1 by the time anything
+   // (here, the shared field below, or downstream) reads it. Default: AMIX iff UAE_030_MMU.
+   if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
+   if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single contiguous window (no $08 CPU RAM board)
+   shared->amix_mode=config.amix_mode;
+   resolve_amix_ram(verbose);               /* AMIX RAM window size: default, bounds, loud refusal */
+   if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
+   shared->service_cadence=config.service_cadence;
+   resolve_overhead_switches(verbose);      /* perf_stats / emu_probes / core0_stats */
+   resolve_prof_config(verbose);            /* CYBERSTORM C1: prof_hz / prof_buckets */
+   publish_warp_default();                  /* WARP ENGINE: never armed at boot */
+
    memcpy(&temp_config,&config,sizeof(CONFIG));
 
    for(int i=0;i<8;i++)
@@ -1038,6 +1338,12 @@ load_successful:;
       COPY_DEFAULT(autoconfig_ram);
       COPY_DEFAULT(autoconfig_rtg);
       COPY_DEFAULT(cpu_ram);
+      COPY_DEFAULT(amix_mode);
+      COPY_DEFAULT(amix_ram);
+      COPY_DEFAULT(service_cadence);
+      COPY_DEFAULT(perf_stats);
+      COPY_DEFAULT(emu_probes);
+      COPY_DEFAULT(core0_stats);
       COPY_DEFAULT(mount_sd_0x76);
       COPY_DEFAULT(mount_sd_root);
       COPY_DEFAULT(kickstart);
@@ -1286,6 +1592,45 @@ retry:
                   if(preset==preset_selected)
                      if(verbose) printf("\e[30m\e[103m[ENV] CPU Ram %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].cpu_ram]);
                   break;
+               case CONFITEM_AMIX_MODE:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].amix_mode=get_yesno_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] AMIX mode %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].amix_mode]);
+                  break;
+               case CONFITEM_AMIX_RAM:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].amix_ram=get_int_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] amix_ram %d MiB\e[0m\n", env_file_vars_temp[preset].amix_ram);
+                  /* Bounds/refusal happen in resolve_amix_ram() once the preset is applied. */
+                  break;
+               case CONFITEM_SERVICE_CADENCE:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].service_cadence=get_int_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] service_cadence %d\e[0m\n", env_file_vars_temp[preset].service_cadence);
+                  break;
+               /* CYBERSTORM C3 overhead switches, per preset. Absent -> the -1 inherited
+                * from default_config -> YES in resolve_overhead_switches(). */
+               case CONFITEM_PERF_STATS:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].perf_stats=get_yesno_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] perf_stats %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].perf_stats]);
+                  break;
+               case CONFITEM_EMU_PROBES:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].emu_probes=get_yesno_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] emu_probes %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].emu_probes]);
+                  break;
+               case CONFITEM_CORE0_STATS:
+                  get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+                  env_file_vars_temp[preset].core0_stats=get_yesno_type(cur_cmd);
+                  if(preset==preset_selected)
+                     if(verbose) printf("\e[30m\e[103m[ENV] core0_stats %s.\e[0m\n", yesno_names[env_file_vars_temp[preset].core0_stats]);
+                  break;
                case CONFITEM_MOUNT_SD_0x76:
                   get_next_string(parse_line, cur_cmd, &str_pos, ' ');
                   env_file_vars_temp[preset].mount_sd_0x76=get_yesno_type(cur_cmd);
@@ -1385,6 +1730,12 @@ retry:
       config.autoconfig_ram=env_file_vars_temp[preset_selected].autoconfig_ram;
       config.autoconfig_rtg=env_file_vars_temp[preset_selected].autoconfig_rtg;
       config.cpu_ram=env_file_vars_temp[preset_selected].cpu_ram;
+      config.amix_mode=env_file_vars_temp[preset_selected].amix_mode;
+      config.amix_ram=env_file_vars_temp[preset_selected].amix_ram;
+      config.service_cadence=env_file_vars_temp[preset_selected].service_cadence;
+      config.perf_stats=env_file_vars_temp[preset_selected].perf_stats;
+      config.emu_probes=env_file_vars_temp[preset_selected].emu_probes;
+      config.core0_stats=env_file_vars_temp[preset_selected].core0_stats;
       config.mount_sd_0x76=env_file_vars_temp[preset_selected].mount_sd_0x76;
       config.mount_sd_root=env_file_vars_temp[preset_selected].mount_sd_root;
       config.cpufreq=env_file_vars_temp[preset_selected].cpufreq;
@@ -1396,6 +1747,28 @@ retry:
       config.bp_toff=env_file_vars_temp[preset_selected].bp_toff;
       config.monitor_switch=env_file_vars_temp[preset_selected].monitor_switch;
       config.arm_frequency=env_file_vars_temp[preset_selected].arm_frequency;
+      // AMIX (UAE_030_MMU): force cpu_ram OFF so scsiboot_rom_loaded stays 0 (main.c:1430-1442):
+      // no emulated PISCSI Z2 autoboot ROM (its driver needs $08000000 and stalled the AMIX boot
+      // at the RDB - "[PISCSI] DRIVER ... not mapped in FPGA RAM"). AMIX instead autoboots via the
+      // a3k204 ROM scsi.device from the A3000 SCSI @ $00DD0000 (a3000_scsi, gated only on enable_mmu).
+      // scsiboot itself stays as the preset set it, so piscsi_init() still maps devs[6]/Amix.hdf for
+      // the a3000_scsi cross-core backend. (This comment used to say the emulator presents NO RAM at
+      // $08000000 and that AMIX runs from a3000mem @ $07000000 -- that describes an OLD map. It is
+      // the other way round now: the AMIX window IS $08000000 (drct_bank, amix_ram MiB wide) and
+      // a3000mem is vestigial. What is unchanged is WHY: exactly one contiguous region in the
+      // memlist, nothing probeable adjacent to it, so no vatosde() coalesce. See amix_ram.h.)
+      // amix_mode decouples the AMIX memory contract from UAE_030_MMU (the PMMU boot mode). Default
+      // (amix_mode==-1, i.e. no amix_mode line in the preset): AMIX iff UAE_030_MMU, so every existing
+      // preset stays byte-identical in behaviour. Only when amix_mode is ON do we force cpu_ram OFF.
+      if(config.amix_mode==-1) config.amix_mode=(config.boot_mode==UAE_030_MMU)?1:0; // default: AMIX iff UAE_030_MMU
+      if(config.amix_mode) config.cpu_ram=0;   // AMIX forces a single contiguous window (no $08 CPU RAM board)
+      shared->amix_mode=config.amix_mode;
+      resolve_amix_ram(verbose);            /* AMIX RAM window size: default, bounds, loud refusal */
+      if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
+      shared->service_cadence=config.service_cadence;
+      resolve_overhead_switches(verbose);   /* perf_stats / emu_probes / core0_stats */
+      resolve_prof_config(verbose);         /* CYBERSTORM C1: prof_hz / prof_buckets */
+      publish_warp_default();               /* WARP ENGINE: never armed at boot */
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }
 
@@ -1464,6 +1837,12 @@ retry:
          f_printf(&fil,"autoconfig_ram %s\n",yesno_names[env_file->autoconfig_ram]);
          f_printf(&fil,"autoconfig_rtg %s\n",yesno_names[env_file->autoconfig_rtg]);
          f_printf(&fil,"cpu_ram %s\n",yesno_names[env_file->cpu_ram]);
+         if(env_file->amix_mode!=-1)
+            f_printf(&fil,"amix_mode %s\n",yesno_names[env_file->amix_mode]);
+         if(env_file->amix_ram!=-1)
+            f_printf(&fil,"amix_ram %d\n",env_file->amix_ram);
+         if(env_file->service_cadence!=-1)
+            f_printf(&fil,"service_cadence %d\n",env_file->service_cadence);
          f_printf(&fil,"mount_sd_0x76 %s\n",yesno_names[env_file->mount_sd_0x76]);
          f_printf(&fil,"mount_sd_root %s\n",yesno_names[env_file->mount_sd_root]);
          f_printf(&fil,"cpufreq %d\n",env_file->cpufreq);
@@ -1521,6 +1900,7 @@ int write_env_files_boot(ENV_FILE_VARS *env_file)
 //   env_file->autoconfig_rtg=config.autoconfig_rtg;
 //   env_file->enable_test=config.enable_test;
 //   env_file->cpu_ram=config.cpu_ram;
+//   env_file->amix_mode=config.amix_mode;
 //   env_file->mount_sd_0x76=config.mount_sd_0x76;
 //   env_file->mount_sd_root=config.mount_sd_root;
 //   env_file->cpufreq=config.cpufreq;
@@ -1550,6 +1930,12 @@ int write_env_files_scsi(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
+   env_file->service_cadence=config.service_cadence;
+   env_file->perf_stats=config.perf_stats;
+   env_file->emu_probes=config.emu_probes;
+   env_file->core0_stats=config.core0_stats;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1608,6 +1994,12 @@ int write_env_files_bootscres(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
+   env_file->service_cadence=config.service_cadence;
+   env_file->perf_stats=config.perf_stats;
+   env_file->emu_probes=config.emu_probes;
+   env_file->core0_stats=config.core0_stats;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1638,6 +2030,12 @@ int write_env_files_misc(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
+   env_file->service_cadence=config.service_cadence;
+   env_file->perf_stats=config.perf_stats;
+   env_file->emu_probes=config.emu_probes;
+   env_file->core0_stats=config.core0_stats;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1667,6 +2065,12 @@ int write_env_files_preset(ENV_FILE_VARS *env_file)
    env_file->autoconfig_rtg=config.autoconfig_rtg;
    env_file->enable_test=config.enable_test;
    env_file->cpu_ram=config.cpu_ram;
+   env_file->amix_mode=config.amix_mode;
+   env_file->amix_ram=config.amix_ram;
+   env_file->service_cadence=config.service_cadence;
+   env_file->perf_stats=config.perf_stats;
+   env_file->emu_probes=config.emu_probes;
+   env_file->core0_stats=config.core0_stats;
    env_file->mount_sd_0x76=config.mount_sd_0x76;
    env_file->mount_sd_root=config.mount_sd_root;
    env_file->cpufreq=config.cpufreq;
@@ -1730,6 +2134,9 @@ retry:
    DELETE_FILE("env/autoconfig_ram");
    DELETE_FILE("env/autoconfig_rtg");
    DELETE_FILE("env/cpu_ram");
+   DELETE_FILE("env/amix_mode");
+   DELETE_FILE("env/amix_ram");
+   DELETE_FILE("env/service_cadence");
    DELETE_FILE("env/cpufreq");
    DELETE_FILE("env/kickstart");
    DELETE_FILE("env/ext_kickstart");

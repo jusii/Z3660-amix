@@ -16,8 +16,34 @@ enum BOOTMODE{
    UAEJIT_030,
    UAE_040,
    UAEJIT_040,
-   BOOTMODE_NUM
+   UAE_030_MMU,        // real 68030 PMMU (AMIX). Append-only; index-aligned with
+   UAE_040_MMU,        // real 68040 MMU. Append-only; index-aligned with
+   BOOTMODE_NUM        // ../Z3660_emu/src/main.h, ZTop/Ztop.c, ARM_ztop.
 };
+
+/* Is this boot mode EMULATED (the 68k is executed by core1) rather than a real CPU
+ * driving the bus? Single source of truth -- main.c, debug_console.c and rtg/rtg.c all
+ * ask here.
+ *
+ * Deliberately a CLOSED list of the REAL-CPU modes. It used to be spelled the other way
+ * round, as eight separate copies that each enumerated the emulator modes, so appending
+ * UAE_040_MMU to BOOTMODE left every copy answering "not emulated". main.c's copy is the
+ * one that starts core1 -- it guards the only site that writes core1's entry address to
+ * 0xFFFFFFF0 and sev's it -- so UAE_040_MMU booted as if a real 68060 were fitted: core1
+ * was never started, core0 fell through to its real-CPU path, relinquished the bus to a
+ * CPU that is not on this board, and the Amiga watchdog-reset every ~3 s forever
+ * (first 040 metal boot 2026-08-20, firmware 2CFA9216: "060 starting now..." instead of
+ * "Starting CPU emulator on Core1", and not one line of core1 output).
+ *
+ * The inversion also changes what a FUTURE appended mode defaults to, from real-CPU to
+ * emulated -- which is the safe direction: core1's own dispatch halts loudly with
+ * "No emulator selected!!!" if it has not been taught the mode, whereas the old default
+ * silently handed the bus to absent silicon. Add a new REAL-CPU mode to this list.
+ */
+static inline int boot_mode_is_emulated(int boot_mode)
+{
+   return !(boot_mode == MOBOCPU || boot_mode == CPU);
+}
 
 enum YESNO{
    NO,
@@ -68,13 +94,28 @@ typedef struct {
    int kickstart;
    int ext_kickstart;
    int scsi_num[7];
-   int cd_target[7];   // per-SCSI-target CD-ROM flag: cd_target[id]!=0 => target id is a read-only 2048-byte CD-ROM (pdt 0x05). Parsed from "cdrom_units".
+   int cd_target[7];   // per-SCSI-target CD-ROM flag: cd_target[id]!=0 => target id is a read-only 2048-byte CD-ROM (pdt 0x05).
+                       // Set by the "isoN" config key, which indexes this by IMAGE SLOT N while piscsi_init() reads it by
+                       // SCSI TARGET -- so a config only works when the iso slot number equals the target number (isoN + "scsiN N").
+                       // Only slots 0..6 are representable here; see z3660cfg.txt and docs/AMIX.md.
    int adf_num[8];
    char hdf[20][150];
    char adf[20][150];
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
+   int service_cadence;
+   /* CYBERSTORM C3 run-loop overhead switches. -1 = unset -> 1 = the historical
+    * behaviour, so an absent key changes nothing. See docs/AMIX.md. */
+   int perf_stats;      // core1 MMU run loops: per-instruction perf accounting
+   int emu_probes;      // core1 MMU run loops: ISSUE-52-era diagnostic probes
+   int core0_stats;     // core0 cooperative loop: C0STAT span stamping
+   /* CYBERSTORM C1 profiler arming, config file only (NOT per preset -- see prof_config.h).
+    * -1 = unset -> off, so an absent key produces a board that does not profile. */
+   int prof_hz;         // core1 PROFILING build: guest-PC sampler rate in Hz, 0 = off
+   int prof_buckets;    // core1 PROFILING build: interpreter stage buckets YES/NO
    int mount_sd_0x76;
    int mount_sd_root;
    float resistor;
@@ -120,6 +161,14 @@ typedef struct {
    int autoconfig_ram;
    int autoconfig_rtg;
    int cpu_ram;
+   int amix_mode;
+   int amix_ram;        // AMIX main-RAM window size in MiB; -1 = unset -> AMIX_RAM_MB_DEFAULT (see amix_ram.h)
+   int service_cadence;
+   /* CYBERSTORM C3 run-loop overhead switches. -1 = unset -> 1 = the historical
+    * behaviour, so an absent key changes nothing. See docs/AMIX.md. */
+   int perf_stats;      // core1 MMU run loops: per-instruction perf accounting
+   int emu_probes;      // core1 MMU run loops: ISSUE-52-era diagnostic probes
+   int core0_stats;     // core0 cooperative loop: C0STAT span stamping
    int mount_sd_0x76;
    int mount_sd_root;
    int kickstart;
@@ -268,6 +317,17 @@ enum CONFITEM {
    CONFITEM_TEST_RANGE6,
    CONFITEM_TEST_RANGE7,
    CONFITEM_ARM_FREQUENCY,
+   CONFITEM_AMIX_MODE,
+   CONFITEM_SERVICE_CADENCE,
+   CONFITEM_AMIX_RAM,
+   CONFITEM_PERF_STATS,
+   CONFITEM_EMU_PROBES,
+   CONFITEM_CORE0_STATS,
+   /* CYBERSTORM C1. APPEND-ONLY, like everything above: config_item_names[] is indexed by
+    * this enum, so a mid-enum insert silently reassigns every key after it and the parser
+    * writes the wrong field for the rest of the file with no diagnostic at all. */
+   CONFITEM_PROF_HZ,
+   CONFITEM_PROF_BUCKETS,
    CONFITEM_NUM
 };
 #define CPUFREQ_MIN 50

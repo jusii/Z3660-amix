@@ -691,6 +691,12 @@ void NOPX_READ(void)
 
 uint32_t last_bank=-1;
 
+/* REG5 as read right after the ack poll of the most recent ARM bus cycle. The poll treats any
+ * non-zero value as "terminated" and check_bus_error() is an empty macro, so until now a cycle
+ * ended by nTEA looked identical in the log to one ended by nTA. Printed RAW by the probes
+ * ("ack=0x..") -- the bit meaning is decoded against z3660.v by the reader, not asserted here. */
+static uint32_t last_ack=0;
+
 void arm_write_amiga_long(uint32_t address, uint32_t data, int *timeout)
 {
    *timeout=100000;
@@ -709,7 +715,8 @@ void arm_write_amiga_long(uint32_t address, uint32_t data, int *timeout)
       (*timeout)--;
    }
    while((read_reg(REG5)&0x3)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    write_reg(REG4,0x0); // ARM Bus Hi-Z
 }
 void arm_write_long(uint32_t address, uint32_t data, int *timeout)
@@ -737,7 +744,8 @@ void arm_write_amiga_word(uint32_t address, uint32_t data, int *timeout)
       (*timeout)--;
    }
    while((read_reg(REG5)&0x3)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    write_reg(REG4,0x0); // ARM Bus Hi-Z
 }
 void arm_write_amiga_byte(uint32_t address, uint32_t data, int *timeout)
@@ -758,7 +766,8 @@ void arm_write_amiga_byte(uint32_t address, uint32_t data, int *timeout)
       (*timeout)--;
    }
    while((read_reg(REG5)&0x3)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    write_reg(REG4,0x0); // ARM Bus Hi-Z
 }
 
@@ -781,7 +790,8 @@ uint32_t arm_read_amiga_long(uint32_t address, int *timeout)
       (*timeout)--;
    }
    while(read_reg(REG5)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    uint32_t data_read=read_reg(REG7); // read data
    write_reg(REG4,0x0); // ARM Bus Hi-Z
    return(data_read);
@@ -805,7 +815,8 @@ uint32_t arm_read_amiga_word(uint32_t address, int *timeout)
       (*timeout)--;
    }
    while(read_reg(REG5)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    write_reg(REG4,0x0); // ARM Bus Hi-Z
    uint32_t data_read=read_reg(REG7); // read data
    return(data_read);
@@ -840,7 +851,8 @@ uint32_t arm_read_amiga_byte(uint32_t address, int *timeout)
       (*timeout)--;
    }
    while(read_reg(REG5)==0 && *timeout>0);        // read ack
-   check_bus_error(read_reg(REG5),address);
+   last_ack=read_reg(REG5);   /* cycle-termination word from the FPGA, for the [REG]/[TEST] probes */
+   check_bus_error(last_ack,address);
    write_reg(REG4,0x0); // ARM Bus Hi-Z
    uint32_t data_read=read_reg(REG7); // read data
    return(data_read);
@@ -1274,6 +1286,107 @@ void mobo_change_jumpers(int reg6)
    print_hdmi_ln(x,message,2);
    printf("%s\n",message);
 }
+
+/* ---- [REG] custom-chip reachability probe ---------------------------------------------------------
+ * Runs under enable_test, right after the CIA-A readback and before the chip-RAM probe, with OVL
+ * already dropped. The Zynq drives the CPU-slot bus itself: no 68060, no emulator. Every access is
+ * a 16-bit cycle through arm_read/write_amiga_word() and reports its own ack timeout, so a register
+ * that never terminates a cycle is reported as such rather than as a value.
+ *
+ * Lane convention: a word at offset 0 of its longword rides D31-16, at offset 2 it rides D15-0
+ * (the same rule ps_read_byte() encodes). The RAW 32-bit REG7 value is printed beside the decoded
+ * word so a wrong assumption here is visible in the log instead of silently mis-scoring a register.
+ *
+ * Only specific, reversible writes: DMACON/INTENA set-then-clear of one inert bit each, SERPER, and
+ * one character into SERDAT (which also puts a real byte on the DB25 for a serial-path check).
+ * Nothing random goes into register space; the exhaustive RAM test never touches $DFF000.
+ * Requested by the A4000T bring-up on 2026-09-12 to separate "Gary/Alice/Bridgette answer" from
+ * "the GAL/DRAM segment answers" on a board whose chip RAM reads a driven 0x00000000. */
+static void reg_line(const char *m)
+{
+   print_hdmi_ln(0,(char *)m,1);
+   printf("%s\n",m);
+}
+static uint32_t reg_ack=0;   /* last_ack of the most recent reg_rd/reg_wr */
+static uint16_t reg_rd(uint32_t a, uint32_t *raw, int *to)
+{
+   uint32_t r=arm_read_amiga_word(a,to);
+   reg_ack=last_ack;
+   *raw=r;
+   return (a&2) ? (uint16_t)(r&0xFFFF) : (uint16_t)((r>>16)&0xFFFF);
+}
+static void reg_wr(uint32_t a, uint16_t d, int *to)
+{
+   arm_write_amiga_word(a,(a&2) ? (uint32_t)d : ((uint32_t)d<<16),to);
+   reg_ack=last_ack;
+}
+static void chip_probe(void)
+{
+   char m[160]; int to; uint32_t raw;
+   uint16_t v, v2;
+   reg_line("[REG] custom-chip reachability probe (ARM bus master, 16-bit cycles, OVL low)");
+
+   /* 1. Alice beam counters: VPOSR once, VHPOSR twice ~1 ms apart. Differing VHPOSR = counter alive
+    *    AND the register READ path through Bridgette works. */
+   v=reg_rd(0xDFF004,&raw,&to);
+   sprintf(m,"[REG] VPOSR   $DFF004 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s",v,raw,reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   v=reg_rd(0xDFF006,&raw,&to);
+   sprintf(m,"[REG] VHPOSR  $DFF006 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s",v,raw,reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   usleep(1000);
+   v2=reg_rd(0xDFF006,&raw,&to);
+   sprintf(m,"[REG] VHPOSR  $DFF006 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  after 1 ms: %s",v2,raw,reg_ack,to?"":"  TIMEOUT",
+           (v!=v2)?"DIFFER (beam counter alive)":"SAME (counter dead or read path stuck)"); reg_line(m);
+
+   /* 2. LISAID: low byte F8 = AGA Lisa, FC = ECS Denise. Identifies which chip answers on DRD. */
+   v=reg_rd(0xDFF07C,&raw,&to);
+   sprintf(m,"[REG] LISAID  $DFF07C -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  low byte %s",v,raw,reg_ack,to?"":"  TIMEOUT",
+           ((v&0xFF)==0xF8)?"F8 = AGA Lisa":((v&0xFF)==0xFC)?"FC = ECS Denise":"unrecognised"); reg_line(m);
+
+   /* 3. Alice write-then-read, one inert bit each, set then cleared. Proves a 16-bit WRITE lands
+    *    in Alice and READS back. DMACON/DMACONR sit at offset 2, INTENA at 2 / INTENAR at 0 --
+    *    so the pair also cross-checks the lane convention above. */
+   v=reg_rd(0xDFF002,&raw,&to);
+   sprintf(m,"[REG] DMACONR $DFF002 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  baseline",v,raw,reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   reg_wr(0xDFF096,0x8020,&to);
+   sprintf(m,"[REG] DMACON  $DFF096 <- 0x8020 (SET SPREN) ack=0x%lX%s",reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   v=reg_rd(0xDFF002,&raw,&to);
+   sprintf(m,"[REG] DMACONR $DFF002 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  SPREN %s",v,raw,reg_ack,to?"":"  TIMEOUT",(v&0x0020)?"SET ok":"NOT SET"); reg_line(m);
+   reg_wr(0xDFF096,0x0020,&to);
+   v2=reg_rd(0xDFF002,&raw,&to);
+   sprintf(m,"[REG] DMACON  $DFF096 <- 0x0020 (CLR) ; DMACONR -> 0x%04X  SPREN %s",v2,(v2&0x0020)?"STILL SET":"cleared ok"); reg_line(m);
+
+   v=reg_rd(0xDFF01C,&raw,&to);
+   sprintf(m,"[REG] INTENAR $DFF01C -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  baseline",v,raw,reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   reg_wr(0xDFF09A,0x8001,&to);
+   v=reg_rd(0xDFF01C,&raw,&to);
+   sprintf(m,"[REG] INTENA  $DFF09A <- 0x8001 (SET TBE) ; INTENAR -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  TBE %s",v,raw,reg_ack,to?"":"  TIMEOUT",(v&0x0001)?"SET ok":"NOT SET"); reg_line(m);
+   reg_wr(0xDFF09A,0x0001,&to);
+   v2=reg_rd(0xDFF01C,&raw,&to);
+   sprintf(m,"[REG] INTENA  $DFF09A <- 0x0001 (CLR) ; INTENAR -> 0x%04X  TBE %s",v2,(v2&0x0001)?"STILL SET":"cleared ok"); reg_line(m);
+
+   /* 4. Paula serial: program 9600 (0x0175 as the A4000T station specified), read SERDATR and
+    *    ADKCONR, send one 'A' with stop bit, re-read SERDATR after ~2 ms. TBE = bit 13, TSRE = bit 12,
+    *    bit 11 = RXD line level. The 'A' is a real character on the DB25 for the serial-path check. */
+   reg_wr(0xDFF032,0x0175,&to);
+   sprintf(m,"[REG] SERPER  $DFF032 <- 0x0175 (9600) ack=0x%lX%s",reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   v=reg_rd(0xDFF018,&raw,&to);
+   sprintf(m,"[REG] SERDATR $DFF018 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  TBE=%d TSRE=%d RXD=%d",v,raw,reg_ack,to?"":"  TIMEOUT",(v>>13)&1,(v>>12)&1,(v>>11)&1); reg_line(m);
+   v=reg_rd(0xDFF010,&raw,&to);
+   sprintf(m,"[REG] ADKCONR $DFF010 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s",v,raw,reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   reg_wr(0xDFF030,0x0141,&to);
+   sprintf(m,"[REG] SERDAT  $DFF030 <- 0x0141 ('A'+stop) ack=0x%lX%s",reg_ack,to?"":"  TIMEOUT"); reg_line(m);
+   usleep(2000);
+   v=reg_rd(0xDFF018,&raw,&to);
+   sprintf(m,"[REG] SERDATR $DFF018 -> 0x%04X  (raw 0x%08lX) ack=0x%lX%s  after 2 ms: TBE=%d TSRE=%d RXD=%d",v,raw,reg_ack,to?"":"  TIMEOUT",(v>>13)&1,(v>>12)&1,(v>>11)&1); reg_line(m);
+
+   /* 5. CIA-B PRA (CIA-A is already reported by the bus test above). */
+   {
+      uint8_t b=ps_read_byte(0xBFD000,&to);
+      sprintf(m,"[REG] CIA-B PRA $BFD000 -> 0x%02X ack=0x%lX%s",b,last_ack,to?"":"  TIMEOUT"); reg_line(m);
+   }
+   reg_line("[REG] probe done");
+}
+
 void mobotest(int sw1_is_down)
 {
    for(int i=0x180;i<0x200;i++) // RTG force no cache
@@ -1403,7 +1516,10 @@ void mobotest(int sw1_is_down)
       print_hdmi_ln(0,message,1);
       printf("%s\n",message);
 
+      chip_probe();
+
       arm_write_amiga_long(0x00000000,0xAA55AA55,&timeout);
+      uint32_t a1=last_ack;
       if(timeout==0)
       {
          failed=1;
@@ -1414,6 +1530,7 @@ void mobotest(int sw1_is_down)
          Font->TextColor=0x00FFFFFF; // white
       }
       arm_write_amiga_long(0x00100000,0x55AA55AA,&timeout);
+      uint32_t a2=last_ack;
       if(timeout==0)
       {
          failed=1;
@@ -1424,6 +1541,7 @@ void mobotest(int sw1_is_down)
          Font->TextColor=0x00FFFFFF; // white
       }
       uint32_t data1=arm_read_amiga_long(0x00000000,&timeout);
+      uint32_t a3=last_ack;
       if(timeout==0)
       {
          failed=1;
@@ -1434,6 +1552,10 @@ void mobotest(int sw1_is_down)
          Font->TextColor=0x00FFFFFF; // white
       }
       uint32_t data2=arm_read_amiga_long(0x00100000,&timeout);
+      uint32_t a4=last_ack;
+      sprintf(message,"[TEST] chip probe acks: W@0 0x%lX  W@100000 0x%lX  R@0 0x%lX  R@100000 0x%lX  (raw REG5 after each ack poll)",a1,a2,a3,a4);
+      print_hdmi_ln(0,message,1);
+      printf("%s\n",message);
       if(timeout==0)
       {
          failed=1;
@@ -1454,6 +1576,12 @@ void mobotest(int sw1_is_down)
          failed=1;
          Font->TextColor=0x00FF0000; // red
          sprintf(message,"[TEST] Test basic Amiga CHIP RAM FAILED!!!");
+         print_hdmi_ln(0,message,1);
+         printf("%s\n",message);
+         /* say WHAT came back, not just that it was wrong -- a driven 0x00000000 and a floating
+          * 0xFFFFFFFF are different faults, and the exhaustive test is the only other place that
+          * shows the value (A4000T bring-up, 2026-09-12) */
+         sprintf(message,"[TEST]   read 0x%08lX @ 0x00000000 (wrote 0xAA55AA55), 0x%08lX @ 0x00100000 (wrote 0x55AA55AA)",data1,data2);
          print_hdmi_ln(0,message,1);
          printf("%s\n",message);
          Font->TextColor=0x00FFFFFF; // white

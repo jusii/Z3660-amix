@@ -1,5 +1,40 @@
 # Z3660 Known Issues / Limitations
 
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+## Amiga UNIX (AMIX) — fork notes
+
+This fork boots Amiga UNIX (AMIX) 2.1; full setup is in **[docs/AMIX.md](docs/AMIX.md)**. The two
+things most likely to bite:
+
+* **The AMIX disk must be on the SCSI id it was installed on** (`scsiN` in the config). AMIX bakes
+  its root device to a fixed *(controller, target)* — the usual A3000 install is **id 6**
+  (root mounts as `/dev/dsk/c6d0s1`). On any other id the kernel loads (you get the SVR4 banner) but
+  root-mount fails and you never reach login.
+* **Use an A3000-variant Kickstart** (e.g. KS 3.1 r40.68 A3000). A4000 ROMs have no A3000 SCSI driver
+  and can't boot AMIX (you get "insert disk").
+
+AMIX 2.1 boots reliably to a stable multiuser login shell. One rare demand-paging edge case under
+extreme sustained load is tracked but does not block normal use — details in
+[docs/AMIX.md](docs/AMIX.md#current-status).
+
+Two more that will be met early:
+
+* **`aen0` cannot work under this firmware — use `zen0`.** The stock `aen` driver hunts for a
+  Commodore A2065; this firmware presents every emulated board as manufacturer `0x144B` and has
+  A2065 emulation compiled out (`uae/include/sysconfig.h:79`), so no config key can satisfy the
+  probe. Other firmware builds *do* present an A2065 façade, so "`aen0` works on that box" does not
+  transfer across a firmware boundary.
+* **Intermittent pre-handoff stall on the real-060 path (`bootmode CPU`).** Roughly 1 boot in 5
+  (5 samples — an order of magnitude, not a rate) loads the Kickstart, maps the hdf and enumerates
+  the RDB, then stops without ever printing `060 starting now`: no further log output, grey screen.
+  **A power cycle cures it.** It is distinct from the older `Reset active (DOWN)` loop, where
+  `060 starting now` *does* print first. Localised to the `f_open` of `z3660_scsi.rom` at
+  `floppy/floppy.c:206`, which performs no useful work in the shipped image.
+
+Both, with the evidence and source references, are in
+**[docs/amix-firmware-facts.md](docs/amix-firmware-facts.md)**.
+<!-- fork:amix end -->
+
 ##Clock configuration
  * upto v1.02 CPLD and FPGA/ARM versions<br>
 The frequency of 060 is limited to 50 and 100 MHz.
@@ -11,6 +46,106 @@ The frequency of the 060 can be selected between 50 and 100 MHz, in 5 Mhz steps.
 
 * v1.03 beta 18 and later FPGA/ARM versions
 The 060 frequency and the CPLD frequency are noe decoupled, so when using an EMU, the 060 will get 50 MHz or less.
+
+<!-- fork:amix begin — self-contained fork section, safe to drop on an upstream merge -->
+### Fork note (2026-08-24 / 2026-09-01, measured): with a REAL 060 (`bootmode CPU`), the working `cpufreq` is **per card**
+
+The "50 to 100 MHz in 5 MHz steps" range above is a **user-facing statement that does not hold
+uniformly when the 68060 is the real CPU**. Two physical Z3660 cards have now been measured, each
+as a single-variable sweep (only `cpufreq` changed between boots), and **they do not agree**:
+
+| Card | `cpufreq` | Result |
+|------|-----------|--------|
+| **A** — the fork's original bench card (A4000) | **100** | Boots KS 3.2.3 from reset through to the full Intuition desktop with a live mouse |
+| **A** | 50 | **Nothing at all** — black HDMI output, zero serial output past the ARM banner, held 13 minutes |
+| **B** — a second Z3660 (A4000D, socketed MC68LC060 rev 4, no FPU) | **50** | Boots AMIX 2.1 to a **multiuser login**, twice from cold power-on |
+| **B** | 70 | Green diagnostic screen (chip RAM error) |
+| **B** | 80 | Colour-screen stall at `arm_frequency` 667 and 867; blue diagnostic screen (custom chip error) at 1100 |
+
+(Card B was not separately booted at 100; its tuned 70/80/100 rows are card A's, and the board does
+not survive 70.)
+
+The earlier conclusion here — *"treat 100 MHz as the only supported real-CPU frequency"* — is
+therefore **withdrawn**. What is measured is narrower and more useful: **the working frequency is a
+property of the individual board, not of this fork.** 50 and 100 MHz have each been observed to
+work, on *different* cards — and 50, which boots card B twice, is the value that produced nothing
+at all on card A. **Determine it per card**, and start from 50 and 100 rather than from the middle
+of the range.
+
+The fault is not the CPU and not the bus. On card B **DiagROM boots fine at 80 MHz on the real
+060**, so both reach 80; AmigaOS and AMIX fail identically there, and what they do that DiagROM
+never does is **Kickstart's early chipset/RAM init**. That is where it dies — which is why the
+symptom is an Amiga diagnostic colour screen (**green = chip RAM error, blue = custom chip error**)
+rather than a hang in a driver.
+
+Clock timings are part of the per-card story: `1:/timings/default_timings.txt` decides what a given
+`cpufreq` actually programs, and a tuned row is **not portable between cards**. Card A's 70/80/100
+rows were applied to card B verbatim and confirmed on the serial — 80 MHz still failed. Only the
+index-0 (50 MHz) row transferred. See [`docs/clock-timings.md`](docs/clock-timings.md).
+
+This corroborates [`z3660-firmware/CPLD/README.md`](z3660-firmware/CPLD/README.md), which says of
+the CPLD images that *"all firmware here is working only at 100 MHz. I have tried other
+frequencies, but only some 'magic' frequencies work"* — i.e. the CPLD README was right that the
+range above is optimistic for the real-CPU path, and right that which frequencies work is a
+per-board property.
+
+Note also that the *code* does not implement the range this section states: `configure_clk()`
+clamps to `[CPUFREQ_MIN, CPUFREQ_MAX]` = `[50, 120]` (`config_file.h:333-334`) and then replaces
+the requested value with a table entry (`config_clk.c:459-470`, `clk = cd[ind].clk`). So the
+configured number is **not** necessarily the number applied — read the `Clock index %d` line
+back from the serial log rather than trusting the config.
+
+This says nothing about emulated boot modes, where the 060 is a bus-parked passenger and the
+whole 50–100 range remains as documented above.
+
+### Fork note (2026-09-27, measured): `monitor_switch` other than 0 hangs the A4000T boot (real 060)
+
+**What happened.** Setting `monitor_switch 34` (SEL + SEL level: the owner's KVM input switch on DB25 pin 13; SEL low
+selects the RTG, measured) hung the firmware boot on an A4000T with a real 68LC060 in **4 of 4 cold boots**.
+
+**Where it hangs.** `monitor_switch(1)` (`Z3660/src/main.c:817`) is first called at `main.c:1579`, **while the FPGA is
+held in reset** (`DiscreteSet(REG0, FPGA_RESET)` just before). It goes over the ARM Amiga-bus path
+(`arm_read_amiga_byte`/`arm_write_amiga_byte`), which has **no timeout**:
+- With `monitor_switch 0`, only the CIA-B DDRA read runs, and the boot is fine.
+- With SEL enabled, it also writes DDRA and does a PRA read-modify-write:
+  - 3 boots never printed "Boot mode is NOT MOBOCPU…", so they were stuck in that call;
+  - 1 boot got through, switched the monitor to the RTG boot screen, then stopped later (after "READ_NBG_ARM()").
+
+Upstream's A4000D context works; the A4000T's bus is not available at that point.
+
+**Not the pin load.** The owner removed the parallel cable, and the hang did not change. So it is the CIA
+access itself, not the load on SEL.
+
+**Root cause (found while fixing, 2026-09-27).** `main.c` declared the byte accessors with the core1 emulator's
+two-argument signatures. Core0 links `mobotest.c`'s versions, which take `int *timeout` and start with
+`*timeout=100000`, so every `monitor_switch()` access wrote through a garbage register pointer.
+- With `monitor_switch 0`, only the single DDRA read ran, and it happened to survive.
+- With SEL enabled, there were four such calls.
+
+**Fixed in this fork:**
+- The prototypes now match `mobotest.c`.
+- All four CIA-B accesses pass a real `&timeout` and fail soft: they skip the switch and log one `[MONSW]` line.
+- With neither CTS nor SEL enabled, the function returns before touching the bus.
+- If the bus does not answer during FPGA reset, the call after `mobotest()` makes the switch.
+
+**After the fix, on the A4000T the boot-time switch has no effect (metal, 2026-09-27, firmware 719AF9B7).**
+- 5 cold boots with `monitor_switch 34` all reached Amix multiuser:
+  - 060 start at +31…+34 s, telnet at +71…+75 s;
+  - both calls logged `[MONSW] monitor switched to RTG`, the first at about +8–9 s during FPGA reset and the
+    second about 3 s later at the boot display;
+  - every CIA-B access was acknowledged.
+- But the monitor never switched: 12 frames per boot, plus a dense 38-frame capture at about 0.5 s intervals, all
+  stayed on the native output. At multiuser DDRA=0xc0, with SEL an input.
+- The reason: CIA-B is still held in reset at both calls. An 8520 in reset forces DDRA to 0 and ignores the writes,
+  and Kickstart's reset at the 060 start would clear any state anyway.
+- The `[MONSW]` line now appends a DDRA/PRA read-back to make this visible.
+- **On this board the monitor switch is an OS-side job:** Amix's RTG driver, or AmigaOS P96 SetSwitch.
+- Whether the A4000D behaves the same way has not been measured.
+
+**Consequence.** Firmware without this fix: keep `monitor_switch 0` on A4000T cards. An Amix-side switch, e.g.
+`cia_sel` via `/dev/mem`, works.
+
+<!-- fork:amix end -->
 
 ##SCSI SD emulation
  * v1.01 CPLD and FPGA/ARM versions<br>
@@ -29,6 +164,67 @@ There is a bug in hunk relocation code that makes that one hdf grows upto fill t
  * v1.03 beta 14 FPGA/ARM versions<br>
  After beta 14, you can make a third partition in the SD with type 0x76 (like you do with pistorm/emu68). It will be automounted by the SCSI SD emulation. (beta 12 and beta 13 had a bug that made some hdfs to grow up, and it was fixed in beta 14).
  
+### Fork note (2026-09-28, observed once): core0 Data Abort during the Kickstart piscsi scan (real 060, A4000T)
+
+**Seen:** firmware 719AF9B7, preset 2, booting an Amix image.
+- 3 s after `060 starting now`, right after `[!!!PISCSI] Found no handler for file system UNI/1` and `res/118`:
+  - `[Core0] DataAbortHandler()`, DFSR 0x00001c06;
+  - instruction address 0x0121467c, word 0xE59237FC;
+  - "Write Fault to 0x00000000".
+- The firmware restarted itself (the banner again), started the 060 again, and then there was no boot I/O.
+- A cold power cycle booted cleanly. One sighting in about 15 boots that day.
+
+**Status (2026-10-03, symbolised):** the archived `BOOT-719AF9B7-core0.elf` puts 0x0121467c in `Xil_L2CacheFlush()`,
+on the way-mask poll. DFSR 0x1c06 is an asynchronous external abort, so that PC is only where the abort was taken, not
+the faulting access; DFAR ("Write Fault to 0x0") is meaningless. This is the same signature as
+`docs/core0-async-data-abort-2026-08-25.md`.
+
+**Second sighting 2026-10-03:** A4000T, same firmware and the same address, preset `kickstart 4`, k1r3-unatt + a blank
+disk. It aborted after the third "no handler" line; a clean boot of the same disks prints five. A cold cycle booted cleanly.
+
+**Third sighting 2026-10-03:** a bench-AmigaOS boot (no Amix partitions) on the diagnostic image F583F05B: the same
+DFSR 0x1c06, 3 s after `060 starting now`, PC 0x012148ac (`Xil_L2CacheFlush` in that build). So the Amix "no handler"
+lines are not required.
+
+**Bench consequence:** the re-init prints fresh `[PISCSI] Map` lines. A boot-activity check must therefore treat a
+Data Abort, or a second banner in one power cycle, as a failed boot.
+
+### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
+
+**Setup:** A4000T, Z3660 card 2, 68LC060 @80; the onboard 53C710 SCSI with board termination built; a ZuluSCSI at
+id 0 as the last device, termination on.
+
+**Through MAPROM (`kickstartN` + `kickstart N`), the plain A4000T 47.115 image boots:**
+- The 060's reset vectors come from the socket chips.
+- The A4000T ROM's `scsi.device 47.4` drives the onboard 710, finds the Zulu, and reaches the Workbench screen
+  +15 s after `060 starting now`.
+- After the boot scan, the 710's SXFER (the byte at `$DD0046`) reads `0x18`: offset 8, period code 1. **The ROM driver
+  negotiates synchronous transfers.** Any later driver for the 710 inherits a target already in sync mode.
+- DSA/TEMP/DSP all point into the Z3660 DDR (`$0800xxxx`).
+
+**From the sockets (`kickstart 0`, which needs the MAPROM latch-order fix):**
+- DiagROM boots on the real 060.
+- The A4000T 47.115 Kickstart does **not** boot. It is black from the first frame, with chips whose content was
+  verified correct by an ARM-side dump, and also with `ext_kickstart 0`.
+- Owner decision (2026-10-03): on the A4000T, Kickstart always comes from the Z3660. The socket question is parked
+  as a board-side issue (chip speed/type and a bus trace are the open leads).
+
+**Not yet proven:** that the 710's data DMA lands in the Z3660 DDR. That needs DNAD sampled during a transfer. The
+attempt stopped when the A4000T froze under read load (the known A4000T-only freeze under sustained I/O).
+
+### Fork note (2026-10-03, measured): core0 ARM bus reads can return the previous read's data (stale REG5)
+
+`arm_read_amiga_long()` (mobotest.c) polls REG5 until it is non-zero and then takes REG7.
+- If REG5 still holds the FPGA's write-state code `0x80000000`, the poll ends at once and returns REG7 from the
+  PREVIOUS read.
+- Seen in an ARM-side 512 KiB dump of the ROM sockets: in one boot 91% of the longwords equalled the read before.
+  In another, the first reads acked `0x1` and the data was good.
+- It is the same race as the emulator's `wait_read_ack()` (a 2026-09-30 note on branch `a4092-busdiag`). The
+  emulated CPU reading Kickstart from the sockets got a garbage reset vector ("CPU reset PC=3").
+- Fix idea for both paths: accept only a real termination (1 = TA, 2 = TEA, 3 = both), or wait for REG5 to leave
+  `0x80000000` before issuing the read. The diagnostic dump settles by re-reading until two reads agree; even that
+  lets two stale reads agree.
+
 ##DMA and Zorro III bus bastmer
  * v1.02 CPLD and FPGA/ARM versions<br>
 The CPLD firmware doesn't implement DMA accesses, so you can't use busmaster Zorro III boards (like the A4091).

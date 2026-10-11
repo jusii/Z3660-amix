@@ -9,12 +9,15 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "main.h"
 #include "cpu_emulator.h"
 #include "config_file.h"
+#include "rom_window.h"
 #include "xscuwdt.h"
 #include "scsi/scsi.h"
 #include "floppy/floppy.h"
+#include "core0_stats.h"
 
 void write_rtg_register(uint16_t zaddr,uint32_t zdata);
 uint32_t read_rtg_register(uint16_t zaddr);
@@ -88,6 +91,18 @@ int load_rom(void)
       unsigned int NumBytesRead;
       int total_bytes_to_read=512*1024; // 512 KB
       total_bytes_to_read=f_size(&fil);
+      /* Same bound as the extended window: the loop below is sized by the file,
+       * so anything over 512 KB would run off the end of the MAPROM window. */
+      ROM_LOAD_VERDICT verdict=rom_window_verdict(total_bytes_to_read,total_bytes_to_read);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: kickstart \"%s\": %s -> not mapped\n",
+               kickstart_pointer,rom_load_verdict_name(verdict));
+         f_close(&fil);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
       if((total_bytes_to_read==512*1024) || (total_bytes_to_read==256*1024))
       {
          printf("ROM filesize %d bytes\n",total_bytes_to_read);
@@ -96,6 +111,9 @@ int load_rom(void)
       {
          printf("ROM filesize %d is NOT 256KB or 512KB\n",total_bytes_to_read);
       }
+      /* A ROM shorter than the window leaves the tail visible to the reset
+       * vector fetch and the RomTagScanner; zero it rather than expose DDR. */
+      memset(ROM,0,ROM_WINDOW_SIZE);
       printf("Loading Kickstart at address: 0x%08lX length %d KB\n",(uint32_t)ROM,total_bytes_to_read/1024);
       printf("Reading %s file:\n[----------------]\n\033[F",kickstart_pointer);
 #define BYTES_TO_READ 128
@@ -237,11 +255,36 @@ int load_romext(void)
          return(2);
       }
       printf("Loading Extended Kickstart at address: 0x%08lX\n",(uint32_t)EXT_ROM);
-      unsigned int NumBytesRead;
+      unsigned int NumBytesRead=0;
       unsigned int size=fil.obj.objsize;
       printf("Extended Kickstart file size: 0x%08lX\n",(uint32_t)size);
+      /* Bound BEFORE reading: the read below is sized by the file, not by the
+       * window, so an oversized image would overrun $00F00000+512KB. */
+      ROM_LOAD_VERDICT verdict=rom_window_verdict(size,size);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: extended kickstart \"%s\": %s -> not mapped\n",
+               ext_kickstart_pointer,rom_load_verdict_name(verdict));
+         f_close(&fil);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
+      /* Kickstart SCANS the whole window for $4AFC resident matchwords, so the
+       * tail behind a short image must not be left as uninitialised DDR. */
+      memset(EXT_ROM,0,ROM_WINDOW_SIZE);
       f_read(&fil, EXT_ROM, size,&NumBytesRead);
       f_close(&fil);
+      verdict=ext_rom_verdict(size,NumBytesRead,((unsigned int)EXT_ROM[0]<<8)|EXT_ROM[1]);
+      if(verdict!=ROM_LOAD_OK)
+      {
+         printf("Error: extended kickstart \"%s\": %s -> not mapped\n",
+               ext_kickstart_pointer,rom_load_verdict_name(verdict));
+         memset(EXT_ROM,0,ROM_WINDOW_SIZE);
+         f_umount(Path);
+         Xil_ExceptionEnable();
+         return(2);
+      }
       printf("File read OK\n");
    }
    Xil_L1DCacheFlush();
@@ -294,18 +337,27 @@ int emulator_thread(struct pt *pt)
    {
       PT_WAIT_UNTIL(pt,shared->shared_data==1);
       shared->shared_data=0;
+      /* Nested C0STAT spans: the enclosing C0T_EMULATOR stamp in main.c cannot
+       * tell an RTG blit from an SD transfer, and the whole point of this
+       * instrumentation is to name the offender. Each span brackets only the
+       * handler call, so the flag/dsb bookkeeping stays with the parent. */
       if(shared->write_rtg==1)
       {
          uint32_t addr=shared->write_rtg_addr;
          uint32_t data=shared->write_rtg_data;
+         C0_SPAN(sp);
          write_rtg_register(addr,data);
+         C0_SPAN_END(sp,C0T_EMU_RTG_WR);
          dsb();
          shared->write_rtg=0;
       }
       else if(shared->read_rtg==1)
       {
          uint32_t addr=shared->read_rtg_addr;
-         uint32_t data=read_rtg_register(addr);
+         uint32_t data;
+         C0_SPAN(sp);
+         data=read_rtg_register(addr);
+         C0_SPAN_END(sp,C0T_EMU_RTG_RD);
          shared->read_rtg_data=data;
          dsb();
          shared->read_rtg=0;
@@ -315,7 +367,9 @@ int emulator_thread(struct pt *pt)
          int type=shared->write_scsi_type;
          uint32_t addr=shared->write_scsi_addr;
          uint32_t data=shared->write_scsi_data;
+         C0_SPAN(sp);
          handle_piscsi_reg_write(addr,data,type);
+         C0_SPAN_END(sp,C0T_EMU_SCSI_WR);
          dsb();
          shared->write_scsi=0;
 //         shared->write_scsi_in_progress=1;
@@ -327,7 +381,9 @@ int emulator_thread(struct pt *pt)
       {
          int type=shared->read_scsi_type;
          uint32_t addr=shared->read_scsi_addr;
+         C0_SPAN(sp);
          shared->read_scsi_data=handle_piscsi_read(addr,type);
+         C0_SPAN_END(sp,C0T_EMU_SCSI_RD);
          dsb();
          shared->read_scsi=0;
       }
@@ -336,7 +392,9 @@ int emulator_thread(struct pt *pt)
          int type=shared->write_floppy_type;
          uint32_t addr=shared->write_floppy_addr;
          uint32_t data=shared->write_floppy_data;
+         C0_SPAN(sp);
          handle_pifloppy_reg_write(addr,data,type);
+         C0_SPAN_END(sp,C0T_EMU_FLOP_WR);
          dsb();
          shared->write_floppy=0;
       }
@@ -344,23 +402,29 @@ int emulator_thread(struct pt *pt)
       {
          int type=shared->read_floppy_type;
          uint32_t addr=shared->read_floppy_addr;
+         C0_SPAN(sp);
          shared->read_floppy_data=handle_pifloppy_read(addr,type);
+         C0_SPAN_END(sp,C0T_EMU_FLOP_RD);
          dsb();
          shared->read_floppy=0;
       }
       else if(shared->reset_emulator==1)
       {
+         C0_SPAN(sp);
          cpu_emulator_reset();
+         C0_SPAN_END(sp,C0T_EMU_RSTE);
          dsb();
          shared->reset_emulator=0;
       }
       else if(shared->core0_hold==1)
       {
+         C0_SPAN(sp);
          shared->core0_hold_ack=1;
          do
          {
             usleep(1000);
          }while(shared->core0_hold==1);
+         C0_SPAN_END(sp,C0T_EMU_HOLD);
          dsb();
          shared->core0_hold_ack=0;
       }
@@ -437,6 +501,29 @@ int emulator_reset_thread(struct pt *pt)
          audio_reset();
          usleep(100000);
          ethernet_init();
+
+         /* Re-load the PISCSI boot ROM + re-map the HDFs, exactly as cold boot
+          * (main.c piscsi_init()) does. Idempotent (forces piscsi_rom_ptr=NULL,
+          * re-mounts the SD, re-opens the HDFs into the static FIL slots) and
+          * touches only the SCSI ROM/device tables -- NOT DDR/GIC/FPGA-clocks/
+          * ethernet/REG0 latches. Needed so the rebooted guest sees the boot
+          * device; the 68k is still held in reset here. */
+         piscsi_init();
+
+         /* Clear any pending Z3660-board interrupt left asserted across the guest
+          * reset.  amiga_interrupt_set() drives FPGA_INT6 (REG0) HIGH to raise the
+          * Amiga's level-6/EXTER line for board events (USB/audio); the bit (and
+          * thus INT6) is only deasserted once the Amiga's Z3660 INT6 handler reads
+          * the cause and the firmware calls amiga_interrupt_clear().  If any source
+          * is still pending when AMIX soft-reboots (e.g. fsck's reboot), FPGA_INT6
+          * stays HIGH -- and the freshly-restarted Kickstart has no Z3660 INT6
+          * handler installed yet, so it can never clear the source.  The level-6
+          * interrupt re-fires forever -> the 68k storms in Kickstart's autovector
+          * handler and never progresses (observed stuck at 0x00F81212, the INT
+          * handler's adda/rte exit, s=1 msk=2).  Cold boot starts with
+          * amiga_interrupts==0 so it never happens.  Force it clear here (also
+          * deasserts FPGA_INT6 since the mask goes to 0) before releasing the 68k. */
+         amiga_interrupt_clear(0xFFFFFFFF);
 
          DiscreteSet(REG0, FPGA_RESET);
          usleep(1000);

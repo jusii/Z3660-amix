@@ -32,6 +32,7 @@
 #include "newcpu.h"
 #include "custom.h"
 #include "defines.h"
+#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: the DMA arm of the decoded-op cache's invalidation */
 
 SHARED *shared;
 extern LOCAL local;
@@ -39,10 +40,27 @@ extern "C" void z3660_printf(const TCHAR *format, ...)
 {
    va_list args{};
    va_start(args, format);
-   while(shared->uart_semaphore!=0);
-   shared->uart_semaphore=1;
-   vprintf(format, args);
-   shared->uart_semaphore=0;
+   // The UART semaphore lives in the SHARED struct, so it can only be taken once `shared`
+   // points at it -- init_shared() does that well inside main(). Calling this helper before
+   // then used to spin forever on ((SHARED*)0)->uart_semaphore, i.e. a read of DDR
+   // 0x0000001C (uart_semaphore's offset), which is ordinary mapped memory at that point in
+   // core1's bring-up and so faults nothing and never changes: core1 wedged in this loop
+   // with not one byte emitted, and core0 waited on the ack forever. That is exactly how
+   // image BBD5C14F killed core1 on EVERY boot mode. Fall back to a bare vprintf until the
+   // struct exists -- the same thing core1's long-proven pre-init prints (the
+   // "MMUL2Table = ..." line) have always done -- and start honouring the semaphore the
+   // moment it is real, so the helper is safe to call from anywhere.
+   if(shared)
+   {
+      while(shared->uart_semaphore!=0);
+      shared->uart_semaphore=1;
+      vprintf(format, args);
+      shared->uart_semaphore=0;
+   }
+   else
+   {
+      vprintf(format, args);
+   }
    va_end(args);
 }
 extern uint32_t MMUTable;
@@ -55,6 +73,9 @@ void init_shared(void)
    shared->nops_write=DEFAULT_NOPS_WRITE;
    shared->nops_read=DEFAULT_NOPS_READ;
 }
+/* Emulator-core debug spam gate (DEMU menu toggle). Accessor so the uae files
+ * (newcpu.cpp / cpummu030.cpp) can check it without pulling in the SHARED struct. */
+extern "C" int z3660_dbg_emu(void){ return shared ? (int)shared->debug_emu : 0; }
 XGpioPs GpioPs;
 XGpioPs_Config *GpioPsConfigPtr;
 /*
@@ -79,9 +100,18 @@ extern "C" void load_romext(void)
    printf("load romext emu %d\n",shared->load_romext_emu);
 }
 int read_irq=0;
+// AMIX A3000 SCSI: software-injected level-2 (Amiga INT2 / PORTS) for the
+// emulated WD33C93+SuperDMAC. Holds the asserted level (0 or 2). Written by
+// a3000_scsi.cpp (recomputed from SDMAC CNTR.INTEN && WD ASR_INT). It is a pure
+// software IPL into THIS core's CPU emulation, NOT the physical FPGA INT6 path
+// (amiga_interrupt_set), which is the wrong level and wrong route for A3000 SCSI.
+volatile int a3000_scsi_irq=0;
 extern "C" int intlev(void)
 {
-   return(read_irq);
+   int level=read_irq;
+   if(a3000_scsi_irq>level) // OR-in the emulated A3000 SCSI INT2 (max with physical IPL)
+      level=a3000_scsi_irq;
+   return(level);
 }
 #define NOP asm(" nop")
 
@@ -155,6 +185,7 @@ enum piscsi_cmds {
    PISCSI_CMD_LOADFS       = 0x94,
    PISCSI_CMD_GET_FS_INFO  = 0x98,
    PISCSI_CMD_USED_DMA     = 0x9C,
+   PISCSI_CMD_PDT          = 0xA0, // read-only peripheral-device-type (T2.P1); handled on core0
    PISCSI_DBG_MSG          = 0x100,
    PISCSI_DBG_VAL1         = 0x110,
    PISCSI_DBG_VAL2         = 0x114,
@@ -236,6 +267,12 @@ uint32_t addr2=0;
 uint32_t addr3=0;
 extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 {
+   /* READ-descriptor stashes for the post-spin core1 L1 invalidate below. The
+    * guest programs the descriptor across separate register-write calls before
+    * the trigger, so these must persist between calls: ADDR2 -> byte length
+    * (core0 piscsi_u32_read[1]), ADDR3 -> DMA target address (piscsi_u32_read[2]). */
+   static uint32_t piscsi_len_stash=0;
+   static uint32_t piscsi_addr_stash=0;
    if(zaddr < PISCSI_DBG_MSG)
    {
       switch(zaddr)
@@ -256,6 +293,10 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 //         Xil_DCacheFlush();
          break;
       case PISCSI_CMD_ADDR2:
+         piscsi_len_stash=zdata; // transfer byte length (core0 piscsi_u32_read[1])
+         break;
+      case PISCSI_CMD_ADDR3:
+         piscsi_addr_stash=zdata; // DMA target address (core0 piscsi_u32_read[2]); no cache op, matching the prior fall-through no-op
          break;
       case PISCSI_CMD_WRITE64:
       case PISCSI_CMD_WRITE:
@@ -286,6 +327,42 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
 
 
    while(shared->write_scsi==1){NOP;}
+
+   /* AMP READ cache-coherence fix. Core0 has now DMAed sector data into DRAM
+    * below the caches (scsi.c pre-invalidates L1+L2 for the target range, then
+    * XSdPs writes DRAM directly). While core1 was parked in the spin above, this
+    * still-live Cortex-A9 can speculatively refill L1D lines covering the DMA
+    * target, leaving stale lines over the fresh DRAM; the guest then reads a mix
+    * of fresh DRAM and stale cache. The consuming core must invalidate its own
+    * L1 AFTER the producer's DMA, so do the target range here for the three READ
+    * triggers only (WRITE never reads the buffer back, and its trigger-time flush
+    * stays). Xil_L1DCacheInvalidateRange clean+invalidates only the unaligned
+    * edge lines (preserving neighbours) and pure-invalidates the interior, which
+    * is what we want: the buffer holds only stale speculative lines. By-MVA
+    * maintenance on an uncached/foreign address is a harmless no-op, so an
+    * unconditional range (incl. the bounce path, where core1 fills the guest
+    * buffer itself afterwards) is safe; guard only on nonzero stashes. */
+   if((zaddr==PISCSI_CMD_READ || zaddr==PISCSI_CMD_READ64 || zaddr==PISCSI_CMD_READBYTES)
+      && piscsi_addr_stash!=0 && piscsi_len_stash!=0)
+   {
+      Xil_L1DCacheInvalidateRange(piscsi_addr_stash,piscsi_len_stash);
+      /* CYBERSTORM C2 rung 1. The two lines are the same problem one level apart, and
+       * the second one is new. The ARM's L1 above holds stale COPIES of guest DRAM; the
+       * decoded-op cache holds stale DECODES of it. core0 has just written instruction
+       * bytes into guest memory that the interpreter never saw go past -- an AMIX text
+       * pagein, or an AmigaOS loader filling a buffer it is about to jump into -- so
+       * every decode this core holds may now describe bytes that are gone.
+       *
+       * This is the right place for it, and the alternative is worth naming because it
+       * looked right first: a SHARED epoch word that core0 bumps after every DMA would
+       * put the knowledge on the producer, and a core1 running against a core0 built
+       * before that field existed would read a permanent zero and never invalidate --
+       * fail-DANGEROUS, silently, in the one direction that corrupts a filesystem. Here
+       * the consumer decides, using knowledge it already has: the spin above ended when
+       * core0 finished, so this line is the exact moment the write became observable to
+       * this core, and it needs nothing from the image on the other side. */
+      z3660_dopc_invalidate_dma(piscsi_addr_stash,piscsi_len_stash);
+   }
 }
 
 extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
@@ -305,6 +382,13 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       switch(zaddr)
       {
       case PISCSI_CMD_BLOCKSIZE:
+      /* The USED_DMA clean+invalidate below is LOAD-BEARING for direct-DMA reads:
+       * every piscsi driver reads USED_DMA right after a READ trigger, and this
+       * whole-L1 flush evicts any stale buffer lines core1 acquired speculatively
+       * while core0 ran the transfer -- the guest's first data read then refills
+       * from the shared L2/DRAM, which core0 guarantees fresh (scsi.c pre-transfer
+       * Xil_DCacheInvalidateRange). Keep it a FLUSH (clean+invalidate): a pure
+       * invalidate would discard core1's own dirty emulator state. */
       case PISCSI_CMD_USED_DMA:
       case PISCSI_CMD_BLOCKS:
       case PISCSI_CMD_GETPART:
@@ -331,6 +415,8 @@ extern "C" uint32_t read_scsi_register(uint16_t zaddr,int type)
       case PISCSI_CMD_READBYTES:
          Xil_L1DCacheInvalidate();
          break;
+      case PISCSI_CMD_PDT:
+         break; // read-only device-type register (forwarded to core0); no cache op -- silence the per-command log
       default:
          printf("SCSI read command %02x\n",zaddr);
       }
@@ -391,6 +477,14 @@ extern "C" void write_floppy_register(uint16_t zaddr,uint32_t zdata,int type)
 
 
    while(shared->write_floppy==1){NOP;}
+
+   /* CYBERSTORM C2 rung 1 -- the same DMA argument as write_scsi_register()'s, and this
+    * arm is the one that matters for an AmigaOS boot: a floppy READ lands sectors in
+    * guest DRAM that the bootblock is about to execute. The address/length descriptor is
+    * not stashed on this path (core0 holds it), so the range is passed as unknown --
+    * which today invalidates everything anyway, and is honest about what is known here. */
+   if(zaddr==PIFLP_CMD_READ || zaddr==PIFLP_CMD_READ64)
+      z3660_dopc_invalidate_dma(0u,0u);
 }
 
 extern "C" uint32_t read_floppy_register(uint16_t zaddr,int type)
@@ -789,6 +883,20 @@ int main()
    Xil_L1DCacheEnable();
    Xil_L2CacheEnable();
 
+   // Breadcrumb, before the first risky init (the MMU-table pokes below). Its ABSENCE is
+   // the diagnostic: it means core0 never started core1 at all -- only core0's emu==1 path
+   // writes core1's entry address to 0xFFFFFFF0 and sev's it -- as opposed to core1 having
+   // launched and then died in its own bring-up. Distinguishing those two cost the first
+   // AMIX-040 metal boot (2026-08-20): UAE_040_MMU was missing from core0's emulator-mode
+   // predicate, so there was no core1 to hear from and every later print was absent too.
+   //
+   // PRE-INIT CONTRACT, learned the hard way one image later: `shared` is NULL here
+   // (init_shared() runs ~30 lines down), so nothing on this line may touch it -- and that
+   // includes the callee. z3660_printf() itself dereferences `shared` for the UART
+   // semaphore; it is now NULL-safe (see above), which is what makes this call legal. Any
+   // print added above init_shared() must keep that property.
+   z3660_printf("[Core1] alive\n");
+
    //    Xil_L1DCacheDisable();
    //    Xil_L2CacheDisable();
 
@@ -876,6 +984,19 @@ int main()
    //    for(int i=0x400,j=0;i<0x500;i++,j++)
    //        Xil_SetTlbAttributes(i*0x100000UL,(0x10000000+j*0x100000UL)|1); // mapped to 0x10000000
 
+#if defined(Z3660_WARP_Q2_PROBE)
+   // Plan WARP ENGINE, M0 / Q2 -- see src/warp_q2probe.cpp. Present in exactly one build
+   // variant (`make q2probe`); the preprocessor removes this call from the other three, so
+   // their images are byte-identical whether the probe exists in the tree or not.
+   //
+   // HERE and not earlier: the undefined-instruction, prefetch-abort and data-abort
+   // handlers are registered on the two lines above, so a probe that fails by executing
+   // garbage reports itself instead of rebooting silently. And not later: it must finish
+   // before the emulator starts, so one boot capture holds the whole answer.
+   extern void warp_q2_probe(void);
+   warp_q2_probe();
+#endif
+
    load_rom();
    load_romext();
    local.z3_enabled=shared->z3_enabled;
@@ -890,6 +1011,12 @@ int main()
       if(shared->shared_data)
       {
          //            sleep(5);
+         // What core0 actually handed us, before any arm is chosen: the boot-mode index
+         // and the AMIX contract flag. Pins cfg_emu against the BOOTMODE enum replicas
+         // (Z3660/src/config_file.h, ZTop, ARM_ztop) and shows the amix_mode core0 read
+         // from the BASE config -- read_env_files() does not rewrite shared->amix_mode.
+         z3660_printf("[Core1] dispatch: cfg_emu=%lu amix_mode=%lu\n",
+                      (unsigned long)shared->cfg_emu,(unsigned long)shared->amix_mode);
 #ifdef UAE_EMULATOR
 #ifdef MUSASHI_EMULATOR
          shared->shared_data=0; // ack to core0
@@ -904,11 +1031,19 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040)
          {
-            uae_emulator(0,68040);
+            uae_emulator(0,68040); // MMU off -> never amix_mode: AMIX is demand-paged (same rule as UAE_030)
          }
          else if(shared->cfg_emu==UAEJIT_040)
          {
-            uae_emulator(1,68040);
+            uae_emulator(1,68040); // JIT excludes the MMU (no fault restart) -> never amix_mode (same rule as UAEJIT_030)
+         }
+         else if(shared->cfg_emu==UAE_030_MMU)
+         {
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAE_040_MMU)
+         {
+            uae_emulator(0,68040,1,shared->amix_mode); // real 68040 MMU, JIT off; amix_mode = AMIX memory contract
          }
          else if(shared->cfg_emu==MUSASHI)
          {
@@ -931,11 +1066,19 @@ int main()
          }
          else if(shared->cfg_emu==UAE_040)
          {
-            uae_emulator(0,68040);
+            uae_emulator(0,68040); // MMU off -> never amix_mode: AMIX is demand-paged (same rule as UAE_030)
          }
-         else// if(shared->cfg_emu==UAEJIT_040)
+         else if(shared->cfg_emu==UAE_030_MMU)
          {
-            uae_emulator(1,68040);
+            uae_emulator(0,68030,1,shared->amix_mode); // real 68030 PMMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAE_040_MMU)
+         {
+            uae_emulator(0,68040,1,shared->amix_mode); // real 68040 MMU, JIT off; amix_mode = AMIX memory contract
+         }
+         else if(shared->cfg_emu==UAEJIT_040)
+         {
+            uae_emulator(1,68040); // JIT excludes the MMU (no fault restart) -> never amix_mode (same rule as UAEJIT_030)
          }
          else // decision #8: was a bare 'else' meaning UAEJIT_040 -- an unknown
          {    // mode silently booted JIT-040. Halt loudly instead.

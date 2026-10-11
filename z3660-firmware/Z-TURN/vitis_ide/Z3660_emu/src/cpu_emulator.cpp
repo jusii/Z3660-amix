@@ -1509,10 +1509,88 @@ static inline void wait_write_ack(int address)
 #endif
 }
 uint32_t last_bank=-1;
+/* ===========================================================================
+ * FRONT-1 BUS WATCHDOG (diagnostic only -- no behaviour change).
+ *
+ * A clean AMIX-040 cycle wedged with core1 executing no guest instructions while
+ * core0 kept ticking. Two live probes eliminated the obvious classes: every
+ * cross-core mailbox flag in SHARED read zero, and read_reset read 1. Two samples
+ * of ps_count/ps_lastaddr nine seconds apart were byte-identical -- ps_count
+ * frozen, last attempted access chip RAM 0x001D6BC0 -- so core1 was parked inside
+ * a real-Amiga-bus cycle that never completed.
+ *
+ * Of the three waits in these accessors, only ONE is unbounded. wait_read_ack()
+ * has WAIT_TIMEOUT + WAIT_TIMEOUT2 and a force-exit; wait_write_ack() has a
+ * 1,000,000 spin and a REG4 recovery poke. Both escape. The pipe-empty wait is a
+ * bare `while(read_reg(REG4)&(1<<4));` in all six accessors with no bound at all,
+ * so a permanent stall parks core1 exactly here. This names it.
+ *
+ * WHY N = 20,000,000. The loop body is one FPGA register read across the Zynq GP
+ * AXI port -- an uncached device access, order 100-300 ns -- so N is roughly 2-6
+ * seconds of waiting. The longest LEGITIMATE lockout on an Amiga is the chipset
+ * winning DMA priority: display fetches cost microseconds per scanline, and the
+ * worst case is a blitter-nasty blit holding the bus for the length of the blit,
+ * order 10-20 ms even for a large one. That is ~100k-200k iterations, so N sits
+ * 100-200x above the worst legitimate stall while still firing within seconds of a
+ * real wedge. The per-iteration cost is deliberately uncalibrated: the threshold is
+ * "seconds, not milliseconds" by construction, which is the property that matters.
+ *
+ * ONE-SHOT and global, so a permanent wedge prints one line and never floods. Not
+ * mmu_model-gated -- this is the bus path, and any guest that wedges here benefits.
+ * Cost when nothing is wrong: the loop is normally not entered at all, and when it
+ * is, one increment plus one compare per iteration.
+ * =========================================================================== */
+extern volatile uint32_t ps_count, ps_lastaddr;
+#define BUS_WD_N 20000000u
+static volatile int bus_wd_reported = 0;
+static void bus_wd_report(const char *what, uint32_t address)
+{
+   if (bus_wd_reported) return;
+   bus_wd_reported = 1;
+   z3660_printf("\r\n[BUSWD] STALL %s addr=%08lX REG4=%08lX REG5=%08lX nbg=%d ps_count=%lu ps_last=%08lX\r\n",
+                what, (unsigned long)address,
+                (unsigned long)read_reg(REG4), (unsigned long)read_reg(REG5),
+                nbg_arm, (unsigned long)ps_count, (unsigned long)ps_lastaddr);
+}
+/* Recovery, and why it belongs HERE.
+ *
+ * Metal, image FF261896: [BUSWD] STALL R32 addr=001D69E0 REG4=00000015 REG5=80000000 nbg=0.
+ * Decoded against the command encoding above -- bit0 valid, bit1 READ_(1)/WRITE_(0),
+ * bits2-3 size (0=LONG,1=BYTE,2=WORD), bit4 pipe-not-empty -- REG4=0x15 is a pending
+ * BYTE WRITE, not the long read we were about to issue. And REG5==0x80000000 is exactly
+ * the value wait_write_ack() spins on: "previous write not yet acknowledged".
+ *
+ * So the wedge is a byte write that entered the pipe and never acked, blocking the next
+ * access. The ordering is the bug: arm_write_amiga_byte() issues its write
+ * FIRE-AND-FORGET (no wait_write_ack() call at all) and relinquishes; the following
+ * access absorbs the latency in the pipe-empty wait. wait_write_ack()'s recovery -- set
+ * REG4 bit 31, then restore, to kick the ARM state machine out -- therefore sits in the
+ * WRITE path, after its own pipe wait, and is unreachable from the READ that is actually
+ * stuck. The escape hatch was behind the thing it would rescue.
+ *
+ * This applies the same, already-proven poke from the place that can reach it, then keeps
+ * spinning and retries every BUS_WD_N. Safe by the same margin argument as the watchdog:
+ * it cannot fire until the pipe has been stuck for seconds, which is 100-200x longer than
+ * the worst legitimate lockout (a blitter-nasty blit), so a healthy boot never executes
+ * it. A permanent wedge becomes a recovered -- possibly lossy -- cycle instead of a dead
+ * core1, which is strictly better than spinning forever. */
+static void bus_wd_recover(void)
+{
+   uint32_t reg4 = read_reg(REG4);
+   write_reg(REG4, 0x80000000 | reg4);   /* force the ARM state machine out (as wait_write_ack) */
+   write_reg(REG4, reg4);
+}
+#define WAIT_PIPE_EMPTY(tag, addr) \
+   do { uint32_t _wd = 0; \
+        while(read_reg(REG4)&(1<<4)) { \
+           if(++_wd >= BUS_WD_N) { bus_wd_report((tag), (addr)); bus_wd_recover(); _wd = 0; } \
+        } \
+   } while(0)
+
 extern "C" void arm_write_amiga_long(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W32", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1534,7 +1612,7 @@ extern "C" void arm_write_amiga_long(uint32_t address, uint32_t data)
 extern "C" void arm_write_amiga_word(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W16", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1556,7 +1634,7 @@ extern "C" void arm_write_amiga_word(uint32_t address, uint32_t data)
 extern "C" void arm_write_amiga_byte(uint32_t address, uint32_t data)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("W8", address); // Wait pipe empty (+ bus watchdog)
 #ifndef WRITE_THROUGH_REGS
    uint32_t bank=(address>>24)&0xFF;
    if(bank!=last_bank)
@@ -1579,7 +1657,7 @@ extern "C" void arm_write_amiga_byte(uint32_t address, uint32_t data)
 extern "C" uint32_t arm_read_amiga_long(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R32", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else
@@ -1606,7 +1684,7 @@ extern "C" uint32_t arm_read_amiga_long(uint32_t address)
 extern "C" uint32_t arm_read_amiga_word(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R16", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else
@@ -1633,7 +1711,7 @@ extern "C" uint32_t arm_read_amiga_word(uint32_t address)
 extern "C" uint32_t arm_read_amiga_byte(uint32_t address)
 {
    BUS_REQUEST();
-   while(read_reg(REG4)&(1<<4)); // Wait pipe empty
+   WAIT_PIPE_EMPTY("R8", address); // Wait pipe empty (+ bus watchdog)
 #ifdef READ_THROUGH_REGS
    write_reg(REG2,address);           // address
 #else
@@ -1657,8 +1735,50 @@ extern "C" uint32_t arm_read_amiga_byte(uint32_t address)
    BUS_RELINQUISH();
    return(data_read);
 }
+// diagnostic: tally guest physical-bus accesses by region to find the slow hot spot
+volatile uint32_t ps_count=0, ps_chip=0, ps_cia=0, ps_custom=0, ps_other=0, ps_lastaddr=0;
+volatile uint32_t custom_hist[256]; // accesses per custom-chip register ($DFF000 + 2*idx)
+volatile uint32_t cia_hist[16];     // accesses per CIA register ((addr>>8)&0xF)
+// AMIX A3000 SCSI: the emulated controller raises a software level-2 (a3000_scsi_irq),
+// but the guest's interrupt handler identifies the source via Paula INTREQR ($DFF01E,
+// PORTS=INT2=bit3). Make INTREQR reads show PORTS set while our SCSI INT is pending so
+// the guest stops spin-polling INTREQR/INTENAR (~39K reads/block) and services promptly.
+extern "C" volatile int a3000_scsi_irq;
+extern "C" volatile int a3000_amix_mode;   // set once the emulated A3000 SCSI (AMIX) is active
+extern "C" volatile int amix_kernel_loaded; // set once the kernel image starts loading (UNIX_Boot)
+extern "C" volatile int amix_mmu_on;        // set once the AMIX kernel's own MMU is up (030 or 040)
+static int amix_click_done = 0;             // auto-click session budget spent -> disarmed for good
+#define INTREQR_PORTS 0x0008
+
+/* AMIX kernel console -> jtag serial. The kernel writes Paula SERDAT ($00DFF030) as
+ * `movew d0,a0@(0x30)` with a0 = $00DFF000 (amix-040-060-port src/serdbg.s, btrace.s,
+ * mainmarks.s), i.e. a WORD write -- which is what ps_write_16 caught. Byte and long
+ * writes are mirrored too, so a differently-compiled console routine can never be the
+ * reason the serial stays silent; on the proven 030 path only the word arm ever fires,
+ * so this adds nothing to it. The first mirrored character announces itself once, which
+ * is what makes "the mirror is armed" provable from the log instead of inferred from
+ * the absence of output. */
+static void amix_serdat_mirror(unsigned int value)
+{
+   static int announced = 0;
+   if (!announced) { announced = 1; z3660_printf("\r\n[SERMIRROR] AMIX console -> serial\r\n"); }
+   char c = (char)(value & 0xFF);
+   if (c == '\n') z3660_printf("\r\n"); else if (c >= 9) z3660_printf("%c", c);
+}
+static inline void ps_tally(unsigned int a)
+{
+   ps_count++;
+   if(a < 0x00200000)                    ps_chip++;     // chip RAM
+   else if(a >= 0x00BFC000 && a < 0x00C00000) { ps_cia++; cia_hist[(a>>8)&0xF]++; } // CIA
+   else if(a >= 0x00DFF000 && a < 0x00E00000) { ps_custom++; custom_hist[(a>>1)&0xFF]++; } // custom chips
+   else                                  ps_other++;
+   ps_lastaddr = a;
+}
 extern "C" void ps_write_32(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF030)   // move.l writes SERDAT (high word) + SERPER
+      amix_serdat_mirror(value >> 16);
    switch(address&3)
    {
       case 0:
@@ -1682,6 +1802,9 @@ extern "C" void ps_write_32(unsigned int address, unsigned int value)
 }
 extern "C" void ps_write_16(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF030) // Paula SERDAT: mirror AMIX serial console to jtag
+      amix_serdat_mirror(value);
    switch(address&3)
    {
       case 0:
@@ -1702,6 +1825,9 @@ extern "C" void ps_write_16(unsigned int address, unsigned int value)
 }
 extern "C" void ps_write_8(unsigned int address, unsigned int value)
 {
+   ps_tally(address);
+   if (a3000_amix_mode && address == 0x00DFF031)   // move.b to SERDAT's low (data) byte
+      amix_serdat_mirror(value);
    switch(address&3)
    {
       case 0:
@@ -1721,6 +1847,60 @@ extern "C" void ps_write_8(unsigned int address, unsigned int value)
 
 extern "C" unsigned int ps_read_8(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01F)   // low byte of INTREQR holds PORTS bit
+      return ((arm_read_amiga_byte(address)) & 0xFF) | INTREQR_PORTS;
+   if (a3000_amix_mode && !amix_kernel_loaded && !amix_mmu_on && !amix_click_done
+       && address == 0x00BFE001) { // CIA-A PRA (LMB=bit6, low)
+      // Auto-click past the AmigaOS boot-loader's "Press a mouse button to continue."
+      // prompt ONLY. AMIX's own later (pre-root) prompt must be left untouched for a REAL
+      // mouse click (its button handling differs - left only redraws, right opens a menu).
+      // Detect the mouse-poll spin via rapid consecutive PRA reads (tiny ps_count gaps).
+      //
+      // THREE DISARMS, because the original single one could not hold:
+      //  - amix_kernel_loaded: the original. Set from an LBA>1700000 read heuristic, so it
+      //    only ever trips on a disk big enough to put the kernel that far in. On the 85 MB
+      //    040 source disk it never trips at all.
+      //  - amix_mmu_on: NEW, and the exact signal. Once the AMIX kernel's own MMU is up the
+      //    loader is long gone and every prompt from here on is AMIX's, so clicking must
+      //    stop. It is disk-size independent and now latches on BOTH cores (the 030 PMOVE
+      //    site and the 040 MOVEC->TC site), which is what makes it usable here.
+      //  - amix_click_done: NEW backstop. A hard session-wide budget that never resets, so
+      //    even with both signals absent the clicker cannot escalate indefinitely.
+      // Without the latter two, image 6FDBDA40 reached [CLICK] e48 with spin=9.4M, clicking
+      // into the running kernel and across the panic screen.
+      //
+      // 030-safe: on the golden path the loader prompt is dismissed long before the AMIX
+      // kernel enables its MMU, so neither new disarm can fire early. The per-episode cap
+      // of 64 is untouched (the post-warm-reboot A3000-KS prompt genuinely needs that many),
+      // and the session budget is 4 full episodes' worth -- AMIX's bootstrap warm reset
+      // needs two, so there is 2x headroom before the backstop engages.
+      static uint32_t last_ps = 0, spin = 0, press = 0, eclicks = 0, total_clicks = 0;
+      static int armed = 0;
+      const uint32_t CLICK_SESSION_BUDGET = 4 * 64;
+      unsigned int v = (arm_read_amiga_byte(address) >> 16) & 0xFF;
+      uint32_t gap = ps_count - last_ps; last_ps = ps_count;
+      if (gap < 16) {
+         if (spin < 0x0FFFFFFF) spin++;
+         if (eclicks < 64 && spin >= 5000 && ((spin - 5000) % 200000) == 0) {  // cap 6->64: the post-warm-reboot A3000-KS prompt isn't dismissed by 6 clicks
+            armed = 1; press = 0; eclicks++; total_clicks++;
+            z3660_printf("[CLICK] e%lu spin=%lu tot=%lu\n", (unsigned long)eclicks,
+                         (unsigned long)spin, (unsigned long)total_clicks);
+            if (total_clicks >= CLICK_SESSION_BUDGET) {
+               amix_click_done = 1; armed = 0;
+               z3660_printf("[CLICK] session budget spent (%lu) -> auto-click disarmed for good\n",
+                            (unsigned long)total_clicks);
+            }
+         }
+         if (armed) {
+            if (press < 40000) { v &= ~0x40u; press++; } // hold the left button
+            else armed = 0;                              // release
+         }
+      } else {
+         spin = 0; armed = 0; eclicks = 0;   // spin ended (loader moved on) -> re-arm next prompt
+      }
+      return v;
+   }
    switch(address&3)
    {
       case 0:
@@ -1736,6 +1916,9 @@ extern "C" unsigned int ps_read_8(unsigned int address)
 }
 extern "C" unsigned int ps_read_16(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01E)   // INTREQR word: show PORTS (INT2) pending
+      return ((arm_read_amiga_word(address)) & 0xFFFF) | INTREQR_PORTS;
    switch(address&3)
    {
       case 0:
@@ -1757,6 +1940,9 @@ extern "C" unsigned int ps_read_16(unsigned int address)
 }
 extern "C" unsigned int ps_read_32(unsigned int address)
 {
+   ps_tally(address);
+   if (a3000_scsi_irq && address == 0x00DFF01C)   // INTENAR:INTREQR long: PORTS in low word
+      return arm_read_amiga_long(address) | INTREQR_PORTS;
    switch(address&3)
    {
       case 0:

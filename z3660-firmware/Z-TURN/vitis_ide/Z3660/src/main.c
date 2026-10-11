@@ -55,6 +55,7 @@ extern ENV_FILE_VARS env_file_vars_temp[9]; // really size 8
 #include "pt/pt.h"
 #include "ethernet.h"
 #include <xtime_l.h>
+#include "core0_stats.h"
 
 #include "usb_proxy.h"
 
@@ -78,8 +79,11 @@ int measures_thread(struct pt *pt);
 int emulator_thread(struct pt *pt);
 int emulator_reset_thread(struct pt *pt);
 int interrupt_thread(struct pt *pt);
-uint32_t arm_read_amiga_byte(uint32_t address);
-void arm_write_amiga_byte(uint32_t address, uint32_t data);
+// Core0's Amiga-bus byte accessors live in mobotest.c and take a timeout counter, which they set
+// and count down. The core1 emulator has its own two-argument versions in a separate ELF; declaring
+// those here made every core0 call pass a garbage pointer as `timeout`.
+uint32_t arm_read_amiga_byte(uint32_t address, int *timeout);
+void arm_write_amiga_byte(uint32_t address, uint32_t data, int *timeout);
 int read_timings(void);
 
 static struct pt pt_rtg;
@@ -818,7 +822,18 @@ void monitor_switch(int RTG)
 #define CIAB_PRA  0xbfd000
 #define CIAB_DDRA 0xbfd200
    // monitor switch
-   uint32_t ciab_ddra=arm_read_amiga_byte(CIAB_DDRA);
+   // Every CIA-B access is bounded. The first call runs while the FPGA is held in reset, and on
+   // the A4000T the bus may not answer yet; then the switch is skipped and a later call
+   // (main.c after mobotest(), mobotest.c) makes it once the bus is live.
+   int timeout;
+   if((config.monitor_switch&3)==0)
+      return;
+   uint32_t ciab_ddra=arm_read_amiga_byte(CIAB_DDRA,&timeout);
+   if(timeout==0)
+   {
+      printf("[MONSW] CIA-B DDRA read got no bus ack, monitor switch skipped\n");
+      return;
+   }
 //   printf("ciab_ddra read 0x%08lX\n",ciab_ddra);
    int write=0;
    uint32_t mask=0;
@@ -838,14 +853,24 @@ void monitor_switch(int RTG)
    if(write==1)
    {
 //      do{
-         arm_write_amiga_byte(CIAB_DDRA,ciab_ddra);
+         arm_write_amiga_byte(CIAB_DDRA,ciab_ddra,&timeout);
 //      }while((arm_read_amiga_byte(CIAB_DDRA)&mask)!=(ciab_ddra&mask));
+      if(timeout==0)
+      {
+         printf("[MONSW] CIA-B DDRA write got no bus ack, monitor switch skipped\n");
+         return;
+      }
 
 //      ciab_ddra=arm_read_amiga_byte(CIAB_DDRA);
 //      printf("ciab_ddra read 0x%08lX\n",ciab_ddra);
 
 
-      uint32_t ciab=arm_read_amiga_byte(CIAB_PRA);
+      uint32_t ciab=arm_read_amiga_byte(CIAB_PRA,&timeout);
+      if(timeout==0)
+      {
+         printf("[MONSW] CIA-B PRA read got no bus ack, monitor switch skipped\n");
+         return;
+      }
       mask=0;
 //      printf("ciab read 0x%08lX\n",ciab);
       if(RTG)
@@ -911,7 +936,20 @@ void monitor_switch(int RTG)
          }
       }
 //      do{
-         arm_write_amiga_byte(CIAB_PRA,ciab);
+         arm_write_amiga_byte(CIAB_PRA,ciab,&timeout);
+      if(timeout==0)
+         printf("[MONSW] CIA-B PRA write got no bus ack, monitor switch not confirmed\n");
+      else
+      {
+         // Diagnostic read-back. On the A4000T, CIA-B is still held in reset here, so the writes are
+         // acknowledged but ignored and DDRA reads back 0x00.
+         int t1, t2;
+         uint32_t rb_ddra=arm_read_amiga_byte(CIAB_DDRA,&t1);
+         uint32_t rb_pra=arm_read_amiga_byte(CIAB_PRA,&t2);
+         printf("[MONSW] monitor switched to %s (monitor_switch 0x%02X); read-back DDRA=0x%02lX%s PRA=0x%02lX%s\n",
+                RTG?"RTG":"native",config.monitor_switch,
+                (unsigned long)(rb_ddra>>24),t1?"":"(no ack)",(unsigned long)(rb_pra>>24),t2?"":"(no ack)");
+      }
 //      }while((arm_read_amiga_byte(CIAB_PRA)&mask)!=(ciab&mask));
 //      ciab=arm_read_amiga_byte(CIAB_PRA);
 //      printf("ciab read 0x%08lX\n",ciab);
@@ -1299,6 +1337,15 @@ int main()
    }
 
    shared->arm_freq_code=config.arm_frequency;
+   /* CYBERSTORM C2-prep: publish the rate the global timer ACTUALLY runs at, next to the
+    * code that selected it. core1's profiler cannot work this out for itself -- the
+    * CPU:global-timer ratio is a fixed 2:1 in silicon, so measuring it tells you nothing
+    * about the PLL -- and the BSP's COUNTS_PER_SECOND is a compile-time constant frozen
+    * at the 666.67 MHz default. Reading that constant on an 1100 MHz board is what made
+    * every Hz and every duration in the 2026-08-22 C1 profiling session low by exactly
+    * 1.65x. This is the same value the switch above just computed, published rather than
+    * recomputed, so the two cannot drift. */
+   shared->arm_wall_hz=counts_per_second;
 
 //ps7_ddr_init_custom(1); // DDR a 667 MHz  
 //ps7_ddr_init_custom(2); // DDR a 800 MHz
@@ -1399,17 +1446,17 @@ int main()
    }
    printf("Current CPU Frequency: %3.3f MHz (applied value)\n",get_current_cpu_frequency()/1000000.0f);
 
-   if(   config.boot_mode==MOBOCPU    )
+   // emu==1 is load-bearing: it gates the ONLY site that starts core1 (below, ~line 1780
+   // -- entry address to 0xFFFFFFF0 + sev + the shared_data handshake). Get it wrong and
+   // core0 walks into the real-CPU path and relinquishes the bus to a CPU that is not
+   // fitted. See boot_mode_is_emulated() in config_file.h for why it is a closed list of
+   // real-CPU modes rather than an enumeration of the emulated ones.
+   if(config.boot_mode==MOBOCPU)
       emu=2;
-   else if(
-         config.boot_mode==MUSASHI
-      || config.boot_mode==UAE_030
-      || config.boot_mode==UAEJIT_030
-      || config.boot_mode==UAE_040
-      || config.boot_mode==UAEJIT_040)
+   else if(boot_mode_is_emulated(config.boot_mode))
       emu=1; // -> 060 not used -> PCLK/2
    else
-      emu=0;
+      emu=0; // CPU: the real 68060 on the card drives the bus
    write_reg_s01(REG2,INT_TON); // 100 us aprox
    write_reg_s01(REG3,INT_TOFF); // 10 ms
 
@@ -1564,6 +1611,64 @@ int main()
 
    //   video_reset();
 
+   // The FPGA latches the MAPROM/MAPROMEXT enables only while FPGA_RESET is held
+   // (z3660.v:374-409), so decide them before the final pulse below. Decided after
+   // it, a disable never reached the FPGA: kickstart 0 on a real CPU fetched an
+   // empty MAPROM window instead of the motherboard ROM.
+   shared->load_rom_addr=(uint32_t)0x00F80000;
+   shared->load_ext_rom_addr=(uint32_t)0x00F00000;
+
+   if(config.kickstart!=0 && (kickstart_pointer[config.kickstart]!=0))
+   {
+      shared->load_rom_emu=load_rom();
+      if(shared->load_rom_emu==1)
+      {
+         ENABLE_MAPROM_FPGA;
+      }
+      else
+      {
+         printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
+         DISABLE_MAPROM_FPGA;
+      }
+   }
+   else
+   {
+      shared->load_rom_emu=2;
+      printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
+      DISABLE_MAPROM_FPGA;
+   }
+   if(config.ext_kickstart!=0 && (ext_kickstart_pointer[config.ext_kickstart]!=0))
+   {
+      shared->load_romext_emu=load_romext();
+      if(shared->load_romext_emu==1)
+      {
+         ENABLE_MAPROMEXT_FPGA;
+      }
+      else
+      {
+         printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
+         DISABLE_MAPROMEXT_FPGA;
+      }
+   }
+   else
+   {
+      shared->load_romext_emu=2;
+      printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
+      DISABLE_MAPROMEXT_FPGA;
+   }
+   // Force to disable maprom
+   //   DISABLE_MAPROM_FPGA;
+   //   DISABLE_MAPROMEXT_FPGA;
+   //   shared->load_rom_emu=2;
+   //   shared->load_romext_emu=2;
+
+   if(emu==1)
+   {
+      // emulated modes keep both windows off in the FPGA, as before this move
+      DISABLE_MAPROM_FPGA;
+      DISABLE_MAPROMEXT_FPGA;
+   }
+
    DiscreteSet(REG0, FPGA_RESET);
    xc3_usleep(2500);
    monitor_switch(1); // 1=RTG
@@ -1685,53 +1790,6 @@ int main()
    shared->z3_enabled|=config.autoconfig_ram?1:0;
    shared->z2_enabled|=!config.autoconfig_rtg && config.scsiboot?1:0;
 
-   shared->load_rom_addr=(uint32_t)0x00F80000;
-   shared->load_ext_rom_addr=(uint32_t)0x00F00000;
-
-   if(config.kickstart!=0 && (kickstart_pointer[config.kickstart]!=0))
-   {
-      shared->load_rom_emu=load_rom();
-      if(shared->load_rom_emu==1)
-      {
-         ENABLE_MAPROM_FPGA;
-      }
-      else
-      {
-         printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
-         DISABLE_MAPROM_FPGA;
-      }
-   }
-   else
-   {
-      shared->load_rom_emu=2;
-      printf("[INFO] kickstart is not loaded -> disabling MAPROM\n");
-      DISABLE_MAPROM_FPGA;
-   }
-   if(config.ext_kickstart!=0 && (ext_kickstart_pointer[config.ext_kickstart]!=0))
-   {
-      shared->load_romext_emu=load_romext();
-      if(shared->load_romext_emu==1)
-      {
-         ENABLE_MAPROMEXT_FPGA;
-      }
-      else
-      {
-         printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
-         DISABLE_MAPROMEXT_FPGA;
-      }
-   }
-   else
-   {
-      shared->load_romext_emu=2;
-      printf("[INFO] extended kickstart is not loaded -> disabling MAPROMEXT\n");
-      DISABLE_MAPROMEXT_FPGA;
-   }
-   // Force to disable maprom
-   //   DISABLE_MAPROM_FPGA;
-   //   DISABLE_MAPROMEXT_FPGA;
-   //   shared->load_rom_emu=2;
-   //   shared->load_romext_emu=2;
-
 #ifndef DISABLE_SCSI
    piscsi_init();
 #endif
@@ -1801,6 +1859,19 @@ int main()
       PT_INIT(&pt_emulator_reset);
       PT_INIT(&pt_ethernet);
       PT_INIT(&pt_usb);
+      /* Per-task duration accounting for this loop (core0_stats.h). Every C0_STAMP
+       * closes the span that started at the previous stamp, so one loop iteration
+       * costs one timer read per timed callee -- not two. A skipped gated callee
+       * emits no stamp, so its call count stays honest and the few instructions of
+       * counter bookkeeping are charged to the next span. C0_ITER() closes the
+       * iteration and drives the rate-limited report; it costs no timer read at
+       * all, because the last stamp already read the clock.
+       *
+       * Instrumented here and NOT in the real-CPU loop below: the crawl under
+       * investigation is an emulated-guest workload, and the real-CPU loop's
+       * M68K_RESET arm would need its own re-arming to avoid charging a whole
+       * reset episode to whichever callee happened to be stamped next. */
+      C0_INIT();
       while(1)
       {
          {
@@ -1809,26 +1880,29 @@ int main()
             if(debug_thread_counter==20)
             {
                debug_thread(&pt_debug);
+               C0_STAMP(C0T_DEBUG);
                debug_thread_counter=0;
             }
          }
-         measures_thread(&pt_measures);
-         interrupt_thread(&pt_interrupt);
+         measures_thread(&pt_measures);   C0_STAMP(C0T_MEASURES);
+         interrupt_thread(&pt_interrupt); C0_STAMP(C0T_INTERRUPT);
 
-         emulator_thread(&pt_emulator);
+         emulator_thread(&pt_emulator);   C0_STAMP(C0T_EMULATOR);
          {
             static int reset_thread_counter=0;
             reset_thread_counter++;
             if(reset_thread_counter==40)
             {
                emulator_reset_thread(&pt_emulator_reset);
+               C0_STAMP(C0T_EMURESET);
                reset_thread_counter=0;
             }
          }
-         ethernet_thread(&pt_ethernet);
-         usb_thread(&pt_usb);
-         other_tasks();
+         ethernet_thread(&pt_ethernet);   C0_STAMP(C0T_ETHERNET);
+         usb_thread(&pt_usb);             C0_STAMP(C0T_USB);
+         other_tasks();                   C0_STAMP(C0T_OTHER);
          task_counter++;
+         C0_ITER();
       }
 
    }

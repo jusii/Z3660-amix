@@ -1,0 +1,29 @@
+===================================================================
+ REFERENCE: Z3660 *emulated* 68030 (UAE 030+MMU) under AMIX 2.1p2a
+===================================================================
+ Machine : real A4000 + Z3660 accelerator (Zynq-7000 ARM @ ~1.1 GHz
+           running the UAE-based 68030+PMMU emulator -- NOT a real 030)
+ OS      : Amiga Unix (AMIX) 2.1p2a, UNIX System V Release 4.0, m68k
+ Build   : cc -O -DHZ=60     Dhrystone runs: 50000     I/O: 2 MB
+ (AMIX system clock HZ = 60; the on-board RTC was unset, so dates print as 1978.)
+
+ --- default emulator config (service_cadence = 1) ---
+ Dhrystone 2.1 :  5068 Dhrystones/sec   (197.3 us/run)   = 2.88 DMIPS
+ disk WRITE 2MB:  real 5.1s  (sys 4.9)   ~402 KB/s
+ disk READ  2MB:  real 1.1s              ~1.86 MB/s
+ mixed dd|compress (640 KB):  real 12.4s  (user 10.4)
+
+ --- Z3660 emulator tuning: IPL/task poll cadence (SERV knob) ---
+ Poll interrupts/cross-core tasks every N instructions instead of every 1.
+ CPU scales with cadence; disk I/O is unaffected (flat); absolute Dhrystone
+ corrected for HZ=60 (the cadence ratios are HZ-independent):
+
+    cadence   Dhrystones/s   DMIPS    note
+       1          5068        2.88     default (safe)
+       8          6424        3.66     recommended (knee; +27% CPU, low latency)
+      64          6682        3.80     max (+32% CPU; higher interrupt latency)
+
+===================================================================
+ Send your REAL 68030 UNIX numbers (sh runbench.sh -> bench-results.<host>.txt)
+ plus: machine model, 030 type + MHz, FPU, RAM, OS/version, compiler.
+===================================================================

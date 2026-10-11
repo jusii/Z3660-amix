@@ -9,6 +9,7 @@
 #include "config_clk.h"
 #include "config_file.h"
 #include <stdlib.h>
+#include <string.h>
 
 void debug_console_help(void);
 void dump_mmu(void);
@@ -21,6 +22,30 @@ void disable_overlay(void);
 DEBUG_CONSOLE debug_console;
 extern SHARED *shared;
 extern int eth_backlog_nag_counter_max;
+/* piscsi service-rate/latency instrumentation (scsi/scsi.c; also in scsi/scsi.h,
+ * declared locally to avoid pulling the FatFs-dependent header in here). */
+void piscsi_stats_toggle(void);
+void piscsi_stats_dump(void);
+int  piscsi_stats_reporting(void);
+/* core0 cooperative-loop per-task duration accounting */
+#include "core0_stats.h"
+/* CYBERSTORM C1: the profiler command word core0 writes into SHARED.prof_ctl. */
+#include "prof_config.h"
+/* CYBERSTORM C2 rung 0. Included DIRECTLY rather than mirrored into a core0 copy the way
+ * prof_config.h mirrors z3660_prof.h -- z3660_prof.h drags in the emulator's headers and
+ * core0 cannot compile it, but z3660_blk.h is #defines and one static inline over
+ * `unsigned` and nothing else. A mirrored copy would only be a second place for the OFF
+ * sentinel to drift away from the one core1 tests against. */
+#include "../../Z3660_emu/src/uae/z3660_blk.h"
+#include "../../Z3660_emu/src/uae/z3660_dopc.h"
+/* CYBERSTORM C2 rung 2: same reasoning again -- z3660_dfast.h is deliberately
+ * self-contained (plain types, no emulator headers) so the ONE rule that turns a mailbox
+ * word into a state lives in one file that both cores compile. */
+#include "../../Z3660_emu/src/uae/z3660_dfast.h"
+/* WARP ENGINE: same reasoning a fourth time -- z3660_warp.h is plain C, #defines and one
+ * static inline, so the ONE rule that turns this mailbox word into an arm state is compiled
+ * by both cores from one file rather than mirrored here. */
+#include "../../Z3660_emu/src/uae/z3660_warp.h"
 typedef enum {
    A,
 
@@ -62,10 +87,40 @@ typedef enum {
    PHD,     PRINT_HIST_DATAABORT,
    VMR,     VIDEO_MODE_RESET,
    OVL,     TOGGLE_OVERLAY,
+   DEMU,    DEBUG_EMU,
+   PERF,    PERF_REPORT,
+   SERV,    SERVICE_CADENCE,
+   PSTAT,   PISCSI_STATS_REPORT,
+   PSTATR,  PISCSI_STATS_RESET,
+   PSTATC,  CORE0_LOOP_DUMP,
+   PSTATZ,  CORE0_LOOP_ZERO,
+   PERFS,   PERF_STATS,
+   PROBES,  EMU_PROBES,
+   CSTAT,   CORE0_LOOP_STATS,
+   /* CYBERSTORM C1 profiler. APPEND-ONLY: command_names[] is indexed by this enum. */
+   PROF,    PROF_ARM,
+   PROFB,   PROF_BUCKETS,
+   PROFD,   PROF_DUMP,
+   PROFR,   PROF_RING,
+   PROFZ,   PROF_ZERO,
+   PROFO,   PROF_OFF,      /* C2-prep: the lossless stop. See the case below. */
+   /* CYBERSTORM C2 rung 0: the block-idiom fast path. APPEND-ONLY, like everything above. */
+   BLK,     BLOCK_IDIOM,
+   /* CYBERSTORM C2 rung 1: the decoded-op cache. APPEND-ONLY, like everything above. */
+   DOPC,    DECODED_OP_CACHE,
+   /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
+   DFAST,   ACCESSOR_FAST_PATH,
+   /* WARP ENGINE: the 68040 MMU block engine. DEFAULT OFF. APPEND-ONLY. */
+   WARP,    WARP_ENGINE,
+   /* WARP ENGINE round 3: the ON-TARGET SELF-TEST. It does not arm and cannot -- it writes
+    * a SECOND magic to the same mailbox word and z3660_warp_resolve() returns 0 for it.
+    * APPEND-ONLY. */
+   WARPTEST, WARP_SELFTEST,
 
    NUM_COMMANDS
 } COMMANDS;
-const char *command_names[NUM_COMMANDS] = {
+/* Deliberately UNSIZED -- see the completeness tripwire below. */
+const char *command_names[] = {
       "A",
 
       "DRTG",    "DEBUG RTG",
@@ -106,7 +161,32 @@ const char *command_names[NUM_COMMANDS] = {
       "PHD",     "PRINT_HIST_DATAABORT",
       "VMR",     "VIDEO_MODE_RESET",
       "OVL",     "TOGGLE_OVERLAY",
+      "DEMU",    "DEBUG EMU",
+      "PERF",    "PERF REPORT",
+      "SERV",    "SERVICE CADENCE",
+      "PSTAT",   "PISCSI STATS REPORT",
+      "PSTATR",  "PISCSI STATS RESET",
+      "PSTATC",  "CORE0 LOOP DUMP",
+      "PSTATZ",  "CORE0 LOOP ZERO",
+      "PERFS",   "PERF STATS",
+      "PROBES",  "EMU PROBES",
+      "CSTAT",   "CORE0 LOOP STATS",
+      "PROF",    "PROF ARM",
+      "PROFB",   "PROF BUCKETS",
+      "PROFD",   "PROF DUMP",
+      "PROFR",   "PROF RING",
+      "PROFZ",   "PROF ZERO",
+      "PROFO",   "PROF OFF",
+      "BLK",     "BLOCK IDIOM",
+      "DOPC",    "DECODED OP CACHE",
+      "DFAST",   "ACCESSOR FAST PATH",
+      "WARP",    "WARP ENGINE",
+      "WARPTEST","WARP SELFTEST",
 };
+/* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
+ * string shifts every command after it -- typing one name would run a different one. */
+typedef char z3660_command_names_complete[
+   (sizeof(command_names)/sizeof(command_names[0]) == NUM_COMMANDS) ? 1 : -1];
 extern clock_data cd[];
 extern CONFIG config;
 
@@ -121,6 +201,8 @@ void debug_console_init(void)
    debug_console.debug_ethernet=0;
    debug_console.debug_soft3d=0;
    debug_console.debug_i2c=0;
+   shared->debug_emu=0;         // emulator-core debug spam default OFF (DEMU menu cmd toggles)
+   shared->perf_report=0;       // 030-MMU instruction-rate readout default OFF (PERF menu cmd)
    debug_console.stop_i2c=0;
    debug_console.step=0;
    debug_console.hist_pointer=0;
@@ -148,6 +230,7 @@ void debug_console_init(void)
    debug_console.reset_cpld=0;
    debug_console.reset_fpga=0;
    debug_console.overlay_enabled=0;
+   debug_console.prof_buckets=0;   /* CYBERSTORM C1: nothing armed at power-on */
 }
 uint32_t hextoi(char *str)
 {
@@ -193,6 +276,60 @@ void dump_mem(uint32_t address, uint32_t length, int swap)
       }
    }
 }
+/* `PROF <hz>` -- arm the interpreter sampler at an EXPLICIT rate.
+ *
+ * The command table is an exact-string match over the whole input line, so a command
+ * with a numeric argument cannot live in it. This runs from the not-found path instead,
+ * which costs nothing until somebody types something the table does not have.
+ *
+ * It exists for the same reason `PROF OFF` does. The rate-cycling `PROF` offers three
+ * rates and no way to ask for a fourth, so a session that wanted the C2 map's
+ * recommended 250 Hz (a wrap-free window long enough to CONTAIN a dhrystone run rather
+ * than the idle loop after it) had to arm at 1000 and accept a ring that wrapped before
+ * the workload ended. Two of the three C1 workload captures were lost exactly that way.
+ *
+ * Returns 1 if the line was consumed, 0 to let the caller report an unknown command.
+ * Rate bounds are core1's (z3660_prof.h, mirrored in prof_config.h) and are CLAMPED
+ * rather than refused, matching the config key -- the rate actually used is recorded in
+ * the dump header either way, so a typo produces a labelled profile rather than none.
+ */
+static int prof_try_explicit_rate(const char *cmd)
+{
+   uint32_t hz=0;
+   int i;
+
+   if(strncmp(cmd,"PROF ",5)!=0) return 0;
+   for(i=5; cmd[i]!=0; i++)
+   {
+      if(cmd[i]<'0' || cmd[i]>'9') return 0;      /* not a number -> not ours */
+      if(hz > 99999u) hz = 99999u;                /* saturate rather than wrap */
+      else hz = hz*10u + (uint32_t)(cmd[i]-'0');
+   }
+   if(i==5) return 0;                             /* bare "PROF " with no digits */
+
+   if(hz==0)
+   {
+      /* `PROF 0` is a rate of nothing, which is a stop -- and a stop must not zero. */
+      shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+      shared->prof_hz=0;
+      debug_console.prof_buckets=0;
+      xil_printf("PROF OFF requested (via 'PROF 0'): sampler and buckets frozen, data KEPT\r\n");
+      return 1;
+   }
+   if(hz<(uint32_t)Z3660_PROF_CFG_HZ_MIN) hz=(uint32_t)Z3660_PROF_CFG_HZ_MIN;
+   if(hz>(uint32_t)Z3660_PROF_CFG_HZ_MAX) hz=(uint32_t)Z3660_PROF_CFG_HZ_MAX;
+   shared->prof_hz=hz;
+   shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM,0);
+   /* The wrap-free window is printed with the rate, because it is the number that
+    * decides whether the capture will contain its workload or the idle loop after it,
+    * and nobody computes it in their head at the console. */
+   xil_printf("PROF ARM %lu Hz requested -- ZEROES buckets, counters and ring "
+              "(PROFILING build only; %lu samples = %lu s before the ring wraps)\r\n",
+              (unsigned long)hz, (unsigned long)Z3660_PROF_CFG_RING_ENTRIES,
+              (unsigned long)((uint32_t)Z3660_PROF_CFG_RING_ENTRIES/hz));
+   return 1;
+}
+
 #define ESC 27
 #include "pt/pt.h"
 int debug_thread(struct pt *pt)
@@ -340,6 +477,304 @@ int debug_thread(struct pt *pt)
                         xil_printf("DEBUG SCSI ON\r\n");
                      else
                         xil_printf("DEBUG SCSI OFF\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case DEMU:
+                  case DEBUG_EMU:
+                     shared->debug_emu=!shared->debug_emu;   // emulator-core debug spam: [PC]/[RTE-B-IF]/fixup (+ AMIX strand trace)
+                     xil_printf("DEBUG EMU %s\r\n", shared->debug_emu?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  /* CYBERSTORM C3 overhead switches. These toggle DIAGNOSTIC COST only --
+                   * no emulation behaviour changes either way -- so they are safe to
+                   * flip live under a running guest during a calibration sweep. */
+                  case PERFS:
+                  case PERF_STATS:
+                     shared->perf_stats=!shared->perf_stats;   // core1 per-instruction perf accounting
+                     xil_printf("PERF STATS %s (core1 run-loop accounting; reaches the loop within ~1s)\r\n",
+                                shared->perf_stats?"ON":"OFF");
+                     if(!shared->perf_stats)
+                        xil_printf("  note: [PERF] kIPS needs PERF STATS ON\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROBES:
+                  case EMU_PROBES:
+                     shared->emu_probes=!shared->emu_probes;   // core1 run-loop diagnostic probes
+                     xil_printf("EMU PROBES %s (ROMENT/RTE/URTE/USTEP on 040, wild-PC ring on 030)\r\n",
+                                shared->emu_probes?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case CSTAT:
+                  case CORE0_LOOP_STATS:
+                     core0_stats_set_enabled(!core0_stats_is_enabled());   // core0 C0STAT span stamping
+                     xil_printf("CORE0 LOOP STATS %s (span stamping; PSTAT only gates the printing)\r\n",
+                                core0_stats_is_enabled()?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case PERF:
+                  case PERF_REPORT:
+                     shared->perf_report=!shared->perf_report;   // 030-MMU instruction-rate readout (~1Hz) to serial
+                     xil_printf("PERF REPORT %s\r\n", shared->perf_report?"ON":"OFF");
+                     debug_console.subcmd=0;
+                     break;
+                  case SERV:
+                  case SERVICE_CADENCE:
+                     {  // cycle the 030-MMU IPL/cross-core poll cadence: 1->2->4->8->16->32->64->1
+                        uint32_t c=shared->service_cadence; c=(c<1)?1:c*2; if(c>64) c=1;
+                        shared->service_cadence=c;
+                        xil_printf("SERVICE CADENCE %lu (instr between IPL/task polls; 1=every instr)\r\n",(unsigned long)c);
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTAT:
+                  case PISCSI_STATS_REPORT:
+                     piscsi_stats_toggle();      // periodic piscsi service-rate/latency summary
+                     // ...and the core0 loop report with it: the two halves of the
+                     // same measurement (request cost vs. who starved the loop) are
+                     // only useful side by side, so one switch drives both.
+                     core0_stats_set_report(piscsi_stats_reporting());
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATR:
+                  case PISCSI_STATS_RESET:
+                     piscsi_stats_dump();        // cumulative totals + per-unit CLMT state, then reset
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATC:
+                  case CORE0_LOOP_DUMP:
+                     core0_stats_dump();         // core0 per-task cumulative totals (non-destructive)
+                     debug_console.subcmd=0;
+                     break;
+                  case PSTATZ:
+                  case CORE0_LOOP_ZERO:
+                     core0_stats_zero();         // zero core0 cumulative totals + worst-ever latch
+                     debug_console.subcmd=0;
+                     break;
+                  /* CYBERSTORM C1 profiler (core1). Every one of these is a WRITE to the
+                   * cross-core command word; core1 consumes it in do_specialties(), so it
+                   * costs nothing per emulated instruction and arrives within an
+                   * interrupt period.
+                   *
+                   * Core0 cannot tell which core1 image is running -- there is no
+                   * "profiler present" bit and adding one would mean another hand-mirrored
+                   * SHARED field for a question that already has an answer: the profiling
+                   * image announces itself at boot with a "[PROF] profiling build: ARM
+                   * clock ..." line. So these commands say what they asked for, not what
+                   * happened, and the absence of a [PROF] reply IS the answer. */
+                  case PROF:
+                  case PROF_ARM:
+                     {  // Cycle the sampler rate: off -> 250 -> 1000 -> 4000 -> off, with
+                        // one exception -- an armed rate that is NOT on the ladder came
+                        // from z3660cfg.txt or from an explicit 'PROF <hz>', so the press
+                        // STOPS it losslessly rather than arming (and zeroing) over a
+                        // capture somebody set up deliberately. The rule and the reason
+                        // live in prof_config.h, where the host guard can test them; this
+                        // is only the keystroke that runs it.
+                        int armed=(int)shared->prof_hz;
+                        int off_ladder=!z3660_prof_cfg_is_ladder_rate(armed);
+                        int hz=z3660_prof_cfg_next_rate(armed);
+                        shared->prof_hz=(uint32_t)hz;
+                        if(hz) {
+                           shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_ARM,0);
+                           xil_printf("PROF ARM %lu Hz requested (zeroes the ring; PROFILING build only)\r\n",
+                                      (unsigned long)hz);
+                        } else {
+                           shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+                           debug_console.prof_buckets=0;   // core1's stop clears both
+                           if(off_ladder) {
+                              xil_printf("PROF STOP requested: armed at %lu Hz, which is not a PROF "
+                                         "ladder rate (250/1000/4000) -- stopping rather than arming "
+                                         "over a capture somebody set up on purpose.\r\n",
+                                         (unsigned long)armed);
+                              xil_printf("  data KEPT: PROFD / PROFR / 'PROF RING' read it. "
+                                         "'PROF <hz>' re-arms (and zeroes).\r\n");
+                           } else {
+                              xil_printf("PROF STOP requested (data kept -- PROFD/PROFR still read it)\r\n");
+                           }
+                        }
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFO:
+                  case PROF_OFF:
+                     /* The direct, unambiguous, always-available lossless stop. Freezes
+                      * the sampler AND the stage buckets and keeps every byte, from any
+                      * armed state whatsoever -- config-armed, ladder-armed or explicitly
+                      * armed. This is the command a metal session reaches for when the
+                      * workload has just finished and the ring must not move again. */
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_STOP;
+                     shared->prof_hz=0;
+                     debug_console.prof_buckets=0;
+                     xil_printf("PROF OFF requested: sampler and buckets frozen, data KEPT "
+                                "(PROFD / PROFR / 'PROF RING' read it)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFB:
+                  case PROF_BUCKETS:
+                     {  // the interpreter stage buckets, which are NOT free -- see below
+                        debug_console.prof_buckets=!debug_console.prof_buckets;
+                        shared->prof_ctl=debug_console.prof_buckets
+                              ? Z3660_PROF_CFG_CTL_BUCKETS_ON : Z3660_PROF_CFG_CTL_BUCKETS_OFF;
+                        xil_printf("PROF BUCKETS %s requested -- these cost real time: "
+                                   "the per-stage SHARES are the answer, the instruction RATE is not\r\n",
+                                   debug_console.prof_buckets?"ON":"OFF");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFD:
+                  case PROF_DUMP:
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_DUMPSTATS;   // buckets + counters, ~35 lines
+                     xil_printf("PROF DUMP requested (stage buckets + counters)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFR:
+                     // The newest 4096 samples: ~90 KB, roughly 8 s of 115200 serial.
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_DUMPRING;    // arg 0 = the default slice
+                     xil_printf("PROF RING requested (newest 4096 samples, ~8 s of serial)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROF_RING:
+                     // The long name dumps the WHOLE ring: 65536 samples, ~1.4 MB, about
+                     // two minutes of serial. Deliberately the one that has to be typed out.
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_MAKE(Z3660_PROF_CFG_CTL_DUMPRING,65535);
+                     xil_printf("PROF RING (full) requested: up to 65535 samples, ~2 min of serial\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case PROFZ:
+                  case PROF_ZERO:
+                     shared->prof_ctl=Z3660_PROF_CFG_CTL_ZERO;        // buckets, counters and ring
+                     xil_printf("PROF ZERO requested (buckets, counters and ring)\r\n");
+                     debug_console.subcmd=0;
+                     break;
+                  case BLK:
+                  case BLOCK_IDIOM:
+                     {  /* CYBERSTORM C2 rung 0. Cycle the chunk cap OFF -> 64 -> 256 -> 1024 -> OFF.
+                        * A cap, not a toggle, because the cap is what bounds interrupt latency
+                        * (the run loop's poll runs once per chunk) -- so the one knob answers
+                        * both "is it on" and "how long a stall will this guest tolerate", and a
+                        * metal session can sweep it against a live workload. The rule that turns
+                        * this word into iterations is z3660_blk.h's z3660_blk_resolve_chunk();
+                        * core1 picks it up at its next knob resync, well under a second. */
+                        uint32_t c=shared->blk_chunk;
+                        if(c==Z3660_BLK_OFF)      c=64;
+                        else if(c==64)            c=256;
+                        else if(c==256)           c=1024;
+                        else if(c==1024)          c=Z3660_BLK_OFF;
+                        else                      c=Z3660_BLK_OFF;   /* unset/anything else */
+                        shared->blk_chunk=c;
+                        if(c==Z3660_BLK_OFF)
+                           xil_printf("BLOCK IDIOM OFF (bzero/mcpy/CPUSHL loops run one guest instruction at a time)\r\n");
+                        else
+                           xil_printf("BLOCK IDIOM %lu iterations/chunk (the interrupt poll runs once per chunk)\r\n",
+                                      (unsigned long)c);
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case DOPC:
+                  case DECODED_OP_CACHE:
+                     {  /* CYBERSTORM C2 rung 1. Toggle the decoded-op cache ON <-> OFF.
+                        * A toggle and not a size, unlike BLK: the geometry is fixed by
+                        * the map's measured PC distribution (4096 entries, 4-way) and a
+                        * runtime way-count knob would put a variable bound on the hit
+                        * path, which is the one place this rung cannot afford one. The
+                        * rule that turns this word into a state is z3660_dopc.h's
+                        * z3660_dopc_resolve(); core1 picks it up at its next knob resync
+                        * and invalidates the whole cache when it does. */
+                        uint32_t c=shared->dopc_on;
+                        c = (z3660_dopc_resolve(c)!=0u) ? Z3660_DOPC_OFF : Z3660_DOPC_DEFAULT;
+                        shared->dopc_on=c;
+                        if(c==Z3660_DOPC_OFF)
+                           xil_printf("DECODED OP CACHE OFF (every instruction is fetched and decoded again)\r\n");
+                        else
+                           xil_printf("DECODED OP CACHE ON (4096 entries, 4-way, 64 KB; carries the block-idiom verdict)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case DFAST:
+                  case ACCESSOR_FAST_PATH:
+                     {  /* CYBERSTORM C2 rung 2. Toggle the data accessors' fast path.
+                        * OFF is the REFERENCE MACHINE -- every access takes the original
+                        * out-of-line accessor -- so this is what makes a PROFZ-fenced
+                        * same-boot A/B of the rung possible without a second flash, which
+                        * is the experiment map SS23.1 says a build difference otherwise
+                        * needs two flashes for. There is nothing to invalidate on the way
+                        * through: the fast path holds no state of its own, only a derived
+                        * verdict table that is rebuilt either way. The rule that turns
+                        * this word into a state is z3660_dfast.h's z3660_dfast_resolve()
+                        * and nothing else re-implements it. */
+                        uint32_t c=shared->dfast_on;
+                        c = (z3660_dfast_resolve(c)!=0u) ? Z3660_DFAST_OFF : Z3660_DFAST_DEFAULT;
+                        shared->dfast_on=c;
+                        if(c==Z3660_DFAST_OFF)
+                           xil_printf("ACCESSOR FAST PATH OFF (every guest data access takes the original out-of-line accessor -- this is the reference arm)\r\n");
+                        else
+                           xil_printf("ACCESSOR FAST PATH ON (TTR verdict + page-cache resolve + direct RAM access, inline, no calls)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case WARP:
+                  case WARP_ENGINE:
+                     {  /* WARP ENGINE (docs/WARP-ENGINE.md). Toggle the 68040 MMU block
+                        * engine: guest basic blocks compiled to ARM and executed in place
+                        * of the interpreter.
+                        *
+                        * DEFAULT OFF, AND THAT IS THE OPPOSITE OF BLK/DOPC/DFAST ABOVE, on
+                        * purpose (plan Q9). For those three the shipped behaviour IS the
+                        * optimisation, so an unwritten mailbox word must resolve to ON. The
+                        * reasoning here is identical and the value is inverted: unset means
+                        * the shipped behaviour, and an engine that is not shipped behaviour
+                        * until the M5 gate has a shipped behaviour of OFF.
+                        *
+                        * ARMING WRITES AN EXACT MAGIC, not 1 -- SHARED is hand-maintained
+                        * in two headers a beta resync has already mis-merged once, so a
+                        * neighbouring field bleeding into this one must DISARM. The rule is
+                        * z3660_warp.h's z3660_warp_resolve() and nothing else re-implements
+                        * it, and it never survives a reboot: core0 republishes the OFF
+                        * sentinel on every boot and there is no config key.
+                        *
+                        * core1 picks the change up at its next knob resync, discards the
+                        * whole code cache on the way through, and prints its own [WARP]
+                        * banner -- this line only says what was REQUESTED. And the banner
+                        * is not the attestation either: read the arm state from the
+                        * counter, because two cores share one unlocked UART. */
+                        uint32_t c=shared->warp_on;
+                        c = (z3660_warp_resolve(c)!=0u) ? Z3660_WARP_OFF : Z3660_WARP_ARM;
+                        shared->warp_on=c;
+                        if(c==Z3660_WARP_ARM)
+                        {
+                           xil_printf("WARP ENGINE ARM requested (guest blocks compiled to ARM; core1 confirms with its own [WARP] banner)\r\n");
+                           xil_printf("          M1 round 1: every block is a NULL BLOCK and bails immediately -- no speedup is expected or claimed\r\n");
+                        }
+                        else
+                           xil_printf("WARP ENGINE OFF requested (the interpreter is the whole machine -- this is the reference arm)\r\n");
+                     }
+                     debug_console.subcmd=0;
+                     break;
+                  case WARPTEST:
+                  case WARP_SELFTEST:
+                     {  /* THE ON-TARGET ARMED SELF-TEST (docs/WARP-ENGINE.md 0.10.5).
+                        *
+                        * THE RULE IT ENFORCES: no metal session arms the engine on a live
+                        * guest until this reports PASS on the image that is about to be
+                        * armed. Round 2's host harness passed 10^8 lockstep boundaries and
+                        * the armed engine still died four times on silicon, because the
+                        * harness reads the emitted words through the DATA side and the
+                        * machine executes them through the INSTRUCTION side. This runs each
+                        * compiled block BOTH ways on the card and compares.
+                        *
+                        * IT CANNOT ARM ANYTHING. It writes a second magic to the same
+                        * mailbox word; z3660_warp_resolve() is unchanged and returns 0 for
+                        * it, so only 'WARP' can ever arm the engine (Q9). core1 consumes the
+                        * word before acting -- z3660_prof.cpp's prof_ctl pattern -- so a
+                        * request that arrives twice runs twice.
+                        *
+                        * It touches no guest memory and leaves the arm state alone, so it is
+                        * safe on a live guest. core1 prints the whole [WTST] report. */
+                        shared->warp_on=Z3660_WARP_SELFTEST;
+                        xil_printf("WARP SELF-TEST requested -- core1 prints the [WTST] report.\r\n");
+                        xil_printf("          Do not arm unless it ends 'VERDICT: PASS 9/9'. A '>>>' family line\r\n");
+                        xil_printf("          with no result under it names the family that died silently.\r\n");
+                     }
                      debug_console.subcmd=0;
                      break;
                   case DAUDIO:
@@ -636,6 +1071,8 @@ int debug_thread(struct pt *pt)
                }
             }
             if(command_found==0)
+               command_found=prof_try_explicit_rate(debug_console.cmd_buf);
+            if(command_found==0)
             {
                xil_printf("Unknown command '%s'. Type 'help' or 'h' for help.\r\n",debug_console.cmd_buf);
                debug_console.subcmd=0;
@@ -783,11 +1220,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -847,11 +1280,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -891,11 +1320,7 @@ int debug_thread(struct pt *pt)
             debug_console.cmd=0;
             debug_console.subcmd=0;
             int emu;
-            if(   config.boot_mode==MUSASHI
-               || config.boot_mode==UAE_030
-               || config.boot_mode==UAEJIT_030
-               || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040)
+            if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                emu=1;
             else
                emu=0;
@@ -911,11 +1336,7 @@ int debug_thread(struct pt *pt)
             debug_console.cmd=0;
             debug_console.subcmd=0;
             int emu;
-            if(   config.boot_mode==MUSASHI
-               || config.boot_mode==UAE_030
-               || config.boot_mode==UAEJIT_030
-               || config.boot_mode==UAE_040
-               || config.boot_mode==UAEJIT_040)
+            if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                emu=1;
             else
                emu=0;
@@ -971,11 +1392,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -1027,11 +1444,7 @@ int debug_thread(struct pt *pt)
                debug_console.cmd=0;
                debug_console.subcmd=0;
                int emu;
-               if(   config.boot_mode==MUSASHI
-                  || config.boot_mode==UAE_030
-                  || config.boot_mode==UAEJIT_030
-                  || config.boot_mode==UAE_040
-                  || config.boot_mode==UAEJIT_040)
+               if(boot_mode_is_emulated(config.boot_mode))   // closed real-CPU list; see config_file.h
                   emu=1;
                else
                   emu=0;
@@ -1088,5 +1501,36 @@ void debug_console_help(void)
    xil_printf("'PHD'     or 'PRINT_HIST_DATAABORT' for printing the data abort histogram (EMU only)\r\n");
    xil_printf("'VMR'     or 'VIDEO_MODE_RESET' for reseting vdma\r\n");
    xil_printf("'OVL'     or 'TOGGLE_OVERLAY' for toggling the debug overlay\r\n");
+   xil_printf("'DEMU'    or 'DEBUG EMU' toggles emulator-core debug spam + AMIX strand trace\r\n");
+   xil_printf("'PERF'    or 'PERF REPORT' toggles the 030-MMU instr/sec readout (~1Hz, EMU)\r\n");
+   xil_printf("'SERV'    or 'SERVICE CADENCE' cycles 030-MMU IPL/task poll cadence 1->2->4..64 (EMU)\r\n");
+   xil_printf("'PSTAT'   or 'PISCSI STATS REPORT' toggles the periodic piscsi + core0-loop reports\r\n");
+   xil_printf("'PSTATR'  or 'PISCSI STATS RESET' dumps piscsi cumulative totals + CLMT state, resets\r\n");
+   xil_printf("'PSTATC'  or 'CORE0 LOOP DUMP' dumps per-task core0 loop totals (who blocks, how long)\r\n");
+   xil_printf("'PSTATZ'  or 'CORE0 LOOP ZERO' zeroes the core0 loop totals and worst-call latch\r\n");
+   xil_printf("'PERFS'   or 'PERF STATS' toggles core1 per-instruction perf accounting (EMU)\r\n");
+   xil_printf("'PROBES'  or 'EMU PROBES' toggles the core1 run-loop diagnostic probes (EMU)\r\n");
+   xil_printf("'CSTAT'   or 'CORE0 LOOP STATS' toggles core0 C0STAT span STAMPING (not just printing)\r\n");
+   xil_printf("--- CYBERSTORM C1 interpreter profiler (PROFILING build only; that image says so at boot) ---\r\n");
+   xil_printf("'PROF'    cycles the guest-PC sampler: off -> 250 -> 1000 -> 4000 Hz -> off (arming zeroes the data)\r\n");
+   xil_printf("'PROF <hz>' arms at an EXPLICIT rate, 1..20000 (also zeroes). Prints the wrap-free window\r\n");
+   xil_printf("'PROFO'   or 'PROF OFF' freezes sampler AND buckets and KEEPS the data -- the lossless stop\r\n");
+   xil_printf("'PROFB'   toggles the interpreter STAGE BUCKETS -- costly: read the shares, not the rate\r\n");
+   xil_printf("'PROFD'   dumps stage buckets + counters (~40 lines)\r\n");
+   xil_printf("'PROFR'   dumps the newest 4096 PC samples (~8 s of serial); 'PROF RING' dumps all 65535 (~2 min)\r\n");
+   xil_printf("'PROFZ'   zeroes buckets, counters and the ring without disarming\r\n");
+   xil_printf("'BLK'     or 'BLOCK IDIOM' cycles the C2 block-idiom chunk cap OFF->64->256->1024 (EMU)\r\n");
+   xil_printf("'DOPC'    or 'DECODED OP CACHE' toggles the C2 decoded-op cache ON/OFF (EMU)\r\n");
+   xil_printf("'DFAST'   or 'ACCESSOR FAST PATH' toggles the C2 data-accessor fast path ON/OFF (EMU); OFF is the reference arm\r\n");
+   xil_printf("'WARP'    or 'WARP ENGINE' toggles the WARP block engine ON/OFF (EMU). DEFAULT OFF -- the one knob here\r\n");
+   xil_printf("          whose unset state is OFF; it needs an exact magic to arm and never survives a reboot\r\n");
+   xil_printf("          M1 round 2: generation one compiles MOVE/MOVEA, register ALU, Bcc and DBcc. docs/WARP-ENGINE.md\r\n");
+   xil_printf("'WARPTEST' or 'WARP SELFTEST' runs the ON-TARGET self-test (EMU): compiles real blocks, publishes\r\n");
+   xil_printf("          them, EXECUTES them on this silicon and compares against the same words INTERPRETED.\r\n");
+   xil_printf("          It never arms. NEVER ARM WITHOUT IT: round 2 died four times where the host harness saw\r\n");
+   xil_printf("          nothing, because a harness has no I-cache. Arm only after 'VERDICT: PASS 9/9'\r\n");
+   xil_printf("          config keys prof_hz / prof_buckets arm it from power-on, for profiling the BOOT\r\n");
+   xil_printf("          stop a config-armed capture with 'PROF OFF' -- every rung of the PROF ladder ARMS,\r\n");
+   xil_printf("          and arming zeroes; turn PSTAT OFF before any long dump (both cores share one UART)\r\n");
 }
 #endif

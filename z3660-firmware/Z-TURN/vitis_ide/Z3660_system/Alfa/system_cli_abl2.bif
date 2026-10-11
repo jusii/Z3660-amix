@@ -1,0 +1,18 @@
+/* Z3660 command-line boot image -- WARP DISARM-RESIDUAL ABLATION VARIANT 2.
+ *
+ * Removes: the arm attestation -- provably off the disarmed path, so THIS ONE IS THE NOISE FLOOR
+ *
+ * AN INSTRUMENT, NOT AN IMAGE. docs/WARP-ENGINE.md 0.14.1 is the design and the decision
+ * rule; this variant exists to be booted once beside the shipping lean, measured, and taken
+ * off the card. NOTHING HERE MAY EVER BE LEFT ON A CARD.
+ *
+ * Identical to system_cli_lean.bif except for the core1 ELF: Z3660_emu/build-abl2/.
+ * Produced by `make abl2` -> sd_card/BOOT-abl2.BIN.
+ */
+the_ROM_image:
+{
+  [bootloader] design_1_wrapper/zynq_fsbl/fsbl.elf
+  design_1_wrapper/hw/design_1_wrapper.bit
+  Z3660/build/Z3660.elf
+  Z3660_emu/build-abl2/Z3660_emu.elf
+}

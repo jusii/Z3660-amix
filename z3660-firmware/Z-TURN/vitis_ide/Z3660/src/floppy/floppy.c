@@ -193,13 +193,34 @@ int pifloppy_init(void)
         }
     }
 
+    /* The open and the seek were both unchecked, so a missing or short
+     * z3660_scsi.rom walked process_hunks() into an uninitialised stack FIL and
+     * printed "Unknown hunk type 00000000" -- an alarming line with no bearing on
+     * the extended kickstart loaded a few lines earlier in the boot log, which is
+     * exactly how it was misread during BLIZZARD F0 (2026-08-24). Fail closed and
+     * say which file. NOTE: 0x2600 is this call site's own constant and is NOT
+     * PISCSI_DRIVER_OFFSET (0x1000, scsi.h:74); in the shipped 16 KB image that
+     * offset holds zeros, so the parse has never yielded a reloc. Left as found --
+     * the correct offset is an upstream question, not a guess to make here. */
     FIL in;
-    f_open(&in,DEFAULT_ROOT "z3660_scsi.rom", FA_READ | FA_OPEN_EXISTING);
-
-    f_lseek(&in, 0x2600);
-    int debug=1;
-    process_hunks(&in, &pifloppy_hinfo, pifloppy_hreloc, 0x2600, debug);
-    f_close(&in);
+    FRESULT fr=f_open(&in,DEFAULT_ROOT "z3660_scsi.rom", FA_READ | FA_OPEN_EXISTING);
+    if(fr!=FR_OK)
+    {
+        printf("[PIFLOPPY] Could not open %sz3660_scsi.rom (%d) -- no hunk relocs\n",
+               DEFAULT_ROOT,(int)fr);
+    }
+    else
+    {
+        fr=f_lseek(&in, 0x2600);
+        if(fr!=FR_OK || f_tell(&in)!=0x2600)
+            printf("[PIFLOPPY] z3660_scsi.rom shorter than 0x2600 -- no hunk relocs\n");
+        else
+        {
+            int debug=1;
+            process_hunks(&in, &pifloppy_hinfo, pifloppy_hreloc, 0x2600, debug);
+        }
+        f_close(&in);
+    }
 
     Xil_L1DCacheFlush();
     Xil_L2CacheFlush();
