@@ -217,3 +217,24 @@ never have returned.
 at `floppy.c:206` turns "silence somewhere in a window" into "confirmed hanging in the SD open".
 Deliberately not applied here — it is a firmware change, and the campaign it came from ended with a
 card that had passed its acceptance run.
+
+## 7. `mac_address` with hex letters is misread, and anything keyed on the MAC keys on the misread value
+
+**What happens:** `get_mac_address_type()` (`config_file.c`, upstream and this fork) converts only the
+digits correctly. Upper-case `A`–`E` keep their ASCII value, `F` becomes `0xC9`, and every lower-case
+`a`–`f` becomes `0xA9`. So `mac_address 00:80:1A:01:02:04` comes up on serial as
+`[CFG] Mac Address 00:80:51:01:02:04`, and that is the MAC on the wire and the one `zen0` reports
+(`1A` → 1·16 + 65 = `0x51`). Seen on metal since 2026-09-26, in every boot log of a card configured that way.
+
+**What depends on the misread value:** anything keyed on the card's MAC was keyed on what the card
+actually sends, so on the misread one: a DHCP static lease for the firmware's own web server, and an
+Amix `zen.conf` row that gives `zen0` its address by MAC.
+
+**The fix** is upstream shanshe/Z3660#25 (branch `fix/mac-address-hex`). Once a firmware carrying it
+boots, a card configured `00:80:1A:…` really is `00:80:1A:…`: its web server misses its lease, and
+Amix falls to zen.conf's `default` row with the `S99zen: WARNING`.
+
+**Migration that changes nothing:** before (or with) that firmware, write the MAC the card already
+uses with digits only, here `00:80:51:01:02:04`. Both the old and the fixed parser read that as the
+same bytes, so leases, zen.conf and every installed image stay valid. Keep every `mac_address`
+digits-only for as long as an unfixed firmware may read it.
