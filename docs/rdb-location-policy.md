@@ -2,9 +2,8 @@
 
 **2026-08-25.** BLIZZARD F4-M2 booted a real 68060 with an AMIX root on the piscsi path and
 got `[PISCSI] No RDB found on disk, making up some CHS values.` — no partitions, no boot.
-Evidence: `Amix/tmp/2026-08-25-blizzard-f4m2/` (`SCORESHEET.md` §4, `80-RDB-LBA0-WORKAROUND.txt`,
-serial spans `70-AMIX-BOOT-SPAN.txt` and `82-BOOT2-SPAN.txt`) and, for the measurements below,
-`Amix/tmp/2026-08-25-blizzard-blockerB/`.
+Evidence (held locally): the 2026-08-25 session's scoresheet, the RDB-at-LBA-0 workaround record and
+two serial boot spans, and for the measurements below a second session the same day.
 
 Written pre-registration-style, like `real-cpu-autoconfig-and-ext-rom.md`: the verdicts first,
 then what each rests on, then what is predicted of the change, so a later metal session can

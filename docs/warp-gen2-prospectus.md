@@ -25,14 +25,14 @@ claim:
 
 | source | what it supplies |
 |---|---|
-| `Amix/tmp/2026-08-24-warp-r5-metal/` | the R5 metal session: `R`, the armed and disarmed rows, the six-variant ablation matrix, six boot windows, the armed profiler dump with all 69 counters |
+| the R5 metal session (2026-08-24, evidence held locally) | `R`, the armed and disarmed rows, the six-variant ablation matrix, six boot windows, the armed profiler dump with all 69 counters |
 | `docs/WARP-ENGINE.md` §0.12.3, §0.12.7, §0.14.8 | the corpus method and the band arithmetic, both validated against rows they were not fitted to |
 | `docs/WARP-ENGINE.md` §0.14.3, §0.14.8 | tranche 2's accept set, and the closing statement that names the write-back exclusion as the wall |
 | `docs/WARP-ENGINE.md` §1.5, §0.4.2 | the ~50 % removable base (48.68 – 49.91 %, one capture) and the Amdahl form built on it |
 | `docs/WARP-ENGINE.md` §2a, §2e, §2f, §2g | block boundaries, the bail contract and the write-back exclusion, the invalidation choke point, the cadence contract |
 | `docs/warp-corpus.py --prospectus` | the exclusion histogram, the candidate ladder, the chain measurement, the block-model calibration |
 | `Z3660_emu/src/uae/jit/compemu_arm.h`, `compemu_support_arm.cpp` | the in-tree classic JIT's `dependency`/`deplist` block-linking machinery |
-| `Amix/tmp/2026-08-24-warp-r4/dhry-text.dis` | the corpus disassembly — the AMIX dhrystone binary every WARP row has been measured on (`sum -r 52076`, 8 135 bytes) |
+| the R4 corpus disassembly (evidence held locally) | the corpus disassembly — the AMIX dhrystone binary every WARP row has been measured on (`sum -r 52076`, 8 135 bytes) |
 
 ---
 
@@ -43,7 +43,7 @@ same-session clean-interpreter reference.** Nothing here is derived. It is the a
 priced scenarios are quoted against, and it is presented first so that a projection can never be
 mistaken for it.
 
-**Session:** 2026-08-24, `Amix/tmp/2026-08-24-warp-r5-metal/`, preset 7, `amix_ram 128`,
+**Session:** 2026-08-24 (evidence held locally), preset 7, `amix_ram 128`,
 `service_cadence 4`, installed 040 root, card as found at `F294E75A` and returned to it.
 Benchmark identity verified on the box before the first row: `sum -r 52076`, 8 135 bytes — the
 same binary as every prior WARP row.

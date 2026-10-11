@@ -100,7 +100,7 @@ whole 50–100 range remains as documented above.
 
 ### Fork note (2026-09-27, measured): `monitor_switch` other than 0 hangs the A4000T boot (real 060)
 
-**What happened.** Setting `monitor_switch 34` (SEL + SEL level: the owner's KVM input switch on DB25 pin 13; SEL low
+**What happened.** Setting `monitor_switch 34` (SEL + SEL level: the KVM input switch on DB25 pin 13; SEL low
 selects the RTG, measured) hung the firmware boot on an A4000T with a real 68LC060 in **4 of 4 cold boots**.
 
 **Where it hangs.** `monitor_switch(1)` (`Z3660/src/main.c:817`) is first called at `main.c:1579`, **while the FPGA is
@@ -113,7 +113,7 @@ held in reset** (`DiscreteSet(REG0, FPGA_RESET)` just before). It goes over the 
 
 Upstream's A4000D context works; the A4000T's bus is not available at that point.
 
-**Not the pin load.** The owner removed the parallel cable, and the hang did not change. So it is the CIA
+**Not the pin load.** The parallel cable was removed, and the hang did not change. So it is the CIA
 access itself, not the load on SEL.
 
 **Root cause (found while fixing, 2026-09-27).** `main.c` declared the byte accessors with the core1 emulator's
@@ -206,7 +206,7 @@ id 0 as the last device, termination on.
 - DiagROM boots on the real 060.
 - The A4000T 47.115 Kickstart does **not** boot. It is black from the first frame, with chips whose content was
   verified correct by an ARM-side dump, and also with `ext_kickstart 0`.
-- Owner decision (2026-10-03): on the A4000T, Kickstart always comes from the Z3660. The socket question is parked
+- Decision (2026-10-03): on the A4000T, Kickstart always comes from the Z3660. The socket question is parked
   as a board-side issue (chip speed/type and a bus trace are the open leads).
 
 **Not yet proven:** that the 710's data DMA lands in the Z3660 DDR. That needs DNAD sampled during a transfer. The

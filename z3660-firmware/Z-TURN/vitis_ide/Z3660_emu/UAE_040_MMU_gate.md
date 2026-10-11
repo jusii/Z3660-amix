@@ -151,7 +151,7 @@ NOT done (out of this step's scope):
 - The Amiga-side ZTop and on-board ARM ZTop UI lists still show the old modes
   (their `NUM_BOOT_MODE_LABELS` is separate) — a later UI-threading item.
 
-## 4. Metal MMU-off smoke recipe (orchestrator-driven)
+## 4. Metal MMU-off smoke recipe
 
 Proves the 68040 interpreter runs real code on hardware, MMU disabled (no AMIX
 needed). FAILSAFE-protected; restore production afterwards.

@@ -456,7 +456,7 @@ the MMU lineage traces to WinUAE 2.6.0 ("Amix … fully working").
 
 **Fast path (skip the multi-hour install):** the "Noth" pre-installed image
 `basicamixX11R4.tbz2` (https://ftp2.grandis.nu/turran/FTP/Misc/AMIX/Noth/) boots
-directly; login `guest` (no password), root password `wasp`.
+directly; login `guest` (no password), or root with the image's root password.
 
 **Config (the load-bearing part — also the spec for the Z3660 `UAE_030_MMU` mode):**
 - Machine: **A3000** (NOT A4000 — the 040/060 MMU is a different, AMIX-incompatible MMU). 68030 only.
