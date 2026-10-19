@@ -27,7 +27,7 @@ extern int eth_backlog_nag_counter_max;
 void piscsi_stats_toggle(void);
 void piscsi_stats_dump(void);
 int  piscsi_stats_reporting(void);
-/* core0 cooperative-loop per-task duration accounting */
+#include "eth_prof.h"   /* the ethernet frame-path profile (ESTAT); next: core0 cooperative-loop per-task duration accounting */
 #include "core0_stats.h"
 /* CYBERSTORM C1: the profiler command word core0 writes into SHARED.prof_ctl. */
 #include "prof_config.h"
@@ -115,7 +115,7 @@ typedef enum {
    /* WARP ENGINE round 3: the ON-TARGET SELF-TEST. It does not arm and cannot -- it writes
     * a SECOND magic to the same mailbox word and z3660_warp_resolve() returns 0 for it.
     * APPEND-ONLY. */
-   WARPTEST, WARP_SELFTEST,
+   WARPTEST, WARP_SELFTEST, EP_COMMANDS
 
    NUM_COMMANDS
 } COMMANDS;
@@ -181,7 +181,7 @@ const char *command_names[] = {
       "DOPC",    "DECODED OP CACHE",
       "DFAST",   "ACCESSOR FAST PATH",
       "WARP",    "WARP ENGINE",
-      "WARPTEST","WARP SELFTEST",
+      "WARPTEST","WARP SELFTEST", EP_COMMAND_NAMES
 };
 /* Tripwire: command_names[] is indexed by COMMANDS. A new enum entry with no matching
  * string shifts every command after it -- typing one name would run a different one. */
@@ -549,7 +549,7 @@ int debug_thread(struct pt *pt)
                   case CORE0_LOOP_ZERO:
                      core0_stats_zero();         // zero core0 cumulative totals + worst-ever latch
                      debug_console.subcmd=0;
-                     break;
+                     break; EP_COMMAND_CASES
                   /* CYBERSTORM C1 profiler (core1). Every one of these is a WRITE to the
                    * cross-core command word; core1 consumes it in do_specialties(), so it
                    * costs nothing per emulated instruction and arrives within an

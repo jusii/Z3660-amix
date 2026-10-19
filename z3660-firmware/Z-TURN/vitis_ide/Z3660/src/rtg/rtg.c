@@ -579,7 +579,7 @@ int rtg_thread(struct pt *pt)
    while(1)
    {
 
-      PT_WAIT_UNTIL(pt,((gpio=read_reg_s01(REG1))&0xC0000000)!=0);
+      PT_WAIT_UNTIL(pt,((gpio=read_reg_s01(REG1))&0xC0000000)!=0); EP_T(ep_td); EP_DECL(int,ep_reg,ep_reg_idx(gpio));
       if((gpio&0x80000000)!=0) //write
       {
          if((gpio&0xF80000)==0xF80000)
@@ -739,7 +739,7 @@ int rtg_thread(struct pt *pt)
          dsb();
          ack_request=1;
       }
-
+      EP_T(ep_th);
       if(ack_request==1)
       {
 //#define PROFILE_ACK_REQUEST // suggested by A4000Rebirth
@@ -749,7 +749,7 @@ int rtg_thread(struct pt *pt)
    XTime_GetTime(&start);
 #endif
 //         DiscreteSet(REG0,READ_WRITE_ACK);
-         int32_t rw_no_ack_cached=read_reg_s01(REG0);
+         int32_t rw_no_ack_cached=read_reg_s01(REG0); EP_DECL(uint32_t,ep_spins,0);
          int32_t rw_ack_cached=rw_no_ack_cached|READ_WRITE_ACK;
          dsb();
          write_reg_s01(REG0,rw_ack_cached);
@@ -764,7 +764,7 @@ int rtg_thread(struct pt *pt)
             dsb();
             write_reg_s01(REG0,rw_no_ack_cached);
             dsb();
-            write_reg_s01(REG0,rw_ack_cached);
+            write_reg_s01(REG0,rw_ack_cached); EP_DO(ep_spins++);
             dsb();
 #ifdef PROFILE_ACK_REQUEST
             cnt++;
@@ -776,7 +776,7 @@ int rtg_thread(struct pt *pt)
 //         DiscreteClear(REG0,READ_WRITE_ACK);
          write_reg_s01(REG0,rw_no_ack_cached);
          dsb();
-         ack_request=0;
+         ack_request=0; EP_DO(ep_ack_done(ep_reg,ep_td,ep_th,ep_spins));
 #ifdef PROFILE_ACK_REQUEST
          XTime_GetTime(&end);
          XTime d = (end - start) / (1100/2); // 1100 ARM at 1100 MHz
@@ -838,13 +838,13 @@ uint32_t read_rtg_register(uint32_t zaddr)
          data=revision_alfa;
          //      printf("Read alfa version number: %d\n",revision_alfa);
          break;
-      case REG_ZZ_ETH_TX:
+      case REG_ZZ_ETH_TX: { EP_T(ep_h);
          data=ethernet_send_result;
-         break;
-      case REG_ZZ_ETH_RX_ADDRESS: {
+         EP_END(EP_H_TX_R,ep_h); break; }
+      case REG_ZZ_ETH_RX_ADDRESS: { EP_T(ep_h);
          //      data=RX_BACKLOG_ADDRESS+(frfb<<11); // <<11 = 2048 (FRAME_SIZE)
          data=(uint32_t)ethernet_current_receive_ptr();
-         break;
+         EP_END(EP_H_RXA_R,ep_h); break;
       }
       case REG_ZZ_AUDIO_SWAB:
          data=audio_buffer_collision;
@@ -1124,7 +1124,7 @@ void write_rtg_register(uint32_t zaddr,uint32_t zdata)
             }
          } else {
             //printf("[enable] eth: %d\n", (int)zdata);
-            interrupt_enabled_ethernet = zdata & 1;
+            interrupt_enabled_ethernet = zdata & 1; EP_CNT(ien_writes);
 
             if (!interrupt_enabled_ethernet) {
                amiga_interrupt_clear(AMIGA_INTERRUPT_ETH);
@@ -1567,13 +1567,13 @@ debug_printf("framebuffer %lX\n",(uint32_t)video_state->framebuffer);
          break;
 
          // Ethernet
-      case REG_ZZ_ETH_TX:
+      case REG_ZZ_ETH_TX: { EP_T(ep_h);
          ethernet_send_result = ethernet_send_frame(zdata);
          //            printf("SEND frame sz: %ld res: %ld\n",zdata,ethernet_send_result);
-         break;
-      case REG_ZZ_ETH_RX: {
+         EP_END(EP_H_TX_W,ep_h); break; }
+      case REG_ZZ_ETH_RX: { EP_T(ep_h);
          //            printf("RECV eth frame sz: %ld\n",zdata);
-         frfb = ethernet_receive_frame();
+         frfb = ethernet_receive_frame(); EP_END(EP_H_RX_W,ep_h);
          //            printf("REG_ZZ_ETH_RX_ADDRESS=0x%08x\n",RX_BACKLOG_ADDRESS+(frfb<<11));
          //            mntzorro_write(MNTZ_BASE_ADDR, MNTZORRO_REG4, frfb);
          if(0)

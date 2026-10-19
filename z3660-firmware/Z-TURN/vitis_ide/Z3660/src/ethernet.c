@@ -87,6 +87,11 @@ static volatile uint32_t frames_received = 0;
 static volatile uint16_t frames_backlog = 0;
 int frames_received_from_backlog = 0;
 
+#if ETH_PROF
+static void ep_release(int slot);
+static void ep_tx_end(int rc, XTime t0, XTime t3, uint32_t sleeps);
+#endif
+
 #define ETH_PHY_TYPE_MICREL    0
 #define ETH_PHY_TYPE_MOTORCOMM 1
 static int eth_phy_type_ = ETH_PHY_TYPE_MICREL;
@@ -432,6 +437,7 @@ static void xEmacPsSendHandler(void *Callback)
    XEmacPs_Bd *BdTxPtr;
    //XEmacPs *EmacPsInstancePtr = (XEmacPs *) Callback;
    XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
+   EP_T(ep_ta);
 
    uint32_t status = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_TXSR_OFFSET);
    XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_TXSR_OFFSET, status);
@@ -465,8 +471,10 @@ static void xEmacPsSendHandler(void *Callback)
 
       XEmacPs_BdSetStatus(BdTxPtr, XEMACPS_TXBUF_USED_MASK); // XEMACPS_TXBUF_WRAP_MASK
 
+      EP_DO(if(eth_prof.t_xmit && eth_prof_on) ep_acc(EP_TX_DONE, ep_now()-eth_prof.t_xmit); eth_prof.t_xmit=0);
       FramesTx++;
    }
+   EP_END(EP_TX_ISR,ep_ta);
 }
 
 #define XEMACPS_BD_TO_INDEX(ringptr, bdptr) \
@@ -515,8 +523,11 @@ static void xEmacPsRecvHandler(void *Callback)
 
    XEmacPs_BdRing* rxring = &(XEmacPs_GetRxRing(EmacPsInstancePtr));
    XEmacPs_Bd* rxbdset, *cur_bd_ptr;
+   EP_T(ep_ra);
 
    num_rx_bufs = XEmacPs_BdRingFromHwRx(rxring, RXBD_CNT, &rxbdset);
+   EP_DO(eth_prof.rx_calls++; if(num_rx_bufs<=0) eth_prof.rx_bufs0++; else eth_prof.rx_frames+=num_rx_bufs;
+         if(num_rx_bufs>(int)eth_prof.rx_bufs_max) eth_prof.rx_bufs_max=num_rx_bufs);
 
    // we immediately process the incoming frame.
    // main task will then signal the Amiga via interrupt
@@ -549,7 +560,9 @@ static void xEmacPsRecvHandler(void *Callback)
          if (frames_backlog<FRAME_MAX_BACKLOG) {
             // copy the frame to the backlog (frames that amiga hasn't fetched yet)
             uint8_t* frame_bl_ptr = (uint8_t*)(RTG_BASE+RX_BACKLOG_ADDRESS+frames_backlog*FRAME_SIZE);
+            EP_T(ep_ca);
             memcpy(frame_bl_ptr+RX_FRAME_PAD, frame_ptr, rx_bytes);
+            EP_END(EP_RX_COPY,ep_ca);
             if(rx_bytes>FRAME_SIZE)
                printf("rx_bytes>FRAME_SIZE!!! <--------------------");
 //            printf("f_s %d rx_b %d fb %d\n",frame_serial,rx_bytes,frames_backlog);
@@ -559,12 +572,15 @@ static void xEmacPsRecvHandler(void *Callback)
             *(frame_bl_ptr+2) = (frame_serial&0xff00)>>8;
             *(frame_bl_ptr+3) = (frame_serial&0xff);
 
+            EP_DO(eth_prof.t_slot[frames_backlog] = eth_prof_on ? ep_now() : 0);
             frames_backlog++;
+            EP_DO(if(frames_backlog>eth_prof.bl_max) eth_prof.bl_max=frames_backlog);
 
             DEBUG_ETHERNET("bd %ld [%d] copied from %p to %p\n", bd_idx, rx_bytes, frame_ptr, frame_bl_ptr);
          } else {
             if(interrupt_enabled_ethernet)
                DEBUG_ETHERNET("EMAC: frames_backlog full\n");
+            EP_DO(eth_prof.bl_full++; eth_prof.bl_full_lost += frames_backlog - frames_received_from_backlog + 1);
             frames_backlog = 0;
             frames_received_from_backlog = 0;
 
@@ -589,7 +605,11 @@ static void xEmacPsRecvHandler(void *Callback)
    }
 
    status = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_RXSR_OFFSET);
+   EP_DO(eth_prof.rxsr_or |= status; if(status&XEMACPS_RXSR_BUFFNA_MASK) eth_prof.rxsr_buffna++;
+         if(status&XEMACPS_RXSR_RXOVR_MASK) eth_prof.rxsr_rxovr++; if(status&XEMACPS_RXSR_HRESPNOK_MASK) eth_prof.rxsr_hresp++;
+         if(status&XEMACPS_RXSR_FRAMERX_MASK) eth_prof.rxsr_framerx++);
    XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_RXSR_OFFSET, status);
+   EP_END(EP_RX_ISR,ep_ra);
 }
 
 volatile uint8_t* ethernet_current_receive_ptr() {
@@ -614,6 +634,7 @@ int ethernet_receive_frame() {
    printf("\n==========================================\n");
     */
    if (frames_backlog>0) {
+      EP_DO(ep_release(frames_received_from_backlog));
       frames_received_from_backlog++;
       if (frames_received_from_backlog >= frames_backlog) {
          // start over
@@ -671,18 +692,22 @@ static void xEmacPsErrorHandler(void *Callback, uint8_t Direction, uint32_t Erro
 {
    (void)Callback;
    //XEmacPs *EmacPsInstancePtr = (XEmacPs *) Callback;
+   EP_T(ep_ea);
 
    DeviceErrors++;
 
    switch (Direction) {
    case XEMACPS_RECV:
       if (ErrorWord & XEMACPS_RXSR_HRESPNOK_MASK) {
+         EP_CNT(hrespnok);
          printf("EMAC: Receive DMA error\n");
       }
       if (ErrorWord & XEMACPS_RXSR_RXOVR_MASK) {
+         EP_CNT(rxovr);
          DEBUG_ETHERNET("EMAC: Receive over run\n");
       }
       if (ErrorWord & XEMACPS_RXSR_BUFFNA_MASK) {
+         EP_CNT(buffna);
          printf("EMAC: Receive buffer not available\n");
          // signal to host that frames are available
          frames_dropped++;
@@ -722,6 +747,7 @@ static void xEmacPsErrorHandler(void *Callback, uint8_t Direction, uint32_t Erro
    if (GemVersion == 2) {
       //EmacPsResetDevice(EmacPsInstancePtr);
    }
+   EP_END(EP_ERR_ISR,ep_ea);
 }
 
 uint32_t xEmacPsDetectPHY(XEmacPs * EmacPsInstancePtr)
@@ -1027,8 +1053,10 @@ static LONG emacPsSetupIntrSystem(XEmacPs *EmacPsInstancePtr, uint16_t EmacPsInt
 uint16_t ethernet_send_frame(uint16_t frame_size) {
    XEmacPs* EmacPsInstancePtr = &EmacPsInstance;
    XEmacPs_Bd *BdTxPtr;
+   EP_T(ep_t0);
 
    if (ethernet_task_state != ETH_TASK_READY) {
+      EP_DO(ep_tx_end(1,ep_t0,0,0));
       return(1);
    }
 
@@ -1037,6 +1065,8 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
 //   Xil_DCacheInvalidateRange((UINTPTR)TxFrame, sizeof(EthernetFrame));
    Xil_L1DCacheFlushRange((UINTPTR)TxFrame, sizeof(EthernetFrame));
    Xil_L2CacheFlushRange((UINTPTR)TxFrame, sizeof(EthernetFrame));
+   EP_T(ep_t1);
+   EP_SPAN(EP_TX_FLUSH,ep_t0,ep_t1);
 
    //   printf("ethernet_send_frame: %lu %d\n",old_frames_tx,frame_size);
    /*
@@ -1054,6 +1084,7 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
 
       // lets unstick this
       //init_ethernet_buffers();
+      EP_DO(ep_tx_end(2,ep_t0,0,0));
       return(2);
    }
 
@@ -1066,13 +1097,17 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
 
    if (Status != XST_SUCCESS) {
       printf("ERROR: BdRingToHw error: %ld\n",Status);
+      EP_DO(ep_tx_end(3,ep_t0,0,0));
       return(3);
    }
 
    //   Xil_L1DCacheFlushRange((UINTPTR)BdTxPtr, 128);
    //   Xil_L2CacheFlushRange((UINTPTR)BdTxPtr, 128);
 
+   EP_DO(eth_prof.t_xmit = eth_prof_on ? ep_now() : 0);
    XEmacPs_Transmit(EmacPsInstancePtr);
+   EP_T(ep_t2);
+   EP_SPAN(EP_TX_QUEUE,ep_t1,ep_t2);
 
    DEBUG_ETHERNET("FramesTx:%ld\n",FramesTx);
    DEBUG_ETHERNET("BdTxPtr:0x%08lx\n",(uint32_t)BdTxPtr);
@@ -1084,12 +1119,16 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
       if (counter>10) {
          printf("ERROR: timeout in ethernet_send_frame waiting for tx!\n");
          //init_ethernet_buffers();
+         EP_DO(ep_tx_end(4,ep_t0,0,counter));
          return(4);
       }
    }
+   EP_T(ep_t3);
+   EP_SPAN(EP_TX_WAIT,ep_t2,ep_t3);
    DEBUG_ETHERNET("frame %ld transmitted!\n",FramesTx);
 
    // all good
+   EP_DO(ep_tx_end(0,ep_t0,ep_t3,counter));
    return(0);
 }
 
@@ -1211,3 +1250,107 @@ void FixEthernetPLLDivisors_z3660()
 }
 
 
+
+#if ETH_PROF
+/* ---- the ethernet frame-path profile (eth_prof.h) ---------------------------------------------------------------- */
+#ifndef ETH_PROF_REF
+#define ETH_PROF_REF 0   /* the build's git commit, short hash as a number (CDEFS -DETH_PROF_REF=0x...) */
+#endif
+extern uint32_t counts_per_second;   /* the live ARM clock / 2 (main.c) */
+ETH_PROF_T eth_prof;
+int eth_prof_on = 1;
+
+static const char *const ep_names[EP_NUM] = {
+   "TX_TOTAL", "TX_FLUSH", "TX_QUEUE", "TX_WAIT", "TX_TAIL", "TX_DONE", "TX_ISR",
+   "RX_ISR", "RX_COPY", "RX_RES", "ERR_ISR",
+   "H_TX_W", "H_TX_R", "H_RX_W", "H_RXA_R",
+   "A_TX_W_SVC", "A_TX_W_ACK", "A_TX_R_SVC", "A_TX_R_ACK", "A_RX_W_SVC", "A_RX_W_ACK", "A_RXA_R_SVC", "A_RXA_R_ACK",
+   "A_OTHER", "LOOP_PASS",
+};
+static const uint32_t ep_gem_off[8] = {
+   XEMACPS_TXCNT_OFFSET, XEMACPS_RXCNT_OFFSET, XEMACPS_RXFCSCNT_OFFSET, XEMACPS_RXRESERRCNT_OFFSET,
+   XEMACPS_RXORCNT_OFFSET, XEMACPS_RXALIGNCNT_OFFSET, XEMACPS_RXUNDRCNT_OFFSET, XEMACPS_RXOVRCNT_OFFSET,
+};
+static const char *const ep_gem_names[8] = { "tx", "rx", "fcs", "reserr", "overrun", "align", "undersize", "oversize" };
+
+static uint32_t ep_ns(uint64_t t) { return (uint32_t)(t * 1000000000ull / counts_per_second); }
+/* ETH_RX released backlog slot `slot`: its residence since the frame was copied in */
+static void ep_release(int slot)
+{
+   if(!eth_prof_on || slot < 0 || slot >= EP_SLOTS || !eth_prof.t_slot[slot]) return;
+   XTime d = ep_now() - eth_prof.t_slot[slot];
+   eth_prof.t_slot[slot] = 0;
+   ep_acc(EP_RX_RES, d);
+   uint32_t ms = (uint32_t)(d * 1000ull / counts_per_second);
+   eth_prof.res_ms[ms < EP_RES_MS ? ms : EP_RES_MS - 1]++;
+}
+static void ep_tx_end(int rc, XTime t0, XTime t3, uint32_t sleeps)
+{
+   eth_prof.tx_rc[rc < EP_TX_RCS ? rc : EP_TX_RCS - 1]++;
+   if(rc == 0 || rc == 4) eth_prof.tx_sleeps[sleeps < EP_TX_SLEEPS ? sleeps : EP_TX_SLEEPS - 1]++;
+   if(!eth_prof_on || !t0) return;
+   XTime t4 = ep_now();
+   if(t3) ep_acc(EP_TX_TAIL, t4 - t3);
+   ep_acc(EP_TX_TOTAL, t4 - t0);
+}
+static uint32_t ep_stamp_cost(void)   /* one XTime_GetTime, best of 64 */
+{
+   XTime a, b, best = ~0ull;
+   for(int i = 0; i < 64; i++) { XTime_GetTime(&a); XTime_GetTime(&b); if(b - a < best) best = b - a; }
+   return ep_ns(best);
+}
+static void ep_gem_read(void)
+{
+   for(int i = 0; i < 8; i++) eth_prof.gem[i] += XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, ep_gem_off[i]);
+}
+void eth_prof_zero(void)
+{
+   memset(&eth_prof, 0, sizeof eth_prof);
+   ep_gem_read();
+   memset(eth_prof.gem, 0, sizeof eth_prof.gem);   /* the GEM counters clear on read: this read started the window */
+   eth_prof.t_zero = ep_now();
+   printf("[ESTAT] zeroed; stamps %s\n", eth_prof_on ? "ON" : "OFF");
+}
+void eth_prof_toggle(void)
+{
+   eth_prof_on = !eth_prof_on;
+   printf("[ESTAT] stamps %s (EPROF); counts that need no timer read keep counting\n", eth_prof_on ? "ON" : "OFF");
+}
+void eth_prof_dump(void)
+{
+   XTime now = ep_now();
+   ep_gem_read();
+   printf("[ESTAT] eth-profile ref %07lx cps %lu stamp %lu ns window %lu ms stamps %s ien %d ien_writes %lu\n",
+          (unsigned long)ETH_PROF_REF, (unsigned long)counts_per_second, (unsigned long)ep_stamp_cost(),
+          (unsigned long)((now - eth_prof.t_zero) * 1000ull / counts_per_second), eth_prof_on ? "ON" : "OFF",
+          interrupt_enabled_ethernet, (unsigned long)eth_prof.ien_writes);
+   printf("[ESTAT] row n avg_ns max_ns sum_us max_counts\n");
+   for(int i = 0; i < EP_NUM; i++) {
+      const EP_ACC *a = &eth_prof.acc[i];
+      printf("[ESTAT] %-12s %lu %lu %lu %lu %lu\n", ep_names[i], (unsigned long)a->n,
+             (unsigned long)(a->n ? ep_ns(a->sum / a->n) : 0), (unsigned long)ep_ns(a->max),
+             (unsigned long)(a->sum * 1000000ull / counts_per_second), (unsigned long)a->max);
+   }
+   printf("[ESTAT] tx_sleeps");
+   for(int i = 0; i < EP_TX_SLEEPS; i++) printf(" %lu", (unsigned long)eth_prof.tx_sleeps[i]);
+   printf("\n[ESTAT] tx_rc");
+   for(int i = 0; i < EP_TX_RCS; i++) printf(" %lu", (unsigned long)eth_prof.tx_rc[i]);
+   printf("\n[ESTAT] rx_res_ms");
+   for(int i = 0; i < EP_RES_MS; i++) printf(" %lu", (unsigned long)eth_prof.res_ms[i]);
+   printf("\n[ESTAT] loop_pass_us<1,2,4..1024,>=1024");
+   for(int i = 0; i < EP_PASS_BUCKETS; i++) printf(" %lu", (unsigned long)eth_prof.pass_hist[i]);
+   printf("\n[ESTAT] rx calls %lu frames %lu bufs0 %lu bufs_max %lu backlog_max %lu backlog_full %lu lost_by_full %lu\n",
+          (unsigned long)eth_prof.rx_calls, (unsigned long)eth_prof.rx_frames, (unsigned long)eth_prof.rx_bufs0,
+          (unsigned long)eth_prof.rx_bufs_max, (unsigned long)eth_prof.bl_max, (unsigned long)eth_prof.bl_full,
+          (unsigned long)eth_prof.bl_full_lost);
+   printf("[ESTAT] err buffna %lu rxovr %lu hrespnok %lu; rxsr_or %02lx buffna %lu rxovr %lu hresp %lu framerx %lu; ack_spins_max %lu\n",
+          (unsigned long)eth_prof.buffna, (unsigned long)eth_prof.rxovr, (unsigned long)eth_prof.hrespnok,
+          (unsigned long)eth_prof.rxsr_or, (unsigned long)eth_prof.rxsr_buffna, (unsigned long)eth_prof.rxsr_rxovr,
+          (unsigned long)eth_prof.rxsr_hresp, (unsigned long)eth_prof.rxsr_framerx, (unsigned long)eth_prof.ack_spins_max);
+   printf("[ESTAT] gem");
+   for(int i = 0; i < 8; i++) printf(" %s %lu", ep_gem_names[i], (unsigned long)eth_prof.gem[i]);
+   printf("\n[ESTAT] fw FramesTx %lu frames_received %lu frame_serial %u backlog %u fetched %d DeviceErrors %ld frames_dropped %d\n",
+          (unsigned long)FramesTx, (unsigned long)frames_received, (unsigned)frame_serial, (unsigned)frames_backlog,
+          frames_received_from_backlog, (long)DeviceErrors, frames_dropped);
+}
+#endif /* ETH_PROF */

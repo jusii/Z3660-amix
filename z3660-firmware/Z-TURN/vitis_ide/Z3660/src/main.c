@@ -1940,11 +1940,13 @@ int main()
    // Wait a bit and check USB interrupt status AFTER starting 060
    xc3_usleep(10000); // Give 060 time to start
 //   check_usb_interrupt_status("After 060 startup");
+   EP_DECL(static XTime, ep_last_pass, 0);   /* the ethernet profile: one real-CPU loop pass (eth_prof.h) */
    while(1)
    {
       switch(state68k)
       {
       case M68K_RUNNING: {
+         EP_DO(ep_pass(&ep_last_pass));
          {
             static int debug_thread_counter=0;
             debug_thread_counter++;
@@ -1974,6 +1976,7 @@ int main()
          break;
       }
       case M68K_RESET: {
+         EP_DO(ep_last_pass=0);
          int long_reset=0;
          while(XGpioPs_ReadPin(&GpioPs, n040RSTI)==0)
          {

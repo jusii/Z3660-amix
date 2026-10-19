@@ -24,6 +24,8 @@
 #ifndef ETHERNET_H_
 #define ETHERNET_H_
 
+#include "eth_prof.h"
+
 int ethernet_init();
 uint16_t ethernet_send_frame(uint16_t frame_size);
 int ethernet_receive_frame();
