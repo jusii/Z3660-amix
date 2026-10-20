@@ -57,7 +57,20 @@ void DEBUG_ETHERNET(const char *format, ...)
 
 #define FRAME_MAX_BACKLOG 64
 
+/* ETH_RXRING N (build flag, default 0): N RX descriptors instead of one. A 1514 B frame lasts 121 us on the wire at
+   100 Mbit and the ISR + copy takes about 26 us, so one descriptor only loses frames when the ISR is held off; N of
+   them bridge N frame times of IRQ latency. N buffers of FRAME_SIZE must fit RX_FRAME_ADDRESS..USB_DATA (64 KiB). */
+#ifndef ETH_RXRING
+#define ETH_RXRING 0
+#endif
+#if ETH_RXRING
+#define RXBD_CNT       ETH_RXRING
+#if RXBD_CNT * FRAME_SIZE > 0x10000
+#error "ETH_RXRING: the RX buffers overrun RX_FRAME_ADDRESS's 64 KiB"
+#endif
+#else
 #define RXBD_CNT       1   /* Number of RxBDs to use */
+#endif
 #define TXBD_CNT       4   /* Number of TxBDs to use */
 
 // could also be 55, 77 (eth1), see interrupts.pdf last page
@@ -508,6 +521,9 @@ void ethernet_alloc_rx_frames() {
       }
    }
 
+#if ETH_RXRING
+   __asm__ volatile ("dsb sy" ::: "memory");   // the cleared RxNew bits are out before the GEM looks again
+#endif
    if (!free_bds) {
       printf("EMAC: no BDs free for allocation\n");
    }
@@ -525,7 +541,15 @@ static void xEmacPsRecvHandler(void *Callback)
    XEmacPs_Bd* rxbdset, *cur_bd_ptr;
    EP_T(ep_ra);
 
+#if ETH_RXRING
+   // While the ring is full the BSP returns one BD per call (HwTail == HwHead), so drain until it returns none;
+   // each pass frees and re-arms what it took, as lwIP's xemacpsif does.
+   int isr_frames = 0;
+   while ((num_rx_bufs = XEmacPs_BdRingFromHwRx(rxring, RXBD_CNT, &rxbdset)) > 0) {
+   isr_frames += num_rx_bufs;
+#else
    num_rx_bufs = XEmacPs_BdRingFromHwRx(rxring, RXBD_CNT, &rxbdset);
+#endif
    EP_DO(eth_prof.rx_calls++; if(num_rx_bufs<=0) eth_prof.rx_bufs0++; else eth_prof.rx_frames+=num_rx_bufs;
          if(num_rx_bufs>(int)eth_prof.rx_bufs_max) eth_prof.rx_bufs_max=num_rx_bufs);
 
@@ -586,7 +610,11 @@ static void xEmacPsRecvHandler(void *Callback)
 
          }
 
+#if !ETH_RXRING
          XEmacPs_BdClearRxNew(cur_bd_ptr);
+#endif
+         // (ring: the BD goes back to the GEM only in ethernet_alloc_rx_frames, after BdRingFree; clearing RxNew
+         // here would let the GEM refill it before the re-arm clears RxNew again and drops that frame)
          cur_bd_ptr = XEmacPs_BdRingNext(rxring, cur_bd_ptr);
 
          frames_received++;
@@ -603,6 +631,11 @@ static void xEmacPsRecvHandler(void *Callback)
 
       DEBUG_ETHERNET("EMAC: backlog %d fetched %d\n", frames_backlog, frames_received_from_backlog);
    }
+#if ETH_RXRING
+   }
+   (void)isr_frames;
+   EP_DO(eth_prof.rx_isr++; if(!isr_frames) eth_prof.rx_isr0++; if(isr_frames>(int)eth_prof.rx_isr_max) eth_prof.rx_isr_max=isr_frames);
+#endif
 
    status = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_RXSR_OFFSET);
    EP_DO(eth_prof.rxsr_or |= status; if(status&XEMACPS_RXSR_BUFFNA_MASK) eth_prof.rxsr_buffna++;
@@ -1339,6 +1372,10 @@ void eth_prof_dump(void)
    for(int i = 0; i < EP_RES_MS; i++) printf(" %lu", (unsigned long)eth_prof.res_ms[i]);
    printf("\n[ESTAT] loop_pass_us<1,2,4..1024,>=1024");
    for(int i = 0; i < EP_PASS_BUCKETS; i++) printf(" %lu", (unsigned long)eth_prof.pass_hist[i]);
+#if ETH_RXRING
+   printf("\n[ESTAT] ring %d isr %lu isr0 %lu isr_frames_max %lu",
+          RXBD_CNT, (unsigned long)eth_prof.rx_isr, (unsigned long)eth_prof.rx_isr0, (unsigned long)eth_prof.rx_isr_max);
+#endif
    printf("\n[ESTAT] rx calls %lu frames %lu bufs0 %lu bufs_max %lu backlog_max %lu backlog_full %lu lost_by_full %lu\n",
           (unsigned long)eth_prof.rx_calls, (unsigned long)eth_prof.rx_frames, (unsigned long)eth_prof.rx_bufs0,
           (unsigned long)eth_prof.rx_bufs_max, (unsigned long)eth_prof.bl_max, (unsigned long)eth_prof.bl_full,

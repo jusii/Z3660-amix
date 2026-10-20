@@ -70,6 +70,7 @@ typedef struct {
    uint32_t buffna, rxovr, hrespnok;       /* the error handler's RXSR bits */
    uint32_t rxsr_or, rxsr_buffna, rxsr_rxovr, rxsr_hresp, rxsr_framerx;   /* RXSR as the recv handler read it */
    uint32_t rx_calls, rx_bufs0, rx_bufs_max, rx_frames, bl_max;
+   uint32_t rx_isr, rx_isr0, rx_isr_max;      /* ETH_RXRING: recv handler entries, those with no frame, most frames drained in one */
    uint32_t ien_writes;                    /* writes to the ethernet interrupt enable */
    uint64_t gem[8];                        /* the GEM statistics, summed over ESTAT reads since ESTATZ */
    XTime t_zero, t_xmit;
