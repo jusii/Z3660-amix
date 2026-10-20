@@ -115,6 +115,7 @@ int frames_received_from_backlog = 0;
 #if ETH_PROF
 static void ep_release(int slot);
 static void ep_tx_end(int rc, XTime t0, XTime t3, uint32_t sleeps);
+static void ep_nwctrl_seen(uint32_t nc);
 #endif
 
 #define ETH_PHY_TYPE_MICREL    0
@@ -1158,6 +1159,7 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
    //   Xil_L2CacheFlushRange((UINTPTR)BdTxPtr, 128);
 
    EP_DO(eth_prof.t_xmit = eth_prof_on ? ep_now() : 0);
+   EP_DO(ep_nwctrl_seen(XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_NWCTRL_OFFSET)));
    XEmacPs_Transmit(EmacPsInstancePtr);
    EP_T(ep_t2);
    EP_SPAN(EP_TX_QUEUE,ep_t1,ep_t2);
@@ -1324,6 +1326,16 @@ static const char *const ep_names[EP_NUM] = {
    "A_TX_W_SVC", "A_TX_W_ACK", "A_TX_R_SVC", "A_TX_R_ACK", "A_RX_W_SVC", "A_RX_W_ACK", "A_RXA_R_SVC", "A_RXA_R_ACK",
    "A_OTHER", "LOOP_PASS", "V_ISR", "V_FLUSH_L1", "V_FLUSH_L2", "AUD_ISR", "SCSI_INV", "SCSI_FLUSH",
 };
+/* NWCTRL's self-clearing action bits: stats clear/inc (5, 6), tx start/halt (9, 10), pause / zero-quantum pause (11, 12),
+   PFC pause (17), flush next RX DPRAM packet (18). A read-modify-write that reads one back set re-issues it. */
+#define EP_NWCTRL_ACTION 0x00061E60u
+static void ep_nwctrl_seen(uint32_t nc)
+{
+   if(!eth_prof.tx_nwctrl_n++) eth_prof.tx_nwctrl_and = nc; else eth_prof.tx_nwctrl_and &= nc;
+   eth_prof.tx_nwctrl_or |= nc;
+   if(nc & EP_NWCTRL_ACTION) eth_prof.tx_nwctrl_action++;
+   if(nc & XEMACPS_NWCTRL_FLUSH_DPRAM_MASK) eth_prof.tx_nwctrl_flush++;
+}
 static const char *const ep_src_names[EP_SRC_N] = { "video", "audio", "gemtx", "gemerr", "txflush", "scsi-inv", "scsi-flush" };
 /* the first 8 are the "gem" line as before; the rest print as "gemx" */
 static const uint32_t ep_gem_off[EP_GEM_N] = {
@@ -1444,6 +1456,16 @@ void eth_prof_dump(void)
              (unsigned long)((nwcfg & XEMACPS_NWCFG_RXCHKSUMEN_MASK) != 0), (unsigned long)((nwcfg & XEMACPS_NWCFG_PAUSEEN_MASK) != 0),
              pri[EMACPS_IRPT_INTR], tgt[EMACPS_IRPT_INTR], pri[INT_INTERRUPT_ID_0], tgt[INT_INTERRUPT_ID_0],
              pri[INT_INTERRUPT_ID_1], tgt[INT_INTERRUPT_ID_1]);
+   }
+   {
+      uint32_t b = EmacPsInstance.Config.BaseAddress;
+      printf("\n[ESTAT] regs nwctrl %08lx nwsr %08lx isr %08lx imr %08lx rxsr %08lx txsr %08lx dmacr %08lx | tx-time nwctrl n %lu or %08lx and %08lx action %lu flush %lu",
+             (unsigned long)XEmacPs_ReadReg(b, XEMACPS_NWCTRL_OFFSET), (unsigned long)XEmacPs_ReadReg(b, XEMACPS_NWSR_OFFSET),
+             (unsigned long)XEmacPs_ReadReg(b, XEMACPS_ISR_OFFSET), (unsigned long)XEmacPs_ReadReg(b, XEMACPS_IMR_OFFSET),
+             (unsigned long)XEmacPs_ReadReg(b, XEMACPS_RXSR_OFFSET), (unsigned long)XEmacPs_ReadReg(b, XEMACPS_TXSR_OFFSET),
+             (unsigned long)XEmacPs_ReadReg(b, XEMACPS_DMACR_OFFSET),
+             (unsigned long)eth_prof.tx_nwctrl_n, (unsigned long)eth_prof.tx_nwctrl_or, (unsigned long)eth_prof.tx_nwctrl_and,
+             (unsigned long)eth_prof.tx_nwctrl_action, (unsigned long)eth_prof.tx_nwctrl_flush);
    }
    if(PhyAddr < 32) {
       /* the PHY over MDIO (console context; no ISR uses MDIO). YT8531S 0x11: speed 15:14, duplex 13, resolved 11,

@@ -95,6 +95,7 @@ typedef struct {
    uint32_t win_src, win_last_src; XTime win_dur, win_exit, win_last_exit;
    uint32_t bunch_n, bunch_unattr, bunch_by_longest[EP_SRC_N], bunch_by_last[EP_SRC_N];
    XTime bunch_gap_max, bunch_longest_max;
+   uint32_t tx_nwctrl_n, tx_nwctrl_or, tx_nwctrl_and, tx_nwctrl_action, tx_nwctrl_flush;   /* NWCTRL as XEmacPs_Transmit reads it back */
    uint32_t scsi_inv_len_max, scsi_flush_len_max;   /* the longest piscsi transfer each range call covered, bytes */
    XTime t_zero, t_xmit;
    XTime t_slot[EP_SLOTS];
