@@ -1368,10 +1368,14 @@ static const uint32_t ep_gem_off[EP_GEM_N] = {
    XEMACPS_RXLENGTHCNT_OFFSET, XEMACPS_RXJABCNT_OFFSET, XEMACPS_RXPAUSECNT_OFFSET, XEMACPS_TXPAUSECNT_OFFSET,
    XEMACPS_TXURUNCNT_OFFSET, XEMACPS_SNGLCOLLCNT_OFFSET, XEMACPS_MULTICOLLCNT_OFFSET, XEMACPS_EXCESSCOLLCNT_OFFSET,
    XEMACPS_LATECOLLCNT_OFFSET, XEMACPS_TXDEFERCNT_OFFSET, XEMACPS_TXCSENSECNT_OFFSET,
+   XEMACPS_OCTRXL_OFFSET, XEMACPS_OCTRXH_OFFSET,   /* low word first: the TRM asks bits 31:0 be read before 47:32 */
+   XEMACPS_RXBROADCNT_OFFSET, XEMACPS_RXMULTICNT_OFFSET, XEMACPS_RX64CNT_OFFSET, XEMACPS_RX65CNT_OFFSET,
+   XEMACPS_RX128CNT_OFFSET, XEMACPS_RX256CNT_OFFSET, XEMACPS_RX512CNT_OFFSET, XEMACPS_RX1024CNT_OFFSET,
 };
 static const char *const ep_gem_names[EP_GEM_N] = { "tx", "rx", "fcs", "reserr", "overrun", "align", "undersize", "oversize",
    "ipcsum", "tcpcsum", "udpcsum", "symbol", "length", "jabber", "rxpause", "txpause",
-   "txurun", "coll1", "collm", "collx", "colllate", "defer", "csense" };
+   "txurun", "coll1", "collm", "collx", "colllate", "defer", "csense",
+   "octets_lo", "octets_hi", "bcast", "mcast", "f64", "f65", "f128", "f256", "f512", "f1024" };
 
 static uint32_t ep_ns(uint64_t t) { return (uint32_t)(t * 1000000000ull / counts_per_second); }
 /* ETH_RX released backlog slot `slot`: its residence since the frame was copied in */

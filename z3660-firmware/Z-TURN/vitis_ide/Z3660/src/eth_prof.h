@@ -69,7 +69,7 @@ typedef enum { EP_SRC_VIDEO, EP_SRC_AUDIO, EP_SRC_GEMTX, EP_SRC_GEMERR, EP_SRC_T
                EP_SRC_N } EP_SRC;
 #define EP_BUNCH         3
 #define EP_ISR_BUCKETS   6   /* < 50, 200, 500, 1000, 2000, >= 2000 us */
-#define EP_GEM_N        23
+#define EP_GEM_N        33
 
 #define EP_TX_SLEEPS    12   /* usleep(100) iterations per frame, 0..11 */
 #define EP_TX_RCS        5   /* ethernet_send_frame return codes 0..4 */
