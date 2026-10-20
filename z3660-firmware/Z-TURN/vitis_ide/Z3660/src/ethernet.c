@@ -68,6 +68,13 @@ void DEBUG_ETHERNET(const char *format, ...)
 #if RXBD_CNT * FRAME_SIZE > 0x10000
 #error "ETH_RXRING: the RX buffers overrun RX_FRAME_ADDRESS's 64 KiB"
 #endif
+// The backlog region ends where TX_FRAME_ADDRESS begins (32 slots). 64 slots overran it into the TX frame (slots
+// 32-47) and the RX buffers (48-63); one RxBD hid that, the ring fills it under AmigaOS. Full -> reset, as before.
+#undef FRAME_MAX_BACKLOG
+#define FRAME_MAX_BACKLOG 32
+#if FRAME_MAX_BACKLOG * FRAME_SIZE > TX_FRAME_ADDRESS - RX_BACKLOG_ADDRESS
+#error "ETH_RXRING: FRAME_MAX_BACKLOG overruns the RX backlog region"
+#endif
 #else
 #define RXBD_CNT       1   /* Number of RxBDs to use */
 #endif
