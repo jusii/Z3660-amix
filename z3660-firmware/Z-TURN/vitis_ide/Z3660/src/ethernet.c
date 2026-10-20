@@ -60,6 +60,11 @@ void DEBUG_ETHERNET(const char *format, ...)
 /* ETH_RXRING N (build flag, default 0): N RX descriptors instead of one. A 1514 B frame lasts 121 us on the wire at
    100 Mbit and the ISR + copy takes about 26 us, so one descriptor only loses frames when the ISR is held off; N of
    them bridge N frame times of IRQ latency. N buffers of FRAME_SIZE must fit RX_FRAME_ADDRESS..USB_DATA (64 KiB). */
+/* ETH_ADV1000 (build flag, default 0): the OS-time PHY setup advertises 1000BASE-T as well as 10/100 (the boot menu's
+   lwIP path links at 1000 on the same RGMII); step2 then sets the GEM speed and clocks from the resolved link. */
+#ifndef ETH_ADV1000
+#define ETH_ADV1000 0
+#endif
 #ifndef ETH_RXRING
 #define ETH_RXRING 0
 #endif
@@ -940,7 +945,11 @@ void micrel_auto_negotiate(XEmacPs *xemacpsp, uint32_t phy_addr, int eth_phy_typ
 
       // register 9, disable 1000base-t
       XEmacPs_PhyRead(xemacpsp, phy_addr, IEEE_1000BASET_CONTROL_REG, &control);
+#if ETH_ADV1000
+      control |= ADVERTISE_1000;   // advertise 1000 as well: 10/100 stay advertised and autonegotiation picks
+#else
       control &= ~(1<<9 | 1<<8);
+#endif
       XEmacPs_PhyWrite(xemacpsp, phy_addr, IEEE_1000BASET_CONTROL_REG,control);
    } else if (link_speed == 1000) {
       // register 0: 1000 mbit
