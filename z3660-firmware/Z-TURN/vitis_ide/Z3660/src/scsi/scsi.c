@@ -26,6 +26,7 @@ _Static_assert(RDB_SCAN_IDENTIFIER == RDB_IDENTIFIER, "rdb_scan id != RDB_IDENTI
 #include "../debug_console.h"
 #include "../cpu_emulator.h"
 #include "../core0_stats.h"
+#include "../eth_prof.h"
 
 extern CONFIG config;
 #define BE(val) be32toh(val)
@@ -1442,7 +1443,11 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
           * post-transfer invalidate then covers lines speculatively re-fetched while
           * the DMA ran. */
          PS_M();
+         EP_T(ep_si);
          Xil_DCacheInvalidateRange((INTPTR)map, piscsi_u32_read[1]);
+         EP_END(EP_SCSI_INV,ep_si);
+         EP_DO(ep_src_done(EP_SRC_SCSIINV,ep_si);
+               if(piscsi_u32_read[1]>eth_prof.scsi_inv_len_max) eth_prof.scsi_inv_len_max=piscsi_u32_read[1]);
          PS_CACHE();
          if(d->fd>(FIL *)1)
          {
@@ -1610,7 +1615,11 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
           * STALE DRAM bytes on the disk. Clean the range through L1+L2 to DRAM
           * first so the DMA reads exactly what the guest wrote. */
          PS_M();
+         EP_T(ep_sf);
          Xil_DCacheFlushRange((INTPTR)map, piscsi_u32_write[1]);
+         EP_END(EP_SCSI_FLUSH,ep_sf);
+         EP_DO(ep_src_done(EP_SRC_SCSIFLUSH,ep_sf);
+               if(piscsi_u32_write[1]>eth_prof.scsi_flush_len_max) eth_prof.scsi_flush_len_max=piscsi_u32_write[1]);
          PS_CACHE();
          if(d->fd>(FIL *)1)
          {

@@ -1313,9 +1313,9 @@ static const char *const ep_names[EP_NUM] = {
    "RX_ISR", "RX_COPY", "RX_RES", "ERR_ISR",
    "H_TX_W", "H_TX_R", "H_RX_W", "H_RXA_R",
    "A_TX_W_SVC", "A_TX_W_ACK", "A_TX_R_SVC", "A_TX_R_ACK", "A_RX_W_SVC", "A_RX_W_ACK", "A_RXA_R_SVC", "A_RXA_R_ACK",
-   "A_OTHER", "LOOP_PASS", "V_ISR", "V_FLUSH_L1", "V_FLUSH_L2", "AUD_ISR",
+   "A_OTHER", "LOOP_PASS", "V_ISR", "V_FLUSH_L1", "V_FLUSH_L2", "AUD_ISR", "SCSI_INV", "SCSI_FLUSH",
 };
-static const char *const ep_src_names[EP_SRC_N] = { "video", "audio", "gemtx", "gemerr", "txflush" };
+static const char *const ep_src_names[EP_SRC_N] = { "video", "audio", "gemtx", "gemerr", "txflush", "scsi-inv", "scsi-flush" };
 /* the first 8 are the "gem" line as before; the rest print as "gemx" */
 static const uint32_t ep_gem_off[EP_GEM_N] = {
    XEMACPS_TXCNT_OFFSET, XEMACPS_RXCNT_OFFSET, XEMACPS_RXFCSCNT_OFFSET, XEMACPS_RXRESERRCNT_OFFSET,
@@ -1411,6 +1411,8 @@ void eth_prof_dump(void)
    for(int i = 0; i < 8; i++) printf(" %s %lu", ep_gem_names[i], (unsigned long)eth_prof.gem[i]);
    printf("\n[ESTAT] gemx");
    for(int i = 8; i < EP_GEM_N; i++) printf(" %s %lu", ep_gem_names[i], (unsigned long)eth_prof.gem[i]);
+   printf("\n[ESTAT] scsi inv_len_max %lu flush_len_max %lu", (unsigned long)eth_prof.scsi_inv_len_max,
+          (unsigned long)eth_prof.scsi_flush_len_max);
    printf("\n[ESTAT] isr_hist_us<50,200,500,1000,2000,>=2000");
    for(int s = 0; s < EP_SRC_N; s++) {
       printf(" %s", ep_src_names[s]);

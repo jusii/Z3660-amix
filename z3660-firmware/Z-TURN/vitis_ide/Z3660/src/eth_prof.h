@@ -58,12 +58,15 @@ typedef enum {
    EP_V_FLUSH_L1,    /* handle_cache_flush: the whole-L1 flush */
    EP_V_FLUSH_L2,    /* handle_cache_flush: the whole-L2 clean+invalidate by way */
    EP_AUD_ISR,       /* isr_audio_tx, whole */
+   EP_SCSI_INV,      /* piscsi read: Xil_DCacheInvalidateRange over the transfer (IRQs masked) */
+   EP_SCSI_FLUSH,    /* piscsi write: Xil_DCacheFlushRange over the transfer (IRQs masked) */
    EP_NUM
 } EP_ID;
 
 /* Sources that run with IRQs masked on core0, for the RX-bunch attribution: the ISRs, and the TX path's L1+L2 range
    flush (the BSP range functions mask IRQs). A bunch is an RX handler entry that drains >= EP_BUNCH frames. */
-typedef enum { EP_SRC_VIDEO, EP_SRC_AUDIO, EP_SRC_GEMTX, EP_SRC_GEMERR, EP_SRC_TXFLUSH, EP_SRC_N } EP_SRC;
+typedef enum { EP_SRC_VIDEO, EP_SRC_AUDIO, EP_SRC_GEMTX, EP_SRC_GEMERR, EP_SRC_TXFLUSH, EP_SRC_SCSIINV, EP_SRC_SCSIFLUSH,
+               EP_SRC_N } EP_SRC;
 #define EP_BUNCH         3
 #define EP_ISR_BUCKETS   6   /* < 50, 200, 500, 1000, 2000, >= 2000 us */
 #define EP_GEM_N        23
@@ -92,6 +95,7 @@ typedef struct {
    uint32_t win_src, win_last_src; XTime win_dur, win_exit, win_last_exit;
    uint32_t bunch_n, bunch_unattr, bunch_by_longest[EP_SRC_N], bunch_by_last[EP_SRC_N];
    XTime bunch_gap_max, bunch_longest_max;
+   uint32_t scsi_inv_len_max, scsi_flush_len_max;   /* the longest piscsi transfer each range call covered, bytes */
    XTime t_zero, t_xmit;
    XTime t_slot[EP_SLOTS];
 } ETH_PROF_T;
