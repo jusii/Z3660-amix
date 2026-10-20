@@ -1436,6 +1436,19 @@ void eth_prof_dump(void)
              pri[EMACPS_IRPT_INTR], tgt[EMACPS_IRPT_INTR], pri[INT_INTERRUPT_ID_0], tgt[INT_INTERRUPT_ID_0],
              pri[INT_INTERRUPT_ID_1], tgt[INT_INTERRUPT_ID_1]);
    }
+   if(PhyAddr < 32) {
+      /* the PHY over MDIO (console context; no ISR uses MDIO). YT8531S 0x11: speed 15:14, duplex 13, resolved 11,
+         link 10; 0x15: its RX error counter. BMSR (1) is read twice: latched, then current. */
+      static const uint8_t regs[] = { 0, 1, 1, 4, 5, 6, 9, 10, 0x11, 0x15 };
+      uint16_t v[sizeof regs];
+      for(unsigned i = 0; i < sizeof regs; i++) XEmacPs_PhyRead(&EmacPsInstance, PhyAddr, regs[i], &v[i]);
+      printf("\n[ESTAT] phy addr %lu", (unsigned long)PhyAddr);
+      for(unsigned i = 0; i < sizeof regs; i++) printf(" r%02x %04x", regs[i], v[i]);
+      uint16_t s = v[8], sp = (s >> 14) & 3;
+      printf(" | speed %s duplex %s resolved %d link %d rxerr %u | lp %04x aner %04x lp_an %d pdf %d",
+             sp == 2 ? "1000" : sp == 1 ? "100" : sp == 0 ? "10" : "?", (s & (1 << 13)) ? "full" : "half",
+             (s >> 11) & 1, (s >> 10) & 1, v[9], v[4], v[5], v[5] & 1, (v[5] >> 4) & 1);
+   }
    printf("\n[ESTAT] fw FramesTx %lu frames_received %lu frame_serial %u backlog %u fetched %d DeviceErrors %ld frames_dropped %d\n",
           (unsigned long)FramesTx, (unsigned long)frames_received, (unsigned)frame_serial, (unsigned)frames_backlog,
           frames_received_from_backlog, (long)DeviceErrors, frames_dropped);
