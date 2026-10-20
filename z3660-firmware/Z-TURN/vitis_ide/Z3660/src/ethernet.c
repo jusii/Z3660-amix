@@ -62,6 +62,19 @@ void DEBUG_ETHERNET(const char *format, ...)
    them bridge N frame times of IRQ latency. N buffers of FRAME_SIZE must fit RX_FRAME_ADDRESS..USB_DATA (64 KiB). */
 /* ETH_ADV1000 (build flag, default 0): the OS-time PHY setup advertises 1000BASE-T as well as 10/100 (the boot menu's
    lwIP path links at 1000 on the same RGMII); step2 then sets the GEM speed and clocks from the resolved link. */
+/* ETH_NWCTRL_FIXED (build flag, default 0): start each transmit by writing NWCTRL from the value captured after
+   XEmacPs_Start (self-clearing action bits masked) | TSTART, instead of XEmacPs_Transmit's read-modify-write, so an
+   action bit that reads back set (flush_next_rx_dpram, pause) is never re-issued by a transmit. */
+#ifndef ETH_NWCTRL_FIXED
+#define ETH_NWCTRL_FIXED 0
+#endif
+#if ETH_NWCTRL_FIXED
+static uint32_t eth_nwctrl_cfg;
+#define ETH_NWCTRL_CAPTURE() (eth_nwctrl_cfg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET) \
+                              & ~(XEMACPS_NWCTRL_FLUSH_DPRAM_MASK | XEMACPS_NWCTRL_PAUSETX_MASK | XEMACPS_NWCTRL_HALTTX_MASK \
+                                  | XEMACPS_NWCTRL_STARTTX_MASK | XEMACPS_NWCTRL_STATINC_MASK | XEMACPS_NWCTRL_STATCLR_MASK \
+                                  | 0x00021000u))
+#endif
 #ifndef ETH_ADV1000
 #define ETH_ADV1000 0
 #endif
@@ -272,6 +285,9 @@ int init_ethernet_buffers() {
    }
 
    XEmacPs_Start(EmacPsInstancePtr);
+#if ETH_NWCTRL_FIXED
+   ETH_NWCTRL_CAPTURE();
+#endif
    printf("EMAC: XEmacPs_Start done.\n");
 
    return(XST_SUCCESS);
@@ -734,6 +750,9 @@ void ethernet_update_mac_address() {
    }
 
    XEmacPs_Start(EmacPsInstancePtr);
+#if ETH_NWCTRL_FIXED
+   ETH_NWCTRL_CAPTURE();
+#endif
 }
 
 static void xEmacPsErrorHandler(void *Callback, uint8_t Direction, uint32_t ErrorWord)
@@ -1160,7 +1179,11 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
 
    EP_DO(eth_prof.t_xmit = eth_prof_on ? ep_now() : 0);
    EP_DO(ep_nwctrl_seen(XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_NWCTRL_OFFSET)));
+#if ETH_NWCTRL_FIXED
+   XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_NWCTRL_OFFSET, eth_nwctrl_cfg | XEMACPS_NWCTRL_STARTTX_MASK);
+#else
    XEmacPs_Transmit(EmacPsInstancePtr);
+#endif
    EP_T(ep_t2);
    EP_SPAN(EP_TX_QUEUE,ep_t1,ep_t2);
 
