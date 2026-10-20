@@ -495,6 +495,7 @@ static void xEmacPsSendHandler(void *Callback)
       FramesTx++;
    }
    EP_END(EP_TX_ISR,ep_ta);
+   EP_DO(ep_src_done(EP_SRC_GEMTX,ep_ta));
 }
 
 #define XEMACPS_BD_TO_INDEX(ringptr, bdptr) \
@@ -642,6 +643,7 @@ static void xEmacPsRecvHandler(void *Callback)
    }
    (void)isr_frames;
    EP_DO(eth_prof.rx_isr++; if(!isr_frames) eth_prof.rx_isr0++; if(isr_frames>(int)eth_prof.rx_isr_max) eth_prof.rx_isr_max=isr_frames);
+   EP_DO(ep_rx_window(isr_frames,ep_ra));
 #endif
 
    status = XEmacPs_ReadReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_RXSR_OFFSET);
@@ -788,6 +790,7 @@ static void xEmacPsErrorHandler(void *Callback, uint8_t Direction, uint32_t Erro
       //EmacPsResetDevice(EmacPsInstancePtr);
    }
    EP_END(EP_ERR_ISR,ep_ea);
+   EP_DO(ep_src_done(EP_SRC_GEMERR,ep_ea));
 }
 
 uint32_t xEmacPsDetectPHY(XEmacPs * EmacPsInstancePtr)
@@ -1107,6 +1110,7 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
    Xil_L2CacheFlushRange((UINTPTR)TxFrame, sizeof(EthernetFrame));
    EP_T(ep_t1);
    EP_SPAN(EP_TX_FLUSH,ep_t0,ep_t1);
+   EP_DO(ep_src_done(EP_SRC_TXFLUSH,ep_t0));
 
    //   printf("ethernet_send_frame: %lu %d\n",old_frames_tx,frame_size);
    /*
@@ -1297,6 +1301,10 @@ void FixEthernetPLLDivisors_z3660()
 #define ETH_PROF_REF 0   /* the build's git commit, short hash as a number (CDEFS -DETH_PROF_REF=0x...) */
 #endif
 extern uint32_t counts_per_second;   /* the live ARM clock / 2 (main.c) */
+#include "video.h"
+#include "config_file.h"
+extern ZZ_VIDEO_STATE vs;
+extern int interrupt_enabled_audio, interrupt_enabled_audio_fake;
 ETH_PROF_T eth_prof;
 int eth_prof_on = 1;
 
@@ -1305,13 +1313,21 @@ static const char *const ep_names[EP_NUM] = {
    "RX_ISR", "RX_COPY", "RX_RES", "ERR_ISR",
    "H_TX_W", "H_TX_R", "H_RX_W", "H_RXA_R",
    "A_TX_W_SVC", "A_TX_W_ACK", "A_TX_R_SVC", "A_TX_R_ACK", "A_RX_W_SVC", "A_RX_W_ACK", "A_RXA_R_SVC", "A_RXA_R_ACK",
-   "A_OTHER", "LOOP_PASS",
+   "A_OTHER", "LOOP_PASS", "V_ISR", "V_FLUSH_L1", "V_FLUSH_L2", "AUD_ISR",
 };
-static const uint32_t ep_gem_off[8] = {
+static const char *const ep_src_names[EP_SRC_N] = { "video", "audio", "gemtx", "gemerr", "txflush" };
+/* the first 8 are the "gem" line as before; the rest print as "gemx" */
+static const uint32_t ep_gem_off[EP_GEM_N] = {
    XEMACPS_TXCNT_OFFSET, XEMACPS_RXCNT_OFFSET, XEMACPS_RXFCSCNT_OFFSET, XEMACPS_RXRESERRCNT_OFFSET,
    XEMACPS_RXORCNT_OFFSET, XEMACPS_RXALIGNCNT_OFFSET, XEMACPS_RXUNDRCNT_OFFSET, XEMACPS_RXOVRCNT_OFFSET,
+   XEMACPS_RXIPCCNT_OFFSET, XEMACPS_RXTCPCCNT_OFFSET, XEMACPS_RXUDPCCNT_OFFSET, XEMACPS_RXSYMBCNT_OFFSET,
+   XEMACPS_RXLENGTHCNT_OFFSET, XEMACPS_RXJABCNT_OFFSET, XEMACPS_RXPAUSECNT_OFFSET, XEMACPS_TXPAUSECNT_OFFSET,
+   XEMACPS_TXURUNCNT_OFFSET, XEMACPS_SNGLCOLLCNT_OFFSET, XEMACPS_MULTICOLLCNT_OFFSET, XEMACPS_EXCESSCOLLCNT_OFFSET,
+   XEMACPS_LATECOLLCNT_OFFSET, XEMACPS_TXDEFERCNT_OFFSET, XEMACPS_TXCSENSECNT_OFFSET,
 };
-static const char *const ep_gem_names[8] = { "tx", "rx", "fcs", "reserr", "overrun", "align", "undersize", "oversize" };
+static const char *const ep_gem_names[EP_GEM_N] = { "tx", "rx", "fcs", "reserr", "overrun", "align", "undersize", "oversize",
+   "ipcsum", "tcpcsum", "udpcsum", "symbol", "length", "jabber", "rxpause", "txpause",
+   "txurun", "coll1", "collm", "collx", "colllate", "defer", "csense" };
 
 static uint32_t ep_ns(uint64_t t) { return (uint32_t)(t * 1000000000ull / counts_per_second); }
 /* ETH_RX released backlog slot `slot`: its residence since the frame was copied in */
@@ -1341,7 +1357,7 @@ static uint32_t ep_stamp_cost(void)   /* one XTime_GetTime, best of 64 */
 }
 static void ep_gem_read(void)
 {
-   for(int i = 0; i < 8; i++) eth_prof.gem[i] += XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, ep_gem_off[i]);
+   for(int i = 0; i < EP_GEM_N; i++) eth_prof.gem[i] += XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, ep_gem_off[i]);
 }
 void eth_prof_zero(void)
 {
@@ -1393,6 +1409,31 @@ void eth_prof_dump(void)
           (unsigned long)eth_prof.rxsr_hresp, (unsigned long)eth_prof.rxsr_framerx, (unsigned long)eth_prof.ack_spins_max);
    printf("[ESTAT] gem");
    for(int i = 0; i < 8; i++) printf(" %s %lu", ep_gem_names[i], (unsigned long)eth_prof.gem[i]);
+   printf("\n[ESTAT] gemx");
+   for(int i = 8; i < EP_GEM_N; i++) printf(" %s %lu", ep_gem_names[i], (unsigned long)eth_prof.gem[i]);
+   printf("\n[ESTAT] isr_hist_us<50,200,500,1000,2000,>=2000");
+   for(int s = 0; s < EP_SRC_N; s++) {
+      printf(" %s", ep_src_names[s]);
+      for(int b = 0; b < EP_ISR_BUCKETS; b++) printf(" %lu", (unsigned long)eth_prof.isr_hist[s][b]);
+   }
+   printf("\n[ESTAT] bunch>=%d n %lu unattr %lu longest_max %lu us gap_max %lu us by_longest", EP_BUNCH,
+          (unsigned long)eth_prof.bunch_n, (unsigned long)eth_prof.bunch_unattr,
+          (unsigned long)(ep_ns(eth_prof.bunch_longest_max) / 1000), (unsigned long)(ep_ns(eth_prof.bunch_gap_max) / 1000));
+   for(int s = 0; s < EP_SRC_N; s++) printf(" %s %lu", ep_src_names[s], (unsigned long)eth_prof.bunch_by_longest[s]);
+   printf(" by_last");
+   for(int s = 0; s < EP_SRC_N; s++) printf(" %s %lu", ep_src_names[s], (unsigned long)eth_prof.bunch_by_last[s]);
+   {
+      volatile uint8_t *pri = (volatile uint8_t *)0xF8F01400, *tgt = (volatile uint8_t *)0xF8F01800;   /* GIC ICDIPR / ICDIPTR */
+      uint32_t nwcfg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_NWCFG_OFFSET);
+      printf("\n[ESTAT] state boot_mode %d video_mode %d colormode %d fb %lux%lu size %lu audio_ien %d audio_fake %d eth_ien %d"
+             " nwcfg %08lx fden %lu rxcsum %lu pauseen %lu gic pri/tgt gem %02x/%02x video %02x/%02x audio %02x/%02x",
+             config.boot_mode, (int)vs.video_mode, (int)vs.colormode, (unsigned long)vs.vmode_hsize, (unsigned long)vs.vmode_vsize,
+             (unsigned long)vs.framebuffer_size, interrupt_enabled_audio, interrupt_enabled_audio_fake, interrupt_enabled_ethernet,
+             (unsigned long)nwcfg, (unsigned long)((nwcfg & XEMACPS_NWCFG_FDEN_MASK) != 0),
+             (unsigned long)((nwcfg & XEMACPS_NWCFG_RXCHKSUMEN_MASK) != 0), (unsigned long)((nwcfg & XEMACPS_NWCFG_PAUSEEN_MASK) != 0),
+             pri[EMACPS_IRPT_INTR], tgt[EMACPS_IRPT_INTR], pri[INT_INTERRUPT_ID_0], tgt[INT_INTERRUPT_ID_0],
+             pri[INT_INTERRUPT_ID_1], tgt[INT_INTERRUPT_ID_1]);
+   }
    printf("\n[ESTAT] fw FramesTx %lu frames_received %lu frame_serial %u backlog %u fetched %d DeviceErrors %ld frames_dropped %d\n",
           (unsigned long)FramesTx, (unsigned long)frames_received, (unsigned)frame_serial, (unsigned)frames_backlog,
           frames_received_from_backlog, (long)DeviceErrors, frames_dropped);

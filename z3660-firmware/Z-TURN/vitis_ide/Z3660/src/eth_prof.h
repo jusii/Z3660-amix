@@ -51,8 +51,20 @@ typedef enum {
    EP_A_RXA_R_SVC, EP_A_RXA_R_ACK,
    EP_A_OTHER,       /* every other register-page access: detection -> ack done */
    EP_LOOP_PASS,     /* one pass of the real-CPU main loop (main.c): the bound on how long a held 060 cycle waits */
+   /* the core0 ISRs that can hold the GEM RX ISR off (handlers do not nest) */
+   EP_V_ISR,         /* isr_video, whole */
+   EP_V_FLUSH_L1,    /* handle_cache_flush: the whole-L1 flush */
+   EP_V_FLUSH_L2,    /* handle_cache_flush: the whole-L2 clean+invalidate by way */
+   EP_AUD_ISR,       /* isr_audio_tx, whole */
    EP_NUM
 } EP_ID;
+
+/* Sources that run with IRQs masked on core0, for the RX-bunch attribution: the ISRs, and the TX path's L1+L2 range
+   flush (the BSP range functions mask IRQs). A bunch is an RX handler entry that drains >= EP_BUNCH frames. */
+typedef enum { EP_SRC_VIDEO, EP_SRC_AUDIO, EP_SRC_GEMTX, EP_SRC_GEMERR, EP_SRC_TXFLUSH, EP_SRC_N } EP_SRC;
+#define EP_BUNCH         3
+#define EP_ISR_BUCKETS   6   /* < 50, 200, 500, 1000, 2000, >= 2000 us */
+#define EP_GEM_N        23
 
 #define EP_TX_SLEEPS    12   /* usleep(100) iterations per frame, 0..11 */
 #define EP_TX_RCS        5   /* ethernet_send_frame return codes 0..4 */
@@ -72,7 +84,12 @@ typedef struct {
    uint32_t rx_calls, rx_bufs0, rx_bufs_max, rx_frames, bl_max;
    uint32_t rx_isr, rx_isr0, rx_isr_max;      /* ETH_RXRING: recv handler entries, those with no frame, most frames drained in one */
    uint32_t ien_writes;                    /* writes to the ethernet interrupt enable */
-   uint64_t gem[8];                        /* the GEM statistics, summed over ESTAT reads since ESTATZ */
+   uint64_t gem[EP_GEM_N];                 /* the GEM statistics, summed over ESTAT reads since ESTATZ */
+   uint32_t isr_hist[EP_SRC_N][EP_ISR_BUCKETS];
+   /* the window since the previous RX handler entry: the longest masked source in it, and the last one */
+   uint32_t win_src, win_last_src; XTime win_dur, win_exit, win_last_exit;
+   uint32_t bunch_n, bunch_unattr, bunch_by_longest[EP_SRC_N], bunch_by_last[EP_SRC_N];
+   XTime bunch_gap_max, bunch_longest_max;
    XTime t_zero, t_xmit;
    XTime t_slot[EP_SLOTS];
 } ETH_PROF_T;
@@ -89,6 +106,34 @@ static inline void ep_acc(int id, XTime d)
    if(v > a->max) a->max = v;
 }
 
+/* a masked source ran from t0 to now: its histogram, and the RX window's longest and last */
+static inline void ep_src_done(int src, XTime t0)
+{
+   if(!eth_prof_on || !t0) return;
+   extern uint32_t counts_per_second;
+   XTime t = ep_now(), d = t - t0;
+   uint32_t us = (uint32_t)(d * 1000000ull / counts_per_second), b;
+   b = us < 50 ? 0 : us < 200 ? 1 : us < 500 ? 2 : us < 1000 ? 3 : us < 2000 ? 4 : 5;
+   eth_prof.isr_hist[src][b]++;
+   if(d > eth_prof.win_dur) { eth_prof.win_dur = d; eth_prof.win_src = src; eth_prof.win_exit = t; }
+   eth_prof.win_last_src = src; eth_prof.win_last_exit = t;
+}
+/* RX handler entry t_in drained `frames`: attribute a bunch to the window's longest and last source, then reset */
+static inline void ep_rx_window(int frames, XTime t_in)
+{
+   if(!eth_prof_on || !t_in) return;
+   if(frames >= EP_BUNCH) {
+      eth_prof.bunch_n++;
+      if(!eth_prof.win_dur) eth_prof.bunch_unattr++;
+      else {
+         eth_prof.bunch_by_longest[eth_prof.win_src]++; eth_prof.bunch_by_last[eth_prof.win_last_src]++;
+         if(eth_prof.win_dur > eth_prof.bunch_longest_max) eth_prof.bunch_longest_max = eth_prof.win_dur;
+         if(t_in > eth_prof.win_exit && t_in - eth_prof.win_exit > eth_prof.bunch_gap_max)
+            eth_prof.bunch_gap_max = t_in - eth_prof.win_exit;
+      }
+   }
+   eth_prof.win_dur = 0; eth_prof.win_exit = 0; eth_prof.win_last_exit = 0;
+}
 /* rtg_thread (real CPU): which row an access belongs to. The driver's four: 0x190 W, 0x190 R, 0x194 W, 0x1A4 R;
    -1 = any other access (A_OTHER) */
 static inline int ep_reg_idx(uint32_t gpio)

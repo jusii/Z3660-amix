@@ -9,6 +9,7 @@
 #include "xtime_l.h"
 #include <math.h>
 #include "ax.h"
+#include "eth_prof.h"
 
 #include "debug_console.h"
 #include "rtg/gfx.h"
@@ -122,6 +123,7 @@ volatile int audio_local_interrput=0;
 // audio formatter interrupt, triggered whenever a period is completed
 void isr_audio_tx(void *dummy) {
    (void)dummy;
+   EP_T(ep_au);
    uint32_t val = XAudioFormatter_ReadReg(XPAR_XAUDIOFORMATTER_0_BASEADDR, XAUD_FORMATTER_STS + XAUD_FORMATTER_MM2S_OFFSET);
    val |= (1<<31); // clear irq
    XAudioFormatter_WriteReg(XPAR_XAUDIOFORMATTER_0_BASEADDR, XAUD_FORMATTER_STS + XAUD_FORMATTER_MM2S_OFFSET, val);
@@ -151,6 +153,8 @@ void isr_audio_tx(void *dummy) {
       last_time = current_time;
 */
    }
+   EP_END(EP_AUD_ISR,ep_au);
+   EP_DO(ep_src_done(EP_SRC_AUDIO,ep_au));
 }
 
 uint32_t audio_get_dma_transfer_count() {

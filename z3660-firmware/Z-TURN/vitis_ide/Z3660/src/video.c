@@ -16,6 +16,7 @@
 #include "config_file.h"
 
 #include "video.h"
+#include "eth_prof.h"
 #include "ax.h"
 #include "rtg/fonts.h"
 
@@ -162,16 +163,20 @@ void handle_cache_flush(uint32_t address,uint32_t size)
 {
    (void)address;
    (void)size;
+   EP_T(ep_c1);
 #ifndef NO_L1_CACHE_FLUSH
 #ifdef L1_CACHE_ENABLED
    Xil_L1DCacheFlush();
 #endif
 #endif
+   EP_END(EP_V_FLUSH_L1,ep_c1);
+   EP_T(ep_c2);
 #ifndef NO_L2_CACHE_FLUSH
 #ifdef L2_CACHE_ENABLED
    Xil_L2CacheFlush();
 #endif
 #endif
+   EP_END(EP_V_FLUSH_L2,ep_c2);
    //	Xil_DCacheFlushRange((INTPTR) address, size);
 }
 
@@ -999,6 +1004,7 @@ uint32_t ticks=0;
 void isr_video(void *dummy)
 {
    (void)dummy;
+   EP_T(ep_v);
    int vblank=video_formatter_read(0);
    /*
    static int c=0;
@@ -1094,6 +1100,8 @@ void isr_video(void *dummy)
          video_formatter_write(vs.split_pos, MNTVF_OP_REPORT_LINE);
       }
    }
+   EP_END(EP_V_ISR,ep_v);
+   EP_DO(ep_src_done(EP_SRC_VIDEO,ep_v));
 }
 
 uint32_t dump_vdma_status(XAxiVdma *InstancePtr) {
