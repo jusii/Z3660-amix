@@ -22,6 +22,8 @@
 #include <stdint.h>
 #include "xtime_l.h"
 
+/* natural layout whatever packing an includer leaves on (rtg/gfx.h ends in an unpaired #pragma pack(4)) */
+#pragma pack(push, 8)
 typedef struct { uint32_t n, max; uint64_t sum; } EP_ACC;
 
 typedef enum {
@@ -93,6 +95,7 @@ typedef struct {
    XTime t_zero, t_xmit;
    XTime t_slot[EP_SLOTS];
 } ETH_PROF_T;
+#pragma pack(pop)
 
 extern ETH_PROF_T eth_prof;
 extern int eth_prof_on;
