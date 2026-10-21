@@ -165,6 +165,11 @@ const char *config_item_names[] = {
       "core0_stats",
       "prof_hz",
       "prof_buckets",
+      "eth_reraise",
+      "eth_rxkick",
+      "eth_taildrop",
+      "eth_tx_poll",
+      "eth_adv1000",
 };
 /* Tripwire: config_item_names[] is indexed by CONFITEM, so a new enum entry with
  * no matching string silently shifts every key after it -- the parser would then
@@ -406,6 +411,11 @@ void load_default_config(void)
    config.core0_stats=Z3660_OVH_UNSET;
    config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
    config.prof_buckets=Z3660_PROF_CFG_UNSET;
+   config.eth_reraise=CFG_ETH_DEFAULT_reraise;   /* ethernet keys (config_file.h) */
+   config.eth_rxkick=CFG_ETH_DEFAULT_rxkick;
+   config.eth_taildrop=CFG_ETH_DEFAULT_taildrop;
+   config.eth_tx_poll=CFG_ETH_DEFAULT_tx_poll;
+   config.eth_adv1000=CFG_ETH_DEFAULT_adv1000;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -590,6 +600,18 @@ void write_config_file(char *filename)
    print_line(&fil,"\n");
    print_line(&fil,"# Select a frequency in MHz for the ARM system (667, 767, 867, 900, 933, 967, 1000, 1033, 1067, 1100, 1133, 1167, 1200, 1233, 1267, 1300)\n");
    print_line(&fil,"arm_frequency 667\n");
+   print_line(&fil,"\n");
+   print_line(&fil,"# Ethernet (YES or NO; a missing line keeps the default shown)\n");
+   print_line(&fil,"# re-raise the Amiga interrupt while received frames remain\n");
+   print_line(&fil,"eth_reraise YES\n");
+   print_line(&fil,"# interrupt the Amiga at once when a frame arrives to an empty queue\n");
+   print_line(&fil,"eth_rxkick YES\n");
+   print_line(&fil,"# when the receive queue is full, drop only the arriving frame\n");
+   print_line(&fil,"eth_taildrop YES\n");
+   print_line(&fil,"# wait for a transmit by polling (bounded 1.1 ms) instead of 100 us sleeps\n");
+   print_line(&fil,"eth_tx_poll YES\n");
+   print_line(&fil,"# advertise 1000BASE-T at OS time (untested on metal)\n");
+   print_line(&fil,"eth_adv1000 NO\n");
    print_line(&fil,"\n");
    f_close(&fil);
 
@@ -848,6 +870,11 @@ retry:
    config.core0_stats=Z3660_OVH_UNSET;
    config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
    config.prof_buckets=Z3660_PROF_CFG_UNSET;
+   config.eth_reraise=CFG_ETH_DEFAULT_reraise;   /* ethernet keys (config_file.h) */
+   config.eth_rxkick=CFG_ETH_DEFAULT_rxkick;
+   config.eth_taildrop=CFG_ETH_DEFAULT_taildrop;
+   config.eth_tx_poll=CFG_ETH_DEFAULT_tx_poll;
+   config.eth_adv1000=CFG_ETH_DEFAULT_adv1000;
    config.mount_sd_0x76=0;
    config.mount_sd_root=0;
    config.resistor=800.0;
@@ -1102,6 +1129,37 @@ retry:
          get_next_string(parse_line, cur_cmd, &str_pos, ' ');
          config.prof_buckets=get_yesno_type(cur_cmd);
          if(verbose) printf("[CFG] prof_buckets %s.\n", yesno_names[config.prof_buckets]);
+         break;
+
+      /* Ethernet keys, config file only (not per preset). YES / NO; an absent key keeps its default. */
+      case CONFITEM_ETH_RERAISE:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.eth_reraise=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] eth_reraise %s.\n", yesno_names[config.eth_reraise]);
+         break;
+
+      case CONFITEM_ETH_RXKICK:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.eth_rxkick=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] eth_rxkick %s.\n", yesno_names[config.eth_rxkick]);
+         break;
+
+      case CONFITEM_ETH_TAILDROP:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.eth_taildrop=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] eth_taildrop %s.\n", yesno_names[config.eth_taildrop]);
+         break;
+
+      case CONFITEM_ETH_TX_POLL:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.eth_tx_poll=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] eth_tx_poll %s.\n", yesno_names[config.eth_tx_poll]);
+         break;
+
+      case CONFITEM_ETH_ADV1000:
+         get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+         config.eth_adv1000=get_yesno_type(cur_cmd);
+         if(verbose) printf("[CFG] eth_adv1000 %s.\n", yesno_names[config.eth_adv1000]);
          break;
 
       case CONFITEM_AMIX_RAM:

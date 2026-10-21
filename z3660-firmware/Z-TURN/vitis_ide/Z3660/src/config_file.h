@@ -154,6 +154,12 @@ typedef struct {
    int monitor_switch;
    range test_range[8];
    int arm_frequency;
+   /* ethernet keys (z3660cfg.txt only, read at boot; an absent key keeps the default set in load_default_config) */
+   int eth_reraise;     // re-raise the Amiga interrupt on release while frames remain   (default YES)
+   int eth_rxkick;      // interrupt on the next loop pass when a frame lands in an empty backlog (default YES)
+   int eth_taildrop;    // a full backlog drops only the arriving frame                   (default YES)
+   int eth_tx_poll;     // transmit wait polls the send count (bounded 1.1 ms) instead of usleep(100) steps (default YES)
+   int eth_adv1000;     // OS-time PHY setup also advertises 1000BASE-T                   (default NO)
 } CONFIG;
 typedef struct {
    int boot_mode;
@@ -328,8 +334,19 @@ enum CONFITEM {
     * writes the wrong field for the rest of the file with no diagnostic at all. */
    CONFITEM_PROF_HZ,
    CONFITEM_PROF_BUCKETS,
+   CONFITEM_ETH_RERAISE,
+   CONFITEM_ETH_RXKICK,
+   CONFITEM_ETH_TAILDROP,
+   CONFITEM_ETH_TX_POLL,
+   CONFITEM_ETH_ADV1000,
    CONFITEM_NUM
 };
+/* ethernet key defaults (config.eth_*; an absent z3660cfg.txt line keeps these). From the 2026-10-21 keys matrix. */
+#define CFG_ETH_DEFAULT_reraise   1
+#define CFG_ETH_DEFAULT_rxkick    1
+#define CFG_ETH_DEFAULT_taildrop  1
+#define CFG_ETH_DEFAULT_tx_poll   1
+#define CFG_ETH_DEFAULT_adv1000   0
 #define CPUFREQ_MIN 50
 #define CPUFREQ_MAX 120
 
