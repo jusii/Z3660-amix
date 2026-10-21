@@ -68,6 +68,12 @@ void DEBUG_ETHERNET(const char *format, ...)
 #ifndef ETH_NWCTRL_FIXED
 #define ETH_NWCTRL_FIXED 0
 #endif
+/* ETH_RERAISE (build flag, default 0): when the Amiga releases a frame (ETH_RX) and more remain in the backlog, raise the
+   ethernet interrupt again at once. Without it the next interrupt waits for the nag (ethernet_thread: 1500 main-loop
+   passes, ~1 ms on the real 060), and a driver that takes one frame per interrupt drains one frame per nag. */
+#ifndef ETH_RERAISE
+#define ETH_RERAISE 0
+#endif
 #if ETH_NWCTRL_FIXED
 static uint32_t eth_nwctrl_cfg;
 #define ETH_NWCTRL_CAPTURE() (eth_nwctrl_cfg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET) \
@@ -717,6 +723,13 @@ int ethernet_receive_frame() {
 
          DEBUG_ETHERNET("EMAC: caught up with backlog\n");
       }
+#if ETH_RERAISE
+      // frames remain: interrupt again at once instead of after the next nag period (a driver that takes one frame
+      // per interrupt otherwise drains about one frame per nag, ~1 ms on the real 060)
+      else if (interrupt_enabled_ethernet) {
+         amiga_interrupt_set(AMIGA_INTERRUPT_ETH);
+      }
+#endif
    } else {
       // this is NOT an error, Amiga wants data and there is no data on RX buffers
       DEBUG_ETHERNET("EMAC: ethernet_receive_frame() called but backlog is empty\n");
