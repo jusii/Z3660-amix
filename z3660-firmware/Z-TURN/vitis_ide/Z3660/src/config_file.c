@@ -610,8 +610,8 @@ void write_config_file(char *filename)
    print_line(&fil,"eth_taildrop YES\n");
    print_line(&fil,"# wait for a transmit by polling (bounded 1.1 ms) instead of 100 us sleeps\n");
    print_line(&fil,"eth_tx_poll YES\n");
-   print_line(&fil,"# advertise 1000BASE-T at OS time (untested on metal)\n");
-   print_line(&fil,"eth_adv1000 NO\n");
+   print_line(&fil,"# advertise 1000BASE-T at OS time (NO = 10/100 only)\n");
+   print_line(&fil,"eth_adv1000 YES\n");
    print_line(&fil,"\n");
    f_close(&fil);
 

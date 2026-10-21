@@ -159,7 +159,7 @@ typedef struct {
    int eth_rxkick;      // interrupt on the next loop pass when a frame lands in an empty backlog (default YES)
    int eth_taildrop;    // a full backlog drops only the arriving frame                   (default YES)
    int eth_tx_poll;     // transmit wait polls the send count (bounded 1.1 ms) instead of usleep(100) steps (default YES)
-   int eth_adv1000;     // OS-time PHY setup also advertises 1000BASE-T                   (default NO)
+   int eth_adv1000;     // OS-time PHY setup also advertises 1000BASE-T                   (default YES)
 } CONFIG;
 typedef struct {
    int boot_mode;
@@ -346,7 +346,7 @@ enum CONFITEM {
 #define CFG_ETH_DEFAULT_rxkick    1
 #define CFG_ETH_DEFAULT_taildrop  1
 #define CFG_ETH_DEFAULT_tx_poll   1
-#define CFG_ETH_DEFAULT_adv1000   0
+#define CFG_ETH_DEFAULT_adv1000   1
 #define CPUFREQ_MIN 50
 #define CPUFREQ_MAX 120
 
