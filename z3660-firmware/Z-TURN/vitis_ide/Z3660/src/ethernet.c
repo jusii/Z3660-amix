@@ -1477,7 +1477,7 @@ static void ep_lat_isr(void *ref)
    case 0x13:            __asm__ volatile("cps #0x13\n\tmov %0, lr\n\tcps #0x12" : "=r"(lr)); break;
    }
    w->gap_us = gus; w->at_ms = (uint32_t)((t - eth_prof.t_zero) * 1000ull / counts_per_second);
-   w->pc = __irq_stack[-1] - 4; w->lr = lr; w->mode = spsr & 0xFF;
+   w->pc = *(volatile uint32_t *)((uintptr_t)__irq_stack - 4) - 4; w->lr = lr; w->mode = spsr & 0xFF;
    w->gpio = eth_prof.svc_gpio; w->sub = eth_prof.svc_sub;
    w->svc_us = w->gpio && eth_prof.svc_t0 && t > eth_prof.svc_t0 ? ep_us(t - eth_prof.svc_t0) : 0;
    w->isr = eth_prof.isr_last_t1 ? eth_prof.isr_last : 0xFF;   /* 0xFF: no ISR stamped since ESTATZ */
