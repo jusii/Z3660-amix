@@ -57,7 +57,7 @@ void DEBUG_ETHERNET(const char *format, ...)
 
 #define FRAME_MAX_BACKLOG 64
 
-/* ETH_RXRING N (build flag, default 0): N RX descriptors instead of one. A 1514 B frame lasts 121 us on the wire at
+/* ETH_RXRING N (build flag, default 16 since the 10-21 golden; 0 = the 1.0 release's single descriptor): N RX descriptors instead of one. A 1514 B frame lasts 121 us on the wire at
    100 Mbit and the ISR + copy takes about 26 us, so one descriptor only loses frames when the ISR is held off; N of
    them bridge N frame times of IRQ latency. N buffers of FRAME_SIZE must fit RX_FRAME_ADDRESS..USB_DATA (64 KiB). */
 /* ETH_NWCTRL_FIXED (build flag, default 0): start each transmit by writing NWCTRL from the value captured after
@@ -101,7 +101,7 @@ static uint32_t eth_nwctrl_cfg;
                                   | 0x00021000u))
 #endif
 #ifndef ETH_RXRING
-#define ETH_RXRING 0
+#define ETH_RXRING 16
 #endif
 #if ETH_RXRING
 #define RXBD_CNT       ETH_RXRING
