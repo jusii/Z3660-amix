@@ -1457,9 +1457,9 @@ static uint32_t ep_us(XTime t) { return t >= (XTime)counts_per_second * 4 ? 0xFF
 static void ep_rxbd_probe(XTime t)
 {
    XEmacPs_BdRing *r = &(XEmacPs_GetRxRing(&EmacPsInstance));
-   uint32_t n = 0;
+   uint32_t n = 0, map = 0;
    for(uint32_t i = 0; i < r->AllCnt; i++)
-      n += *(volatile uint32_t *)(r->BaseBdAddr + i * r->Separation) & XEMACPS_RXBUF_NEW_MASK;
+      if(*(volatile uint32_t *)(r->BaseBdAddr + i * r->Separation) & XEMACPS_RXBUF_NEW_MASK) { n++; if(i < 32) map |= 1u << i; }
    if(!n) { eth_prof.bd_t0 = 0; return; }
    uint32_t b = EmacPsInstance.Config.BaseAddress, bit = 1u << (EMACPS_IRPT_INTR % 32);
    uint32_t isr = XEmacPs_ReadReg(b, XEMACPS_ISR_OFFSET);   /* write-to-clear: reading changes nothing */
@@ -1486,6 +1486,8 @@ static void ep_rxbd_probe(XTime t)
    w->n = n; w->isr = isr; w->imr = imr; w->rxsr = XEmacPs_ReadReg(b, XEMACPS_RXSR_OFFSET);
    w->nwctrl = XEmacPs_ReadReg(b, XEMACPS_NWCTRL_OFFSET); w->rxq = XEmacPs_ReadReg(b, XEMACPS_RXQBASE_OFFSET);
    w->gicp = gp; w->gica = ga;
+   w->map = map; w->head = ((UINTPTR)r->HwHead - r->BaseBdAddr) / r->Separation; w->hwcnt = r->HwCnt;
+   w->gemidx = (w->rxq - (uint32_t)r->BaseBdAddr) / r->Separation;
 }
 static void ep_lat_isr(void *ref)
 {
@@ -1679,10 +1681,11 @@ void eth_prof_dump(void)
              (unsigned long)eth_prof.bd_long, (unsigned long)eth_prof.bd_rx0, (unsigned long)eth_prof.bd_rx1_idle,
              (unsigned long)eth_prof.bd_gicp, (unsigned long)eth_prof.bd_gica, (unsigned long)eth_prof.bd_masked);
       if(w->dur_us)
-         printf("[ESTAT] rxbd_longest dur_us %lu at_ms %lu since_rx_us %lu | start n %lu isr %08lx gicp %lu | end n %lu isr %08lx imr %08lx rxsr %08lx nwctrl %08lx rxq %08lx gicp %lu gica %lu\n",
+         printf("[ESTAT] rxbd_longest dur_us %lu at_ms %lu since_rx_us %lu | start n %lu isr %08lx gicp %lu | end n %lu isr %08lx imr %08lx rxsr %08lx nwctrl %08lx rxq %08lx gicp %lu gica %lu | map %08lx sw_head %lu hwcnt %lu gem_idx %lu\n",
                 (unsigned long)w->dur_us, (unsigned long)w->at_ms, (unsigned long)w->since_rx_us, (unsigned long)w->n0,
                 (unsigned long)w->isr0, (unsigned long)w->gicp0, (unsigned long)w->n, (unsigned long)w->isr, (unsigned long)w->imr,
-                (unsigned long)w->rxsr, (unsigned long)w->nwctrl, (unsigned long)w->rxq, (unsigned long)w->gicp, (unsigned long)w->gica);
+                (unsigned long)w->rxsr, (unsigned long)w->nwctrl, (unsigned long)w->rxq, (unsigned long)w->gicp, (unsigned long)w->gica,
+                (unsigned long)w->map, (unsigned long)w->head, (unsigned long)w->hwcnt, (unsigned long)w->gemidx);
    }
    for(int i = 0; i < EP_LAT_WORST; i++) {
       const EP_LAT_W *w = &eth_prof.lat_worst[i];

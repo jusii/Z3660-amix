@@ -99,6 +99,7 @@ typedef struct {
    uint32_t dur_us, at_ms, since_rx_us;                  /* interval, when it ended, its end -> the last RX handler entry */
    uint32_t n0, isr0, gicp0;                             /* at the first tick that saw it: descriptors, GEM ISR, GIC pending */
    uint32_t n, isr, imr, rxsr, nwctrl, rxq, gicp, gica;  /* at its longest */
+   uint32_t map, head, hwcnt, gemidx;                    /* used-bit map (bit i = BD i), software HwHead index, HwCnt, GEM's BD index */
 } EP_BD_W;
 
 typedef struct {
