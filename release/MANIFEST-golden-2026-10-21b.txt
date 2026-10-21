@@ -1,0 +1,19 @@
+Z3660 fork firmware: golden 2026-10-21b (the release-cut candidate), successor of 9994961A
+
+fat/Z3660.bin    golden          13417468 B  crc32 66660DDB
+                 sha256 5a3050a54808cf542c116779c24a6c5f03b8188693e1211fddb3c71c6e2eb26f
+shelf            9994961A (MANIFEST-golden-2026-10-21.txt) and C96EAD03 (MANIFEST-1.0.txt), the rollbacks
+
+source     branch eth-rxring, commit fef1e02 (= 9994961A's 10c7501 + eth_adv1000 default YES)
+build      plain (no -D flags); core0 in the Vitis docker (gcc 12.2), FSBL/bitstream/core1 as in 1.0;
+           core0 ELF sha256 b3815c6e16d6de055153f7f6618bfbe25cffd280a6468621348c7da07de104af
+           Code differs from 9994961A only in load_default_config / read_config_file (the new default) and the
+           template text.
+
+ethernet   as 9994961A; z3660cfg.txt keys, all optional (absent = default):
+             eth_reraise YES   eth_rxkick YES   eth_taildrop YES   eth_tx_poll YES   eth_adv1000 YES
+           eth_adv1000 YES: the OS-time PHY setup advertises 1000BASE-T (A4000D 2026-10-21: 1 Gbit, push 354 KB/s,
+           pull 1604 KB/s, resource errors 0); eth_adv1000 NO keeps 10/100 only.
+AmigaOS    Z3660Net.device 1.5Beta (crc32 ABCE15E9), z3660-drivers/eth and 0_Z3660.adf.
+
+Not deployed yet: both boxes take it once, at the release acceptance.
