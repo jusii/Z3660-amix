@@ -87,6 +87,12 @@ void DEBUG_ETHERNET(const char *format, ...)
 #ifndef ETH_TXPOLL
 #define ETH_TXPOLL 0
 #endif
+/* ETH_TAILDROP (build flag, default 0): a frame that finds the backlog full is dropped alone; the frames already queued
+   stay for the Amiga. The release resets the whole backlog instead, losing every frame not yet fetched (10-21 AmigaOS
+   pushes: ~5.6 frames per full backlog). */
+#ifndef ETH_TAILDROP
+#define ETH_TAILDROP 0
+#endif
 #if ETH_TXPOLL
 #include "xtime_l.h"
 extern uint32_t counts_per_second;   /* the live ARM clock / 2 (main.c) */
@@ -666,9 +672,13 @@ static void xEmacPsRecvHandler(void *Callback)
          } else {
             if(interrupt_enabled_ethernet)
                DEBUG_ETHERNET("EMAC: frames_backlog full\n");
+#if ETH_TAILDROP
+            EP_DO(eth_prof.bl_full++; eth_prof.bl_full_lost++);
+#else
             EP_DO(eth_prof.bl_full++; eth_prof.bl_full_lost += frames_backlog - frames_received_from_backlog + 1);
             frames_backlog = 0;
             frames_received_from_backlog = 0;
+#endif
 
          }
 
