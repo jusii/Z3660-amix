@@ -5,13 +5,14 @@
 
 #include "../debug_console.h"
 #include "str_dmaop.h"
+#include "../eth_prof.h"   /* EP_SUB: the op this register-page access runs (ESTAT dma_op / acc_op rows) */
 
 //int set_framebuffer_address(uint32_t fb);
 extern DEBUG_CONSOLE debug_console;
 
 void handle_blitter_dma_op(ZZ_VIDEO_STATE* vs,uint16_t zdata)
 {
-   struct GFXData *data = (struct GFXData*)((uint32_t)Z3_SCRATCH_ADDR);
+   struct GFXData *data = (struct GFXData*)((uint32_t)Z3_SCRATCH_ADDR); EP_SUB(1,zdata);
    //    if((zdata!=11)&&(zdata!=2)&&(zdata!=5))
    //       printf("OP %d\n",zdata);
    if(debug_console.debug_rtg)

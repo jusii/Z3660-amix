@@ -440,6 +440,7 @@ void ethernet_task() {
    case ETH_TASK_SETUP:
       // FIXME
       emacPsSetupIntrSystem(EmacPsInstancePtr, EMACPS_IRPT_INTR);
+      EP_DO(ep_lat_start());
 
       ethernet_task_state = ETH_TASK_NEGOTIATE;
       break;
@@ -570,6 +571,7 @@ static void xEmacPsRecvHandler(void *Callback)
    XEmacPs_BdRing* rxring = &(XEmacPs_GetRxRing(EmacPsInstancePtr));
    XEmacPs_Bd* rxbdset, *cur_bd_ptr;
    EP_T(ep_ra);
+   EP_DO(ep_rx_entry(ep_ra));
 
 #if ETH_RXRING
    // While the ring is full the BSP returns one BD per call (HwTail == HwHead), so drain until it returns none;
@@ -674,6 +676,7 @@ static void xEmacPsRecvHandler(void *Callback)
          if(status&XEMACPS_RXSR_FRAMERX_MASK) eth_prof.rxsr_framerx++);
    XEmacPs_WriteReg(EmacPsInstancePtr->Config.BaseAddress, XEMACPS_RXSR_OFFSET, status);
    EP_END(EP_RX_ISR,ep_ra);
+   EP_DO(if(eth_prof_on && ep_ra) ep_isr_mark(EP_SRC_GEMRX,ep_ra,ep_now()));
 }
 
 volatile uint8_t* ethernet_current_receive_ptr() {
@@ -1359,7 +1362,8 @@ static void ep_nwctrl_seen(uint32_t nc)
    if(nc & EP_NWCTRL_ACTION) eth_prof.tx_nwctrl_action++;
    if(nc & XEMACPS_NWCTRL_FLUSH_DPRAM_MASK) eth_prof.tx_nwctrl_flush++;
 }
-static const char *const ep_src_names[EP_SRC_N] = { "video", "audio", "gemtx", "gemerr", "txflush", "scsi-inv", "scsi-flush" };
+static const char *const ep_src_names[EP_SRC_N + 1] = { "video", "audio", "gemtx", "gemerr", "txflush", "scsi-inv", "scsi-flush",
+                                                         "gemrx" };
 /* the first 8 are the "gem" line as before; the rest print as "gemx" */
 static const uint32_t ep_gem_off[EP_GEM_N] = {
    XEMACPS_TXCNT_OFFSET, XEMACPS_RXCNT_OFFSET, XEMACPS_RXFCSCNT_OFFSET, XEMACPS_RXRESERRCNT_OFFSET,
@@ -1407,9 +1411,97 @@ static void ep_gem_read(void)
 {
    for(int i = 0; i < EP_GEM_N; i++) eth_prof.gem[i] += XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, ep_gem_off[i]);
 }
+/* ---- the IRQ-latency sampler (eth_prof.h) ---- */
+#include "xttcps_hw.h"
+#define EP_TTC        XPS_TTC0_BASEADDR   /* TTC0 counter 1: nothing else in either core uses the TTCs */
+#define EP_TTC_IRQ    XPS_TTC0_0_INT_ID
+#define EP_TTC_PRI    0x80                /* above the GEM and video (0xA0) and audio (0x90) */
+#define EP_SLCR_621   0xF80001C4u         /* SLCR CLK_621_TRUE: bit 0 set = CPU_6x4x:CPU_1x 6:1, else 4:1 */
+extern uint32_t __irq_stack[];            /* lscript.ld: IRQ mode's SP after boot.S. IRQHandler's first push
+                                             (stmdb sp!, {r0-r3,r12,lr}) leaves the return LR at __irq_stack[-1]. */
+static int ep_lat_run, ep_lat_hooked;
+static XTime ep_lat_edge[EP_LAT_BUCKETS - 1];
+static const uint32_t ep_lat_edge_us[EP_LAT_BUCKETS - 1] = { 150, 200, 300, 500, 1000, 2000, 5000, 10000, 20000 };
+static uint32_t ep_us(XTime t) { return t >= (XTime)counts_per_second * 4 ? 0xFFFFFFFFu : (uint32_t)(t * 1000000ull / counts_per_second); }
+static void ep_lat_isr(void *ref)
+{
+   (void)ref;
+   (void)Xil_In32(EP_TTC + XTTCPS_ISR_OFFSET);   /* clears on read */
+   XTime t = ep_now(), last = eth_prof.lat_last;
+   if(!eth_prof_on) { eth_prof.lat_last = 0; return; }
+   eth_prof.lat_last = t;
+   if(!last) return;
+   XTime gap = t - last;
+   int b = 0;
+   eth_prof.lat_gap_last = gap; eth_prof.lat_ticks++;
+   if(gap > eth_prof.lat_max) eth_prof.lat_max = gap;
+   while(b < EP_LAT_BUCKETS - 1 && gap >= ep_lat_edge[b]) b++;
+   eth_prof.lat_hist[b]++;
+   if(gap <= 2 * eth_prof.lat_period) return;
+   eth_prof.lat_long++;
+   uint32_t gus = ep_us(gap), k = 0;
+   for(uint32_t i = 1; i < EP_LAT_WORST; i++) if(eth_prof.lat_worst[i].gap_us < eth_prof.lat_worst[k].gap_us) k = i;
+   if(gus <= eth_prof.lat_worst[k].gap_us) return;
+   EP_LAT_W *w = &eth_prof.lat_worst[k];
+   uint32_t spsr, lr = 0;
+   __asm__ volatile("mrs %0, spsr" : "=r"(spsr));
+   switch(spsr & 0x1F) {   /* the interrupted mode's LR: switch to it with IRQs still masked, read, come back */
+   case 0x10: case 0x1F: __asm__ volatile("cps #0x1F\n\tmov %0, lr\n\tcps #0x12" : "=r"(lr)); break;
+   case 0x13:            __asm__ volatile("cps #0x13\n\tmov %0, lr\n\tcps #0x12" : "=r"(lr)); break;
+   }
+   w->gap_us = gus; w->at_ms = (uint32_t)((t - eth_prof.t_zero) * 1000ull / counts_per_second);
+   w->pc = __irq_stack[-1] - 4; w->lr = lr; w->mode = spsr & 0xFF;
+   w->gpio = eth_prof.svc_gpio; w->sub = eth_prof.svc_sub;
+   w->svc_us = w->gpio && eth_prof.svc_t0 && t > eth_prof.svc_t0 ? ep_us(t - eth_prof.svc_t0) : 0;
+   w->isr = eth_prof.isr_last_t1 ? eth_prof.isr_last : 0xFF;   /* 0xFF: no ISR stamped since ESTATZ */
+   w->isr_us = eth_prof.isr_last_t1 > eth_prof.isr_last_t0 ? ep_us(eth_prof.isr_last_t1 - eth_prof.isr_last_t0) : 0;
+   w->isr_end_us = eth_prof.isr_last_t1 && t > eth_prof.isr_last_t1 ? ep_us(t - eth_prof.isr_last_t1) : 0xFFFFFFFFu;
+}
+/* (re)program the interval from the live clock and restart the count; the TTC runs on CPU_1x */
+static void ep_lat_program(void)
+{
+   uint32_t div = (Xil_In32(EP_SLCR_621) & 1) ? 3 : 2;   /* counts_per_second = CPU/2; CPU_1x = CPU/6 or CPU/4 */
+   uint32_t iv = counts_per_second / div / (1000000 / EP_LAT_US);
+   eth_prof.lat_interval = iv > 0xFFFF ? 0xFFFF : iv;
+   eth_prof.lat_period = (XTime)counts_per_second / (1000000 / EP_LAT_US);
+   for(int i = 0; i < EP_LAT_BUCKETS - 1; i++) ep_lat_edge[i] = (XTime)counts_per_second * ep_lat_edge_us[i] / 1000000;
+   Xil_Out32(EP_TTC + XTTCPS_CNT_CNTRL_OFFSET, XTTCPS_CNT_CNTRL_DIS_MASK | XTTCPS_CNT_CNTRL_EN_WAVE_MASK);
+   Xil_Out32(EP_TTC + XTTCPS_CLK_CNTRL_OFFSET, 0);
+   Xil_Out32(EP_TTC + XTTCPS_INTERVAL_VAL_OFFSET, eth_prof.lat_interval);
+   Xil_Out32(EP_TTC + XTTCPS_IER_OFFSET, XTTCPS_IXR_INTERVAL_MASK);
+   (void)Xil_In32(EP_TTC + XTTCPS_ISR_OFFSET);
+   eth_prof.lat_last = 0;
+   if(ep_lat_run)   /* interval mode, counter reset, waveform output off */
+      Xil_Out32(EP_TTC + XTTCPS_CNT_CNTRL_OFFSET,
+                XTTCPS_CNT_CNTRL_INT_MASK | XTTCPS_CNT_CNTRL_RST_MASK | XTTCPS_CNT_CNTRL_EN_WAVE_MASK);
+}
+void ep_lat_start(void)
+{
+   XScuGic *gic = interrupt_get_intc();
+   if(!ep_lat_hooked) {
+      XScuGic_Connect(gic, EP_TTC_IRQ, (Xil_InterruptHandler)ep_lat_isr, NULL);
+      XScuGic_SetPriorityTriggerType(gic, EP_TTC_IRQ, EP_TTC_PRI, 0x01);   /* active-high level */
+      uint32_t tgt = XScuGic_DistReadReg(gic, XSCUGIC_SPI_TARGET_OFFSET_CALC(EP_TTC_IRQ));
+      tgt &= ~(0xFFu << ((EP_TTC_IRQ % 4) * 8)); tgt |= 0x01u << ((EP_TTC_IRQ % 4) * 8);   /* CPU0 */
+      XScuGic_DistWriteReg(gic, XSCUGIC_SPI_TARGET_OFFSET_CALC(EP_TTC_IRQ), tgt);
+      XScuGic_Enable(gic, EP_TTC_IRQ);
+      ep_lat_hooked = 1;
+   }
+   ep_lat_run = 1;
+   ep_lat_program();
+   printf("[ESTAT] latency sampler on: TTC0 interval %lu (%d us)\n", (unsigned long)eth_prof.lat_interval, EP_LAT_US);
+}
+void ep_lat_toggle(void)
+{
+   if(!ep_lat_hooked) { printf("[ESTAT] latency sampler not started (ethernet not set up)\n"); return; }
+   ep_lat_run = !ep_lat_run;
+   ep_lat_program();
+   printf("[ESTAT] latency sampler %s (ELAT)\n", ep_lat_run ? "ON" : "OFF");
+}
 void eth_prof_zero(void)
 {
    memset(&eth_prof, 0, sizeof eth_prof);
+   if(ep_lat_hooked) ep_lat_program();
    ep_gem_read();
    memset(eth_prof.gem, 0, sizeof eth_prof.gem);   /* the GEM counters clear on read: this read started the window */
    eth_prof.t_zero = ep_now();
@@ -1510,5 +1602,36 @@ void eth_prof_dump(void)
    printf("\n[ESTAT] fw FramesTx %lu frames_received %lu frame_serial %u backlog %u fetched %d DeviceErrors %ld frames_dropped %d\n",
           (unsigned long)FramesTx, (unsigned long)frames_received, (unsigned)frame_serial, (unsigned)frames_backlog,
           frames_received_from_backlog, (long)DeviceErrors, frames_dropped);
+   printf("[ESTAT] lat %s interval %lu period_us %lu ticks %lu long %lu max_us %lu hist_us<150,200,300,500,1000,2000,5000,10000,20000,>=20000",
+          ep_lat_run ? "ON" : "OFF", (unsigned long)eth_prof.lat_interval, (unsigned long)ep_us(eth_prof.lat_period),
+          (unsigned long)eth_prof.lat_ticks, (unsigned long)eth_prof.lat_long, (unsigned long)ep_us(eth_prof.lat_max));
+   for(int i = 0; i < EP_LAT_BUCKETS; i++) printf(" %lu", (unsigned long)eth_prof.lat_hist[i]);
+   printf("\n[ESTAT] rx_after_gap %lu max_us %lu\n", (unsigned long)eth_prof.rx_after_gap, (unsigned long)ep_us(eth_prof.rx_after_gap_max));
+   for(int i = 0; i < EP_LAT_WORST; i++) {
+      const EP_LAT_W *w = &eth_prof.lat_worst[i];
+      if(!w->gap_us) continue;
+      printf("[ESTAT] lat_worst gap_us %lu at_ms %lu pc %08lx lr %08lx mode %02lx svc %08lx sub %05lx svc_us %lu isr %s isr_us %lu isr_end_us %lu\n",
+             (unsigned long)w->gap_us, (unsigned long)w->at_ms, (unsigned long)w->pc, (unsigned long)w->lr, (unsigned long)w->mode,
+             (unsigned long)w->gpio, (unsigned long)w->sub, (unsigned long)w->svc_us,
+             w->isr <= EP_SRC_GEMRX ? ep_src_names[w->isr] : "none", (unsigned long)w->isr_us, (unsigned long)w->isr_end_us);
+   }
+   printf("[ESTAT] reg rw offset n avg_ns max_ns sum_us (detection -> ack done, accesses with n > 0)\n");
+   for(int i = 0; i < EP_REGS; i++) {
+      const EP_ACC *a = &eth_prof.reg[i];
+      if(!a->n) continue;
+      printf("[ESTAT] reg %c 0x%03x %lu %lu %lu %lu\n", i >= 256 ? 'W' : 'R', (i & 255) << 1, (unsigned long)a->n,
+             (unsigned long)ep_ns(a->sum / a->n), (unsigned long)ep_ns(a->max), (unsigned long)(a->sum * 1000000ull / counts_per_second));
+   }
+   for(int i = 0; i < 2; i++) {
+      const EP_ACC *a = &eth_prof.reg_hi[i];
+      if(a->n) printf("[ESTAT] reg %c >=0x200 %lu %lu %lu %lu\n", i ? 'W' : 'R', (unsigned long)a->n,
+                      (unsigned long)ep_ns(a->sum / a->n), (unsigned long)ep_ns(a->max), (unsigned long)(a->sum * 1000000ull / counts_per_second));
+   }
+   for(int k = 0; k < 2; k++)
+      for(int i = 0; i < EP_OPS; i++) {
+         const EP_ACC *a = k ? &eth_prof.acc_op[i] : &eth_prof.dma_op[i];
+         if(a->n) printf("[ESTAT] %s %d %lu %lu %lu %lu\n", k ? "acc_op" : "dma_op", i, (unsigned long)a->n,
+                         (unsigned long)ep_ns(a->sum / a->n), (unsigned long)ep_ns(a->max), (unsigned long)(a->sum * 1000000ull / counts_per_second));
+      }
 }
 #endif /* ETH_PROF */

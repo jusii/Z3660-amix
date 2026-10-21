@@ -5,6 +5,7 @@
 #include "../debug_console.h"
 #include "compression/compression.h"
 #include "../main.h"
+#include "../eth_prof.h"   /* EP_SUB: the op this register-page access runs (ESTAT dma_op / acc_op rows) */
 
 #define inline
 
@@ -16,7 +17,7 @@ extern DEBUG_CONSOLE debug_console;
 
 void handle_acc_op(uint16_t zdata)
 {
-    struct GFXData *data = (struct GFXData*)((uint32_t)Z3_SCRATCH_ADDR);
+    struct GFXData *data = (struct GFXData*)((uint32_t)Z3_SCRATCH_ADDR); EP_SUB(2,zdata);
     //int cf_bpp[MNTVA_COLOR_NUM] = { 1, 2, 4, -8, 2, };
     if(debug_console.debug_rtg)
  	   printf("acc_op 0x%X\n",zdata);
