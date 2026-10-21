@@ -74,6 +74,16 @@ void DEBUG_ETHERNET(const char *format, ...)
 #ifndef ETH_RERAISE
 #define ETH_RERAISE 0
 #endif
+/* ETH_RXKICK (build flag, default 0): when a frame lands in an empty backlog, the RX ISR pushes the nag counter past its
+   limit so ethernet_thread raises the interrupt on the next main-loop pass instead of after ~1 ms. The ISR does not call
+   amiga_interrupt_set itself: that read-modify-write is not safe against the main loop it interrupts. A kick lost to
+   other_tasks' unlocked increment falls back to the normal nag. */
+#ifndef ETH_RXKICK
+#define ETH_RXKICK 0
+#endif
+#if ETH_RXKICK
+extern uint32_t eth_backlog_nag_counter, eth_backlog_nag_counter_max;   /* rtg.c */
+#endif
 #if ETH_NWCTRL_FIXED
 static uint32_t eth_nwctrl_cfg;
 #define ETH_NWCTRL_CAPTURE() (eth_nwctrl_cfg = XEmacPs_ReadReg(EmacPsInstance.Config.BaseAddress, XEMACPS_NWCTRL_OFFSET) \
@@ -636,6 +646,10 @@ static void xEmacPsRecvHandler(void *Callback)
 
             EP_DO(eth_prof.t_slot[frames_backlog] = eth_prof_on ? ep_now() : 0);
             frames_backlog++;
+#if ETH_RXKICK
+            if (frames_backlog == 1 && interrupt_enabled_ethernet)
+               eth_backlog_nag_counter = eth_backlog_nag_counter_max + 1;
+#endif
             EP_DO(if(frames_backlog>eth_prof.bl_max) eth_prof.bl_max=frames_backlog);
 
             DEBUG_ETHERNET("bd %ld [%d] copied from %p to %p\n", bd_idx, rx_bytes, frame_ptr, frame_bl_ptr);
