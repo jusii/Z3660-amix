@@ -1,0 +1,19 @@
+Z3660 fork firmware: bench golden 2026-10-21 (Amix + AmigaOS ethernet), successor of 1.0's C96EAD03
+
+fat/Z3660.bin    golden          13417468 B  crc32 9994961A
+                 sha256 62243f06c37bbbc8247fd8630d781b1f8c03e418e2c4c840984f45289d57a643
+rollback         1.0 release     13417468 B  crc32 C96EAD03 (MANIFEST-1.0.txt), kept on the card as 1:/hdf/rollback-C96EAD03.bin
+
+source     branch eth-rxring, commit 10c7501 (= release-1.0-fw 5ae322e + the eth-profile / eth-rxring work)
+build      plain (no -D flags); core0 in the Vitis docker (gcc 12.2), FSBL/bitstream/core1 as in 1.0;
+           core0 ELF sha256 2be7601861a9a248c56e7969166d89c85c49993d73b1db32a3648bc7b4bb2b80
+           Built the same way, release-1.0-fw 5ae322e reproduces C96EAD03 apart from the header checksum,
+           the build id and the __DATE__ string (42 bytes).
+
+ethernet   16-descriptor RX ring (ETH_RXRING 16); a MAC change no longer restarts the GEM (ring offset fix);
+           z3660cfg.txt keys, all optional (absent = default):
+             eth_reraise YES   eth_rxkick YES   eth_taildrop YES   eth_tx_poll YES   eth_adv1000 NO
+AmigaOS    Z3660Net.device 1.5Beta (crc32 ABCE15E9): the frame task drains the backlog per interrupt
+           (z3660-drivers/eth, 0_Z3660.adf).
+
+CPLD (z3660.jed), z3660_scsi.rom, BOOT.BIN and FAILSAFE.bin are unchanged by this cut.
