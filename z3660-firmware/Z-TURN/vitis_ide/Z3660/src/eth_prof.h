@@ -93,6 +93,13 @@ typedef struct {
    uint32_t gpio, sub, svc_us;  /* rtg_thread's access in service then (0 = none), its op, and how long it had run */
    uint32_t isr, isr_us, isr_end_us;   /* the last stamped ISR / masked source: id, duration, its end -> the tick */
 } EP_LAT_W;
+/* The RX descriptor probe (in the sampler tick): completed RX descriptors (used bit set) the handler has not taken yet.
+   For the longest such interval: the state when it began and at its longest. GIC = ICDISPR / ICDABR bit for the GEM. */
+typedef struct {
+   uint32_t dur_us, at_ms, since_rx_us;                  /* interval, when it ended, its end -> the last RX handler entry */
+   uint32_t n0, isr0, gicp0;                             /* at the first tick that saw it: descriptors, GEM ISR, GIC pending */
+   uint32_t n, isr, imr, rxsr, nwctrl, rxq, gicp, gica;  /* at its longest */
+} EP_BD_W;
 
 typedef struct {
    EP_ACC acc[EP_NUM];
@@ -122,6 +129,12 @@ typedef struct {
    /* the access rtg_thread is serving (detection -> ack), and the last stamped ISR or masked source */
    uint32_t svc_gpio, svc_sub; XTime svc_t0;
    uint32_t isr_last; XTime isr_last_t0, isr_last_t1;
+   /* the RX descriptor probe: ticks with completed descriptors waiting, those inside an interval > 1 ms split by where
+      the interrupt was (GEM FRAMERX clear / set with the GIC idle / GIC pending / GIC active; FRAMERX masked in IMR) */
+   uint32_t bd_ticks, bd_long, bd_rx0, bd_rx1_idle, bd_gicp, bd_gica, bd_masked, bd_nmax;
+   XTime bd_t0, bd_max, rx_last;
+   uint32_t bd_n0, bd_isr0, bd_gicp0;
+   EP_BD_W bd_w;
    /* every register-page access, detection -> ack done, per register and per RTG op */
    EP_ACC reg[EP_REGS], reg_hi[2], dma_op[EP_OPS], acc_op[EP_OPS];
    XTime t_zero, t_xmit;
@@ -207,6 +220,7 @@ static inline void ep_ack_done(int reg, XTime td, XTime th, uint32_t spins)
    tick runs first and the RX handler comes right after it) */
 static inline void ep_rx_entry(XTime t)
 {
+   eth_prof.rx_last = t;
    if(!t || !eth_prof.lat_last || !eth_prof.lat_period) return;
    if(t - eth_prof.lat_last < eth_prof.lat_period && eth_prof.lat_gap_last > 2 * eth_prof.lat_period) {
       eth_prof.rx_after_gap++;

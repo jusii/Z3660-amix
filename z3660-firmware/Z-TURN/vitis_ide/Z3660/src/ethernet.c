@@ -1450,6 +1450,43 @@ static int ep_lat_run, ep_lat_hooked;
 static XTime ep_lat_edge[EP_LAT_BUCKETS - 1];
 static const uint32_t ep_lat_edge_us[EP_LAT_BUCKETS - 1] = { 150, 200, 300, 500, 1000, 2000, 5000, 10000, 20000 };
 static uint32_t ep_us(XTime t) { return t >= (XTime)counts_per_second * 4 ? 0xFFFFFFFFu : (uint32_t)(t * 1000000ull / counts_per_second); }
+#define EP_GIC_SPR(id)   (0xF8F01200u + ((id) / 32) * 4)   /* ICDISPR: set-pending, reads the pending state */
+#define EP_GIC_ABR(id)   (0xF8F01300u + ((id) / 32) * 4)   /* ICDABR: active */
+/* the RX descriptor probe, every tick: completed descriptors (used bit) not yet taken by the RX handler. Handlers do not
+   nest, so at a tick every descriptor is either the GEM's or re-armed: a used bit here is a frame nobody has seen. */
+static void ep_rxbd_probe(XTime t)
+{
+   XEmacPs_BdRing *r = &(XEmacPs_GetRxRing(&EmacPsInstance));
+   uint32_t n = 0;
+   for(uint32_t i = 0; i < r->AllCnt; i++)
+      n += *(volatile uint32_t *)(r->BaseBdAddr + i * r->Separation) & XEMACPS_RXBUF_NEW_MASK;
+   if(!n) { eth_prof.bd_t0 = 0; return; }
+   uint32_t b = EmacPsInstance.Config.BaseAddress, bit = 1u << (EMACPS_IRPT_INTR % 32);
+   uint32_t isr = XEmacPs_ReadReg(b, XEMACPS_ISR_OFFSET);   /* write-to-clear: reading changes nothing */
+   uint32_t imr = XEmacPs_ReadReg(b, XEMACPS_IMR_OFFSET);
+   uint32_t gp = (Xil_In32(EP_GIC_SPR(EMACPS_IRPT_INTR)) & bit) != 0, ga = (Xil_In32(EP_GIC_ABR(EMACPS_IRPT_INTR)) & bit) != 0;
+   eth_prof.bd_ticks++;
+   if(n > eth_prof.bd_nmax) eth_prof.bd_nmax = n;
+   if(!eth_prof.bd_t0) { eth_prof.bd_t0 = t; eth_prof.bd_n0 = n; eth_prof.bd_isr0 = isr; eth_prof.bd_gicp0 = gp; return; }
+   XTime d = t - eth_prof.bd_t0;
+   if(d > 10 * eth_prof.lat_period) {   /* waiting > 1 ms: where is the interrupt? */
+      eth_prof.bd_long++;
+      if(imr & XEMACPS_IXR_FRAMERX_MASK) eth_prof.bd_masked++;
+      if(ga) eth_prof.bd_gica++;
+      else if(gp) eth_prof.bd_gicp++;
+      else if(isr & XEMACPS_IXR_FRAMERX_MASK) eth_prof.bd_rx1_idle++;
+      else eth_prof.bd_rx0++;
+   }
+   if(d <= eth_prof.bd_max) return;
+   EP_BD_W *w = &eth_prof.bd_w;
+   eth_prof.bd_max = d;
+   w->dur_us = ep_us(d); w->at_ms = (uint32_t)((t - eth_prof.t_zero) * 1000ull / counts_per_second);
+   w->since_rx_us = eth_prof.rx_last && t > eth_prof.rx_last ? ep_us(t - eth_prof.rx_last) : 0xFFFFFFFFu;
+   w->n0 = eth_prof.bd_n0; w->isr0 = eth_prof.bd_isr0; w->gicp0 = eth_prof.bd_gicp0;
+   w->n = n; w->isr = isr; w->imr = imr; w->rxsr = XEmacPs_ReadReg(b, XEMACPS_RXSR_OFFSET);
+   w->nwctrl = XEmacPs_ReadReg(b, XEMACPS_NWCTRL_OFFSET); w->rxq = XEmacPs_ReadReg(b, XEMACPS_RXQBASE_OFFSET);
+   w->gicp = gp; w->gica = ga;
+}
 static void ep_lat_isr(void *ref)
 {
    (void)ref;
@@ -1464,6 +1501,7 @@ static void ep_lat_isr(void *ref)
    if(gap > eth_prof.lat_max) eth_prof.lat_max = gap;
    while(b < EP_LAT_BUCKETS - 1 && gap >= ep_lat_edge[b]) b++;
    eth_prof.lat_hist[b]++;
+   ep_rxbd_probe(t);
    if(gap <= 2 * eth_prof.lat_period) return;
    eth_prof.lat_long++;
    uint32_t gus = ep_us(gap), k = 0;
@@ -1634,6 +1672,18 @@ void eth_prof_dump(void)
           (unsigned long)eth_prof.lat_ticks, (unsigned long)eth_prof.lat_long, (unsigned long)ep_us(eth_prof.lat_max));
    for(int i = 0; i < EP_LAT_BUCKETS; i++) printf(" %lu", (unsigned long)eth_prof.lat_hist[i]);
    printf("\n[ESTAT] rx_after_gap %lu max_us %lu\n", (unsigned long)eth_prof.rx_after_gap, (unsigned long)ep_us(eth_prof.rx_after_gap_max));
+   {
+      const EP_BD_W *w = &eth_prof.bd_w;
+      printf("[ESTAT] rxbd ticks %lu n_max %lu max_us %lu | >1ms ticks %lu: framerx_clear %lu framerx_set_gic_idle %lu gic_pending %lu gic_active %lu imr_framerx_masked %lu\n",
+             (unsigned long)eth_prof.bd_ticks, (unsigned long)eth_prof.bd_nmax, (unsigned long)ep_us(eth_prof.bd_max),
+             (unsigned long)eth_prof.bd_long, (unsigned long)eth_prof.bd_rx0, (unsigned long)eth_prof.bd_rx1_idle,
+             (unsigned long)eth_prof.bd_gicp, (unsigned long)eth_prof.bd_gica, (unsigned long)eth_prof.bd_masked);
+      if(w->dur_us)
+         printf("[ESTAT] rxbd_longest dur_us %lu at_ms %lu since_rx_us %lu | start n %lu isr %08lx gicp %lu | end n %lu isr %08lx imr %08lx rxsr %08lx nwctrl %08lx rxq %08lx gicp %lu gica %lu\n",
+                (unsigned long)w->dur_us, (unsigned long)w->at_ms, (unsigned long)w->since_rx_us, (unsigned long)w->n0,
+                (unsigned long)w->isr0, (unsigned long)w->gicp0, (unsigned long)w->n, (unsigned long)w->isr, (unsigned long)w->imr,
+                (unsigned long)w->rxsr, (unsigned long)w->nwctrl, (unsigned long)w->rxq, (unsigned long)w->gicp, (unsigned long)w->gica);
+   }
    for(int i = 0; i < EP_LAT_WORST; i++) {
       const EP_LAT_W *w = &eth_prof.lat_worst[i];
       if(!w->gap_us) continue;
