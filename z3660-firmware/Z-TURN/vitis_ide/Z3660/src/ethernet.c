@@ -81,6 +81,16 @@ void DEBUG_ETHERNET(const char *format, ...)
 #ifndef ETH_RXKICK
 #define ETH_RXKICK 0
 #endif
+/* ETH_TXPOLL (build flag, default 0): ethernet_send_frame polls the send handler's count against the global timer
+   instead of sleeping in usleep(100) steps. One usleep(100) per frame held the 060's bus cycle ~70 us after the frame
+   had already gone (the GEM finishes in ~10 us). The bound is today's 11 x 100 us, so the worst case is unchanged. */
+#ifndef ETH_TXPOLL
+#define ETH_TXPOLL 0
+#endif
+#if ETH_TXPOLL
+#include "xtime_l.h"
+extern uint32_t counts_per_second;   /* the live ARM clock / 2 (main.c) */
+#endif
 #if ETH_RXKICK
 extern uint32_t eth_backlog_nag_counter, eth_backlog_nag_counter_max;   /* rtg.c */
 #endif
@@ -1232,6 +1242,21 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
 
    DEBUG_ETHERNET("FramesTx:%ld\n",FramesTx);
    DEBUG_ETHERNET("BdTxPtr:0x%08lx\n",(uint32_t)BdTxPtr);
+#if ETH_TXPOLL
+   uint32_t counter = 0;   /* whole 100 us steps the wait took, for ESTAT's tx_sleeps */
+   XTime tx_t0, tx_now;
+   XTime_GetTime(&tx_t0);
+   while (old_frames_tx == FramesTx) {
+      XTime_GetTime(&tx_now);
+      if (tx_now - tx_t0 > (XTime)counts_per_second * 11 / 10000) {
+         printf("ERROR: timeout in ethernet_send_frame waiting for tx!\n");
+         EP_DO(ep_tx_end(4,ep_t0,0,11));
+         return(4);
+      }
+   }
+   XTime_GetTime(&tx_now);
+   counter = (uint32_t)((tx_now - tx_t0) * 10000 / counts_per_second);
+#else
    uint32_t counter = 0;
    while (old_frames_tx == FramesTx) {
       usleep(100);
@@ -1244,6 +1269,7 @@ uint16_t ethernet_send_frame(uint16_t frame_size) {
          return(4);
       }
    }
+#endif
    EP_T(ep_t3);
    EP_SPAN(EP_TX_WAIT,ep_t2,ep_t3);
    DEBUG_ETHERNET("frame %ld transmitted!\n",FramesTx);
