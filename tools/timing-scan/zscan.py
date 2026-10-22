@@ -275,6 +275,8 @@ class FakeCard:
                       for i, r in enumerate(ROWS)}
         self.off = self.rnd.uniform(-15, 15)               # where the windows sit against the table
         self.shift = shift or {}                           # {mhz: deg}: a row whose table misses its window
+        self.contam_p = 0.0                                # chance a failing mobo step leaves the board faulty
+        self.contam = False
         self.w = 70 + self.rnd.uniform(-10, 10)
         self.pwin = (-90, 15)
         self.pres = 0xF7 if mode == 'cpu' else 0x23     # no Z3 board; emulated: chip, mobo, cia
@@ -296,6 +298,7 @@ class FakeCard:
         self.cnt = [[0, 0, 0] for _ in range(8)]
         self.last_t = self.t
         self.params = {}
+        self.contam = False
         return self.alive
 
     def win(self, mhz):
@@ -341,7 +344,10 @@ class FakeCard:
                 continue
             ops = n * 6000
             self.cnt[p][1] += ops
-            if not self.path_ok(p, mhz, ph):
+            bad = not self.path_ok(p, mhz, ph)
+            if bad and p == 1 and self.rnd.random() < self.contam_p:
+                self.contam = True
+            if bad or (p == 1 and self.contam):
                 self.cnt[p][0] += max(1, int(ops * self.rnd.uniform(1e-5, 1e-3)))
 
     def rowline(self, tag):
@@ -390,8 +396,9 @@ class FakeCard:
             elif how == 'RESET':
                 self.applied = new
                 self.parked = False
+                self.contam = False
                 self.rs += 1
-                self.alive = not self.hung(*new) and self.rnd.random() > 0.05
+                self.alive = not self.hung(*new) and self.rnd.random() > 0.01
             else:
                 self.applied = new
                 self.alive = not self.hung(*new)
@@ -493,6 +500,7 @@ class Scanner:
         self.row = None
         self.lock = '-'         # lock_us of the last TAPPLY
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
+        self.contaminated = 0   # failing steps that left the board faulty until a reset
         self.safe = None        # the current pass's start values (known good)
         self.boot = None        # the row the preset boots (where a reboot lands)
         self.cycles = 0         # power cycles this run
@@ -680,8 +688,8 @@ class Scanner:
             self.log('restart failure %d (no heartbeat at the baseline values after a power cycle)' % self.rfail)
         raise SystemExit('three restart failures in a row: stopping (power left as the shim left it)')
 
-    def step(self, pas, off, ph):
-        how0 = 'live' if self.a.mode == 'emu' else 'park'
+    def step(self, pas, off, ph, how0=None):
+        how0 = how0 or ('live' if self.a.mode == 'emu' else 'park')
         tries = []
         how, real = self.apply(ph, how0)
         if how in ('tph-refused', 'apply-failed'):
@@ -727,6 +735,31 @@ class Scanner:
         return dict(off=off, ph=list(ph), silent=res['silent'], fails=res['fails'], v=v,
                     pathok=self.path_ok(res))
 
+    def clean_check(self, pas, r):
+        """after a step that failed with errors: back at the pass start values the program must run clean.
+        A failing step can leave the board faulty until an Amiga reset (METAL-2: motherboard RAM erring at the
+        boot row's own values after row 90's table step; clean again after a reset), and every later step would
+        be measured on that board. Not clean: reset (060: TAPPLY RESET, emulated: soft reboot), re-check."""
+        if not self.a.clean_check or not r['fails'] or r['silent'] or not self.safe:
+            return
+        how0 = 'live' if self.a.mode == 'emu' else 'park'
+        how, real = self.apply(self.safe, how0)
+        back = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else dict(silent=True, fails=[])
+        if not back['silent'] and not back['fails']:
+            return
+        self.contaminated += 1
+        self.log('%s: CONTAMINATED -- the start values fail (%s) after a failing step: reset' % (
+            pas, 'silent' if back['silent'] else ','.join(back['fails'])))
+        if self.a.mode == 'cpu':
+            self.reset_safe(pas, 0, self.safe, real, [], back)
+        else:
+            self.recover()
+            self.apply(self.safe, how0)
+            back = self.measure(self.a.dwell)
+            if back['silent'] or back['fails']:
+                raise SystemExit('STOP: the start values still fail after a reboot (%s)' % (
+                    'silent' if back['silent'] else ','.join(back['fails'])))
+
     def reset_safe(self, pas, off, ph, real, tries, res):
         """RESET at the pass start values; a silent one (30 s) is the METAL stop rule"""
         self.apply(self.safe, 'reset')
@@ -735,6 +768,8 @@ class Scanner:
             self.con.sleep(20)
             back = self.measure(self.a.dwell)
         tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
+        if not back['silent'] and back['fails']:
+            self.log('RESET at the start values runs but fails %s' % back['fails'])
         if back['silent']:
             self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
             raise SystemExit('STOP RULE: a RESET at the pass start values %s did not bring the program back'
@@ -823,6 +858,7 @@ class Scanner:
                 r = self.step(pas, off, vary(base, off))
                 results[off] = r
                 self.log('%s %+4d: %s' % (pas, off, r['v']))
+                self.clean_check(pas, r)
                 bad = bad + 1 if (r['silent'] or r['fails']) else 0
                 if bad >= 2 or (r['silent'] and not self.a.two_silent):
                     break
@@ -839,6 +875,7 @@ class Scanner:
                         if o2 not in results:
                             results[o2] = self.step(pas + '-fine', o2, vary(base, o2))
                             self.log('%s-fine %+4d: %s' % (pas, o2, results[o2]['v']))
+                            self.clean_check(pas, results[o2])
                         o2 += sign * fine
                     break
                 last_ok = o
@@ -1015,13 +1052,17 @@ def scan_row(a, sc, mhz):
                 if off == -180 or sign in dead:
                     continue
                 ph = [base[0], base[1], base[2] + off, base[3], base[4]]
-                r = sc.step('start', off, ph)
+                r = sc.step('start', off, ph, how0='reset' if a.mode == 'cpu' else None)
                 sc.log('row %d start search bclk %+d: %s' % (row['mhz'], off, r['v']))
                 if not r['silent'] and not r['fails']:
                     found = ph
                     break
                 if r['silent']:
                     dead.add(sign)
+                elif r['fails'] and a.clean_check and a.mode == 'emu':
+                    # no known-good values to check against here: the next search step starts from a reset
+                    # board (the 060 applies every search step by RESET)
+                    sc.recover()
             if found or len(dead) == 2:
                 break
         if found:
@@ -1120,6 +1161,8 @@ def main():
     ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
     ap.add_argument('--keep-going', action='store_true',
                     help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--no-clean-check', dest='clean_check', action='store_false',
+                    help='skip the return check at the pass start values after a failing step')
     ap.add_argument('--find-start', action='store_true',
                     help="a row whose table values fail: step BCLK outward (10 deg) for a passing point to sweep from")
     ap.add_argument('--switch', help='A,B: no sweep; change frequency between rows A and B --switch-n times')
@@ -1154,6 +1197,8 @@ def main():
     ap.add_argument('--fake-restart-fail', type=float, default=0.03, help='dry run: chance a power-on never starts the 060')
     ap.add_argument('--fake-rt', type=float, default=2.3, help='dry run: seconds per console round trip')
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
+    ap.add_argument('--fake-contam', type=float, default=0.0,
+                    help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
     ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
     ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
     ap.add_argument('--serve', action='store_true', help="one persistent '<shim> serve' instead of a call per line")
@@ -1163,6 +1208,7 @@ def main():
     if a.dry_run:
         shift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_shift.split(',') if x))
         card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
+        card.contam_p = a.fake_contam
         con = FakeConsole(card, lambda m: sc.log(m), a.fake_rt)
     elif a.shim:
         con = (ServeConsole if a.serve else ShimConsole)(a.shim, lambda m: sc.log(m))
@@ -1208,8 +1254,8 @@ def main():
         sc.log('STOP RULE: %s -- nothing more is sent; the box is left as it is' % e)
         raise SystemExit(3)
     finally:
-        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d; raw log %s' % (
-            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.raw.name))
+        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d; raw log %s' % (
+            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated, sc.raw.name))
         if isinstance(con, ServeConsole):
             con.close()
 
