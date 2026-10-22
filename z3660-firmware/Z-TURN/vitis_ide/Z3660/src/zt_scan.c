@@ -66,6 +66,16 @@ static uint32_t zt_us(void)
    XTime_GetTime(&t);
    return (uint32_t)(t / (counts_per_second / 1000000u));
 }
+/* die temperature in tenths of a degree (XADC, adc.c) and seconds since the last PS reset: every TSTAT and TMB
+ * carries both, so a scan can be read against the card's own warming */
+extern float xadc_get_temperature(void);
+static int zt_temp10(void) { return (int)(xadc_get_temperature() * 10.0f); }
+static unsigned long zt_up_s(void)
+{
+   XTime t;
+   XTime_GetTime(&t);
+   return (unsigned long)(t / counts_per_second);
+}
 static void zt_wait_us(uint32_t us)
 {
    uint32_t t0 = zt_us();
@@ -355,10 +365,10 @@ static void zt_tmb(void)
              (unsigned long)zt_rd68k(r + 0x08), (unsigned long)zt_rd68k(r + 0x0C),
              (unsigned long)zt_rd68k(r + 0x10), (unsigned long)zt_rd68k(r + 0x18));
    }
-   printf(" sz=%08lX/%08lX/%08lX/%08lX/%08lX\n",
+   printf(" sz=%08lX/%08lX/%08lX/%08lX/%08lX temp10=%d up=%lu\n",
           (unsigned long)zt_rd68k(b + 0x120), (unsigned long)zt_rd68k(b + 0x124),
           (unsigned long)zt_rd68k(b + 0x128), (unsigned long)zt_rd68k(b + 0x12C),
-          (unsigned long)zt_rd68k(b + 0x130));
+          (unsigned long)zt_rd68k(b + 0x130), zt_temp10(), zt_up_s());
 }
 
 static void zt_wm(const char *s)
@@ -394,7 +404,8 @@ static void zt_tstat(void)
    printf("ZT TSTAT st68k=%d rr=%d rsti=%lu rstc=%lu nbr=%lu mio15=%lu emu=%d mhz=%d idx=%d armmhz=%lu "
           "m=%lu d=%lu div=%d/%d/%d/%d/%d/%d ph=%d/%d/%d/%d/%d/%d "
           "rowdiv=%d/%d/%d/%d/%d rowph=%d/%d/%d/%d/%d xp=%d snap=%d live=%d "
-          "park=%lu nogrant=%lu notparked=%lu lockto=%lu reset=%lu applylive=%lu refused=%lu lock_us=%lu\n",
+          "park=%lu nogrant=%lu notparked=%lu lockto=%lu reset=%lu applylive=%lu refused=%lu lock_us=%lu "
+          "temp10=%d up=%lu\n",
           state68k, read_reset,
           (unsigned long)XGpioPs_ReadPin(&GpioPs, n040RSTI), (unsigned long)XGpioPs_ReadPin(&GpioPs, PS_MIO_13),
           (unsigned long)XGpioPs_ReadPin(&GpioPs, PS_MIO_8), (unsigned long)XGpioPs_ReadPin(&GpioPs, PS_MIO_15),
@@ -407,7 +418,7 @@ static void zt_tstat(void)
           zt_snap_taken, zt_row_live(),
           (unsigned long)zt_n.park_ok, (unsigned long)zt_n.nogrant, (unsigned long)zt_n.notparked,
           (unsigned long)zt_n.lockto, (unsigned long)zt_n.reset, (unsigned long)zt_n.live,
-          (unsigned long)zt_n.refused, (unsigned long)zt_n.last_lock_us);
+          (unsigned long)zt_n.refused, (unsigned long)zt_n.last_lock_us, zt_temp10(), zt_up_s());
 }
 
 static void zt_trest(void)
