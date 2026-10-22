@@ -745,7 +745,9 @@ class Scanner:
         send the -360 form (its line input drops '-': debug_console.c:345), so those values cannot be applied"""
         if self.a.mode != 'emu' or not self.row:
             return False
-        return any(norm360(ph[i]) + self.row['xp'] > 360 for i in (3, 4))
+        # a sum of exactly 360 is valid for the firmware but fails on the board (METAL-2c row 70: whole-word mobo
+        # errors at CLK90 360.00, repeated in two runs) and cannot be folded to 0 without a '-': not applied either
+        return any(norm360(ph[i]) + self.row['xp'] >= 360 for i in (3, 4))
 
     def apply(self, ph, how):
         if self.unreachable(ph):
