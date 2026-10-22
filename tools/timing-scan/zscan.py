@@ -745,6 +745,9 @@ class Scanner:
             self.log('TROW %d: %s' % (mhz, r.line))
             return None, None
         row = self.read_row()
+        # TSTAT's m/d are the wizard registers (the row applied so far); the staged row's own M/D are in the
+        # TROW reply (cd[], as TAPPLY will write them)
+        row['m'], row['d'] = int(r.kv['m']), int(r.kv['d'])
         self.row = row
         self.safe = None                    # no known-good values at a new row until its start passes
         res = self.step('row', 0, row['ph'])
