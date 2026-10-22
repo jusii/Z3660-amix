@@ -623,16 +623,19 @@ class Scanner:
 
     # ---- apply a phase set and measure, with the D7/D13 retry rule ----
     def tph(self, ph):
-        """TPH values in the firmware's -360..360; emulated, cpuclk/clk90 also get emu_extra_phase added
-        (zt_row_check refuses the sum above 360), so those two drop by 360 when the sum would pass it"""
-        out = [norm360(x) for x in ph]
-        if self.a.mode == 'emu' and self.row:
-            for i in (3, 4):
-                if out[i] + self.row['xp'] > 360:
-                    out[i] -= 360
-        return 'TPH %s' % ' '.join(map(str, out))
+        """TPH values as 0..359: the console's line input drops '-' (debug_console.c:345)"""
+        return 'TPH %s' % ' '.join(str(norm360(x)) for x in ph)
+
+    def unreachable(self, ph):
+        """emulated: cpuclk/clk90 + emu_extra_phase above 360 is refused by zt_row_check, and the console cannot
+        send the -360 form (its line input drops '-': debug_console.c:345), so those values cannot be applied"""
+        if self.a.mode != 'emu' or not self.row:
+            return False
+        return any(norm360(ph[i]) + self.row['xp'] > 360 for i in (3, 4))
 
     def apply(self, ph, how):
+        if self.unreachable(ph):
+            return 'tph-refused', 'unreachable over the console (emulated phase + extra above 360)'
         r = self.con.send(self.tph(ph))[0]
         if r.verb != 'TPH' or r.has('bad'):
             return 'tph-refused', r.line
