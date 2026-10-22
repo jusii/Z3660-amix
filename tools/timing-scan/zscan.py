@@ -743,13 +743,20 @@ class Scanner:
         if not self.a.clean_check or not r['fails'] or r['silent'] or not self.safe:
             return
         how0 = 'live' if self.a.mode == 'emu' else 'park'
-        how, real = self.apply(self.safe, how0)
-        back = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else dict(silent=True, fails=[])
-        if not back['silent'] and not back['fails']:
-            return
-        self.contaminated += 1
-        self.log('%s: CONTAMINATED -- the start values fail (%s) after a failing step: reset' % (
-            pas, 'silent' if back['silent'] else ','.join(back['fails'])))
+        real = None
+        if not self.a.reset_after_fail:
+            how, real = self.apply(self.safe, how0)
+            back = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else \
+                dict(silent=True, fails=[])
+            if not back['silent'] and not back['fails']:
+                return
+            self.contaminated += 1
+            self.log('%s: CONTAMINATED -- the start values fail (%s) after a failing step: reset' % (
+                pas, 'silent' if back['silent'] else ','.join(back['fails'])))
+        else:
+            # METAL-2: a board faulted by a failing step can still pass at the start values while failing at
+            # weaker phases, so the check cannot see it: reset after every failing step
+            back = dict(silent=False, fails=[])
         if self.a.mode == 'cpu':
             self.reset_safe(pas, 0, self.safe, real, [], back)
         else:
@@ -759,6 +766,22 @@ class Scanner:
             if back['silent'] or back['fails']:
                 raise SystemExit('STOP: the start values still fail after a reboot (%s)' % (
                     'silent' if back['silent'] else ','.join(back['fails'])))
+
+    def reset_board(self):
+        """a clean board at the boot row: TREST (RESET on the 060) or a soft reboot (emulated)"""
+        if self.a.mode == 'cpu':
+            r = self.con.send('TREST')[0]
+            self.log('reset_board: %s' % r.line)
+            self.row = dict(self.boot)
+            self.epoch += 1
+            self.wm(epoch=self.epoch, cmd=CMD_RUN)
+            res = self.measure(self.a.dwell)
+            if res['silent'] or res['fails']:
+                raise SystemExit('STOP RULE: TREST (RESET at the boot row) did not bring the program back clean (%s)'
+                                 % res['summary'])
+        else:
+            self.row = dict(self.boot)
+            self.recover()
 
     def reset_safe(self, pas, off, ph, real, tries, res):
         """RESET at the pass start values; a silent one (30 s) is the METAL stop rule"""
@@ -1078,6 +1101,8 @@ def scan_row(a, sc, mhz):
     if r0['silent'] or r0['fails']:
         write_row(a, sc, base, base, {}, {}, remark='P-27 scanner: the table values fail at this row (%s)%s; no sweep' % (
             r0['v'], ' and no BCLK step from -170 to +180 passes' if a.find_start else ''))
+        if a.reset_after_fail and not r0['silent']:
+            sc.reset_board()
         return False
     centre = list(base)
     wins, var_bases = {}, {}
@@ -1161,6 +1186,8 @@ def main():
     ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
     ap.add_argument('--keep-going', action='store_true',
                     help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--reset-after-fail', action='store_true',
+                    help='reset after every failing step (060: RESET at the pass start values; emulated: soft reboot)')
     ap.add_argument('--no-clean-check', dest='clean_check', action='store_false',
                     help='skip the return check at the pass start values after a failing step')
     ap.add_argument('--find-start', action='store_true',
