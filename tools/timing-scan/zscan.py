@@ -501,6 +501,13 @@ class Scanner:
         self.lock = '-'         # lock_us of the last TAPPLY
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
+        rp = os.path.join(out, 'resets-%s.csv' % a.card)
+        new = not os.path.exists(rp)
+        self.resets_fh = open(rp, 'a', newline='')
+        self.resets = csv.writer(self.resets_fh)
+        if new:
+            self.resets.writerow(['t', 'card', 'cpu', 'rev', 'row', 'pass', 'kind', 'phases', 'lock_us', 'heartbeat_s'])
+        self.nresets = {}
         self.safe = None        # the current pass's start values (known good)
         self.boot = None        # the row the preset boots (where a reboot lands)
         self.cycles = 0         # power cycles this run
@@ -702,20 +709,20 @@ class Scanner:
         tries.append(how)
         if res['silent'] and self.a.mode == 'cpu':
             # D13: one RESET first
-            how, real = self.apply(ph, 'reset')
+            self.timed_reset('d13-same', pas, ph)
             res = self.measure(self.a.dwell)
             tries.append('reset')
             if res['silent'] and self.a.reset_to_safe and self.safe and list(ph) != self.safe:
                 # silent twice: RESET back to the pass's start values (known good), then ONE more try of the
                 # same step; silent again = the step fails, no power action (a timing failure repeats, a
                 # restart failure does not)
-                self.reset_safe(pas, off, ph, real, tries, res)
+                self.reset_safe(pas, off, ph, real, tries, res, kind='d13-safe')
                 how, real = self.apply(ph, how0)
                 res = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else \
                     dict(silent=True, fails=[], mb=None, where=0, summary='silent')
                 tries.append('retry+' + how)
                 if res['silent']:
-                    self.reset_safe(pas, off, ph, real, tries, res)
+                    self.reset_safe(pas, off, ph, real, tries, res, kind='d13-safe')
                     v = 'fail-silent'
                     self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
                     return dict(off=off, ph=list(ph), silent=True, fails=[], v=v, pathok=self.path_ok(res))
@@ -758,7 +765,7 @@ class Scanner:
             # weaker phases, so the check cannot see it: reset after every failing step
             back = dict(silent=False, fails=[])
         if self.a.mode == 'cpu':
-            self.reset_safe(pas, 0, self.safe, real, [], back)
+            self.reset_safe(pas, 0, self.safe, real, [], back, kind='after-fail')
         else:
             self.recover()
             self.apply(self.safe, how0)
@@ -783,9 +790,31 @@ class Scanner:
             self.row = dict(self.boot)
             self.recover()
 
-    def reset_safe(self, pas, off, ph, real, tries, res):
+    def timed_reset(self, kind, pas, ph):
+        """TAPPLY RESET at ph, timed to the first heartbeat of the restarted program (rs + 1, this epoch);
+        one line per reset in resets-<card>.csv: the restart-path sample"""
+        mb0 = self.tmb()
+        rs0 = mb0['rs'] if mb0 else None
+        t0 = self.con.now()
+        how, real = self.apply(ph, 'reset')
+        t_hb = None
+        if how not in ('tph-refused', 'apply-failed'):
+            while self.con.now() - t0 < 30:
+                mb = self.tmb()
+                if mb and (rs0 is None or mb['rs'] > rs0) and mb['epoch'] == self.epoch and mb['hb'] > 0:
+                    t_hb = self.con.now() - t0
+                    break
+                self.con.sleep(0.5)
+        self.resets.writerow([self.stamp(), self.a.card, self.cpu[0], self.cpu[1], self.row['mhz'], pas, kind,
+                              '/'.join(str(norm360(x)) for x in ph), self.lock,
+                              '%.1f' % t_hb if t_hb is not None else 'none'])
+        self.resets_fh.flush()
+        self.nresets[kind] = self.nresets.get(kind, 0) + 1
+        return t_hb
+
+    def reset_safe(self, pas, off, ph, real, tries, res, kind='safe'):
         """RESET at the pass start values; a silent one (30 s) is the METAL stop rule"""
-        self.apply(self.safe, 'reset')
+        self.timed_reset(kind, pas, self.safe)
         back = self.measure(self.a.dwell)
         if back['silent']:                      # the METAL-1 rule allows the heartbeat 30 s
             self.con.sleep(20)
@@ -1281,8 +1310,8 @@ def main():
         sc.log('STOP RULE: %s -- nothing more is sent; the box is left as it is' % e)
         raise SystemExit(3)
     finally:
-        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d; raw log %s' % (
-            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated, sc.raw.name))
+        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d, resets %s; raw log %s' % (
+            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated, sc.nresets or 0, sc.raw.name))
         if isinstance(con, ServeConsole):
             con.close()
 
