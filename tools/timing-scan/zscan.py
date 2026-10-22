@@ -674,6 +674,10 @@ class Scanner:
                 self.apply(self.safe, 'reset')
                 back = self.measure(self.a.dwell)
                 tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
+                if back['silent'] and not self.a.no_reset_stop:
+                    self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
+                    raise SystemExit('STOP RULE: a RESET at the pass start values %s did not bring the program back'
+                                     % [norm360(x) for x in self.safe])
                 if not back['silent']:
                     v = 'fail-silent'
                     self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
@@ -1062,6 +1066,8 @@ def main():
     ap.add_argument('--reset-to-safe', action='store_true',
                     help='real 060: a step silent after its RESET retry gets a RESET at the pass start values '
                          'instead of a power cycle; the step fails, no reboot')
+    ap.add_argument('--no-reset-stop', action='store_true',
+                    help='with --reset-to-safe: a silent RESET at the start values reboots instead of ending the run')
     ap.add_argument('--two-silent', action='store_true',
                     help='keep stepping outward after a silent step (default: a silent step ends that side)')
     ap.add_argument('--max-cycles', type=int, help='power cycles this run may spend; past it the run stops')
