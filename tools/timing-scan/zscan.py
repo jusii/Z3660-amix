@@ -1233,6 +1233,8 @@ def keep_form(v):
         v -= 360
     while v < -360:
         v += 360
+    if v in (360, -360):        # the wizard's 360 is not its 0 (METAL-2c row 70): fold it
+        v = 0
     return v
 
 
@@ -1322,6 +1324,13 @@ def write_row(a, sc, base, centre, wins, var_bases, remark=None):
                     q, d['%s_lo' % q], d['%s_hi' % q], d['%s_centre' % q], d['%s_margin' % q]))
                 for p in PATHS:
                     fh.write('#    %-5s %s..%s\n' % (p, d['%s_%s_lo' % (q, p)], d['%s_%s_hi' % (q, p)]))
+            fh.write('# rule: phase (+ emu_extra_phase on cpuclk/clk90 when emulated) never equals 360 -- the wizard\'s\n'
+                     '# 360 is not its 0 (METAL-2c: CLK90 at 360.00 fails whole-word on motherboard RAM, repeatably)\n')
+            xp = row['xp'] if a.mode == 'emu' else 0
+            sums = [keep_form(centre[0]), keep_form(centre[1]), keep_form(centre[2]),
+                    norm360(centre[3]) + xp, norm360(centre[4]) + xp]
+            if any(x == 360 for x in sums):
+                fh.write('# WARNING: a phase + extra below sums to 360 -- move it off 360 before this row is used\n')
             fh.write('index %d\n# %d MHz\n' % (row['idx'], row['mhz']))
             fh.write('    global.multiplier = %3d\n    global.divider    = %3d\n' % (row['m'], row['d']))
             names = ('pclk', 'clken', 'bclk', 'cpuclk', 'clk90')
