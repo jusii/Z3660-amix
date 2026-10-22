@@ -279,6 +279,8 @@ class FakeCard:
         self.shift = shift or {}                           # {mhz: deg}: a row whose table misses its window
         self.pshift = {}                                   # {mhz: deg}: the card-local (PCLK) window off its table
         self.contam_p = 0.0                                # chance a failing mobo step leaves the board faulty
+        self.pagelost_p = 0.0                              # chance a RESET comes back cold, page lost
+        self.need_magic = False
         self.contam = False
         self.w = 70 + self.rnd.uniform(-10, 10)
         self.pwin = (-90, 15)
@@ -402,6 +404,8 @@ class FakeCard:
                 self.applied = new
                 self.parked = False
                 self.contam = False
+                if self.rnd.random() < self.pagelost_p:
+                    self.params, self.epoch, self.rs, self.need_magic, self.hb = {}, 0, 0, True, 0
                 self.rs += 1
                 self.alive = not self.hung(*new) and self.rnd.random() > 0.01
             else:
@@ -415,6 +419,11 @@ class FakeCard:
                 name = [k for k, o in OFF.items() if o == off]
                 if name:
                     self.params[name[0]] = int(x, 16)
+            names = [k for i in range(len(w) - 2) for k, o in OFF.items() if o == a + 4 * i - PA]
+            if self.need_magic:
+                if 'magic' not in names:
+                    return 'ZT WM ok n=%d' % (len(w) - 2)       # a cold page: an epoch alone is not adopted
+                self.need_magic = False
             if self.alive:
                 cmd = self.params.get('cmd', CMD_RUN)
                 if self.params.get('epoch', 0) != self.epoch and cmd != CMD_PARK:
@@ -509,6 +518,8 @@ class Scanner:
         self.up = None
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
+        self.pagelost = 0       # cold restarts with the mailbox page lost, re-armed
+        self.acfg = 0
         rp = os.path.join(out, 'resets-%s.csv' % a.card)
         new = not os.path.exists(rp)
         self.resets_fh = open(rp, 'a', newline='')
@@ -630,9 +641,10 @@ class Scanner:
         if not mb or mb['hb'] == 0:
             return None
         self.pres = mb['sz'][0]
+        self.acfg = mb['sz'][4]
         self.cpu = cpu_ident(mb, self.a.mode)
         self.epoch += 1
-        self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=mb['sz'][4])
+        self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=self.acfg)
         res = self.measure(self.a.dwell)
         self.log('baseline: present=%02X cpu=%s rev=%s %s' % (self.pres, self.cpu[0], self.cpu[1], res['summary']))
         return res
@@ -649,11 +661,32 @@ class Scanner:
         return worst == 0
 
     # ---- one measurement at whatever is applied ----
-    def measure(self, dwell):
+    @staticmethod
+    def cold(a, b):
+        """running (heartbeat rising) at epoch 0: ztest restarted with its page and parameter block lost"""
+        return a is not None and b is not None and b['hb'] > a['hb'] and b['epoch'] == 0
+
+    def rearm(self, why):
+        """a cold-restarted ztest (page lost, e.g. a runaway 060 scribbled the mailbox before a RESET): the whole
+        parameter block again -- magic, mode, SIZE, then RUN with the frozen present mask -- not just the epoch"""
+        self.pagelost += 1
+        self.log('page-lost restart (%s): re-arming the parameter block' % why)
+        self.epoch += 1
+        self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=2 if self.a.mode == 'emu' else 1,
+                en=self.a.en, flags=self.a.flags)
+        self.con.sleep(3)
+        self.tmb()
+        self.epoch += 1
+        self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=self.acfg)
+
+    def measure(self, dwell, rearmed=False):
         self.con.sleep(dwell)
         a = self.tmb()
         self.con.sleep(1.5)
         b = self.tmb()
+        if self.epoch and not rearmed and self.cold(a, b):
+            self.rearm('measure')
+            return self.measure(dwell, rearmed=True)
         silent = (a is None or b is None or b['hb'] <= a['hb'] or b['epoch'] != self.epoch)
         res = dict(silent=silent, mb=b or a, where=(b or a or {}).get('lwhere', 0))
         fails = []
@@ -846,11 +879,18 @@ class Scanner:
         how, real = self.apply(ph, 'reset')
         t_hb = None
         if how not in ('tph-refused', 'apply-failed'):
+            prev = None
             while self.con.now() - t0 < 30:
                 mb = self.tmb()
                 if mb and (rs0 is None or mb['rs'] > rs0) and mb['epoch'] == self.epoch and mb['hb'] > 0:
                     t_hb = self.con.now() - t0
                     break
+                if self.cold(prev, mb):
+                    t_hb = self.con.now() - t0
+                    kind += '+page-lost'
+                    self.rearm('after a RESET')
+                    break
+                prev = mb
                 self.con.sleep(0.5)
         self.resets.writerow([self.stamp(), self.a.card, self.cpu[0], self.cpu[1], self.row['mhz'], pas, kind,
                               '/'.join(str(norm360(x)) for x in ph), self.lock,
@@ -1333,6 +1373,7 @@ def main():
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
     ap.add_argument('--fake-contam', type=float, default=0.0,
                     help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
+    ap.add_argument('--fake-pagelost', type=float, default=0.0, help='dry run: chance a RESET restarts cold, page lost')
     ap.add_argument('--fake-width', type=float, default=0, help='dry run: forwarded window width in degrees')
     ap.add_argument('--fake-pshift', default='', help="dry run: 'mhz:deg,...' rows whose PCLK window sits off their table")
     ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
@@ -1345,6 +1386,7 @@ def main():
         shift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_shift.split(',') if x))
         card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
         card.contam_p = a.fake_contam
+        card.pagelost_p = a.fake_pagelost
         if a.fake_width:
             card.w = a.fake_width
         card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))
@@ -1394,8 +1436,9 @@ def main():
         sc.log('STOP RULE: %s -- nothing more is sent; the box is left as it is' % e)
         raise SystemExit(3)
     finally:
-        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d, resets %s; raw log %s' % (
-            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated, sc.nresets or 0, sc.raw.name))
+        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d, resets %s, '
+               'page-lost restarts %d; raw log %s' % (con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated,
+                                                     sc.nresets or 0, sc.pagelost, sc.raw.name))
         if isinstance(con, ServeConsole):
             con.close()
 
