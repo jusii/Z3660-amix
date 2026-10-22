@@ -407,6 +407,19 @@ def main():
     check('TOENB probe: flags 2 no fault on a TOENB-gated Gary, flags 6 faults, both registers back to 0',
           ok2 and p6['berr'] >= 3 and p6['err'] == 0 and s.board.gary_to == 0 and s.board.gary_toen == 0, mb)
 
+    # 13. flags bit 3: Gary in BERR mode for the whole run, cleared once when the bit goes off
+    params(s.board, epoch=6, flags=8)
+    mb = s.run_passes(3)
+    on = s.board.gary_to == 0x80 and s.board.gary_toen == 0x80
+    clean = all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths'])
+    params(s.board, epoch=7, flags=10)
+    mb = s.run_passes(3)
+    probe_kept = mb['paths'][5]['berr'] >= 3 and s.board.gary_to == 0x80 and s.board.gary_toen == 0x80
+    params(s.board, epoch=8, flags=0)
+    mb = s.run_passes(2)
+    check('flags 8: BERR mode on for the run (paths clean), kept by the probe (flags 10), cleared at flags 0',
+          on and clean and probe_kept and s.board.gary_to == 0 and s.board.gary_toen == 0, mb)
+
     bad = [n for n, c in results if not c]
     print('%d/%d scenarios pass' % (len(results) - len(bad), len(results)))
     sys.exit(1 if bad else 0)

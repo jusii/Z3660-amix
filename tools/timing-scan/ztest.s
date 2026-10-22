@@ -14,7 +14,7 @@
 
 		machine	68060
 
-BUILD		equ	2			; bump on every change; reported in MB_VER
+BUILD		equ	3			; bump on every change; reported in MB_VER
 
 MB		equ	$0FFF0000		; mailbox page, top 64 KB of CPU RAM
 STACKTOP	equ	$0FFFF000
@@ -68,7 +68,8 @@ PA_CHUNK	equ	$244			; longwords per RAM path per pass
 PA_CACR		equ	$248			; bit31 set: use bits 30:0 as CACR; 0: I-cache on
 PA_CIA		equ	$24C			; CIA iterations per pass
 PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4; bit1: Gary BERR probe (path 6);
-					; bit2: the probe also sets TOENB ($DE0001)
+					; bit2: the probe also sets TOENB ($DE0001);
+					; bit3: Gary in BERR mode for the whole run (real 060)
 PA_BPROBE	equ	$254			; BERR probe address; 0 = $00F00000
 
 VBRT		equ	$400			; vector table, 1 KB
@@ -89,6 +90,7 @@ V_LFSR		equ	$A4C
 V_SPIN		equ	$A50
 V_CHASH		equ	$A54			; card autoconfig nibble hash
 V_CLEAN		equ	$A58			; params were valid this pass
+V_GB		equ	$A5C			; Gary BERR mode set by flags bit 3
 ; effective parameters, recomputed every pass
 E_CMD		equ	$A80
 E_EN		equ	$A84
@@ -194,6 +196,7 @@ start:
 		clr.l	MB_STAT(a5)
 		bsr	detect_cpu		; after the page init, which clears MB_STAT and MB_ID
 		clr.l	V_SIZED(a5)
+		clr.l	V_GB(a5)
 		clr.l	V_Z3OK(a5)
 		clr.l	V_MOBI(a5)
 		lea	V_OFF(a5),a0
@@ -390,6 +393,7 @@ loop:
 		clr.l	V_PATH(a5)
 		move.l	#W_IDLE,MB_WHERE(a5)
 		bsr	eff_params
+		bsr	gary_mode
 		move.l	PA_EPOCH(a5),d0
 		tst.l	V_CLEAN(a5)
 		bne.s	.ep
@@ -416,6 +420,25 @@ loop:
 		addq.l	#1,MB_HB(a5)
 		bsr	publish
 		bra	loop
+
+; flags bit 3 (real 060): Gary in BERR mode (TIMEOUT + TOENB) for the whole run, so a motherboard cycle nobody
+; ends becomes a caught bus error on its path instead of a hang (METAL-2c: the first chip-RAM read after a runaway
+; and a CPLD reset never ended). Off again: both registers cleared once.
+gary_mode:
+		tst.l	V_MODE(a5)
+		bne.s	.r
+		btst	#3,E_FLAGS+3(a5)
+		beq.s	.off
+		move.b	#$80,GARY_TOEN
+		move.b	#$80,GARY_TO
+		move.l	#1,V_GB(a5)
+		rts
+.off:		tst.l	V_GB(a5)
+		beq.s	.r
+		clr.b	GARY_TO
+		clr.b	GARY_TOEN
+		clr.l	V_GB(a5)
+.r:		rts
 
 park:
 		move.l	#W_PARKED,MB_WHERE(a5)
@@ -938,9 +961,11 @@ berr_probe:
 		moveq	#0,d1
 		bsr	bad
 .fault:		lea	MB,a5
+		btst	#3,E_FLAGS+3(a5)	; the whole run in BERR mode: leave it set
+		bne.s	.keep
 		clr.b	GARY_TO
 		clr.b	GARY_TOEN		; Kickstart's own setting: both clear
-		rts
+.keep:		rts
 ; one CIA at a4: timer A then timer B latch, d3 low word = value
 cia_timer:
 		moveq	#1,d2			; 1: timer A at $400/$500, 0: timer B at $600/$700
