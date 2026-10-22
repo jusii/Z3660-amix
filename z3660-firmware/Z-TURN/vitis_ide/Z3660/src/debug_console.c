@@ -845,7 +845,7 @@ int debug_thread(struct pt *pt)
                   case DUMP_MEM_SWAP:
                      xil_printf("Address (hex): ");
                      debug_console.subcmd=1;
-                     debug_console.cmd=DM;
+                     debug_console.cmd=DMS;
                      break;
                   case S:
                   case STEP:
