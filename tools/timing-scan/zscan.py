@@ -840,8 +840,8 @@ class Scanner:
         A failing step can leave the board faulty until an Amiga reset (METAL-2: motherboard RAM erring at the
         boot row's own values after row 90's table step; clean again after a reset), and every later step would
         be measured on that board. Not clean: reset (060: TAPPLY RESET, emulated: soft reboot), re-check."""
-        if not self.a.clean_check or not r['fails'] or r['silent'] or not self.safe:
-            return
+        if not self.a.clean_check or not r['fails'] or r['silent'] or not self.safe or 'refused' in r['fails']:
+            return                          # a refused step applied nothing: nothing to reset
         how0 = 'live' if self.a.mode == 'emu' else 'park'
         real = None
         if not self.a.reset_after_fail:
