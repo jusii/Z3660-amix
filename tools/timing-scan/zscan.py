@@ -98,6 +98,8 @@ def parse_tmb(r):
         out['paths'].append(dict(err=int(f[0]), ops=int(f[1]), berr=int(f[2]), fa=int(f[3], 16),
                                  fx=int(f[4], 16), pres=int(f[5])))
     out['sz'] = [int(x, 16) for x in k.get('sz', '0/0/0/0/0').split('/')]
+    out['temp'] = int(k['temp10']) / 10.0 if 'temp10' in k else None     # die temperature (newer firmware)
+    out['up'] = int(k['up']) if 'up' in k else None
     return out
 
 
@@ -433,7 +435,8 @@ class FakeCard:
             pcr = 0x04310402 if self.mode == 'cpu' else 0
             return ('ZT TMB crc=%s lwhere=%08X hb=%d where=%08X epoch=%d st=%08X rs=%d id=%08X %s sz=%08X/%08X/FFFFFFFF/0000A48B/DD9D6123'
                     % ('mirror' if self.rnd.random() > 0.1 else 'ok', where, self.hb, where, self.epoch,
-                       0x75 if self.mode == 'cpu' else 0x4004D, self.rs, pcr, ' '.join(ps), self.pres, 0xFF00))
+                       0x75 if self.mode == 'cpu' else 0x4004D, self.rs, pcr, ' '.join(ps), self.pres, 0xFF00)
+                    + ' temp10=%d up=%d' % (450 + min(200, int(self.t / 30)), int(self.t)))
         if v == 'TSTAT':
             r = self.rows[self.cur]
             amhz, aph = self.applied
@@ -502,6 +505,8 @@ class Scanner:
         self.cpu = ('?', '?')
         self.row = None
         self.lock = '-'         # lock_us of the last TAPPLY
+        self.temp = None        # die temperature (C) and firmware uptime (s) of the last TMB
+        self.up = None
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
         rp = os.path.join(out, 'resets-%s.csv' % a.card)
@@ -550,8 +555,20 @@ class Scanner:
         for _ in range(3):
             r = self.con.send('TMB')[0]
             if r.verb == 'TMB' and r.kv.get('crc') in ('ok', 'mirror'):
-                return parse_tmb(r)
-        return parse_tmb(r) if r.verb == 'TMB' else None
+                return self.note(parse_tmb(r))
+        return self.note(parse_tmb(r)) if r.verb == 'TMB' else None
+
+    def note(self, mb):
+        if mb.get('temp') is not None:
+            self.temp, self.up = mb['temp'], mb['up']
+        return mb
+
+    def since_on(self):
+        """seconds since the session's power-on (--power-on, UTC ISO time), or '-'"""
+        if not self.a.power_on:
+            return '-'
+        t0 = dt.datetime.fromisoformat(self.a.power_on.replace('Z', '+00:00'))
+        return '%d' % (dt.datetime.now(dt.timezone.utc) - t0).total_seconds()
 
     def tstat(self):
         r = self.con.send('TSTAT')[0]
@@ -918,7 +935,9 @@ class Scanner:
             f.append('%s=%d/%d/%d' % (name, p['err'], p['ops'], p['berr']))
             berr += p['berr']
             fx |= p['fx']
-        f += ['berr=%d' % berr, 'fx=%08X' % fx, 'where=%08X' % res.get('where', 0), 'v=%s' % v]
+        f += ['berr=%d' % berr, 'fx=%08X' % fx, 'where=%08X' % res.get('where', 0),
+              'temp=%s' % ('%.1f' % self.temp if self.temp is not None else '-'),
+              'up=%s' % (self.up if self.up is not None else '-'), 'since_on=%s' % self.since_on(), 'v=%s' % v]
         self.raw.write(' '.join(f) + '\n')
         self.raw.flush()
 
@@ -1016,7 +1035,8 @@ SUMMARY_COLS = ['Machine', 'Kickstart', 'HW Rev', 'CPLD', 'Boot.bin', 'SCSI', 'A
                 'card', 'cpu_rev', 'arm_mhz', 'pclk_div', 'clken_div', 'bclk_div', 'cpuclk_div', 'clk90_div',
                 'bus_mhz', 'start_phases', 'dbc_centre', 'dbc_centre_ns'] + \
                ['%s_%s' % (q, x) for q in PASSES for x in ('lo', 'hi', 'centre', 'margin')] + \
-               ['%s_%s_%s' % (q, p, x) for q in PASSES for p in PATHS for x in ('lo', 'hi')]
+               ['%s_%s_%s' % (q, p, x) for q in PASSES for p in PATHS for x in ('lo', 'hi')] + \
+               ['temp_start_c', 'temp_end_c']
 
 
 def keep_form(v):
@@ -1083,8 +1103,20 @@ def write_row(a, sc, base, centre, wins, var_bases, remark=None):
     d = summary_row(a, sc, base, centre, wins, var_bases)
     if remark:
         d['Remarks'] = remark
+    d['temp_start_c'] = '%.1f' % sc.row_temp0 if getattr(sc, 'row_temp0', None) is not None else ''
+    d['temp_end_c'] = '%.1f' % sc.temp if sc.temp is not None else ''
     sp = os.path.join(a.out, 'summary-%s.csv' % a.card)
     new = not os.path.exists(sp)
+    if not new:
+        with open(sp) as fh:
+            old = list(csv.DictReader(fh))
+            hdr = old[0].keys() if old else []
+        if list(hdr) != SUMMARY_COLS:       # an older file: the new columns are appended, the old lines kept
+            with open(sp, 'w', newline='') as fh:
+                w = csv.DictWriter(fh, SUMMARY_COLS)
+                w.writeheader()
+                for x in old:
+                    w.writerow(dict((c, x.get(c, '')) for c in SUMMARY_COLS))
     with open(sp, 'a', newline='') as fh:
         w = csv.DictWriter(fh, SUMMARY_COLS)
         if new:
@@ -1124,6 +1156,7 @@ def scan_row(a, sc, mhz):
         if r0 is None:
             return None
     base = list(row['ph'])
+    sc.row_temp0 = sc.temp
     passes = [p.strip() for p in a.passes.split(',') if p.strip()]
     sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz -> %s' % (
         row['mhz'], row['idx'], row['m'], row['d'], row['div'], base, row['armmhz'], r0['v']))
@@ -1265,6 +1298,7 @@ def main():
                     help='skip the return check at the pass start values after a failing step')
     ap.add_argument('--find-start', action='store_true',
                     help="a row whose table values fail: step BCLK outward (10 deg) for a passing point to sweep from")
+    ap.add_argument('--power-on', help="the session's power-on time, UTC ISO (from POWER-LOG): raw lines get since_on=")
     ap.add_argument('--switch', help='A,B: no sweep; change frequency between rows A and B --switch-n times')
     ap.add_argument('--switch-n', type=int, default=20)
     ap.add_argument('--mode', choices=('cpu', 'emu'), required=True)
