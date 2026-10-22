@@ -280,6 +280,8 @@ class FakeCard:
         self.pshift = {}                                   # {mhz: deg}: the card-local (PCLK) window off its table
         self.contam_p = 0.0                                # chance a failing mobo step leaves the board faulty
         self.pagelost_p = 0.0                              # chance a RESET comes back cold, page lost
+        self.flaky_p = 0.0                                 # chance an apply gives a one-off chip error
+        self.flaky_now = False
         self.need_magic = False
         self.contam = False
         self.w = 70 + self.rnd.uniform(-10, 10)
@@ -304,6 +306,7 @@ class FakeCard:
         self.last_t = self.t
         self.params = {}
         self.contam = False
+        self.flaky_now = False
         return self.alive
 
     def win(self, mhz):
@@ -351,7 +354,7 @@ class FakeCard:
                 continue
             ops = n * 6000
             self.cnt[p][1] += ops
-            bad = not self.path_ok(p, mhz, ph)
+            bad = not self.path_ok(p, mhz, ph) or (p == 0 and self.flaky_now)
             if bad and p == 1 and self.rnd.random() < self.contam_p:
                 self.contam = True
             if bad or (p == 1 and self.contam):
@@ -411,6 +414,7 @@ class FakeCard:
             else:
                 self.applied = new
                 self.alive = not self.hung(*new)
+            self.flaky_now = self.rnd.random() < self.flaky_p
             return 'ZT TAPPLY ok how=%s lock_us=%d' % (how, 27 + self.rnd.randint(0, 1))
         if v == 'WM':
             a = int(w[1], 16)
@@ -519,6 +523,15 @@ class Scanner:
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
         self.pagelost = 0       # cold restarts with the mailbox page lost, re-armed
+        self.flaky = 0          # failing steps that passed on the confirm (--confirm-fail)
+        fp = os.path.join(out, 'flaky-%s.csv' % a.card)
+        newf = not os.path.exists(fp)
+        self.flaky_fh = open(fp, 'a', newline='')
+        self.flaky_w = csv.writer(self.flaky_fh)
+        if newf:
+            self.flaky_w.writerow(['t', 'card', 'mode', 'row', 'pass', 'step', 'phases', 'first_fails',
+                                   'first_counts_fx', 'temp_c'])
+            self.flaky_fh.flush()
         self.acfg = 0
         rp = os.path.join(out, 'resets-%s.csv' % a.card)
         new = not os.path.exists(rp)
@@ -820,7 +833,7 @@ class Scanner:
         v = 'fail-silent' if res['silent'] else res['summary']
         self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
         return dict(off=off, ph=list(ph), silent=res['silent'], fails=res['fails'], v=v,
-                    pathok=self.path_ok(res))
+                    pathok=self.path_ok(res), mb=res.get('mb'))
 
     def clean_check(self, pas, r):
         """after a step that failed with errors: back at the pass start values the program must run clean.
@@ -850,9 +863,45 @@ class Scanner:
             self.recover()
             self.apply(self.safe, how0)
             back = self.measure(self.a.dwell)
+            if back['fails'] and not back['silent'] and self.a.confirm_fail:
+                self.log('the start values fail once after the reboot (%s): one confirm' % ','.join(back['fails']))
+                self.apply(self.safe, how0)
+                back = self.measure(self.a.dwell)
             if back['silent'] or back['fails']:
                 raise SystemExit('STOP: the start values still fail after a reboot (%s)' % (
                     'silent' if back['silent'] else ','.join(back['fails'])))
+
+    def confirm(self, pas, off, ph, r):
+        """--confirm-fail: a step that failed with errors is measured once more on a reset board and counts as
+        failed only if it fails again ("a timing failure repeats"); a one-off is logged as flaky with the first
+        try's counts and fx, so a marginal step (few errors, partial-bit fx) and a faulted board (whole-word fx)
+        stay apart"""
+        if not self.a.confirm_fail or r['silent'] or not r['fails'] or 'refused' in r['fails']:
+            return r
+        how0 = None
+        if not (self.a.reset_after_fail and self.safe):     # no reset happened yet: make one
+            if self.a.mode == 'cpu':
+                how0 = 'reset'
+            else:
+                self.recover()
+        r2 = self.step(pas + '-confirm', off, ph, how0=how0)
+        if not r2['silent'] and not r2['fails']:
+            mb = r.get('mb') or {}
+            first = []
+            for i, p in enumerate((mb.get('paths') or [])):
+                if PATHS[i] in r['fails']:
+                    first.append('%s=%d/%d fx=%08X' % (PATHS[i], p['err'], p['ops'], p['fx']))
+            self.flaky += 1
+            self.log('FLAKY %s %+d at row %d: failed once (%s), passed on the confirm' % (
+                pas, off, self.row['mhz'], ' '.join(first) or ','.join(r['fails'])))
+            self.flaky_w.writerow([self.stamp(), self.a.card, self.a.mode, self.row['mhz'], pas, off,
+                                   '/'.join(str(norm360(x)) for x in ph), ','.join(r['fails']), ' '.join(first),
+                                   '%.1f' % self.temp if self.temp is not None else ''])
+            self.flaky_fh.flush()
+            return r2
+        if r2['fails']:
+            self.clean_check(pas, r2)
+        return r2
 
     def reset_board(self):
         """a clean board at the boot row: TREST (RESET on the 060) or a soft reboot (emulated)"""
@@ -1000,9 +1049,10 @@ class Scanner:
             while (k * coarse <= limit if sign > 0 else k * coarse < limit) and len(results) < maxsteps + 1:
                 off = sign * k * coarse
                 r = self.step(pas, off, vary(base, off))
-                results[off] = r
                 self.log('%s %+4d: %s' % (pas, off, r['v']))
                 self.clean_check(pas, r)
+                r = self.confirm(pas, off, vary(base, off), r)
+                results[off] = r
                 bad = bad + 1 if (r['silent'] or r['fails']) else 0
                 if bad >= 2 or (r['silent'] and not self.a.two_silent):
                     break
@@ -1017,9 +1067,10 @@ class Scanner:
                     o2 = last_ok + sign * fine
                     while abs(o2) < abs(o):
                         if o2 not in results:
-                            results[o2] = self.step(pas + '-fine', o2, vary(base, o2))
-                            self.log('%s-fine %+4d: %s' % (pas, o2, results[o2]['v']))
-                            self.clean_check(pas, results[o2])
+                            r2 = self.step(pas + '-fine', o2, vary(base, o2))
+                            self.log('%s-fine %+4d: %s' % (pas, o2, r2['v']))
+                            self.clean_check(pas, r2)
+                            results[o2] = self.confirm(pas + '-fine', o2, vary(base, o2), r2)
                         o2 += sign * fine
                     break
                 last_ok = o
@@ -1196,6 +1247,8 @@ def scan_row(a, sc, mhz):
         if r0 is None:
             return None
     base = list(row['ph'])
+    if not r0['silent'] and r0['fails']:
+        r0 = sc.confirm('row', 0, base, r0)
     sc.row_temp0 = sc.temp
     passes = [p.strip() for p in a.passes.split(',') if p.strip()]
     sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz -> %s' % (
@@ -1220,6 +1273,7 @@ def scan_row(a, sc, mhz):
                     ph = [base[0], base[1], base[2] + off, base[3], base[4]]
                 r = sc.step('start', off, ph, how0='reset' if a.mode == 'cpu' else None)
                 sc.log('row %d start search %s %+d: %s' % (row['mhz'], axis, off, r['v']))
+                r = sc.confirm('start', off, ph, r)
                 if not r['silent'] and not r['fails']:
                     found = ph
                     break
@@ -1332,6 +1386,9 @@ def main():
     ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
     ap.add_argument('--keep-going', action='store_true',
                     help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--confirm-fail', action='store_true',
+                    help='a step failing with errors is measured once more after its reset; failed only if it fails '
+                         'again, else logged as flaky (flaky-<card>.csv)')
     ap.add_argument('--reset-after-fail', action='store_true',
                     help='reset after every failing step (060: RESET at the pass start values; emulated: soft reboot)')
     ap.add_argument('--no-clean-check', dest='clean_check', action='store_false',
@@ -1373,6 +1430,7 @@ def main():
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
     ap.add_argument('--fake-contam', type=float, default=0.0,
                     help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
+    ap.add_argument('--fake-flaky', type=float, default=0.0, help='dry run: chance an apply gives a one-off error')
     ap.add_argument('--fake-pagelost', type=float, default=0.0, help='dry run: chance a RESET restarts cold, page lost')
     ap.add_argument('--fake-width', type=float, default=0, help='dry run: forwarded window width in degrees')
     ap.add_argument('--fake-pshift', default='', help="dry run: 'mhz:deg,...' rows whose PCLK window sits off their table")
@@ -1387,6 +1445,7 @@ def main():
         card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
         card.contam_p = a.fake_contam
         card.pagelost_p = a.fake_pagelost
+        card.flaky_p = a.fake_flaky
         if a.fake_width:
             card.w = a.fake_width
         card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))
@@ -1437,8 +1496,9 @@ def main():
         raise SystemExit(3)
     finally:
         sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d, resets %s, '
-               'page-lost restarts %d; raw log %s' % (con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated,
-                                                     sc.nresets or 0, sc.pagelost, sc.raw.name))
+               'page-lost restarts %d, flaky %d; raw log %s' % (con.now() - t0, sc.cycles, sc.softs, sc.rfail,
+                                                               sc.contaminated, sc.nresets or 0, sc.pagelost, sc.flaky,
+                                                               sc.raw.name))
         if isinstance(con, ServeConsole):
             con.close()
 
