@@ -1178,8 +1178,14 @@ class Scanner:
             else:
                 hi_fail = o
                 break
-        for o in sorted((o for o in offs if o < 0), reverse=True):
-            if pred(results[o]):
+        # phase is circular: an upward side that went on past its fail edge and round past +180 measured the
+        # downward side too; those steps count there as o - 360 (a measured negative step wins over a wrapped one)
+        neg = dict((o, results[o]) for o in offs if o < 0)
+        for o in offs:
+            if o > 180 and (hi_fail is None or o > hi_fail) and (o - 360) not in neg:
+                neg[o - 360] = results[o]
+        for o in sorted(neg, reverse=True):
+            if pred(neg[o]):
                 lo = o
             else:
                 lo_fail = o
