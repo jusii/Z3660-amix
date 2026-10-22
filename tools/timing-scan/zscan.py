@@ -510,6 +510,7 @@ class Scanner:
         self.resets = csv.writer(self.resets_fh)
         if new:
             self.resets.writerow(['t', 'card', 'cpu', 'rev', 'row', 'pass', 'kind', 'phases', 'lock_us', 'heartbeat_s'])
+            self.resets_fh.flush()
         self.nresets = {}
         self.safe = None        # the current pass's start values (known good)
         self.boot = None        # the row the preset boots (where a reboot lands)
