@@ -185,12 +185,20 @@ class ServeConsole(ShimConsole):
     def send(self, *lines):
         reps = []
         for l in lines:
+            if self.p is not None and self.p.poll() is not None:
+                self.log('serve exited (rc %s): the shim guard refused or the console went away' % self.p.returncode)
+                self.p = None
             if self.p is None:
                 reps.append(Reply('ZT NOCONSOLE'))
                 continue
-            self.p.stdin.write((l + '\n').encode('ascii'))
-            self.p.stdin.flush()
-            r = self.readline(60) or 'ZT TIMEOUT'
+            try:
+                self.p.stdin.write((l + '\n').encode('ascii'))
+                self.p.stdin.flush()
+            except BrokenPipeError:
+                self.p = None
+                reps.append(Reply('ZT NOCONSOLE'))
+                continue
+            r = self.readline(60) or ('ZT TIMEOUT' if self.p.poll() is None else 'ZT NOCONSOLE')
             reps.append(Reply(r))
             if r in ('ZT ABORT', 'ZT BANNER'):
                 raise StopRule('%s after "%s"' % (r, l))
@@ -199,11 +207,16 @@ class ServeConsole(ShimConsole):
     def close(self):
         if self.p is not None:
             try:
-                self.p.stdin.write(b'QUIT\n')
-                self.p.stdin.flush()
-                self.p.wait(timeout=10)
+                if self.p.poll() is None:
+                    self.p.stdin.write(b'QUIT\n')
+                    self.p.stdin.flush()
+                    self.p.wait(timeout=10)
             except Exception:
                 self.p.kill()
+            try:
+                self.p.stdin.close()
+            except Exception:
+                pass
         self.p = None
 
     def cycle(self):
