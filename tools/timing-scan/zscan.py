@@ -673,6 +673,9 @@ class Scanner:
                 # the step is silent twice: back to the pass's start values by RESET, no power action
                 self.apply(self.safe, 'reset')
                 back = self.measure(self.a.dwell)
+                if back['silent']:              # the METAL-1 rule allows the heartbeat 30 s
+                    self.con.sleep(20)
+                    back = self.measure(self.a.dwell)
                 tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
                 if back['silent'] and not self.a.no_reset_stop:
                     self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
