@@ -910,8 +910,11 @@ class Scanner:
         for sign in (+1, -1):
             bad = 0
             k = 1
-            # +180 and -180 are one phase: the negative side stops short of it
-            while (k * coarse <= 180 if sign > 0 else k * coarse < 180) and len(results) < maxsteps + 1:
+            # phase is circular: the upward side keeps going past +180 (across 0/360) while it passes, up to one
+            # step short of a full turn; the downward side stops short of what the upward side already covered
+            top = max(o for o in results) if sign < 0 else 0
+            limit = 360 - coarse if sign > 0 else 360 - top
+            while (k * coarse <= limit if sign > 0 else k * coarse < limit) and len(results) < maxsteps + 1:
                 off = sign * k * coarse
                 r = self.step(pas, off, vary(base, off))
                 results[off] = r
@@ -1252,7 +1255,7 @@ def main():
     ap.add_argument('--warmup', type=int, default=600, help='seconds at the baseline before the passes')
     ap.add_argument('--coarse', type=int, default=10)
     ap.add_argument('--fine', type=int, default=3)
-    ap.add_argument('--max-steps', type=int, default=36)
+    ap.add_argument('--max-steps', type=int, default=72)
     ap.add_argument('--passes', default='cpuclk,bclk', help='comma list of cpuclk,bclk,clk90off,pclk')
     ap.add_argument('--en', type=lambda x: int(x, 0), default=0, help='ztest path-enable mask (0 = all)')
     ap.add_argument('--flags', type=lambda x: int(x, 0), default=0, help='ztest flags (bit1 = Gary BERR probe)')
@@ -1271,6 +1274,7 @@ def main():
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
     ap.add_argument('--fake-contam', type=float, default=0.0,
                     help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
+    ap.add_argument('--fake-width', type=float, default=0, help='dry run: forwarded window width in degrees')
     ap.add_argument('--fake-pshift', default='', help="dry run: 'mhz:deg,...' rows whose PCLK window sits off their table")
     ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
     ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
@@ -1282,6 +1286,8 @@ def main():
         shift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_shift.split(',') if x))
         card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
         card.contam_p = a.fake_contam
+        if a.fake_width:
+            card.w = a.fake_width
         card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))
         con = FakeConsole(card, lambda m: sc.log(m), a.fake_rt)
     elif a.shim:
