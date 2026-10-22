@@ -1037,7 +1037,7 @@ int debug_thread(struct pt *pt)
                      break;
                   case SCT:
                   case SAVE_CURRENT_TIMINGS:
-                     write_timings();
+                     if(ZT_SCT_ALLOWED()) write_timings();
                      break;
                   case PHD:
                   case PRINT_HIST_DATAABORT:
@@ -1071,7 +1071,7 @@ int debug_thread(struct pt *pt)
                }
             }
             if(command_found==0)
-               command_found=prof_try_explicit_rate(debug_console.cmd_buf);
+               command_found=ZT_TRY(prof_try_explicit_rate(debug_console.cmd_buf),debug_console.cmd_buf);
             if(command_found==0)
             {
                xil_printf("Unknown command '%s'. Type 'help' or 'h' for help.\r\n",debug_console.cmd_buf);
