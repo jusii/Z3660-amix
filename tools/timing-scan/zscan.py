@@ -1133,7 +1133,8 @@ def scan_row(a, sc, mhz):
         found = None
         dead = set()                        # a side that went silent: further out only hangs harder
         # only the card-local paths failing = the PCLK/CLKEN pair's business (D16), else BCLK's
-        local = bool(r0['fails']) and all(PATHS.index(p) in CARD_LOCAL for p in r0['fails'] if p in PATHS)
+        fp = [p for p in r0['fails'] if p in PATHS]
+        local = bool(fp) and all(PATHS.index(p) in CARD_LOCAL for p in fp)
         axis = 'pclk' if local else 'bclk'
         for k in range(1, 19):
             for sign in (+1, -1):
@@ -1210,7 +1211,7 @@ def scan_row(a, sc, mhz):
                 o = win['all'][edge]
                 if o is None or results[o]['silent']:
                     continue
-                local = [p for p in results[o]['fails'] if PATHS.index(p) in CARD_LOCAL]
+                local = [p for p in results[o]['fails'] if p in PATHS and PATHS.index(p) in CARD_LOCAL]
                 if local:
                     sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here (D16)'
                            % (pas, o, local))
