@@ -483,6 +483,7 @@ class Scanner:
         self.cpu = ('?', '?')
         self.row = None
         self.lock = '-'         # lock_us of the last TAPPLY
+        self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.safe = None        # the current pass's start values (known good)
         self.boot = None        # the row the preset boots (where a reboot lands)
         self.cycles = 0         # power cycles this run
@@ -635,6 +636,7 @@ class Scanner:
         """--soft-first: one RARM (PS software reset, no power action) before the power cycles"""
         if self.a.soft_first:
             self.softs += 1
+            self.reboot = 'soft'
             self.con.soft()
             res = self.baseline()
             if res and not res['silent']:
@@ -649,6 +651,7 @@ class Scanner:
             if self.a.max_cycles is not None and self.cycles >= self.a.max_cycles:
                 raise SystemExit('power-cycle budget of this run (%d) spent: stopping' % self.a.max_cycles)
             self.cycles += 1
+            self.reboot = 'cycle'
             self.con.cycle()
             res = self.baseline()
             if res and not res['silent']:
@@ -670,18 +673,16 @@ class Scanner:
             res = self.measure(self.a.dwell)
             tries.append('reset')
             if res['silent'] and self.a.reset_to_safe and self.safe and list(ph) != self.safe:
-                # the step is silent twice: back to the pass's start values by RESET, no power action
-                self.apply(self.safe, 'reset')
-                back = self.measure(self.a.dwell)
-                if back['silent']:              # the METAL-1 rule allows the heartbeat 30 s
-                    self.con.sleep(20)
-                    back = self.measure(self.a.dwell)
-                tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
-                if back['silent'] and not self.a.no_reset_stop:
-                    self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
-                    raise SystemExit('STOP RULE: a RESET at the pass start values %s did not bring the program back'
-                                     % [norm360(x) for x in self.safe])
-                if not back['silent']:
+                # silent twice: RESET back to the pass's start values (known good), then ONE more try of the
+                # same step; silent again = the step fails, no power action (a timing failure repeats, a
+                # restart failure does not)
+                self.reset_safe(pas, off, ph, real, tries, res)
+                how, real = self.apply(ph, how0)
+                res = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else \
+                    dict(silent=True, fails=[], mb=None, where=0, summary='silent')
+                tries.append('retry+' + how)
+                if res['silent']:
+                    self.reset_safe(pas, off, ph, real, tries, res)
                     v = 'fail-silent'
                     self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
                     return dict(off=off, ph=list(ph), silent=True, fails=[], v=v, pathok=self.path_ok(res))
@@ -690,16 +691,29 @@ class Scanner:
                 self.recover()
                 how, real = self.apply(ph, how0)
                 res = self.measure(self.a.dwell)
-                tries.append('cycle+' + how)
+                tries.append(self.reboot + '+' + how)
         elif res['silent']:
             self.recover()
             how, real = self.apply(ph, how0)
             res = self.measure(self.a.dwell)
-            tries.append('cycle+' + how)
+            tries.append(self.reboot + '+' + how)
         v = 'fail-silent' if res['silent'] else res['summary']
         self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
         return dict(off=off, ph=list(ph), silent=res['silent'], fails=res['fails'], v=v,
                     pathok=self.path_ok(res))
+
+    def reset_safe(self, pas, off, ph, real, tries, res):
+        """RESET at the pass start values; a silent one (30 s) is the METAL stop rule"""
+        self.apply(self.safe, 'reset')
+        back = self.measure(self.a.dwell)
+        if back['silent']:                      # the METAL-1 rule allows the heartbeat 30 s
+            self.con.sleep(20)
+            back = self.measure(self.a.dwell)
+        tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
+        if back['silent']:
+            self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
+            raise SystemExit('STOP RULE: a RESET at the pass start values %s did not bring the program back'
+                             % [norm360(x) for x in self.safe])
 
     def goto_row(self, mhz):
         """stage a frequency row and apply it at its own table values: a live frequency change"""
@@ -709,6 +723,7 @@ class Scanner:
             return None, None
         row = self.read_row()
         self.row = row
+        self.safe = None                    # no known-good values at a new row until its start passes
         res = self.step('row', 0, row['ph'])
         k = self.tstat()                    # the wizard registers only change with the apply
         if k:
@@ -1067,10 +1082,8 @@ def main():
     ap.add_argument('--soft-first', action='store_true',
                     help='a silent step that RESET does not cure gets a soft reboot (RARM) before a power cycle')
     ap.add_argument('--reset-to-safe', action='store_true',
-                    help='real 060: a step silent after its RESET retry gets a RESET at the pass start values '
-                         'instead of a power cycle; the step fails, no reboot')
-    ap.add_argument('--no-reset-stop', action='store_true',
-                    help='with --reset-to-safe: a silent RESET at the start values reboots instead of ending the run')
+                    help='real 060: a step silent after its RESET retry gets a RESET at the pass start values and one '
+                         'more try; silent again = the step fails, no reboot (Amix ruling on D13, 2026-10-22)')
     ap.add_argument('--two-silent', action='store_true',
                     help='keep stepping outward after a silent step (default: a silent step ends that side)')
     ap.add_argument('--max-cycles', type=int, help='power cycles this run may spend; past it the run stops')
