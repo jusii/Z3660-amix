@@ -263,7 +263,7 @@ class FakeCard:
     Restarts fail now and then, as the real 060 does.
     """
 
-    def __init__(self, seed, row, mode, arm_mhz, restart_fail=0.03, ceiling=95):
+    def __init__(self, seed, row, mode, arm_mhz, restart_fail=0.03, ceiling=95, shift=None):
         self.rnd = random.Random(seed)
         self.restart_fail = restart_fail
         self.t = 0.0
@@ -274,6 +274,7 @@ class FakeCard:
         self.table = {r[0]: dict(idx=i, m=r[1], d=r[2], div=list(r[3]), ph=list(r[4]), xp=r[5])
                       for i, r in enumerate(ROWS)}
         self.off = self.rnd.uniform(-15, 15)               # where the windows sit against the table
+        self.shift = shift or {}                           # {mhz: deg}: a row whose table misses its window
         self.w = 70 + self.rnd.uniform(-10, 10)
         self.pwin = (-90, 15)
         self.pres = 0xF7 if mode == 'cpu' else 0x23     # no Z3 board; emulated: chip, mobo, cia
@@ -299,7 +300,8 @@ class FakeCard:
 
     def win(self, mhz):
         t = self.table[mhz]['ph']
-        c, w = sdeg(t[2] - t[3]) + self.off + (mhz - 80) * 0.3, self.w * (1.0 - (mhz - 80) * 0.004)
+        c, w = sdeg(t[2] - t[3]) + self.off + (mhz - 80) * 0.3 + self.shift.get(mhz, 0), \
+            self.w * (1.0 - (mhz - 80) * 0.004)
         return {0: (c - w * 0.45, c + w * 0.40), 1: (c - w * 0.55, c + w * 0.50), 4: (c - w * 0.6, c + w * 0.6),
                 5: (c - w * 0.9, c + w * 0.8), 6: (c - w * 0.7, c + w * 0.7), 'hang': (c - w * 0.75, c + w * 0.70)}
 
@@ -1002,8 +1004,39 @@ def scan_row(a, sc, mhz):
     base = list(row['ph'])
     sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz -> %s' % (
         row['mhz'], row['idx'], row['m'], row['d'], row['div'], base, row['armmhz'], r0['v']))
+    if (r0['silent'] or r0['fails']) and a.find_start:
+        # the table values are outside this card's window: look along BCLK for a passing point to sweep from
+        sc.safe = None
+        found = None
+        dead = set()                        # a side that went silent: further out only hangs harder
+        for k in range(1, 19):
+            for sign in (+1, -1):
+                off = sign * 10 * k
+                if off == -180 or sign in dead:
+                    continue
+                ph = [base[0], base[1], base[2] + off, base[3], base[4]]
+                r = sc.step('start', off, ph)
+                sc.log('row %d start search bclk %+d: %s' % (row['mhz'], off, r['v']))
+                if not r['silent'] and not r['fails']:
+                    found = ph
+                    break
+                if r['silent']:
+                    dead.add(sign)
+            if found or len(dead) == 2:
+                break
+        if found:
+            sc.log('row %d: the table values fail (%s); sweeping from bclk %+d instead' % (
+                row['mhz'], r0['v'], found[2] - base[2]))
+            r0 = dict(r0, silent=False, fails=[])
+            start_remark = 'table values fail (%s); swept from bclk %d' % (r0['v'], keep_form(found[2]))
+            base = found
+        else:
+            start_remark = None
+    else:
+        start_remark = None
     if r0['silent'] or r0['fails']:
-        write_row(a, sc, base, base, {}, {}, remark='P-27 scanner: the table values fail at this row (%s); no sweep' % r0['v'])
+        write_row(a, sc, base, base, {}, {}, remark='P-27 scanner: the table values fail at this row (%s)%s; no sweep' % (
+            r0['v'], ' and no BCLK step from -170 to +180 passes' if a.find_start else ''))
         return False
     centre = list(base)
     wins, var_bases = {}, {}
@@ -1043,9 +1076,10 @@ def scan_row(a, sc, mhz):
                 if local:
                     sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here (D16)'
                            % (pas, o, local))
-    write_row(a, sc, base, centre, wins, var_bases)
+    write_row(a, sc, base, centre, wins, var_bases,
+              remark=('measured window, P-27 scanner; ' + start_remark) if start_remark else None)
     # leave the row's table values staged (a later TREST or revisit starts from the table)
-    sc.con.send(sc.tph(base))
+    sc.con.send(sc.tph(row['ph']))
     return True
 
 
@@ -1086,6 +1120,8 @@ def main():
     ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
     ap.add_argument('--keep-going', action='store_true',
                     help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--find-start', action='store_true',
+                    help="a row whose table values fail: step BCLK outward (10 deg) for a passing point to sweep from")
     ap.add_argument('--switch', help='A,B: no sweep; change frequency between rows A and B --switch-n times')
     ap.add_argument('--switch-n', type=int, default=20)
     ap.add_argument('--mode', choices=('cpu', 'emu'), required=True)
@@ -1118,13 +1154,15 @@ def main():
     ap.add_argument('--fake-restart-fail', type=float, default=0.03, help='dry run: chance a power-on never starts the 060')
     ap.add_argument('--fake-rt', type=float, default=2.3, help='dry run: seconds per console round trip')
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
+    ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
     ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
     ap.add_argument('--serve', action='store_true', help="one persistent '<shim> serve' instead of a call per line")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
     if a.dry_run:
-        card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling)
+        shift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_shift.split(',') if x))
+        card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
         con = FakeConsole(card, lambda m: sc.log(m), a.fake_rt)
     elif a.shim:
         con = (ServeConsole if a.serve else ShimConsole)(a.shim, lambda m: sc.log(m))
