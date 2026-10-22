@@ -644,20 +644,34 @@ class Scanner:
                 '%08X' % mb['st'] if mb else 'unread'))
 
     # ---- baseline ----
+    def adopted(self, epoch, timeout, sized=False):
+        """poll until the program publishes this epoch (and, for SIZE, has left the sizing marker): a running
+        program at any older epoch is not a dead one. Sizing through a timeout-class socket ROM (the A4000T,
+        ~8.7 us per access) takes longer than a fixed wait."""
+        t0 = self.con.now()
+        mb = None
+        while self.con.now() - t0 < timeout:
+            mb = self.tmb()
+            if mb and mb['epoch'] == epoch and mb['hb'] > 0 and (not sized or mb['lwhere'] != 0xFFFD0000):
+                return mb
+            self.con.sleep(1)
+        return None
+
     def baseline(self):
         self.epoch += 1
         mode = 2 if self.a.mode == 'emu' else 1
         self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=mode, en=self.a.en,
                 flags=self.a.flags)
         self.con.sleep(3)
-        mb = self.tmb()
-        if not mb or mb['hb'] == 0:
+        mb = self.adopted(self.epoch, 30, sized=True)     # the sizing result of THIS epoch, never a stale one
+        if not mb:
             return None
         self.pres = mb['sz'][0]
         self.acfg = mb['sz'][4]
         self.cpu = cpu_ident(mb, self.a.mode)
         self.epoch += 1
         self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=self.acfg)
+        self.adopted(self.epoch, 20)
         res = self.measure(self.a.dwell)
         self.log('baseline: present=%02X cpu=%s rev=%s %s' % (self.pres, self.cpu[0], self.cpu[1], res['summary']))
         return res
@@ -1467,6 +1481,16 @@ def main():
             row['mhz'], row['idx'], row['m'], row['d'], row['div'], row['ph'], row['armmhz']))
         sc.ensure_mode()
         res = sc.baseline()
+        if not res or res['silent']:
+            # a running program that will not take the block, or a stalled one: a reset before any power cycle
+            sc.log('baseline %s: %s first' % ('unread' if not res else 'silent',
+                                             'TAPPLY RESET' if a.mode == 'cpu' else 'a soft reboot'))
+            if a.mode == 'cpu':
+                sc.apply(row['ph'], 'reset')
+            else:
+                sc.softs += 1
+                con.soft()
+            res = sc.baseline()
         if not res or res['silent']:
             sc.restart_at_baseline()
             res = sc.baseline()
