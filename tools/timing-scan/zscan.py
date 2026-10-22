@@ -275,6 +275,7 @@ class FakeCard:
                       for i, r in enumerate(ROWS)}
         self.off = self.rnd.uniform(-15, 15)               # where the windows sit against the table
         self.shift = shift or {}                           # {mhz: deg}: a row whose table misses its window
+        self.pshift = {}                                   # {mhz: deg}: the card-local (PCLK) window off its table
         self.contam_p = 0.0                                # chance a failing mobo step leaves the board faulty
         self.contam = False
         self.w = 70 + self.rnd.uniform(-10, 10)
@@ -317,11 +318,13 @@ class FakeCard:
         lo, hi = self.win(mhz)['hang']
         if not (lo <= self.delta(ph) <= hi):
             return True
-        return not (self.pwin[0] - 25 <= sdeg(ph[0]) <= self.pwin[1] + 25)
+        q = self.pshift.get(mhz, 0)
+        return not (self.pwin[0] + q - 25 <= sdeg(ph[0]) <= self.pwin[1] + q + 25)
 
     def path_ok(self, p, mhz, ph):
         if p in CARD_LOCAL:
-            return self.pwin[0] <= sdeg(ph[0]) <= self.pwin[1]
+            q = self.pshift.get(mhz, 0)
+            return self.pwin[0] + q <= sdeg(ph[0]) <= self.pwin[1] + q
         lo, hi = self.win(mhz).get(p, (-180, 180))
         return lo <= self.delta(ph) <= hi
 
@@ -1094,6 +1097,7 @@ def scan_row(a, sc, mhz):
         if r0 is None:
             return None
     base = list(row['ph'])
+    passes = [p.strip() for p in a.passes.split(',') if p.strip()]
     sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz -> %s' % (
         row['mhz'], row['idx'], row['m'], row['d'], row['div'], base, row['armmhz'], r0['v']))
     if (r0['silent'] or r0['fails']) and a.find_start:
@@ -1101,14 +1105,20 @@ def scan_row(a, sc, mhz):
         sc.safe = None
         found = None
         dead = set()                        # a side that went silent: further out only hangs harder
+        # only the card-local paths failing = the PCLK/CLKEN pair's business (D16), else BCLK's
+        local = bool(r0['fails']) and all(PATHS.index(p) in CARD_LOCAL for p in r0['fails'] if p in PATHS)
+        axis = 'pclk' if local else 'bclk'
         for k in range(1, 19):
             for sign in (+1, -1):
                 off = sign * 10 * k
                 if off == -180 or sign in dead:
                     continue
-                ph = [base[0], base[1], base[2] + off, base[3], base[4]]
+                if axis == 'pclk':
+                    ph = [base[0] + off, base[1] - off, base[2], base[3], base[4]]
+                else:
+                    ph = [base[0], base[1], base[2] + off, base[3], base[4]]
                 r = sc.step('start', off, ph, how0='reset' if a.mode == 'cpu' else None)
-                sc.log('row %d start search bclk %+d: %s' % (row['mhz'], off, r['v']))
+                sc.log('row %d start search %s %+d: %s' % (row['mhz'], axis, off, r['v']))
                 if not r['silent'] and not r['fails']:
                     found = ph
                     break
@@ -1121,11 +1131,14 @@ def scan_row(a, sc, mhz):
             if found or len(dead) == 2:
                 break
         if found:
-            sc.log('row %d: the table values fail (%s); sweeping from bclk %+d instead' % (
-                row['mhz'], r0['v'], found[2] - base[2]))
+            k = 0 if axis == 'pclk' else 2
+            sc.log('row %d: the table values fail (%s); sweeping from %s %+d instead' % (
+                row['mhz'], r0['v'], axis, found[k] - base[k]))
+            start_remark = 'table values fail (%s); swept from %s %d' % (r0['v'], axis, keep_form(found[k]))
             r0 = dict(r0, silent=False, fails=[])
-            start_remark = 'table values fail (%s); swept from bclk %d' % (r0['v'], keep_form(found[2]))
             base = found
+            if axis == 'pclk' and 'pclk' not in passes:
+                passes.append('pclk')       # D16: a pclk pass where the card-local paths fail first
         else:
             start_remark = None
     else:
@@ -1138,7 +1151,7 @@ def scan_row(a, sc, mhz):
         return False
     centre = list(base)
     wins, var_bases = {}, {}
-    for pas in [p.strip() for p in a.passes.split(',') if p.strip()]:
+    for pas in passes:
         if pas == 'cpuclk':
             vary = lambda b, o: [b[0], b[1], b[2], b[3] + o, b[3] + o + 90]
             var_base = centre[3]
@@ -1258,6 +1271,7 @@ def main():
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
     ap.add_argument('--fake-contam', type=float, default=0.0,
                     help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
+    ap.add_argument('--fake-pshift', default='', help="dry run: 'mhz:deg,...' rows whose PCLK window sits off their table")
     ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
     ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
     ap.add_argument('--serve', action='store_true', help="one persistent '<shim> serve' instead of a call per line")
@@ -1268,6 +1282,7 @@ def main():
         shift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_shift.split(',') if x))
         card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling, shift)
         card.contam_p = a.fake_contam
+        card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))
         con = FakeConsole(card, lambda m: sc.log(m), a.fake_rt)
     elif a.shim:
         con = (ServeConsole if a.serve else ShimConsole)(a.shim, lambda m: sc.log(m))
