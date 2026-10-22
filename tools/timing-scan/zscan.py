@@ -281,6 +281,8 @@ class FakeCard:
         self.contam_p = 0.0                                # chance a failing mobo step leaves the board faulty
         self.pagelost_p = 0.0                              # chance a RESET comes back cold, page lost
         self.flaky_p = 0.0                                 # chance an apply gives a one-off chip error
+        self.hang_p = 0.0                                  # chance a RESET after a runaway leaves ztest hung
+        self.reset_fail = 0.01                             # chance any RESET fails to restart (METAL-2 D: 0/12)
         self.flaky_now = False
         self.need_magic = False
         self.contam = False
@@ -404,13 +406,18 @@ class FakeCard:
                 self.applied = new
                 self.alive = not self.hung(*new) and self.rnd.random() > 0.005
             elif how == 'RESET':
+                was_hung = not self.alive
                 self.applied = new
                 self.parked = False
                 self.contam = False
+                if was_hung and self.rnd.random() < self.hang_p:
+                    self.alive = False
+                    self.rs += 1
+                    return 'ZT TAPPLY ok how=%s lock_us=%d' % (how, 27)
                 if self.rnd.random() < self.pagelost_p:
                     self.params, self.epoch, self.rs, self.need_magic, self.hb = {}, 0, 0, True, 0
                 self.rs += 1
-                self.alive = not self.hung(*new) and self.rnd.random() > 0.01
+                self.alive = not self.hung(*new) and self.rnd.random() > self.reset_fail
             else:
                 self.applied = new
                 self.alive = not self.hung(*new)
@@ -523,6 +530,9 @@ class Scanner:
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
         self.pagelost = 0       # cold restarts with the mailbox page lost, re-armed
+        self.runaways = 0       # silent real-060 steps (--runaway-policy), session and this row
+        self.row_runaways = 0
+        self.hangs = 0          # resets that left the program hung
         self.flaky = 0          # failing steps that passed on the confirm (--confirm-fail)
         fp = os.path.join(out, 'flaky-%s.csv' % a.card)
         newf = not os.path.exists(fp)
@@ -814,6 +824,18 @@ class Scanner:
             return dict(off=off, ph=list(ph), silent=False, fails=['refused'], v=v, pathok=[False] * 8)
         res = self.measure(self.a.dwell)
         tries.append(how)
+        if res['silent'] and self.a.mode == 'cpu' and self.a.runaway_policy:
+            # owner/Amix 10-22 (METAL-2c): a CPLD reset after a runaway is not reliable (D 6/7, tower 1/2), so a
+            # silent step is the edge of its direction: no same-value retry, recovery by RESET at the start values
+            self.runaways += 1
+            self.row_runaways += 1
+            self.log('RUNAWAY %d at row %d %s %+d (%d this row)' % (self.runaways, self.row['mhz'], pas, off,
+                                                                    self.row_runaways))
+            tries.append('runaway')
+            self.recover_runaway(pas, tries)
+            v = 'fail-silent'
+            self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
+            return dict(off=off, ph=list(ph), silent=True, fails=[], v=v, pathok=self.path_ok(res))
         if res['silent'] and self.a.mode == 'cpu':
             # D13: one RESET first
             self.timed_reset('d13-same', pas, ph)
@@ -917,6 +939,46 @@ class Scanner:
             self.clean_check(pas, r2)
         return r2
 
+    def recover_runaway(self, pas, tries):
+        """RESET at the pass start values (or TREST at the boot row when the pass has none); a program left hung
+        by it (no heartbeat in 30 s) gets one power cycle and the scan resumes at the same row; a second hang in
+        the session is the stop rule"""
+        if self.safe:
+            t_hb = self.timed_reset('runaway', pas, self.safe)
+            back = self.measure(self.a.dwell)
+        else:
+            r = self.con.send('TREST')[0]           # the boot row, applied by RESET
+            self.epoch += 1
+            self.wm(epoch=self.epoch, cmd=CMD_RUN)
+            back = self.measure(self.a.dwell)
+            self.log('runaway recovery by TREST: %s' % r.line)
+            if self.row['mhz'] != self.boot['mhz']:
+                rr = self.con.send('TROW %d' % self.row['mhz'])[0]    # the scanned row staged again
+                self.log('restaged row %d after TREST: %s' % (self.row['mhz'], rr.line))
+        if not back['silent']:
+            tries.append('reset-ok')
+            return
+        self.con.sleep(20)                      # the METAL-1 rule allows the heartbeat 30 s
+        back = self.measure(self.a.dwell)
+        if not back['silent']:
+            tries.append('reset-ok-late')
+            return
+        tries.append('hung+cycle')
+        self.reset_hang(back)
+
+    def reset_hang(self, back):
+        """--runaway-policy: a reset at known-good values left the program hung: one power cycle and the scan
+        resumes at the same row; a second one in the session is the stop rule"""
+        self.hangs += 1
+        mb = back.get('mb') or {}
+        self.log('RESET LEFT THE PROGRAM HUNG (%d this session): rs=%s hb=%s where=%s -- %s' % (
+            self.hangs, mb.get('rs'), mb.get('hb'), '%08X' % mb['where'] if mb.get('where') is not None else '-',
+            'one power cycle, resume at this row' if self.hangs <= self.a.max_hangs else 'over --max-hangs: STOP RULE'))
+        if self.hangs > self.a.max_hangs:
+            raise SystemExit('STOP RULE: reset-hang %d this session, --max-hangs %d (runaway policy)' % (
+                self.hangs, self.a.max_hangs))
+        self.restart_at_baseline()
+
     def reset_board(self):
         """a clean board at the boot row: TREST (RESET on the 060) or a soft reboot (emulated)"""
         if self.a.mode == 'cpu':
@@ -972,6 +1034,9 @@ class Scanner:
         tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
         if not back['silent'] and back['fails']:
             self.log('RESET at the start values runs but fails %s' % back['fails'])
+        if back['silent'] and self.a.runaway_policy:
+            self.reset_hang(back)
+            return
         if back['silent']:
             self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, 'fail-silent')
             raise SystemExit('STOP RULE: a RESET at the pass start values %s did not bring the program back'
@@ -989,6 +1054,7 @@ class Scanner:
         row['m'], row['d'] = int(r.kv['m']), int(r.kv['d'])
         self.row = row
         self.safe = None                    # no known-good values at a new row until its start passes
+        self.row_runaways = 0
         res = self.step('row', 0, row['ph'])
         k = self.tstat()                    # the wizard registers only change with the apply
         if k:
@@ -1061,6 +1127,10 @@ class Scanner:
             top = max(o for o in results) if sign < 0 else 0
             limit = 360 - coarse if sign > 0 else 360 - top
             while (k * coarse <= limit if sign > 0 else k * coarse < limit) and len(results) < maxsteps + 1:
+                if self.a.runaway_policy and self.row_runaways >= self.a.runaway_cap:
+                    self.log('%s: the row\'s runaway cap (%d) is reached: no more steps on this row' % (
+                        pas, self.a.runaway_cap))
+                    break
                 off = sign * k * coarse
                 r = self.step(pas, off, vary(base, off))
                 self.log('%s %+4d: %s' % (pas, off, r['v']))
@@ -1077,9 +1147,13 @@ class Scanner:
             last_ok = 0
             for o in offs:
                 r = results[o]
+                if r['silent'] and self.a.runaway_policy:
+                    break                       # a silent edge stays at coarse accuracy: every fine step is a runaway
                 if r['silent'] or r['fails']:
                     o2 = last_ok + sign * fine
                     while abs(o2) < abs(o):
+                        if self.a.runaway_policy and self.row_runaways >= self.a.runaway_cap:
+                            break
                         if o2 not in results:
                             r2 = self.step(pas + '-fine', o2, vary(base, o2))
                             self.log('%s-fine %+4d: %s' % (pas, o2, r2['v']))
@@ -1141,7 +1215,7 @@ SUMMARY_COLS = ['Machine', 'Kickstart', 'HW Rev', 'CPLD', 'Boot.bin', 'SCSI', 'A
                 'bus_mhz', 'start_phases', 'dbc_centre', 'dbc_centre_ns'] + \
                ['%s_%s' % (q, x) for q in PASSES for x in ('lo', 'hi', 'centre', 'margin')] + \
                ['%s_%s_%s' % (q, p, x) for q in PASSES for p in PATHS for x in ('lo', 'hi')] + \
-               ['temp_start_c', 'temp_end_c']
+               ['temp_start_c', 'temp_end_c', 'runaways']
 
 
 def keep_form(v):
@@ -1210,6 +1284,7 @@ def write_row(a, sc, base, centre, wins, var_bases, remark=None):
         d['Remarks'] = remark
     d['temp_start_c'] = '%.1f' % sc.row_temp0 if getattr(sc, 'row_temp0', None) is not None else ''
     d['temp_end_c'] = '%.1f' % sc.temp if sc.temp is not None else ''
+    d['runaways'] = sc.row_runaways if a.runaway_policy else ''
     sp = os.path.join(a.out, 'summary-%s.csv' % a.card)
     new = not os.path.exists(sp)
     if not new:
@@ -1321,6 +1396,9 @@ def scan_row(a, sc, mhz):
     centre = list(base)
     wins, var_bases = {}, {}
     for pas in passes:
+        if a.runaway_policy and sc.row_runaways >= a.runaway_cap:
+            sc.log('row %d: runaway cap reached, pass %s not run' % (row['mhz'], pas))
+            break
         if pas == 'cpuclk':
             vary = lambda b, o: [b[0], b[1], b[2], b[3] + o, b[3] + o + 90]
             var_base = centre[3]
@@ -1400,6 +1478,13 @@ def main():
     ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
     ap.add_argument('--keep-going', action='store_true',
                     help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--runaway-policy', action='store_true',
+                    help='real 060: a silent step ends its direction (no same-value retry), RESET at the start values; '
+                         'no fine refinement across a silent edge; a reset that leaves the program hung gets one power '
+                         'cycle, a second one is the stop rule')
+    ap.add_argument('--runaway-cap', type=int, default=2, help='runaways per row before the row is closed')
+    ap.add_argument('--max-hangs', type=int, default=1,
+                    help='reset-hangs a session absorbs with a power cycle each; one more is the stop rule (ruled: 1)')
     ap.add_argument('--confirm-fail', action='store_true',
                     help='a step failing with errors is measured once more after its reset; failed only if it fails '
                          'again, else logged as flaky (flaky-<card>.csv)')
@@ -1444,6 +1529,8 @@ def main():
     ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
     ap.add_argument('--fake-contam', type=float, default=0.0,
                     help='dry run: chance per pass that a failing mobo step leaves mobo faulty until a reset')
+    ap.add_argument('--fake-reset-fail', type=float, default=0.01, help='dry run: chance any RESET fails')
+    ap.add_argument('--fake-hang', type=float, default=0.0, help='dry run: chance a RESET after a runaway leaves it hung')
     ap.add_argument('--fake-flaky', type=float, default=0.0, help='dry run: chance an apply gives a one-off error')
     ap.add_argument('--fake-pagelost', type=float, default=0.0, help='dry run: chance a RESET restarts cold, page lost')
     ap.add_argument('--fake-width', type=float, default=0, help='dry run: forwarded window width in degrees')
@@ -1460,6 +1547,8 @@ def main():
         card.contam_p = a.fake_contam
         card.pagelost_p = a.fake_pagelost
         card.flaky_p = a.fake_flaky
+        card.hang_p = a.fake_hang
+        card.reset_fail = a.fake_reset_fail
         if a.fake_width:
             card.w = a.fake_width
         card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))
@@ -1520,9 +1609,9 @@ def main():
         raise SystemExit(3)
     finally:
         sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d, contaminated %d, resets %s, '
-               'page-lost restarts %d, flaky %d; raw log %s' % (con.now() - t0, sc.cycles, sc.softs, sc.rfail,
-                                                               sc.contaminated, sc.nresets or 0, sc.pagelost, sc.flaky,
-                                                               sc.raw.name))
+               'page-lost restarts %d, flaky %d, runaways %d, reset-hangs %d; raw log %s' % (
+                   con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.contaminated, sc.nresets or 0, sc.pagelost,
+                   sc.flaky, sc.runaways, sc.hangs, sc.raw.name))
         if isinstance(con, ServeConsole):
             con.close()
 
