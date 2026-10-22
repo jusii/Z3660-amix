@@ -67,7 +67,8 @@ PA_ACFG		equ	$240			; expected mobo autoconfig hash; 0 = sizing
 PA_CHUNK	equ	$244			; longwords per RAM path per pass
 PA_CACR		equ	$248			; bit31 set: use bits 30:0 as CACR; 0: I-cache on
 PA_CIA		equ	$24C			; CIA iterations per pass
-PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4
+PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4; bit1: Gary BERR probe (path 6)
+PA_BPROBE	equ	$254			; BERR probe address; 0 = $00F00000
 
 VBRT		equ	$400			; vector table, 1 KB
 ; variables
@@ -132,6 +133,8 @@ ROMSIZE		equ	$00080000
 Z3CFG		equ	$FF000000
 Z2CFG		equ	$00E80000
 Z3660_MFR	equ	$144B
+GARY_TO		equ	$DE0000			; Gary: bit 7 set = a cycle nobody answers ends in BERR
+BPROBE_DEF	equ	$00F00000		; empty on the A4000D: Gary's timeout ends the cycle
 
 ; TRY <label>: an exception from here on resumes at <label> with SP as it is now.
 TRY		macro
@@ -906,6 +909,31 @@ path_cia:
 		subq.l	#1,d5
 		bpl.s	.it
 		clr.b	$300(a2)
+		btst	#1,E_FLAGS+3(a5)
+		beq.s	.nobp
+		tst.l	V_MODE(a5)		; real 060 only: the emulator's bus does not take a BERR
+		bne.s	.nobp
+		bsr	berr_probe
+.nobp:		rts
+
+; one read of an empty motherboard address with Gary in BERR mode. The access fault is
+; the expected result (berr +1 through the handler); a read that completes is an error.
+; Each probe costs Gary's BERR timeout (~0.28 s on the A4000T), so it is a diagnostic only.
+berr_probe:
+		move.l	PA_BPROBE(a5),d0
+		bne.s	.a
+		move.l	#BPROBE_DEF,d0
+.a:		movea.l	d0,a1
+		addq.l	#1,REC_OPS(a6)
+		move.b	#$80,GARY_TO
+		TRY	.fault
+		move.l	(a1),d0
+		nop				; the access completes inside the TRY
+		lea	MB,a5
+		moveq	#0,d1
+		bsr	bad
+.fault:		lea	MB,a5
+		clr.b	GARY_TO
 		rts
 ; one CIA at a4: timer A then timer B latch, d3 low word = value
 cia_timer:
@@ -916,6 +944,7 @@ cia_timer:
 		move.w	d3,d0
 		lsr.w	#8,d0
 		move.b	d0,$100(a1)		; TxHI: loads the stopped counter
+		tst.b	(a1)			; the 8520 load lands an E cycle after the write
 		moveq	#0,d0
 		move.b	$100(a1),d0
 		lsl.w	#8,d0

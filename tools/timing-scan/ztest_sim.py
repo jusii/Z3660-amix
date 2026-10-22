@@ -8,7 +8,10 @@ detects "emulated" unless the parameter block forces the real-CPU paths).
 
 The model: chip RAM 2 MB with the Gary overlay (CIA-A PRA bit 0), motherboard RAM blocks 0-3
 at $07000000 (blocks 4-15 float), card RAM $08000000-$0FFFFFFF, the image at $F80000, both
-8520s (timers, DDRs, PRA), custom chips as a write sink. machine68k maps only the low 256 MB,
+8520s (timers, DDRs, PRA; a stopped timer's counter loads one CIA access after the TxHI write, as
+measured on the A4000D in METAL-1), Gary's timeout register at $DE0000 (bit 7 set: a read of an empty
+address faults; the fault is injected as a 68060 format-4 access-fault frame from the instruction
+hook), custom chips as a write sink. machine68k maps only the low 256 MB,
 so the Zorro III spaces ($FF000000, $40000000) read as empty: path 4 is NP, path 7 hashes a
 constant.
 
@@ -34,8 +37,12 @@ class Board:
         self.cia = {'A': [0] * 16, 'B': [0] * 16}
         self.latch = {'A': [0, 0], 'B': [0, 0]}      # timer A, B latch
         self.count = {'A': [0, 0], 'B': [0, 0]}
+        self.pend = {'A': [None, None], 'B': [None, None]}   # counter loads not landed yet
         self.flip = []                                # (lo, hi, xor, every)
         self.reads = 0
+        self.gary_to = 0                              # $DE0000 bit 7
+        self.gary_berr = True                         # False: Gary ignores the BERR mode
+        self.fault = None                             # address of a faulted read, for the hook
 
     # ---- storage ----
     def page(self, a):
@@ -70,6 +77,8 @@ class Board:
         if 0x00DF0000 <= a < 0x00E00000:
             return 0
         if not self.present(a):
+            if self.gary_to & 0x80 and self.gary_berr and 0x00F00000 <= a < 0x00F80000:
+                self.fault = a
             return 0xFF
         b, o = self.page(a)
         return b[o]
@@ -81,6 +90,9 @@ class Board:
         if 0x00BF0000 <= a < 0x00C00000:
             return self.cia_w(a, v & 0xFF)
         if 0x00DF0000 <= a < 0x00E00000:
+            return
+        if a == 0x00DE0000:
+            self.gary_to = v & 0xFF
             return
         if not self.present(a):
             return
@@ -111,10 +123,21 @@ class Board:
             return 'B', (a >> 8) & 0xF
         return None, 0
 
+    def cia_land(self, c):
+        for t in (0, 1):
+            if self.pend[c][t] is not None:
+                self.count[c][t] = self.pend[c][t]
+                self.pend[c][t] = None
+
     def cia_r(self, a):
         c, r = self.cia_which(a)
         if c is None:
             return 0xFF
+        v = self.cia_r_now(c, r)
+        self.cia_land(c)
+        return v
+
+    def cia_r_now(self, c, r):
         if r in (4, 5, 6, 7):
             t = (r - 4) // 2
             v = self.count[c][t]
@@ -128,6 +151,7 @@ class Board:
         c, r = self.cia_which(a)
         if c is None:
             return
+        self.cia_land(c)
         if r in (4, 5, 6, 7):
             t = (r - 4) // 2
             if r % 2 == 0:
@@ -135,8 +159,8 @@ class Board:
             else:
                 self.latch[c][t] = (self.latch[c][t] & 0x00FF) | (v << 8)
                 cr = self.cia[c][0xE + t]
-                if not (cr & 1):                     # stopped: the high byte loads the counter
-                    self.count[c][t] = self.latch[c][t]
+                if not (cr & 1):                     # stopped: the high byte loads the counter,
+                    self.pend[c][t] = self.latch[c][t]   # one CIA access later
             return
         self.cia[c][r] = v
 
@@ -176,10 +200,30 @@ def make_machine(board):
 
 
 class Sim:
-    def __init__(self, rom):
+    def __init__(self, rom, berr=False):
         self.board = Board(rom)
         self.mach = make_machine(self.board)
+        if berr:
+            self.mach.cpu.set_instr_hook_callback(self.hook)
         self.reset()
+
+    def hook(self, pc):
+        """a read that faulted in the previous instruction: take the access fault now"""
+        a = self.board.fault
+        if a is None:
+            return
+        self.board.fault = None
+        cpu, b = self.mach.cpu, self.board
+        sr = cpu.r_sr()
+        sp = cpu.r_sp() - 16
+        b.w(sp, sr, 2)
+        b.w(sp + 2, pc, 4)
+        b.w(sp + 6, 0x4000 | (2 << 2), 2)           # format 4, vector 2 (access fault)
+        b.w(sp + 8, a, 4)
+        b.w(sp + 12, 0x01050020, 4)                 # FSLW as the A4000T read it in T5
+        cpu.w_sp(sp)
+        cpu.w_sr(sr | 0x2700)
+        cpu.w_pc(b.r(MB + 0x400 + 8, 4))            # VBR = MB+$400 (ztest's own table)
 
     def reset(self):
         # what a CPLD reset does to the board: CIAs reset (overlay back on), RAM kept
@@ -315,6 +359,34 @@ def main():
     mb = s.run_passes(3)
     s.board.flip = []
     check('overlay ROM fault lands on path 5', mb['paths'][4]['err'] > 0 and mb['paths'][0]['err'] == 0, mb)
+
+    # 9. the 8520 counter load lands one access after TxHI: the CIA path must stay clean
+    s = Sim(rom)
+    mb = s.run_passes(4)
+    check('CIA timers with the late 8520 load: path 6 clean', mb['paths'][5]['ops'] > 0 and
+          mb['paths'][5]['err'] == 0, mb)
+
+    # 10. Gary BERR probe (flags bit 1, real-CPU mode): one access fault per pass on path 6
+    s = Sim(rom, berr=True)
+    params(s.board, mode=1, cmd=2, epoch=1)
+    mb = s.run_passes(2)
+    params(s.board, mode=1, cmd=0, epoch=2, pres=mb['sz'][0], flags=2)
+    mb = s.run_passes(2)
+    hb, x0 = mb['hb'], mb['xcnt']
+    mb = s.run_passes(3)
+    p6 = mb['paths'][5]
+    check('BERR probe: path 6 berr per pass, no errors, vector 2, running on, Gary back to 0',
+          p6['berr'] >= 3 and p6['err'] == 0 and mb['xcnt'] >= x0 + 3 and (mb['st'] >> 16) & 0xFF == 2
+          and mb['hb'] >= hb + 3 and s.board.gary_to == 0 and
+          all(p['err'] == 0 and p['berr'] == 0 for i, p in enumerate(mb['paths']) if i != 5), mb)
+
+    # 11. the probe when no BERR comes (Gary ignores the mode): counted as an error on path 6
+    s.board.gary_berr = False
+    params(s.board, epoch=3)
+    mb = s.run_passes(3)
+    p6 = mb['paths'][5]
+    check('BERR probe without a fault: path 6 err at the probe address, berr 0',
+          p6['err'] > 0 and p6['berr'] == 0 and p6['fa'] == 0x00F00000, mb)
 
     bad = [n for n, c in results if not c]
     print('%d/%d scenarios pass' % (len(results) - len(bad), len(results)))
