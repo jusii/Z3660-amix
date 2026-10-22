@@ -579,6 +579,29 @@ class Scanner:
         if a.arm_mhz and abs(row['armmhz'] - a.arm_mhz) > 15:
             raise SystemExit('ARM at %d MHz, asked for %d (z3660cfg arm_frequency)' % (row['armmhz'], a.arm_mhz))
 
+    def ensure_mode(self):
+        """ztest takes its CPU mode at start, from the parameter block when that is valid, and card RAM keeps the
+        block over a soft reboot (METAL-2: mode=2 left by an emulated session started ztest emulated on the 060).
+        A running program in the other mode gets the mode written and a restart."""
+        mb = self.tmb()
+        if not mb:
+            return
+        want = 1 if self.a.mode == 'emu' else 0
+        if (mb['st'] >> 3) & 1 == want:
+            return
+        self.log('ztest runs in the other mode (st %08X): writing mode=%d and restarting it' % (
+            mb['st'], 2 if want else 1))
+        self.wm(magic=0x5A545041, mode=2 if want else 1)
+        if self.a.mode == 'cpu':
+            self.apply(self.row['ph'], 'reset')
+        else:
+            self.softs += 1
+            self.con.soft()
+        mb = self.tmb()
+        if not mb or (mb['st'] >> 3) & 1 != want:
+            raise SystemExit('ztest still runs in the other mode after the restart (st %s)' % (
+                '%08X' % mb['st'] if mb else 'unread'))
+
     # ---- baseline ----
     def baseline(self):
         self.epoch += 1
@@ -1306,6 +1329,7 @@ def main():
         sc.row = sc.boot = row
         sc.log('boot row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz' % (
             row['mhz'], row['idx'], row['m'], row['d'], row['div'], row['ph'], row['armmhz']))
+        sc.ensure_mode()
         res = sc.baseline()
         if not res or res['silent']:
             sc.restart_at_baseline()
