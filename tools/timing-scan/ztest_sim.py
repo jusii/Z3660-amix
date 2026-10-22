@@ -41,7 +41,9 @@ class Board:
         self.flip = []                                # (lo, hi, xor, every)
         self.reads = 0
         self.gary_to = 0                              # $DE0000 bit 7
+        self.gary_toen = 0                            # $DE0001 bit 7
         self.gary_berr = True                         # False: Gary ignores the BERR mode
+        self.gary_needs_toen = False                  # True: BERR only with TOENB set as well (the D?)
         self.fault = None                             # address of a faulted read, for the hook
 
     # ---- storage ----
@@ -77,7 +79,8 @@ class Board:
         if 0x00DF0000 <= a < 0x00E00000:
             return 0
         if not self.present(a):
-            if self.gary_to & 0x80 and self.gary_berr and 0x00F00000 <= a < 0x00F80000:
+            if self.gary_to & 0x80 and self.gary_berr and 0x00F00000 <= a < 0x00F80000 and \
+                    (self.gary_toen & 0x80 or not self.gary_needs_toen):
                 self.fault = a
             return 0xFF
         b, o = self.page(a)
@@ -93,6 +96,9 @@ class Board:
             return
         if a == 0x00DE0000:
             self.gary_to = v & 0xFF
+            return
+        if a == 0x00DE0001:
+            self.gary_toen = v & 0xFF
             return
         if not self.present(a):
             return
@@ -387,6 +393,19 @@ def main():
     p6 = mb['paths'][5]
     check('BERR probe without a fault: path 6 err at the probe address, berr 0',
           p6['err'] > 0 and p6['berr'] == 0 and p6['fa'] == 0x00F00000, mb)
+
+    # 12. a Gary that needs TOENB too: flags 2 completes the read (error), flags 6 (TIMEOUT + TOENB) faults
+    s.board.gary_berr = True
+    s.board.gary_needs_toen = True
+    params(s.board, epoch=4, flags=2)
+    mb = s.run_passes(3)
+    p6 = mb['paths'][5]
+    ok2 = p6['err'] > 0 and p6['berr'] == 0
+    params(s.board, epoch=5, flags=6)
+    mb = s.run_passes(3)
+    p6 = mb['paths'][5]
+    check('TOENB probe: flags 2 no fault on a TOENB-gated Gary, flags 6 faults, both registers back to 0',
+          ok2 and p6['berr'] >= 3 and p6['err'] == 0 and s.board.gary_to == 0 and s.board.gary_toen == 0, mb)
 
     bad = [n for n, c in results if not c]
     print('%d/%d scenarios pass' % (len(results) - len(bad), len(results)))

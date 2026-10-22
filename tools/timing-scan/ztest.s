@@ -67,7 +67,8 @@ PA_ACFG		equ	$240			; expected mobo autoconfig hash; 0 = sizing
 PA_CHUNK	equ	$244			; longwords per RAM path per pass
 PA_CACR		equ	$248			; bit31 set: use bits 30:0 as CACR; 0: I-cache on
 PA_CIA		equ	$24C			; CIA iterations per pass
-PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4; bit1: Gary BERR probe (path 6)
+PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4; bit1: Gary BERR probe (path 6);
+					; bit2: the probe also sets TOENB ($DE0001)
 PA_BPROBE	equ	$254			; BERR probe address; 0 = $00F00000
 
 VBRT		equ	$400			; vector table, 1 KB
@@ -134,6 +135,7 @@ Z3CFG		equ	$FF000000
 Z2CFG		equ	$00E80000
 Z3660_MFR	equ	$144B
 GARY_TO		equ	$DE0000			; Gary: bit 7 set = a cycle nobody answers ends in BERR
+GARY_TOEN	equ	$DE0001			; Gary TOENB: bit 7 = the bus timeout enable (METAL-2: $DE0000 alone did nothing on the D)
 BPROBE_DEF	equ	$00F00000		; empty on the A4000D: Gary's timeout ends the cycle
 
 ; TRY <label>: an exception from here on resumes at <label> with SP as it is now.
@@ -925,7 +927,10 @@ berr_probe:
 		move.l	#BPROBE_DEF,d0
 .a:		movea.l	d0,a1
 		addq.l	#1,REC_OPS(a6)
-		move.b	#$80,GARY_TO
+		btst	#2,E_FLAGS+3(a5)
+		beq.s	.to
+		move.b	#$80,GARY_TOEN
+.to:		move.b	#$80,GARY_TO
 		TRY	.fault
 		move.l	(a1),d0
 		nop				; the access completes inside the TRY
@@ -934,6 +939,7 @@ berr_probe:
 		bsr	bad
 .fault:		lea	MB,a5
 		clr.b	GARY_TO
+		clr.b	GARY_TOEN		; Kickstart's own setting: both clear
 		rts
 ; one CIA at a4: timer A then timer B latch, d3 low word = value
 cia_timer:
