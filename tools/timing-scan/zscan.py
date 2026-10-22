@@ -366,12 +366,19 @@ class FakeCard:
         if v == 'TPH':
             if self.snap is None:
                 self.snap = {k: list(x['ph']) for k, x in self.rows.items()}
-            self.rows[self.cur]['ph'] = [int(x) for x in w[1:6]]
+            v5 = [int(x) for x in w[1:6]]
+            if any(not -360 <= x <= 360 for x in v5):
+                return 'ZT TPH bad'
+            self.rows[self.cur]['ph'] = v5
             return self.rowline('TPH')
         if v == 'TAPPLY':
             how = w[1]
             if self.mode == 'emu' and how != 'LIVE':
                 return 'ZT TAPPLY refused emu'
+            r = self.rows[self.cur]
+            xp = r['xp'] if self.mode == 'emu' else 0
+            if any(not -360 <= x <= 360 for x in r['ph'][:3] + [r['ph'][3] + xp, r['ph'][4] + xp]):
+                return 'ZT TAPPLY refused phase'
             new = (self.cur, list(self.rows[self.cur]['ph']))
             if how == 'PARK':
                 if not self.parked:
@@ -598,8 +605,18 @@ class Scanner:
         return res
 
     # ---- apply a phase set and measure, with the D7/D13 retry rule ----
+    def tph(self, ph):
+        """TPH values in the firmware's -360..360; emulated, cpuclk/clk90 also get emu_extra_phase added
+        (zt_row_check refuses the sum above 360), so those two drop by 360 when the sum would pass it"""
+        out = [norm360(x) for x in ph]
+        if self.a.mode == 'emu' and self.row:
+            for i in (3, 4):
+                if out[i] + self.row['xp'] > 360:
+                    out[i] -= 360
+        return 'TPH %s' % ' '.join(map(str, out))
+
     def apply(self, ph, how):
-        r = self.con.send('TPH %s' % ' '.join(str(norm360(x)) for x in ph))[0]
+        r = self.con.send(self.tph(ph))[0]
         if r.verb != 'TPH' or r.has('bad'):
             return 'tph-refused', r.line
         real = r.kv.get('real', '')
@@ -665,7 +682,13 @@ class Scanner:
         how0 = 'live' if self.a.mode == 'emu' else 'park'
         tries = []
         how, real = self.apply(ph, how0)
-        res = self.measure(self.a.dwell) if how not in ('tph-refused', 'apply-failed') else dict(silent=True, fails=[], mb=None, where=0, summary='silent')
+        if how in ('tph-refused', 'apply-failed'):
+            # the firmware refused the values (range check): nothing was applied, nothing to recover
+            v = 'refused'
+            self.rawline(pas, off, ph, real, how, 1, dict(silent=False, mb=None, where=0), v)
+            self.log('%s %+d: apply refused (%s)' % (pas, off, real))
+            return dict(off=off, ph=list(ph), silent=False, fails=['refused'], v=v, pathok=[False] * 8)
+        res = self.measure(self.a.dwell)
         tries.append(how)
         if res['silent'] and self.a.mode == 'cpu':
             # D13: one RESET first
@@ -1019,7 +1042,7 @@ def scan_row(a, sc, mhz):
                            % (pas, o, local))
     write_row(a, sc, base, centre, wins, var_bases)
     # leave the row's table values staged (a later TREST or revisit starts from the table)
-    sc.con.send('TPH %s' % ' '.join(str(norm360(x)) for x in base))
+    sc.con.send(sc.tph(base))
     return True
 
 
