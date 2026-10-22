@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """zscan.py -- host loop of the Z3660 timing scanner (P-27; PRIMITIVES.md section 3).
 
-Drives a card running a ZT_SCAN firmware and ztest.rom through its debug console, one
-timings row and CPU mode per run:
+Drives a card running a ZT_SCAN firmware and ztest.rom through its debug console, one CPU
+mode per run, over one or more timings rows (--rows): the rows are reached by a live frequency
+change (TROW + apply at the row's own table values), outward from the boot row; a row whose own
+values fail ends that direction. Per row:
 
   baseline   size the paths at the card's own values, freeze the present mask, require 0 errors
   warm-up    keep the program running at the baseline values (margins shrink warm)
@@ -16,7 +18,12 @@ then refines each edge at 3 deg. The variable is logged as BCLK - CPUCLK in degr
 clock and in ns. A silent step gets one TAPPLY RESET, then one power cycle, then fails; restart
 failures (a power-on that never gets the program running at the baseline) are logged apart.
 
-Outputs, in --out:
+--switch A,B changes frequency between two rows --switch-n times instead of sweeping (each change
+measured like a step; switch-<card>.csv). --soft-first puts a soft reboot (RARM) before a power cycle,
+--reset-to-safe ends a twice-silent real-060 step with a RESET at the pass start values instead of a
+reboot, --max-cycles caps the power cycles of a run.
+
+Outputs, in --out (the summary line and the timings file are written as each row ends):
   raw-<card>.log          one ZT1 line per step (key=value)
   summary-<card>.csv      one line per row/mode/pass: the community tracker's columns plus the
                           dividers, bus MHz, CPU type/revision, ARM MHz and the window per path
@@ -25,13 +32,16 @@ Outputs, in --out:
 Transports:
   --dry-run               a simulated card (fake firmware + a timing-window model); no hardware
   --shim <cmd>            the bench: '<cmd> send <line>...' prints one 'ZT ...' reply per line,
-                          '<cmd> cycle' power-cycles and waits for '060 starting now'
+                          '<cmd> cycle' power-cycles and waits for the ready line, '<cmd> soft'
+                          reboots without a power action
+  --shim <cmd> --serve    one long-lived '<cmd> serve': a console line per stdin line, one reply each
 """
 import argparse
 import csv
 import datetime as dt
 import os
 import random
+import select
 import shlex
 import subprocess
 import sys
@@ -44,7 +54,7 @@ CARD_LOCAL = (2, 3, 7)          # 0-based: card, z3, self (PHASES.md section 1)
 CMD_RUN, CMD_PARK, CMD_SIZE = 0, 1, 2
 OFF = dict(magic=0x00, epoch=0x04, cmd=0x08, en=0x0C, pres=0x10, mode=0x14, chlo=0x18, chhi=0x1C,
            mobo=0x20, clo=0x24, chi=0x28, z3b=0x2C, z3o=0x30, z3l=0x34, romb=0x38, acfg=0x40,
-           chunk=0x44, cacr=0x48, cia=0x4C, flags=0x50)
+           chunk=0x44, cacr=0x48, cia=0x4C, flags=0x50, bprobe=0x54)
 
 
 def norm360(p):
@@ -103,6 +113,10 @@ def cpu_ident(mb, mode):
 
 # --------------------------------------------------------------------------------------
 # transports
+class StopRule(Exception):
+    """a core0 abort or an unexpected boot banner in a reply window (METAL stop rule)"""
+
+
 class ShimConsole:
     """The bench: an external shim does the serial and the power (bench-specific, not in this repo)."""
 
@@ -118,13 +132,112 @@ class ShimConsole:
             reps.append(Reply('ZT TIMEOUT'))
         return reps
 
-    def cycle(self):
-        p = subprocess.run(self.shim + ['cycle'], capture_output=True, text=True, timeout=600)
-        self.log('shim cycle: ' + p.stdout.strip().splitlines()[-1] if p.stdout.strip() else 'shim cycle: no output')
+    def verb(self, v, timeout=600):
+        p = subprocess.run(self.shim + [v], capture_output=True, text=True, timeout=timeout)
+        out = p.stdout.strip().splitlines()
+        self.log('shim %s: %s' % (v, out[-1] if out else 'no output'))
         return p.returncode == 0
+
+    def cycle(self):
+        return self.verb('cycle')
+
+    def soft(self):
+        return self.verb('soft')
 
     def sleep(self, s):
         time.sleep(s)
+
+
+class ServeConsole(ShimConsole):
+    """One long-lived '<shim> serve': a console line per stdin line, one 'ZT ...' reply per line.
+    The shim keeps its own guard on every send; this only saves the per-call start-up."""
+
+    def __init__(self, shim, log):
+        ShimConsole.__init__(self, shim, log)
+        self.p = None
+        self.buf = b''
+        self.open()
+
+    def open(self):
+        self.p = subprocess.Popen(self.shim + ['serve'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.buf = b''
+        first = self.readline(120)
+        if first != 'ZT SERVE ready':
+            self.log('serve did not start: %r' % first)
+            self.close()
+
+    def readline(self, timeout):
+        end = time.time() + timeout
+        while b'\n' not in self.buf:
+            left = end - time.time()
+            if left <= 0 or self.p is None:
+                return None
+            r, _, _ = select.select([self.p.stdout], [], [], left)
+            if not r:
+                return None
+            chunk = os.read(self.p.stdout.fileno(), 4096)
+            if not chunk:
+                return None
+            self.buf += chunk
+        line, self.buf = self.buf.split(b'\n', 1)
+        return line.decode('ascii', 'replace').strip()
+
+    def send(self, *lines):
+        reps = []
+        for l in lines:
+            if self.p is None:
+                reps.append(Reply('ZT NOCONSOLE'))
+                continue
+            self.p.stdin.write((l + '\n').encode('ascii'))
+            self.p.stdin.flush()
+            r = self.readline(60) or 'ZT TIMEOUT'
+            reps.append(Reply(r))
+            if r in ('ZT ABORT', 'ZT BANNER'):
+                raise StopRule('%s after "%s"' % (r, l))
+        return reps
+
+    def close(self):
+        if self.p is not None:
+            try:
+                self.p.stdin.write(b'QUIT\n')
+                self.p.stdin.flush()
+                self.p.wait(timeout=10)
+            except Exception:
+                self.p.kill()
+        self.p = None
+
+    def cycle(self):
+        self.close()
+        ok = ShimConsole.cycle(self)
+        self.open()
+        return ok
+
+    def soft(self):
+        self.close()
+        ok = ShimConsole.soft(self)
+        self.open()
+        return ok
+
+
+# the stock timings table (default_timings.txt 206c251a): mhz, M, D, dividers pclk/clken/bclk/cpuclk/clk90,
+# phases, emu_extra_phase -- the dry run's rows
+ROWS = [
+    (50, 4, 1, [16, 32, 64, 64, 64], [-50, 50, -40, 190, 280], 60),
+    (55, 22, 5, [16, 32, 64, 64, 64], [-50, 50, -20, 220, 310], 20),
+    (60, 24, 5, [16, 32, 64, 64, 64], [-50, 50, -20, 180, 270], 60),
+    (65, 26, 5, [16, 32, 64, 64, 64], [-45, 45, -50, 180, 270], 60),
+    (70, 56, 10, [16, 32, 64, 64, 64], [-45, 45, -40, 180, 270], 60),
+    (75, 30, 5, [16, 32, 64, 64, 64], [-40, 40, 50, 180, 270], 40),
+    (80, 28, 5, [14, 28, 56, 56, 56], [-40, 40, 50, 180, 270], 40),
+    (85, 21, 5, [10, 20, 40, 40, 40], [-45, 45, 70, 180, 270], 60),
+    (90, 27, 5, [12, 24, 48, 48, 48], [-45, 45, 80, 180, 270], 60),
+    (95, 19, 4, [10, 20, 40, 40, 40], [-45, 45, 90, 180, 270], 60),
+    (100, 25, 5, [10, 20, 40, 40, 40], [-20, 30, 40, 220, 310], 0),
+    (105, 21, 5, [8, 16, 32, 32, 32], [-20, 40, 60, 200, 290], 30),
+    (110, 22, 5, [8, 16, 32, 32, 32], [-10, 50, 60, 240, 330], 0),
+    (115, 23, 5, [8, 16, 32, 32, 32], [-10, 50, 60, 250, 340], 0),
+    (120, 30, 5, [10, 20, 40, 48, 48], [-40, 40, 60, 200, 290], 60),
+]
 
 
 class FakeCard:
@@ -133,29 +246,22 @@ class FakeCard:
     Window model (degrees of the bus clock, Delta = bclk - cpuclk): the forwarded paths pass
     inside their own window, error just outside it, and the 060 hangs further out. The CIA
     tolerates more than RAM, chip RAM less than Ramsey RAM. The card-local paths only see
-    PCLK. Restarts fail now and then, as the real 060 does.
+    PCLK. The window drifts with the row; a real 060 hangs at any phase above its ceiling row.
+    Restarts fail now and then, as the real 060 does.
     """
 
-    def __init__(self, seed, row, mode, arm_mhz, restart_fail=0.03):
+    def __init__(self, seed, row, mode, arm_mhz, restart_fail=0.03, ceiling=95):
         self.rnd = random.Random(seed)
         self.restart_fail = restart_fail
-        self.idx = min(14, max(0, (row - 46) // 5))       # get_clock_index() for the rows in use
         self.t = 0.0
         self.mode = mode
         self.arm_mhz = arm_mhz
-        self.row = row
-        base = dict(m=4, d=1, div=[10, 20, 32, 32, 32], ph=[-40, 40, 50, 180, 270], extra=40)
-        self.boot_row = dict(base)
-        self.boot_row['ph'] = list(base['ph'])
-        self.staged = list(base['ph'])
-        self.applied = list(base['ph'])
-        self.snap = None
-        centre = sdeg(50 - 180) + self.rnd.uniform(-15, 15)        # where the forwarded window sits
-        w = 70 + self.rnd.uniform(-10, 10)
-        self.win = {0: (centre - w * 0.45, centre + w * 0.40), 1: (centre - w * 0.55, centre + w * 0.50),
-                    4: (centre - w * 0.6, centre + w * 0.6), 5: (centre - w * 0.9, centre + w * 0.8),
-                    6: (centre - w * 0.7, centre + w * 0.7)}
-        self.hang = (centre - w * 0.75, centre + w * 0.70)
+        self.boot_mhz = row
+        self.ceiling = ceiling if mode == 'cpu' else 999
+        self.table = {r[0]: dict(idx=i, m=r[1], d=r[2], div=list(r[3]), ph=list(r[4]), xp=r[5])
+                      for i, r in enumerate(ROWS)}
+        self.off = self.rnd.uniform(-15, 15)               # where the windows sit against the table
+        self.w = 70 + self.rnd.uniform(-10, 10)
         self.pwin = (-90, 15)
         self.pres = 0xF7 if mode == 'cpu' else 0x23     # no Z3 board; emulated: chip, mobo, cia
         self.params = {}
@@ -163,8 +269,9 @@ class FakeCard:
 
     # ---- the board ----
     def boot(self):
-        self.applied = list(self.boot_row['ph'])
-        self.staged = list(self.boot_row['ph'])
+        self.rows = {k: dict(v, ph=list(v['ph'])) for k, v in self.table.items()}   # timings file reloaded
+        self.cur = self.boot_mhz
+        self.applied = (self.cur, list(self.rows[self.cur]['ph']))
         self.snap = None
         self.alive = self.rnd.random() > self.restart_fail   # restart failure now and then
         self.hb = 0
@@ -177,19 +284,27 @@ class FakeCard:
         self.params = {}
         return self.alive
 
+    def win(self, mhz):
+        t = self.table[mhz]['ph']
+        c, w = sdeg(t[2] - t[3]) + self.off + (mhz - 80) * 0.3, self.w * (1.0 - (mhz - 80) * 0.004)
+        return {0: (c - w * 0.45, c + w * 0.40), 1: (c - w * 0.55, c + w * 0.50), 4: (c - w * 0.6, c + w * 0.6),
+                5: (c - w * 0.9, c + w * 0.8), 6: (c - w * 0.7, c + w * 0.7), 'hang': (c - w * 0.75, c + w * 0.70)}
+
     def delta(self, ph):
         return sdeg(ph[2] - ph[3])
 
-    def hung(self, ph):
-        d = self.delta(ph)
-        if not (self.hang[0] <= d <= self.hang[1]):
+    def hung(self, mhz, ph):
+        if mhz > self.ceiling:
+            return True
+        lo, hi = self.win(mhz)['hang']
+        if not (lo <= self.delta(ph) <= hi):
             return True
         return not (self.pwin[0] - 25 <= sdeg(ph[0]) <= self.pwin[1] + 25)
 
-    def path_ok(self, p, ph):
+    def path_ok(self, p, mhz, ph):
         if p in CARD_LOCAL:
             return self.pwin[0] <= sdeg(ph[0]) <= self.pwin[1]
-        lo, hi = self.win.get(p, (-180, 180))
+        lo, hi = self.win(mhz).get(p, (-180, 180))
         return lo <= self.delta(ph) <= hi
 
     def advance(self):
@@ -198,51 +313,67 @@ class FakeCard:
         if not self.alive or self.parked:
             return
         cmd = self.params.get('cmd', CMD_SIZE if not self.sized else CMD_RUN)
-        n = int(dtm * 90)
+        n = int(dtm * 60)
         if n <= 0:
             return
         if cmd == CMD_SIZE or not self.sized:
             self.sized = True
         self.hb += n
         pres = self.params.get('pres') or self.pres
+        mhz, ph = self.applied
         for p in range(8):
             if not (pres >> p) & 1 or (self.mode == 'emu' and p in (2, 3, 4, 6, 7)):
                 continue
             ops = n * 6000
             self.cnt[p][1] += ops
-            if not self.path_ok(p, self.applied):
+            if not self.path_ok(p, mhz, ph):
                 self.cnt[p][0] += max(1, int(ops * self.rnd.uniform(1e-5, 1e-3)))
+
+    def rowline(self, tag):
+        r = self.rows[self.cur]
+        ed = 2 if self.mode == 'emu' else 1
+        return 'ZT %s idx=%d mhz=%d emu=%d m=%d d=%d div=%d/%d/%d/%d/%d req=%s real=%s' % (
+            tag, r['idx'], self.cur, self.mode == 'emu', r['m'], r['d'], r['div'][0] * ed, r['div'][1] * ed,
+            r['div'][2], r['div'][3], r['div'][4], '/'.join(map(str, r['ph'])),
+            '/'.join('%d.00' % norm360(x) for x in r['ph']))
 
     # ---- the console ----
     def reply(self, line):
         self.advance()
         w = line.upper().split()
         v = w[0]
+        if v == 'TROW':
+            mhz = int(w[1])
+            if mhz not in self.rows:
+                return 'ZT TROW bad'
+            if self.snap is None:
+                self.snap = {k: list(x['ph']) for k, x in self.rows.items()}
+            self.cur = mhz
+            return self.rowline('TROW')
         if v == 'TPH':
             if self.snap is None:
-                self.snap = list(self.applied)
-            self.staged = [int(x) for x in w[1:6]]
-            return 'ZT TPH idx=%d mhz=%d emu=%d m=4 d=1 div=10/20/32/32/32 req=%s real=%s' % (
-                self.idx, self.row, self.mode == 'emu', '/'.join(map(str, self.staged)),
-                '/'.join('%d.00' % x for x in self.staged))
+                self.snap = {k: list(x['ph']) for k, x in self.rows.items()}
+            self.rows[self.cur]['ph'] = [int(x) for x in w[1:6]]
+            return self.rowline('TPH')
         if v == 'TAPPLY':
             how = w[1]
             if self.mode == 'emu' and how != 'LIVE':
                 return 'ZT TAPPLY refused emu'
+            new = (self.cur, list(self.rows[self.cur]['ph']))
             if how == 'PARK':
                 if not self.parked:
                     return 'ZT TAPPLY notparked where=%08X' % (self.hb and 0x00060000)
-                self.applied = list(self.staged)
-                self.alive = not self.hung(self.applied) and self.rnd.random() > 0.005
+                self.applied = new
+                self.alive = not self.hung(*new) and self.rnd.random() > 0.005
             elif how == 'RESET':
-                self.applied = list(self.staged)
+                self.applied = new
                 self.parked = False
                 self.rs += 1
-                self.alive = not self.hung(self.applied) and self.rnd.random() > 0.05
+                self.alive = not self.hung(*new) and self.rnd.random() > 0.05
             else:
-                self.applied = list(self.staged)
-                self.alive = not self.hung(self.applied)
-            return 'ZT TAPPLY ok how=%s lock_us=%d' % (how, 60 + self.rnd.randint(0, 30))
+                self.applied = new
+                self.alive = not self.hung(*new)
+            return 'ZT TAPPLY ok how=%s lock_us=%d' % (how, 27 + self.rnd.randint(0, 1))
         if v == 'WM':
             a = int(w[1], 16)
             for i, x in enumerate(w[2:]):
@@ -267,36 +398,45 @@ class FakeCard:
                     pr = 2
                 ps.append('p%d=%d/%d/%d/00000000/%08X/%d' % (p + 1, self.cnt[p][0], self.cnt[p][1], 0,
                                                             0x80 if self.cnt[p][0] else 0, pr))
-            pcr = 0x04310400 if self.mode == 'cpu' else 0
-            return ('ZT TMB crc=%s lwhere=%08X hb=%d where=%08X epoch=%d st=%08X rs=%d id=%08X %s sz=%08X/%08X/FFFFFFFF/0000A0F4/7BD94DEF'
-                    % ('ok' if self.rnd.random() > 0.05 else 'mirror', where, self.hb, where, self.epoch,
-                       0x45 if self.mode == 'cpu' else 0x4D, self.rs, pcr, ' '.join(ps), self.pres, 0x000F))
+            pcr = 0x04310402 if self.mode == 'cpu' else 0
+            return ('ZT TMB crc=%s lwhere=%08X hb=%d where=%08X epoch=%d st=%08X rs=%d id=%08X %s sz=%08X/%08X/FFFFFFFF/0000A48B/DD9D6123'
+                    % ('mirror' if self.rnd.random() > 0.1 else 'ok', where, self.hb, where, self.epoch,
+                       0x75 if self.mode == 'cpu' else 0x4004D, self.rs, pcr, ' '.join(ps), self.pres, 0xFF00))
         if v == 'TSTAT':
-            ph = self.applied
-            xp = self.boot_row['extra'] if self.mode == 'emu' else 0
-            return ('ZT TSTAT st68k=0 rr=0 rsti=1 rstc=1 nbr=1 mio15=1 emu=%d mhz=%d idx=%d armmhz=%d m=4 d=1 '
-                    'div=5/%s ph=0/%d/%d/%d/%d/%d rowdiv=10/20/32/32/32 rowph=%s xp=%d snap=%d live=%d park=0 '
-                    'nogrant=0 notparked=0 lockto=0 reset=0 applylive=0 refused=0 lock_us=70'
-                    % (self.mode == 'emu', self.row, self.idx, self.arm_mhz,
-                       '20/40/32/32/32' if self.mode == 'emu' else '10/20/32/32/32',
-                       ph[0], ph[1], ph[2], ph[3] + xp, ph[4] + xp, '/'.join(map(str, ph)), self.boot_row['extra'],
-                       self.snap is not None, self.applied != self.boot_row['ph']))
+            r = self.rows[self.cur]
+            amhz, aph = self.applied
+            a = self.rows[amhz]
+            ed = 2 if self.mode == 'emu' else 1
+            xp = r['xp'] if self.mode == 'emu' else 0
+            return ('ZT TSTAT st68k=0 rr=0 rsti=1 rstc=1 nbr=1 mio15=1 emu=%d mhz=%d idx=%d armmhz=%d m=%d d=%d '
+                    'div=%d/%d/%d/%d/%d/%d ph=0/%d/%d/%d/%d/%d rowdiv=%s rowph=%s xp=%d snap=%d live=%d park=0 '
+                    'nogrant=0 notparked=0 lockto=0 reset=0 applylive=0 refused=0 lock_us=27'
+                    % (self.mode == 'emu', self.cur, r['idx'], self.arm_mhz, r['m'], r['d'],
+                       a['div'][0] // 2, a['div'][0] * ed, a['div'][1] * ed, a['div'][2], a['div'][3], a['div'][4],
+                       aph[0], aph[1], aph[2], aph[3] + xp, aph[4] + xp, '/'.join(map(str, r['div'])),
+                       '/'.join(map(str, r['ph'])), r['xp'], self.snap is not None,
+                       self.snap is not None and (self.cur != self.boot_mhz or
+                                                  any(self.rows[k]['ph'] != v for k, v in self.snap.items()))))
         if v == 'TREST':
-            self.staged = list(self.boot_row['ph'])
+            if self.snap:
+                for k, ph in self.snap.items():
+                    self.rows[k]['ph'] = list(ph)
+            self.cur = self.boot_mhz
             return self.reply('TAPPLY ' + ('LIVE' if self.mode == 'emu' else 'RESET'))
         return 'ZT ? %s' % line
 
 
 class FakeConsole:
-    def __init__(self, card, log):
+    def __init__(self, card, log, rt=2.0):
         self.card = card
         self.log = log
+        self.rt = rt
         self.now = lambda: card.t
 
     def send(self, *lines):
         out = []
         for l in lines:
-            self.card.t += 2.0                      # what one console round trip costs on the bench
+            self.card.t += self.rt                  # what one console round trip costs on the bench
             out.append(Reply(self.card.reply(l)))
         return out
 
@@ -304,6 +444,12 @@ class FakeConsole:
         self.card.t += 60.0
         ok = self.card.boot()
         self.log('fake cycle: %s' % ('060 running' if ok else 'restart failure'))
+        return True
+
+    def soft(self):
+        self.card.t += 25.0
+        ok = self.card.boot()
+        self.log('fake soft reboot: %s' % ('running' if ok else 'restart failure'))
         return True
 
     def sleep(self, s):
@@ -323,6 +469,11 @@ class Scanner:
         self.pres = 0
         self.cpu = ('?', '?')
         self.row = None
+        self.lock = '-'         # lock_us of the last TAPPLY
+        self.safe = None        # the current pass's start values (known good)
+        self.boot = None        # the row the preset boots (where a reboot lands)
+        self.cycles = 0         # power cycles this run
+        self.softs = 0          # soft reboots (RARM) this run
 
     def log(self, msg):
         line = '%s %s' % (self.stamp(), msg)
@@ -379,7 +530,7 @@ class Scanner:
 
     def check_identity(self, row):
         a = self.a
-        if row['mhz'] != a.row:
+        if a.row and row['mhz'] != a.row:
             raise SystemExit('card runs row %d, asked for %d (boot the right preset)' % (row['mhz'], a.row))
         if row['emu'] != (a.mode == 'emu'):
             raise SystemExit('card mode emu=%d, asked for %s' % (row['emu'], a.mode))
@@ -390,7 +541,8 @@ class Scanner:
     def baseline(self):
         self.epoch += 1
         mode = 2 if self.a.mode == 'emu' else 1
-        self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=mode)
+        self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=mode, en=self.a.en,
+                flags=self.a.flags)
         self.con.sleep(3)
         mb = self.tmb()
         if not mb or mb['hb'] == 0:
@@ -453,18 +605,41 @@ class Scanner:
             r = self.con.send('TAPPLY RESET')[0]
         else:
             r = self.con.send('TAPPLY LIVE')[0]
+        self.lock = r.kv.get('lock_us', '-')
         if not r.has('ok'):
             return 'apply-failed', r.line
         self.epoch += 1
         self.wm(epoch=self.epoch, cmd=CMD_RUN)
         return how, real
 
+    def restage(self):
+        """a reboot lands on the boot row: stage the row being scanned again (TPH/TAPPLY follow)"""
+        if self.row and self.boot and self.row['mhz'] != self.boot['mhz']:
+            r = self.con.send('TROW %d' % self.row['mhz'])[0]
+            self.log('restage after the reboot: %s' % r.line)
+
+    def recover(self):
+        """--soft-first: one RARM (PS software reset, no power action) before the power cycles"""
+        if self.a.soft_first:
+            self.softs += 1
+            self.con.soft()
+            res = self.baseline()
+            if res and not res['silent']:
+                self.restage()
+                return True
+            self.log('soft reboot did not bring the program back: power cycle next')
+        return self.restart_at_baseline()
+
     def restart_at_baseline(self):
         """Power cycle until the program runs at the card's own values (<= 3), re-baseline."""
         for n in range(3):
+            if self.a.max_cycles is not None and self.cycles >= self.a.max_cycles:
+                raise SystemExit('power-cycle budget of this run (%d) spent: stopping' % self.a.max_cycles)
+            self.cycles += 1
             self.con.cycle()
             res = self.baseline()
             if res and not res['silent']:
+                self.restage()
                 return True
             self.rfail += 1
             self.log('restart failure %d (no heartbeat at the baseline values after a power cycle)' % self.rfail)
@@ -481,14 +656,23 @@ class Scanner:
             how, real = self.apply(ph, 'reset')
             res = self.measure(self.a.dwell)
             tries.append('reset')
+            if res['silent'] and self.a.reset_to_safe and self.safe and list(ph) != self.safe:
+                # the step is silent twice: back to the pass's start values by RESET, no power action
+                self.apply(self.safe, 'reset')
+                back = self.measure(self.a.dwell)
+                tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
+                if not back['silent']:
+                    v = 'fail-silent'
+                    self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
+                    return dict(off=off, ph=list(ph), silent=True, fails=[], v=v, pathok=self.path_ok(res))
             if res['silent']:
-                # then one power cycle, the same step again
-                self.restart_at_baseline()
+                # then one power cycle (--soft-first: a soft reboot before it), the same step again
+                self.recover()
                 how, real = self.apply(ph, how0)
                 res = self.measure(self.a.dwell)
                 tries.append('cycle+' + how)
         elif res['silent']:
-            self.restart_at_baseline()
+            self.recover()
             how, real = self.apply(ph, how0)
             res = self.measure(self.a.dwell)
             tries.append('cycle+' + how)
@@ -496,6 +680,20 @@ class Scanner:
         self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
         return dict(off=off, ph=list(ph), silent=res['silent'], fails=res['fails'], v=v,
                     pathok=self.path_ok(res))
+
+    def goto_row(self, mhz):
+        """stage a frequency row and apply it at its own table values: a live frequency change"""
+        r = self.con.send('TROW %d' % mhz)[0]
+        if r.verb != 'TROW' or r.has('bad') or r.has('refused'):
+            self.log('TROW %d: %s' % (mhz, r.line))
+            return None, None
+        row = self.read_row()
+        self.row = row
+        res = self.step('row', 0, row['ph'])
+        k = self.tstat()                    # the wizard registers only change with the apply
+        if k:
+            row['regdiv'] = [int(x) for x in k['div'].split('/')][1:]
+        return res, row
 
     def path_ok(self, res):
         ok = []
@@ -523,7 +721,7 @@ class Scanner:
              'xp=%d' % (row['xp'] if a.mode == 'emu' else 0), 'busmhz=%.2f' % busmhz,
              'req=%s' % '/'.join(str(norm360(x)) for x in ph), 'real=%s' % (real or '-'),
              'dbc=%.1f' % dbc, 'dbc_ns=%.2f' % (dbc / 360.0 * 1000.0 / busmhz),
-             'c90off=%d' % sdeg(ph[4] - ph[3]), 'how=%s' % how, 'try=%d' % tries,
+             'c90off=%d' % sdeg(ph[4] - ph[3]), 'how=%s' % how, 'try=%d' % tries, 'lock=%s' % self.lock,
              'sil=%d' % int(res['silent']), 'rfail=%d' % self.rfail, 'epoch=%d' % self.epoch,
              'hb=%d' % (mb['hb'] if mb else -1), 'dwell=%.1f' % a.dwell]
         berr = 0
@@ -546,6 +744,7 @@ class Scanner:
 
     # ---- a sweep: coarse outward, then edges refined ----
     def sweep(self, pas, base, vary, coarse, fine, maxsteps):
+        self.safe = list(base)
         results = {0: None}
         r0 = self.step(pas, 0, base)
         results[0] = r0
@@ -562,7 +761,7 @@ class Scanner:
                 results[off] = r
                 self.log('%s %+4d: %s' % (pas, off, r['v']))
                 bad = bad + 1 if (r['silent'] or r['fails']) else 0
-                if bad >= 2:
+                if bad >= 2 or (r['silent'] and not self.a.two_silent):
                     break
                 k += 1
         # refine: between the last passing and the first failing coarse step on each side
@@ -681,61 +880,70 @@ def summary_row(a, sc, start, final, wins, var_bases):
     return d
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--card', required=True, help='card name in the logs (ddev, tdev)')
-    ap.add_argument('--box', required=True, help='box name in the logs (a4000d, a4000t)')
-    ap.add_argument('--row', type=int, required=True, help='timings row (cpufreq of the booted preset)')
-    ap.add_argument('--mode', choices=('cpu', 'emu'), required=True)
-    ap.add_argument('--arm-mhz', type=int, default=1000, help='expected ARM clock; checked against TSTAT')
-    ap.add_argument('--fw', default='-', help='firmware CRC (scanner build) for the log')
-    ap.add_argument('--prog', default='-', help='ztest.rom sha256 prefix for the log')
-    ap.add_argument('--machine', default='', help='summary: Machine column')
-    ap.add_argument('--kickstart', default='', help='summary: Kickstart column')
-    ap.add_argument('--hwrev', default='', help='summary: HW Rev column (card revision)')
-    ap.add_argument('--cpld', default='', help='summary: CPLD column')
-    ap.add_argument('--out', required=True)
-    ap.add_argument('--dwell', type=float, default=3.0, help='seconds the program runs per step')
-    ap.add_argument('--warmup', type=int, default=600, help='seconds at the baseline before the passes')
-    ap.add_argument('--coarse', type=int, default=10)
-    ap.add_argument('--fine', type=int, default=3)
-    ap.add_argument('--max-steps', type=int, default=36)
-    ap.add_argument('--passes', default='cpuclk,bclk', help='comma list of cpuclk,bclk,clk90off,pclk')
-    ap.add_argument('--dry-run', action='store_true', help='simulated card, no hardware')
-    ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--fake-restart-fail', type=float, default=0.03, help='dry run: chance a power-on never starts the 060')
-    ap.add_argument('--shim', help="bench shim command ('<shim> send <line>...', '<shim> cycle')")
-    a = ap.parse_args()
-    os.makedirs(a.out, exist_ok=True)
+def parse_rows(spec):
+    """'50-100' (5 MHz steps), '80,50', or a mix"""
+    out = []
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-')
+            out += list(range(int(lo), int(hi) + 1, 5))
+        elif part:
+            out.append(int(part))
+    return out
 
-    events = []
-    if a.dry_run:
-        card = FakeCard(a.seed, a.row, a.mode, a.arm_mhz, a.fake_restart_fail)
-        con = FakeConsole(card, lambda m: sc.log(m))
-    elif a.shim:
-        con = ShimConsole(a.shim, lambda m: sc.log(m))
+
+def write_row(a, sc, base, centre, wins, var_bases, remark=None):
+    """the summary CSV line and the timings file of one row, written as soon as the row ends"""
+    d = summary_row(a, sc, base, centre, wins, var_bases)
+    if remark:
+        d['Remarks'] = remark
+    sp = os.path.join(a.out, 'summary-%s.csv' % a.card)
+    new = not os.path.exists(sp)
+    with open(sp, 'a', newline='') as fh:
+        w = csv.DictWriter(fh, SUMMARY_COLS)
+        if new:
+            w.writeheader()
+        w.writerow(d)
+    row = sc.row
+    tp = os.path.join(a.out, 'timings-%s-%d-%s.txt' % (a.card, row['mhz'], a.mode))
+    if wins:
+        with open(tp, 'w') as fh:
+            fh.write('# Z3660 timings row measured by the P-27 scanner -- not for a card until the OS campaign passes (D11)\n')
+            fh.write('# card %s box %s cpu %s rev %s ARM %d MHz mode %s; BCLK-CPUCLK at the centre %s deg = %s ns\n' % (
+                a.card, a.box, sc.cpu[0], sc.cpu[1], row['armmhz'], a.mode, d['dbc_centre'], d['dbc_centre_ns']))
+            for q in wins:
+                fh.write('# %s pass: window %s..%s centre %s margin +-%s deg\n' % (
+                    q, d['%s_lo' % q], d['%s_hi' % q], d['%s_centre' % q], d['%s_margin' % q]))
+                for p in PATHS:
+                    fh.write('#    %-5s %s..%s\n' % (p, d['%s_%s_lo' % (q, p)], d['%s_%s_hi' % (q, p)]))
+            fh.write('index %d\n# %d MHz\n' % (row['idx'], row['mhz']))
+            fh.write('    global.multiplier = %3d\n    global.divider    = %3d\n' % (row['m'], row['d']))
+            names = ('pclk', 'clken', 'bclk', 'cpuclk', 'clk90')
+            for n, v in zip(names, centre):
+                fh.write('    %-12s = %3d\n' % (n + '.phase', keep_form(v)))
+            for n, v in zip(names, row['div']):
+                fh.write('    %-14s = %3d\n' % (n + '.divider', v))
+            if a.mode == 'emu':
+                fh.write('    emu_extra_phase = %3d\n' % row['xp'])
+    sc.log('row %d written: summary %s%s' % (row['mhz'], sp, (', timings ' + tp) if wins else ' (no window)'))
+
+
+def scan_row(a, sc, mhz):
+    """one frequency row: get there at its table values, then the passes. False = its own values fail."""
+    if sc.row and mhz == sc.row['mhz'] and sc.row['ph'] == sc.boot['ph'] and mhz == sc.boot['mhz']:
+        row = sc.row
+        r0 = sc.step('row', 0, row['ph'])
     else:
-        raise SystemExit('need --dry-run or --shim')
-    sc = Scanner(a, con, a.out)
-    sc.log('zscan %s: card=%s box=%s row=%d mode=%s arm=%d passes=%s' % (
-        'DRY RUN' if a.dry_run else 'BENCH', a.card, a.box, a.row, a.mode, a.arm_mhz, a.passes))
-
-    row = sc.read_row()
-    sc.check_identity(row)
-    sc.row = row
+        r0, row = sc.goto_row(mhz)
+        if r0 is None:
+            return None
     base = list(row['ph'])
-    sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz' % (
-        row['mhz'], row['idx'], row['m'], row['d'], row['div'], base, row['armmhz']))
-
-    res = sc.baseline()
-    if not res or res['silent']:
-        sc.restart_at_baseline()
-        res = sc.baseline()
-    if res['silent'] or res['fails']:
-        raise SystemExit('baseline fails (%s): instrument or board fault, no sweep' % res['summary'])
-    if a.warmup and not sc.warmup(a.warmup):
-        raise SystemExit('errors during the warm-up at the baseline: stop')
-
+    sc.log('row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz -> %s' % (
+        row['mhz'], row['idx'], row['m'], row['d'], row['div'], base, row['armmhz'], r0['v']))
+    if r0['silent'] or r0['fails']:
+        write_row(a, sc, base, base, {}, {}, remark='P-27 scanner: the table values fail at this row (%s); no sweep' % r0['v'])
+        return False
     centre = list(base)
     wins, var_bases = {}, {}
     for pas in [p.strip() for p in a.passes.split(',') if p.strip()]:
@@ -774,41 +982,137 @@ def main():
                 if local:
                     sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here (D16)'
                            % (pas, o, local))
+    write_row(a, sc, base, centre, wins, var_bases)
+    # leave the row's table values staged (a later TREST or revisit starts from the table)
+    sc.con.send('TPH %s' % ' '.join(str(norm360(x)) for x in base))
+    return True
 
-    # back to the card's own values
-    r = con.send('TREST')[0]
-    sc.log('TREST: %s' % r.line)
 
-    d = summary_row(a, sc, base, centre, wins, var_bases)
-    sp = os.path.join(a.out, 'summary-%s.csv' % a.card)
+def run_switch(a, sc):
+    """owner item 5: a live frequency change between two rows, each at its own table values"""
+    ra, rb = [int(x) for x in a.switch.split(',')]
+    sp = os.path.join(a.out, 'switch-%s.csv' % a.card)
     new = not os.path.exists(sp)
-    with open(sp, 'a', newline='') as fh:
-        w = csv.DictWriter(fh, SUMMARY_COLS)
-        if new:
-            w.writeheader()
-        w.writerow(d)
+    fh = open(sp, 'a', newline='')
+    w = csv.writer(fh)
+    if new:
+        w.writerow(['t', 'card', 'mode', 'cpu', 'rev', 'arm_mhz', 'n', 'from', 'to', 'how', 'lock_us', 'verdict'])
+    if sc.row['mhz'] != ra:
+        r0, _ = sc.goto_row(ra)
+        if r0 is None or r0['silent'] or r0['fails']:
+            raise SystemExit('switch: row %d does not run at its own values (%s)' % (ra, r0 and r0['v']))
+    ok = 0
+    for i in range(1, a.switch_n + 1):
+        frm = sc.row['mhz']
+        to = rb if frm == ra else ra
+        r, row = sc.goto_row(to)
+        v = 'refused' if r is None else r['v']
+        ok += v == 'pass'
+        w.writerow([sc.stamp(), a.card, a.mode, sc.cpu[0], sc.cpu[1], sc.row['armmhz'], i, frm, to,
+                    'live' if a.mode == 'emu' else 'park', sc.lock, v])
+        fh.flush()
+        sc.log('switch %d: %d -> %d MHz: %s (lock %s us)' % (i, frm, to, v, sc.lock))
+    fh.close()
+    sc.log('SWITCH %d/%d ok between rows %d and %d (%s)' % (ok, a.switch_n, ra, rb, sp))
+    return ok
 
-    tp = os.path.join(a.out, 'timings-%s-%d-%s.txt' % (a.card, row['mhz'], a.mode))
-    with open(tp, 'w') as fh:
-        fh.write('# Z3660 timings row measured by the P-27 scanner -- not for a card until the OS campaign passes (D11)\n')
-        fh.write('# card %s box %s cpu %s rev %s ARM %d MHz mode %s; BCLK-CPUCLK at the centre %s deg = %s ns\n' % (
-            a.card, a.box, sc.cpu[0], sc.cpu[1], row['armmhz'], a.mode, d['dbc_centre'], d['dbc_centre_ns']))
-        for q in wins:
-            fh.write('# %s pass: window %s..%s centre %s margin +-%s deg\n' % (
-                q, d['%s_lo' % q], d['%s_hi' % q], d['%s_centre' % q], d['%s_margin' % q]))
-            for p in PATHS:
-                fh.write('#    %-5s %s..%s\n' % (p, d['%s_%s_lo' % (q, p)], d['%s_%s_hi' % (q, p)]))
-        fh.write('index %d\n# %d MHz\n' % (row['idx'], row['mhz']))
-        fh.write('    global.multiplier = %3d\n    global.divider    = %3d\n' % (row['m'], row['d']))
-        names = ('pclk', 'clken', 'bclk', 'cpuclk', 'clk90')
-        for n, v in zip(names, centre):
-            fh.write('    %-12s = %3d\n' % (n + '.phase', keep_form(v)))
-        for n, v in zip(names, row['div']):
-            fh.write('    %-14s = %3d\n' % (n + '.divider', v))
-        if a.mode == 'emu':
-            fh.write('    emu_extra_phase = %3d\n' % row['xp'])
-    sc.log('raw log %s, summary %s, timings %s; restart failures %d' % (
-        sc.raw.name, sp, tp, sc.rfail))
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--card', required=True, help='card name in the logs (ddev, tdev)')
+    ap.add_argument('--box', required=True, help='box name in the logs (a4000d, a4000t)')
+    ap.add_argument('--row', type=int, help='the boot row, checked against TSTAT (default: whatever it boots)')
+    ap.add_argument('--rows', help="rows to scan: '50-100' (5 MHz steps), '80,50', ... (default: the boot row)")
+    ap.add_argument('--keep-going', action='store_true',
+                    help='go on past a row whose table values fail (default: that ends the direction)')
+    ap.add_argument('--switch', help='A,B: no sweep; change frequency between rows A and B --switch-n times')
+    ap.add_argument('--switch-n', type=int, default=20)
+    ap.add_argument('--mode', choices=('cpu', 'emu'), required=True)
+    ap.add_argument('--arm-mhz', type=int, default=1000, help='expected ARM clock; checked against TSTAT')
+    ap.add_argument('--fw', default='-', help='firmware CRC (scanner build) for the log')
+    ap.add_argument('--prog', default='-', help='ztest.rom CRC for the log')
+    ap.add_argument('--machine', default='', help='summary: Machine column')
+    ap.add_argument('--kickstart', default='', help='summary: Kickstart column')
+    ap.add_argument('--hwrev', default='', help='summary: HW Rev column (card revision)')
+    ap.add_argument('--cpld', default='', help='summary: CPLD column')
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--dwell', type=float, default=5.0, help='seconds the program runs per step')
+    ap.add_argument('--warmup', type=int, default=600, help='seconds at the baseline before the passes')
+    ap.add_argument('--coarse', type=int, default=10)
+    ap.add_argument('--fine', type=int, default=3)
+    ap.add_argument('--max-steps', type=int, default=36)
+    ap.add_argument('--passes', default='cpuclk,bclk', help='comma list of cpuclk,bclk,clk90off,pclk')
+    ap.add_argument('--en', type=lambda x: int(x, 0), default=0, help='ztest path-enable mask (0 = all)')
+    ap.add_argument('--flags', type=lambda x: int(x, 0), default=0, help='ztest flags (bit1 = Gary BERR probe)')
+    ap.add_argument('--soft-first', action='store_true',
+                    help='a silent step that RESET does not cure gets a soft reboot (RARM) before a power cycle')
+    ap.add_argument('--reset-to-safe', action='store_true',
+                    help='real 060: a step silent after its RESET retry gets a RESET at the pass start values '
+                         'instead of a power cycle; the step fails, no reboot')
+    ap.add_argument('--two-silent', action='store_true',
+                    help='keep stepping outward after a silent step (default: a silent step ends that side)')
+    ap.add_argument('--max-cycles', type=int, help='power cycles this run may spend; past it the run stops')
+    ap.add_argument('--dry-run', action='store_true', help='simulated card, no hardware')
+    ap.add_argument('--seed', type=int, default=1)
+    ap.add_argument('--fake-restart-fail', type=float, default=0.03, help='dry run: chance a power-on never starts the 060')
+    ap.add_argument('--fake-rt', type=float, default=2.3, help='dry run: seconds per console round trip')
+    ap.add_argument('--fake-ceiling', type=int, default=95, help='dry run: the real 060 hangs above this row')
+    ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
+    ap.add_argument('--serve', action='store_true', help="one persistent '<shim> serve' instead of a call per line")
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+
+    if a.dry_run:
+        card = FakeCard(a.seed, a.row or 80, a.mode, a.arm_mhz, a.fake_restart_fail, a.fake_ceiling)
+        con = FakeConsole(card, lambda m: sc.log(m), a.fake_rt)
+    elif a.shim:
+        con = (ServeConsole if a.serve else ShimConsole)(a.shim, lambda m: sc.log(m))
+    else:
+        raise SystemExit('need --dry-run or --shim')
+    sc = Scanner(a, con, a.out)
+    t0 = con.now()
+    sc.log('zscan %s: card=%s box=%s rows=%s switch=%s mode=%s arm=%d passes=%s dwell=%.1f' % (
+        'DRY RUN' if a.dry_run else 'BENCH', a.card, a.box, a.rows or a.row, a.switch, a.mode, a.arm_mhz,
+        a.passes, a.dwell))
+    try:
+        row = sc.read_row()
+        sc.check_identity(row)
+        sc.row = sc.boot = row
+        sc.log('boot row %d idx %d: M/D %d/%d div %s phases %s ARM %d MHz' % (
+            row['mhz'], row['idx'], row['m'], row['d'], row['div'], row['ph'], row['armmhz']))
+        res = sc.baseline()
+        if not res or res['silent']:
+            sc.restart_at_baseline()
+            res = sc.baseline()
+        if res['silent'] or res['fails']:
+            raise SystemExit('baseline fails (%s): instrument or board fault, no sweep' % res['summary'])
+        if a.warmup and not sc.warmup(a.warmup):
+            raise SystemExit('errors during the warm-up at the baseline: stop')
+
+        if a.switch:
+            run_switch(a, sc)
+        else:
+            rows = parse_rows(a.rows) if a.rows else [row['mhz']]
+            boot = row['mhz']
+            for direction in ([r for r in sorted(rows, reverse=True) if r <= boot],
+                              [r for r in sorted(rows) if r > boot]):
+                for mhz in direction:
+                    ok = scan_row(a, sc, mhz)
+                    if ok is None:
+                        sc.log('row %d: TROW refused, skipped' % mhz)
+                    elif not ok and not a.keep_going:
+                        sc.log('row %d fails at its table values: the rest of this direction is skipped' % mhz)
+                        break
+        r = con.send('TREST')[0]
+        sc.log('TREST: %s' % r.line)
+    except StopRule as e:
+        sc.log('STOP RULE: %s -- nothing more is sent; the box is left as it is' % e)
+        raise SystemExit(3)
+    finally:
+        sc.log('run time %.0f s; power cycles %d, soft reboots %d, restart failures %d; raw log %s' % (
+            con.now() - t0, sc.cycles, sc.softs, sc.rfail, sc.raw.name))
+        if isinstance(con, ServeConsole):
+            con.close()
 
 
 if __name__ == '__main__':

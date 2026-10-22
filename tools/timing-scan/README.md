@@ -74,9 +74,17 @@ zscan.py --shim '<bench shim>' --card ddev --box a4000d --row 80 --mode cpu --ar
 3. **Pass A:** CPUCLK with CLK90 locked 90° behind it.
 4. **Pass B:** BCLK around the pass-A centre.
 
-Each pass runs 10° steps outward until two consecutive steps fail, then 3° steps across each edge.
+Each pass runs 10° steps outward until two consecutive steps fail or one step is silent, then 3° steps
+across each edge.
 
-A silent step (no heartbeat) gets one `TAPPLY RESET`, then one power cycle, then counts as failed. A
+`--rows 50-100` scans several rows in one boot: each row is reached by a live frequency change (`TROW`, then
+the apply at the row's own table values), outward from the boot row, and a row whose own values fail ends
+that direction. The summary line and the timings file are written as each row ends. `--switch 80,50` only
+changes frequency between two rows (`--switch-n` times) and measures each change like a step.
+
+A silent step (no heartbeat) gets one `TAPPLY RESET`, then one power cycle, then counts as failed. With
+`--reset-to-safe` a step still silent after its RESET gets a RESET at the pass's start values instead of the
+power cycle; with `--soft-first` a reboot is tried as `soft` (no power action) before `cycle`. A
 power-on that never runs the program at the baseline values is logged as a restart failure, apart from the
 timing results.
 
@@ -92,4 +100,11 @@ Outputs:
 The bench shim is site-specific (serial transport, power socket, power log) and is not part of this tree.
 `zscan.py` needs two verbs from it:
 - `send <line>...` prints one `ZT ...` reply per line;
-- `cycle` power-cycles the box and waits for `060 starting now`.
+- `cycle` power-cycles the box and waits for `060 starting now`;
+- `soft` (for `--soft-first`) reboots the board without a power action;
+- `serve` (for `--serve`) reads one console line per stdin line and prints one reply each.
+
+`ztest.s` also has a bus-error probe (`--flags 2`, real 060 only): once per pass, path 6 sets Gary's
+timeout register at $DE0000 to BERR mode and reads an empty motherboard address ($00F00000 by default, or
+the parameter at $0FFF0254). The access fault counts as path 6 `berr`; a read that completes counts as an
+error at that address. Each probe costs Gary's BERR timeout (about 0.28 s), so it is a diagnostic only.
