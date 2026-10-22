@@ -662,7 +662,9 @@ class Scanner:
         mb = None
         while self.con.now() - t0 < timeout:
             mb = self.tmb()
-            if mb and mb['epoch'] == epoch and mb['hb'] > 0 and (not sized or mb['lwhere'] != 0xFFFD0000):
+            # a CRC-valid record of this epoch: published after a complete pass (for SIZE, a complete sizing;
+            # ztest re-sizes every pass in SIZE, so its live marker is almost always the sizing one)
+            if mb and mb['epoch'] == epoch and mb['hb'] > 0 and (not sized or mb['crc'] in ('ok', 'mirror')):
                 return mb
             self.con.sleep(1)
         return None
@@ -1580,6 +1582,11 @@ def main():
         'DRY RUN' if a.dry_run else 'BENCH', a.card, a.box, a.rows or a.row, a.switch, a.mode, a.arm_mhz,
         a.passes, a.dwell))
     try:
+        k = sc.tstat()
+        if k and k.get('live') == '1':
+            # a scan row left live by an earlier run: a reboot would land on the preset's row, not on this one
+            r = con.send('TREST')[0]
+            sc.log('a scan row was live at start (mhz %s): TREST -> %s' % (k.get('mhz'), r.line))
         row = sc.read_row()
         sc.check_identity(row)
         sc.row = sc.boot = row
