@@ -115,6 +115,10 @@ def cpu_ident(mb, mode):
 
 # --------------------------------------------------------------------------------------
 # transports
+class RowClosed(Exception):
+    """this row's start values no longer run clean after a reboot: a marginal row, closed with what it has"""
+
+
 class StopRule(Exception):
     """a core0 abort or an unexpected boot banner in a reply window (METAL stop rule)"""
 
@@ -908,7 +912,7 @@ class Scanner:
                 self.apply(self.safe, how0)
                 back = self.measure(self.a.dwell)
             if back['silent'] or back['fails']:
-                raise SystemExit('STOP: the start values still fail after a reboot (%s)' % (
+                raise RowClosed('the start values still fail after a reboot (%s)' % (
                     'silent' if back['silent'] else ','.join(back['fails'])))
 
     def confirm(self, pas, off, ph, r):
@@ -1623,7 +1627,14 @@ def main():
             for direction in ([r for r in sorted(rows, reverse=True) if r <= boot],
                               [r for r in sorted(rows) if r > boot]):
                 for mhz in direction:
-                    ok = scan_row(a, sc, mhz)
+                    try:
+                        ok = scan_row(a, sc, mhz)
+                    except RowClosed as e:
+                        sc.log('row %d CLOSED: %s -- a marginal row; the scan goes on' % (mhz, e))
+                        write_row(a, sc, sc.row['ph'], sc.row['ph'], {}, {},
+                                  remark='P-27 scanner: row closed, %s (a marginal row at its table values)' % e)
+                        sc.reset_board()
+                        ok = True
                     if ok is None:
                         sc.log('row %d: TROW refused, skipped' % mhz)
                     elif not ok and not a.keep_going:
