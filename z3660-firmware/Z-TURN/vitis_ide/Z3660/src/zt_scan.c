@@ -8,7 +8,7 @@
  *
  *   TPH <pclk> <clken> <bclk> <cpuclk> <clk90>   stage the phases of the current row
  *   TROW <mhz>                                    stage another row (config.cpufreq)
- *   TAPPLY PARK|RESET|LIVE                        program the clock wizard
+ *   TAPPLY PARK|RESET|LIVE|GRANT                  program the clock wizard
  *   TMB                                           decode the mailbox at ZT_MB
  *   WM <addr> <v1> [v2 ...]                       write params (68k longwords, hex)
  *   TSTAT                                         restart and clock state
@@ -54,7 +54,7 @@ static int zt_snap_taken;
 static int zt_snap_freq;
 
 static struct {
-   uint32_t park_ok, nogrant, notparked, lockto, reset, live, refused;
+   uint32_t park_ok, nogrant, notparked, lockto, reset, live, refused, grant_ok;
    uint32_t last_lock_us;
 } zt_n;
 
@@ -299,6 +299,28 @@ static void zt_tapply(const char *s)
       Xil_ExceptionEnable();
       zt_n.park_ok += ok;
    }
+   else if (strcmp(s, "GRANT") == 0)
+   {
+      /* PARK without the test program: the 060 runs an OS and is stopped only by the bus request.
+       * Whatever it fetches from its caches runs on; its next bus cycle waits for the release.
+       * The OS sees ~1 ms with no bus and no ARM-side interrupt service (eth, piscsi, RTG). */
+      if (emu) { zt_n.refused++; printf("ZT TAPPLY refused emu\n"); return; }
+      Xil_ExceptionDisable();
+      NBR_ARM(0);
+      if (!zt_wait_grant())
+      {
+         NBR_ARM(1);
+         Xil_ExceptionEnable();
+         zt_n.nogrant++;
+         printf("ZT TAPPLY nogrant\n");
+         return;
+      }
+      ok = zt_configure(ind, 0, &lock_us);
+      zt_wait_us(1000);
+      NBR_ARM(1);
+      Xil_ExceptionEnable();
+      zt_n.grant_ok += ok;
+   }
    else if (strcmp(s, "RESET") == 0)
    {
       if (emu) { zt_n.refused++; printf("ZT TAPPLY refused emu\n"); return; }
@@ -404,7 +426,7 @@ static void zt_tstat(void)
    printf("ZT TSTAT st68k=%d rr=%d rsti=%lu rstc=%lu nbr=%lu mio15=%lu emu=%d mhz=%d idx=%d armmhz=%lu "
           "m=%lu d=%lu div=%d/%d/%d/%d/%d/%d ph=%d/%d/%d/%d/%d/%d "
           "rowdiv=%d/%d/%d/%d/%d rowph=%d/%d/%d/%d/%d xp=%d snap=%d live=%d "
-          "park=%lu nogrant=%lu notparked=%lu lockto=%lu reset=%lu applylive=%lu refused=%lu lock_us=%lu "
+          "park=%lu nogrant=%lu notparked=%lu lockto=%lu reset=%lu applylive=%lu refused=%lu grant=%lu lock_us=%lu "
           "temp10=%d up=%lu\n",
           state68k, read_reset,
           (unsigned long)XGpioPs_ReadPin(&GpioPs, n040RSTI), (unsigned long)XGpioPs_ReadPin(&GpioPs, PS_MIO_13),
@@ -418,7 +440,8 @@ static void zt_tstat(void)
           zt_snap_taken, zt_row_live(),
           (unsigned long)zt_n.park_ok, (unsigned long)zt_n.nogrant, (unsigned long)zt_n.notparked,
           (unsigned long)zt_n.lockto, (unsigned long)zt_n.reset, (unsigned long)zt_n.live,
-          (unsigned long)zt_n.refused, (unsigned long)zt_n.last_lock_us, zt_temp10(), zt_up_s());
+          (unsigned long)zt_n.refused, (unsigned long)zt_n.grant_ok, (unsigned long)zt_n.last_lock_us, zt_temp10(),
+          zt_up_s());
 }
 
 static void zt_trest(void)
