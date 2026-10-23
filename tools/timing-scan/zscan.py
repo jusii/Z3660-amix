@@ -1447,9 +1447,12 @@ def scan_row(a, sc, mhz):
         if pas in ('cpuclk', 'bclk') and isinstance(win['all'], dict):
             for edge in ('lo_fail', 'hi_fail'):
                 o = win['all'][edge]
-                if o is None or results[o]['silent']:
+                r_edge = results.get(o) if o is not None else None
+                if r_edge is None and o is not None:
+                    r_edge = results.get(o + 360)            # a wrapped step (window() maps o+360 to o)
+                if r_edge is None or r_edge['silent']:
                     continue
-                local = [p for p in results[o]['fails'] if p in PATHS and PATHS.index(p) in CARD_LOCAL]
+                local = [p for p in r_edge['fails'] if p in PATHS and PATHS.index(p) in CARD_LOCAL]
                 if local:
                     sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here (D16)'
                            % (pas, o, local))
