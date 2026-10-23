@@ -14,7 +14,7 @@
 
 		machine	68060
 
-BUILD		equ	3			; bump on every change; reported in MB_VER
+BUILD		equ	4			; bump on every change; reported in MB_VER
 
 MB		equ	$0FFF0000		; mailbox page, top 64 KB of CPU RAM
 STACKTOP	equ	$0FFFF000
@@ -123,7 +123,7 @@ ST_PARAMS	equ	6
 W_START		equ	$FFFE0000
 W_PARKED	equ	$FFFF0000
 W_IDLE		equ	$FFFC0000
-W_SIZE		equ	$FFFD0000
+W_SIZE		equ	$FFFD0000		; + the sizing step 1..8 (BUILD 4), so a hang names its step
 
 NX_EMU		equ	%11011100		; paths 3,4,5,7,8 do not reach the bus when emulated
 
@@ -1124,8 +1124,10 @@ sizing:
 		move.l	#W_SIZE,MB_WHERE(a5)
 		moveq	#0,d7			; present mask
 		; 1 chip RAM: write, disturb, read back
+		move.l	#W_SIZE+1,MB+MB_WHERE
 		bsr	probe_win
 		; 2 motherboard RAM: 1 MB blocks at $07000000
+		move.l	#W_SIZE+2,MB+MB_WHERE
 		bsr	size_mobo
 		tst.l	V_MOBO(a5)
 		beq.s	.nomb
@@ -1133,11 +1135,13 @@ sizing:
 .nomb:		tst.l	V_MODE(a5)
 		bne	.emu
 		; 3 card RAM, CPU decode
+		move.l	#W_SIZE+3,MB+MB_WHERE
 		move.l	E_CLO(a5),a1
 		bsr	probe_at
 		beq.s	.n3
 		bset	#2,d7
 .n3:		; 4 card RAM, Z3 window
+		move.l	#W_SIZE+4,MB+MB_WHERE
 		btst	#0,V_Z3OK+3(a5)
 		beq.s	.n4
 		move.l	E_Z3B(a5),a1
@@ -1146,6 +1150,7 @@ sizing:
 		beq.s	.n4
 		bset	#3,d7
 .n4:		; 5 socket ROM: per-chunk sums
+		move.l	#W_SIZE+5,MB+MB_WHERE
 		TRY	.n5
 		bsr	ovl_on
 		suba.l	a1,a1
@@ -1164,6 +1169,7 @@ sizing:
 		bset	#4,d7
 .n5:		bsr	ovl_off_safe
 		; 6 CIA
+		move.l	#W_SIZE+6,MB+MB_WHERE
 		TRY	.n6
 		move.b	#$5A,CIAA+$300
 		move.b	CIAA+$300,d0
@@ -1173,12 +1179,14 @@ sizing:
 		bset	#5,d7
 .n6:		lea	MB,a5
 		; 7 autoconfig: always comparable (faults are part of the hash)
+		move.l	#W_SIZE+7,MB+MB_WHERE
 		bsr	acfg_hash
 		move.l	d4,V_ACFG(a5)
 		move.l	d4,MB_SZ+16(a5)
 		move.l	V_CHASH(a5),MB_SZ+12(a5)
 		bset	#6,d7
 		; 8 this image
+		move.l	#W_SIZE+8,MB+MB_WHERE
 		lea	MB+SELFSUMS,a3
 		movea.l	#ROMBASE,a1
 		move.w	#127,d5
@@ -1187,7 +1195,8 @@ sizing:
 		dbra	d5,.ss
 		bset	#7,d7
 		bra.s	.fin
-.emu:		bset	#5,d7			; CIA reaches the bus under the emulator
+.emu:		move.l	#W_SIZE+6,MB+MB_WHERE
+		bset	#5,d7			; CIA reaches the bus under the emulator
 		TRY	.fin
 		move.b	#$5A,CIAA+$300
 		move.b	CIAA+$300,d0

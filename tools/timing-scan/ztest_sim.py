@@ -45,6 +45,7 @@ class Board:
         self.gary_berr = True                         # False: Gary ignores the BERR mode
         self.gary_needs_toen = False                  # True: BERR only with TOENB set as well (the D?)
         self.fault = None                             # address of a faulted read, for the hook
+        self.wtrace = []                              # every longword written to MB_WHERE, in order
 
     # ---- storage ----
     def page(self, a):
@@ -118,6 +119,8 @@ class Board:
         return v
 
     def w(self, a, v, n):
+        if a == MB + 0x0C and n == 4:
+            self.wtrace.append(v & 0xFFFFFFFF)
         for i in range(n):
             self.w8(a + i, (v >> (8 * (n - 1 - i))) & 0xFF)
 
@@ -270,6 +273,15 @@ def params(board, **kw):
     board.wm(0x200, 0x5A545041)
 
 
+def insequence(trace, want):
+    """want appears in trace in order (other values may come between)"""
+    i = 0
+    for v in trace:
+        if i < len(want) and v == want[i]:
+            i += 1
+    return i == len(want)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--rom', default='ztest.rom')
@@ -293,6 +305,8 @@ def main():
           and all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths'])
           and mb['paths'][0]['ops'] > 0 and mb['paths'][5]['ops'] > 0
           and mb['sz'][1] == 0x000F and (mb['st'] >> 3) & 1 == 1, mb)
+    check('sizing marks its steps: W_SIZE, then +1 chip, +2 mobo, +6 CIA (emulated), then idle',
+          insequence(s.board.wtrace, [0xFFFD0000, 0xFFFD0001, 0xFFFD0002, 0xFFFD0006, 0xFFFC0000]), mb)
     # a host read can tear against the program's copy loop: valid in most samples, never required in all
     good = 0
     for _ in range(40):
@@ -351,6 +365,8 @@ def main():
         and mb['paths'][2]['ops'] > 0 and mb['paths'][4]['ops'] > 0 and mb['paths'][7]['ops'] > 0
     check('real-CPU paths: card/rom/self run clean, Z3 NP without a board', ok, mb)
     check('socket ROM whole sum = FFFFFFFF (ztest is its own socket ROM here)', mb['sz'][2] == 0xFFFFFFFF, mb)
+    check('real-CPU sizing marks all eight steps in order (BUILD 4)',
+          insequence(s.board.wtrace, [0xFFFD0000] + [0xFFFD0000 + n for n in range(1, 9)] + [0xFFFC0000]), mb)
 
     # 8. faults on card RAM and on the overlay ROM land on paths 3 and 5
     s.board.flip = [(0x08100000, 0x08300000, 0x00010000, 53)]
