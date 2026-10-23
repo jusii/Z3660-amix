@@ -534,6 +534,7 @@ class Scanner:
         self.reboot = 'cycle'   # how the last recovery rebooted (soft / cycle)
         self.contaminated = 0   # failing steps that left the board faulty until a reset
         self.pagelost = 0       # cold restarts with the mailbox page lost, re-armed
+        self.last_bad = False   # the last step failed or was silent (a faulted board may be left behind)
         self.runaways = 0       # silent real-060 steps (--runaway-policy), session and this row
         self.row_runaways = 0
         self.hangs = 0          # resets that left the program hung
@@ -875,6 +876,7 @@ class Scanner:
             res = self.measure(self.a.dwell)
             tries.append(self.reboot + '+' + how)
         v = 'fail-silent' if res['silent'] else res['summary']
+        self.last_bad = res['silent'] or bool(res['fails'])
         self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
         return dict(off=off, ph=list(ph), silent=res['silent'], fails=res['fails'], v=v,
                     pathok=self.path_ok(res), mb=res.get('mb'))
@@ -1642,6 +1644,12 @@ def main():
                         break
         r = con.send('TREST')[0]
         sc.log('TREST: %s' % r.line)
+        if a.mode == 'emu' and a.reset_after_fail and sc.last_bad:
+            # METAL-2c: 1b3 ended on row 120's silent start and the next run's warm-up found mobo faulted
+            # (50240 whole-word errors); an emulated TREST is a LIVE apply and clears nothing
+            sc.log('the last step failed: a soft reboot so the next run starts on a clean board')
+            sc.softs += 1
+            con.soft()
     except StopRule as e:
         sc.log('STOP RULE: %s -- nothing more is sent; the box is left as it is' % e)
         raise SystemExit(3)
