@@ -998,9 +998,13 @@ class Scanner:
             self.epoch += 1
             self.wm(epoch=self.epoch, cmd=CMD_RUN)
             res = self.measure(self.a.dwell)
-            if res['silent'] or res['fails']:
-                raise SystemExit('STOP RULE: TREST (RESET at the boot row) did not bring the program back clean (%s)'
-                                 % res['summary'])
+            if res['silent']:
+                raise SystemExit('STOP RULE: TREST (RESET at the boot row) did not bring the program back (silent)')
+            if res['fails']:
+                # running but erring at the boot row: a board a runaway faulted beyond what a CPLD reset clears
+                # (METAL-2c 2b: the autoconfig chain hash changed and path 7 erred until a power cycle)
+                self.log('the board runs but fails at the boot row after TREST (%s): a power cycle' % res['summary'])
+                self.restart_at_baseline()
         else:
             self.row = dict(self.boot)
             self.recover()
