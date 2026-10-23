@@ -712,12 +712,20 @@ class Scanner:
 
     def rearm(self, why):
         """a cold-restarted ztest (page lost, e.g. a runaway 060 scribbled the mailbox before a RESET): the whole
-        parameter block again -- magic, mode, SIZE, then RUN with the frozen present mask -- not just the epoch"""
+        parameter block again -- magic, mode, RUN with the frozen present mask and autoconfig hash -- not just the
+        epoch. No SIZE: on the tower the SIZE this re-arm used to command hung 4/4 (TOWER-2: where=W_SIZE, hb>0,
+        so ztest's own sizing after the restart had finished), while restarts that kept the frozen mask went
+        straight to RUN and recovered (FIRMWARE-QUESTIONS a)."""
         self.pagelost += 1
         self.log('page-lost restart (%s): re-arming the parameter block' % why)
         self.epoch += 1
-        self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=2 if self.a.mode == 'emu' else 1,
-                en=self.a.en, flags=self.a.flags)
+        common = dict(magic=0x5A545041, epoch=self.epoch, mode=2 if self.a.mode == 'emu' else 1, en=self.a.en,
+                      flags=self.a.flags)
+        if self.pres:
+            self.wm(cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **common)
+            return
+        # no baseline yet, so no frozen mask: the program has to size
+        self.wm(cmd=CMD_SIZE, pres=0, **common)
         self.con.sleep(3)
         self.tmb()
         self.epoch += 1
