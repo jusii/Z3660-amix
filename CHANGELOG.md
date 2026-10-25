@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-25 — eth-rxring: Z3660Net.device 1.5, bench goldens, the timing scanner and ztest BUILD 5 (01a7df3..7289136)
+
+Ethernet: an RX descriptor ring (ETH_RXRING, 16 descriptors default) with a capped backlog, INT6 re-raise/kick options,
+polling and tail-drop variants, 1000BASE-T advertising (eth_adv1000 YES by default), the five build flags as z3660cfg keys,
+and the eth_prof instrumentation (ESTAT/ESTATZ/EPROF: GEM stats, PHY registers, IRQ-latency sampler, RX descriptor probe);
+Z3660Net.device 1.5 drains the backlog per wake. Release manifests for the bench golden 9994961A and the release-cut 66660DDB.
+Timing scanner (ZT_SCAN builds only, plain image unchanged): debug-console primitives (TAPPLY PARK/RESET/LIVE/GRANT, TSTAT/TMB
+with die temperature and uptime, DMS byte order fixed), the ztest bus test program (eight paths, Gary BERR/TOENB probe, step
+markers, BUILD 4) and its simulator, the zscan host loop (rows in one boot, find-start, reset-after-fail, confirm-fail,
+runaway policy, page-lost re-arm, circular sweeps, 360 rule, resets CSV). ztest BUILD 5 (EE008C04) adds path 9, the
+ARM-served RTG register zone (constants, ADF_TXT read-back, VBLANK control); zscan parses 8 or 9 paths; the scanner TMB
+prints the 9th record (scanner image FB078756, not deployed).
+
 ## 2026-10-04 — firmware 1.0 (release-1.0-fw); deferred R-16 KNOWN_ISSUES line (9ea9a4d..ff9e8fb)
 
 Firmware 1.0: MAPROM/MAPROMEXT decided before the final FPGA reset pulse (kickstart 0 works again on a real CPU)
