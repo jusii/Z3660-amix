@@ -13,7 +13,10 @@ measured on the A4000D in METAL-1), Gary's timeout register at $DE0000 (bit 7 se
 address faults; the fault is injected as a 68060 format-4 access-fault frame from the instruction
 hook), custom chips as a write sink. machine68k maps only the low 256 MB,
 so the Zorro III spaces ($FF000000, $40000000) read as empty: path 4 is NP, path 7 hashes a
-constant.
+constant, and path 9 (the RTG register zone) is NP unless the parameter block points it at the
+register-zone model at ZZBASE (PA_ZZB): rtg.c's read handler for the three firmware constants, the
+unhandled register ($FFFFFFFF) and the ADF_TXT range (read back from what the PL wrote), and the
+PL's own VBLANK_STATUS (bit 0 only).
 
     ztest_sim.py [--rom ztest.rom] [--quiet]     runs the scenario list, exit 0 when all pass
 """
@@ -27,7 +30,10 @@ import machine68k as m
 PAGE = 0x10000
 MB = 0x0FFF0000
 ROMBASE = 0x00F80000
-PATHS = ('chip', 'mobo', 'card', 'z3', 'rom', 'cia', 'acfg', 'self')
+PATHS = ('chip', 'mobo', 'card', 'z3', 'rom', 'cia', 'acfg', 'self', 'zzreg')
+ZZBASE = 0x04000000                 # the register-zone model (on the card: E_Z3B + $10000000)
+ZZ_FW = {0x1A0: 0x00000103, 0x280: 21, 0x284: 0}     # FW_VERSION (major<<8|minor), FW_BETA, FW_ALFA
+ZZ_TXT = ((0x500, 0x596), (0x600, 0x696), (0x700, 0x796), (0x800, 0x896))   # read back from DDR
 
 
 class Board:
@@ -46,6 +52,8 @@ class Board:
         self.gary_needs_toen = False                  # True: BERR only with TOENB set as well (the D?)
         self.fault = None                             # address of a faulted read, for the hook
         self.wtrace = []                              # every longword written to MB_WHERE, in order
+        self.zzddr = bytearray(0x2000)                # what the PL wrote in the register zone
+        self.zzreads = 0
 
     # ---- storage ----
     def page(self, a):
@@ -69,8 +77,21 @@ class Board:
         return False
 
     # ---- byte access ----
+    def zz_r8(self, o):
+        al = o & ~3
+        if any(lo <= al < hi for lo, hi in ZZ_TXT):
+            return self.zzddr[o]
+        if al == 0x17C:                               # the PL answers VBLANK_STATUS itself
+            v = (self.zzreads >> 2) & 1
+        else:
+            v = ZZ_FW.get(al, 0xFFFFFFFF)             # rtg.c's default for an unhandled register
+        return (v >> (8 * (3 - (o & 3)))) & 0xFF
+
     def r8(self, a):
         a &= 0xFFFFFFFF
+        if ZZBASE <= a < ZZBASE + 0x2000:
+            self.zzreads += 1
+            return self.zz_r8(a - ZZBASE)
         if ROMBASE <= a < ROMBASE + len(self.rom):
             return self.rom[a - ROMBASE]
         if a < 0x00080000 and self.ovl():
@@ -89,6 +110,9 @@ class Board:
 
     def w8(self, a, v):
         a &= 0xFFFFFFFF
+        if ZZBASE <= a < ZZBASE + 0x2000:
+            self.zzddr[a - ZZBASE] = v & 0xFF
+            return
         if ROMBASE <= a < ROMBASE + len(self.rom):
             return
         if 0x00BF0000 <= a < 0x00C00000:
@@ -188,11 +212,13 @@ class Board:
         ok = rec[:4] == b'ZTMB' and zlib.crc32(rec[:0x1FC]) == struct.unpack('>I', rec[0x1FC:])[0]
         g = lambda x: struct.unpack('>I', rec[x:x + 4])[0]
         paths = []
-        for p in range(8):
-            r = 0x20 + p * 0x20
-            paths.append(dict(err=g(r), ops=g(r + 4), berr=g(r + 8), fa=g(r + 12), fx=g(r + 16), pres=g(r + 24)))
-        return dict(crc=ok, hb=g(8), where=g(12), epoch=g(16), st=g(20), rs=g(24), id=g(28),
-                    paths=paths, sz=[g(0x120 + 4 * i) for i in range(5)], xcnt=g(0x13C), raw=rec)
+        for p in range(9):
+            r = 0x20 + p * 0x20 if p < 8 else 0x140      # record 9 sits after MB_SZ/MB_X*
+            paths.append(dict(err=g(r), ops=g(r + 4), berr=g(r + 8), fa=g(r + 12), fx=g(r + 16), last=g(r + 20),
+                              pres=g(r + 24), exp=g(r + 28)))
+        return dict(crc=ok, hb=g(8), ver=g(4), where=g(12), epoch=g(16), st=g(20), rs=g(24), id=g(28),
+                    paths=paths, sz=[g(0x120 + 4 * i) for i in range(5)], xcnt=g(0x13C),
+                    zz=[g(0x160 + 4 * i) for i in range(3)], raw=rec)
 
 
 def make_machine(board):
@@ -259,15 +285,16 @@ def fmt(mb):
         mb['crc'], mb['hb'], mb['where'], mb['epoch'], mb['rs'], mb['st'], mb['xcnt'],
         '/'.join('%08X' % x for x in mb['sz']))
     for i, p in enumerate(mb['paths']):
-        s += '\n   p%d %-5s pres=%d err=%d ops=%d berr=%d fa=%08X fx=%08X' % (
-            i + 1, PATHS[i], p['pres'], p['err'], p['ops'], p['berr'], p['fa'], p['fx'])
-    return s
+        s += '\n   p%d %-5s pres=%d err=%d ops=%d berr=%d fa=%08X fx=%08X exp=%08X last=%08X' % (
+            i + 1, PATHS[i], p['pres'], p['err'], p['ops'], p['berr'], p['fa'], p['fx'], p['exp'], p['last'])
+    return s + '\n   zz=%s' % '/'.join('%08X' % x for x in mb['zz'])
 
 
 def params(board, **kw):
     lay = dict(magic=0x200, epoch=0x204, cmd=0x208, en=0x20C, pres=0x210, mode=0x214, chlo=0x218, chhi=0x21C,
                mobo=0x220, clo=0x224, chi=0x228, z3b=0x22C, z3o=0x230, z3l=0x234, romb=0x238, acfg=0x240,
-               chunk=0x244, cacr=0x248, cia=0x24C, flags=0x250)
+               chunk=0x244, cacr=0x248, cia=0x24C, flags=0x250, zzk=0x258, zzv=0x25C, zzbe=0x260, zzal=0x264,
+               zzn=0x268, zzb=0x26C)
     for k, v in kw.items():
         board.wm(lay[k], v)
     board.wm(0x200, 0x5A545041)
@@ -301,7 +328,7 @@ def main():
     mb = s.run_passes(4)
     pres = [p['pres'] for p in mb['paths']]
     check('cold start: sized and running, NX map, zero errors',
-          mb['crc'] and mb['hb'] >= 4 and pres == [1, 1, 2, 2, 2, 1, 2, 2]
+          mb['crc'] and mb['hb'] >= 4 and pres == [1, 1, 2, 2, 2, 1, 2, 2, 2]
           and all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths'])
           and mb['paths'][0]['ops'] > 0 and mb['paths'][5]['ops'] > 0
           and mb['sz'][1] == 0x000F and (mb['st'] >> 3) & 1 == 1, mb)
@@ -361,12 +388,13 @@ def main():
     params(s.board, mode=1, cmd=0, epoch=2, pres=mb['sz'][0])
     mb = s.run_passes(3)
     pres = [p['pres'] for p in mb['paths']]
-    ok = pres == [1, 1, 1, 0, 1, 1, 1, 1] and all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths']) \
-        and mb['paths'][2]['ops'] > 0 and mb['paths'][4]['ops'] > 0 and mb['paths'][7]['ops'] > 0
-    check('real-CPU paths: card/rom/self run clean, Z3 NP without a board', ok, mb)
+    ok = pres == [1, 1, 1, 0, 1, 1, 1, 1, 0] and all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths']) \
+        and mb['paths'][2]['ops'] > 0 and mb['paths'][4]['ops'] > 0 and mb['paths'][7]['ops'] > 0 \
+        and mb['paths'][8]['ops'] == 0 and mb['ver'] & 0xFFFF == 5
+    check('real-CPU paths: card/rom/self run clean, Z3 and zzreg NP without a board, BUILD 5', ok, mb)
     check('socket ROM whole sum = FFFFFFFF (ztest is its own socket ROM here)', mb['sz'][2] == 0xFFFFFFFF, mb)
-    check('real-CPU sizing marks all eight steps in order (BUILD 4)',
-          insequence(s.board.wtrace, [0xFFFD0000] + [0xFFFD0000 + n for n in range(1, 9)] + [0xFFFC0000]), mb)
+    check('real-CPU sizing marks all nine steps in order (BUILD 5)',
+          insequence(s.board.wtrace, [0xFFFD0000] + [0xFFFD0000 + n for n in range(1, 10)] + [0xFFFC0000]), mb)
 
     # 8. faults on card RAM and on the overlay ROM land on paths 3 and 5
     s.board.flip = [(0x08100000, 0x08300000, 0x00010000, 53)]
@@ -435,6 +463,70 @@ def main():
     mb = s.run_passes(2)
     check('flags 8: BERR mode on for the run (paths clean), kept by the probe (flags 10), cleared at flags 0',
           on and clean and probe_kept and s.board.gary_to == 0 and s.board.gary_toen == 0, mb)
+
+    # 14. path 9 on the register-zone model: sized (constants captured), frozen with 'ZZK1', clean, tail restored
+    s = Sim(rom)
+    params(s.board, mode=1, cmd=2, epoch=1, zzb=ZZBASE)
+    mb = s.run_passes(2)
+    zz = mb['zz']
+    params(s.board, mode=1, cmd=0, epoch=2, pres=mb['sz'][0], zzk=0x5A5A4B31, zzv=zz[0], zzbe=zz[1], zzal=zz[2])
+    mb = s.run_passes(3)
+    p9 = mb['paths'][8]
+    check('zzreg: present, constants sized as 00000103/00000015/00000000, clean, ADF_TXT tail back to 0',
+          (mb['sz'][0] >> 8) & 1 and zz == [0x103, 21, 0] and p9['pres'] == 1 and p9['err'] == 0 and
+          p9['berr'] == 0 and p9['ops'] > 0 and s.board.zzddr[0x880:0x894] == bytes(20) and
+          all(p['err'] == 0 and p['berr'] == 0 for p in mb['paths']), mb)
+
+    def only9(mb):
+        return all(p['err'] == 0 for i, p in enumerate(mb['paths']) if i != 8)
+
+    # 15. a wrong constant: FW_VERSION reads with bit 4 flipped now and then
+    s.board.flip = [(ZZBASE + 0x1A0, ZZBASE + 0x1A4, 0x10, 7)]
+    params(s.board, epoch=3)
+    mb = s.run_passes(3)
+    s.board.flip = []
+    p9 = mb['paths'][8]
+    check('zzreg wrong constant: err at R+$1A0, expected 00000103, got 00000113',
+          p9['err'] > 0 and p9['fa'] == ZZBASE + 0x1A0 and p9['exp'] == 0x103 and p9['last'] == 0x113 and
+          p9['fx'] == 0x10 and only9(mb), mb)
+
+    # 16. a wrong read-back in the ADF_TXT tail: bit 16 of one slot
+    s.board.flip = [(ZZBASE + 0x888, ZZBASE + 0x88C, 0x00010000, 3)]
+    params(s.board, epoch=4)
+    mb = s.run_passes(3)
+    s.board.flip = []
+    p9 = mb['paths'][8]
+    check('zzreg read-back: err at R+$888, fx=00010000 (exp = the first wrong read\'s pattern, last = the last one)',
+          p9['err'] > 0 and p9['fa'] == ZZBASE + 0x888 and p9['fx'] == 0x10000 and only9(mb), mb)
+
+    # 17. VBLANK_STATUS with bit 1 stuck: every read is an error, expected = got & 1
+    s.board.flip = [(ZZBASE + 0x17C, ZZBASE + 0x180, 0x2, 1)]
+    params(s.board, epoch=5)
+    mb = s.run_passes(3)
+    s.board.flip = []
+    p9 = mb['paths'][8]
+    check('zzreg VBLANK bit 1 stuck: err at R+$17C, expected = bit 0 of the read, got has bit 1, fx=00000002',
+          p9['err'] >= 3 * 16 and p9['fa'] == ZZBASE + 0x17C and p9['last'] & 2 and p9['exp'] in (0, 1) and
+          p9['fx'] == 0x2 and only9(mb), mb)
+
+    # 18. the frozen constants rule: a RUN with 'ZZK1' compares against the host's values, not sizing's
+    params(s.board, epoch=6, zzv=0x104)
+    mb = s.run_passes(2)
+    p9 = mb['paths'][8]
+    ok = p9['err'] > 0 and p9['fa'] == ZZBASE + 0x1A0 and p9['exp'] == 0x104 and p9['last'] == 0x103
+    params(s.board, epoch=7, zzv=zz[0])
+    mb = s.run_passes(2)
+    check('zzreg frozen constants: a host value 00000104 fails at R+$1A0, the right one runs clean',
+          ok and mb['paths'][8]['err'] == 0 and mb['paths'][8]['ops'] > 0, mb)
+
+    # 19. a RUN on a frozen mask with neither sizing since the start nor 'ZZK1': the constant compares are skipped
+    #     (no stale expected values), the unhandled register, read-back and VBLANK still run: 16 + 50 + 16 per pass
+    s = Sim(rom)
+    params(s.board, mode=1, cmd=0, epoch=1, en=0x100, pres=0x100, zzb=ZZBASE)
+    mb = s.run_passes(3)
+    p9 = mb['paths'][8]
+    check('zzreg without constants: no compares against stale values, 82 ops per pass, clean',
+          p9['pres'] == 1 and p9['err'] == 0 and p9['ops'] > 0 and p9['ops'] % 82 == 0 and only9(mb), mb)
 
     bad = [n for n, c in results if not c]
     print('%d/%d scenarios pass' % (len(results) - len(bad), len(results)))

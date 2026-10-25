@@ -14,7 +14,7 @@
 
 		machine	68060
 
-BUILD		equ	4			; bump on every change; reported in MB_VER
+BUILD		equ	5			; bump on every change; reported in MB_VER (5: path 9)
 
 MB		equ	$0FFF0000		; mailbox page, top 64 KB of CPU RAM
 STACKTOP	equ	$0FFFF000
@@ -28,11 +28,13 @@ MB_EPOCH	equ	$010			; params epoch the counters belong to
 MB_STAT		equ	$014			; ST_ bits, last exception vector in 23:16
 MB_RS		equ	$018			; entries at 'start' since the page was valid
 MB_ID		equ	$01C			; 68060 PCR, 0 when emulated
-MB_REC		equ	$020			; 8 path records of 32 bytes
+MB_REC		equ	$020			; path records 1-8, 32 bytes each ($020-$11F)
 MB_SZ		equ	$120			; sizing report: present map, mobo mask, rom sum, card acfg hash, mobo acfg hash
 MB_XADDR	equ	$134			; last exception: frame long at +8 (060 fault address)
 MB_XPC		equ	$138			; last exception: stacked PC
 MB_XCNT		equ	$13C			; exceptions taken
+MB_REC9		equ	$140			; path 9 record ($140-$15F): the 8 at $020 end where MB_SZ starts
+MB_ZZ		equ	$160			; path 9 sizing: FW_VERSION, FW_BETA, FW_ALFA as read ($160-$16B)
 MB_CRC		equ	$1FC			; CRC32 of $000-$1FB
 MB_MIRROR	equ	$800
 
@@ -44,7 +46,8 @@ REC_FA		equ	$0C			; first failing address (0 = none yet)
 REC_FX		equ	$10			; OR of (expected XOR read)
 REC_LAST	equ	$14			; last wrong value read
 REC_PRES	equ	$18			; 0 NP, 1 run, 2 NX (emulated), 3 disabled
-NPATH		equ	8
+REC_EXP		equ	$1C			; expected value at the first failure
+NPATH		equ	9
 
 ; parameters, written by the ARM; zero means "default"
 PA_MAGIC	equ	$200			; 'ZTPA'
@@ -71,6 +74,12 @@ PA_FLAGS	equ	$250			; bit0: no MOVE16 burst on paths 3/4; bit1: Gary BERR probe 
 					; bit2: the probe also sets TOENB ($DE0001);
 					; bit3: Gary in BERR mode for the whole run (real 060)
 PA_BPROBE	equ	$254			; BERR probe address; 0 = $00F00000
+PA_ZZK		equ	$258			; 'ZZK1': PA_ZZV/PA_ZZBE/PA_ZZAL hold the frozen path 9 constants
+PA_ZZV		equ	$25C			; expected REG_ZZ_FW_VERSION
+PA_ZZBE		equ	$260			; expected REG_ZZ_FW_BETA
+PA_ZZAL		equ	$264			; expected REG_ZZ_FW_ALFA
+PA_ZZN		equ	$268			; path 9 reads per register per pass
+PA_ZZB		equ	$26C			; path 9 register base override (simulator); 0 = the RTG board acfg_card configured
 
 VBRT		equ	$400			; vector table, 1 KB
 ; variables
@@ -91,6 +100,11 @@ V_SPIN		equ	$A50
 V_CHASH		equ	$A54			; card autoconfig nibble hash
 V_CLEAN		equ	$A58			; params were valid this pass
 V_GB		equ	$A5C			; Gary BERR mode set by flags bit 3
+V_ZZR		equ	$A60			; RTG board base acfg_card wrote, 0 = none
+V_ZZV		equ	$A64			; path 9 constants read at sizing
+V_ZZBE		equ	$A68
+V_ZZAL		equ	$A6C
+V_ZZOK		equ	$A70			; 1: V_ZZ* were read by sizing since this start
 ; effective parameters, recomputed every pass
 E_CMD		equ	$A80
 E_EN		equ	$A84
@@ -108,6 +122,8 @@ E_ACFG		equ	$AB0
 E_CHUNK		equ	$AB4
 E_CIA		equ	$AB8
 E_FLAGS		equ	$ABC
+E_ZZN		equ	$AC0
+E_ZZB		equ	$AC4
 CRCTAB		equ	$C00			; 256 longs
 ROMSUMS		equ	$1000			; 128 x 4 KB chunk sums of the socket ROM (sizing)
 SELFSUMS	equ	$1200			; 128 x 4 KB chunk sums of this image (sizing)
@@ -123,9 +139,9 @@ ST_PARAMS	equ	6
 W_START		equ	$FFFE0000
 W_PARKED	equ	$FFFF0000
 W_IDLE		equ	$FFFC0000
-W_SIZE		equ	$FFFD0000		; + the sizing step 1..8 (BUILD 4), so a hang names its step
+W_SIZE		equ	$FFFD0000		; + the sizing step 1..9 (BUILD 4; 9 since BUILD 5), so a hang names its step
 
-NX_EMU		equ	%11011100		; paths 3,4,5,7,8 do not reach the bus when emulated
+NX_EMU		equ	%111011100		; paths 3,4,5,7,8,9 do not reach the bus when emulated
 
 CIAA		equ	$BFE001
 CIAB		equ	$BFD000
@@ -139,6 +155,13 @@ Z3660_MFR	equ	$144B
 GARY_TO		equ	$DE0000			; Gary: bit 7 set = a cycle nobody answers ends in BERR
 GARY_TOEN	equ	$DE0001			; Gary TOENB: bit 7 = the bus timeout enable (METAL-2: $DE0000 alone did nothing on the D)
 BPROBE_DEF	equ	$00F00000		; empty on the A4000D: Gary's timeout ends the cycle
+; path 9: the RTG board's register zone (its first 2 MB), served by the ARM through the PL handshake
+ZZ_VBLANK	equ	$17C			; REG_ZZ_VBLANK_STATUS: answered by the PL itself, bit 0 only
+ZZ_FWV		equ	$1A0			; REG_ZZ_FW_VERSION
+ZZ_FWBE		equ	$280			; REG_ZZ_FW_BETA
+ZZ_FWAL		equ	$284			; REG_ZZ_FW_ALFA
+ZZ_NONE		equ	$31C			; REG_ZZ_NOT_USED_0x31C: no handler case, reads $FFFFFFFF
+ZZ_TXT		equ	$880			; ADF_TXT tail: a PL write to DDR, read back by the ARM; 5 longs
 
 ; TRY <label>: an exception from here on resumes at <label> with SP as it is now.
 TRY		macro
@@ -198,6 +221,8 @@ start:
 		clr.l	V_SIZED(a5)
 		clr.l	V_GB(a5)
 		clr.l	V_Z3OK(a5)
+		clr.l	V_ZZR(a5)
+		clr.l	V_ZZOK(a5)
 		clr.l	V_MOBI(a5)
 		lea	V_OFF(a5),a0
 		moveq	#NPATH-1,d0
@@ -319,7 +344,7 @@ eff_params:
 		move.l	PA_CMD(a5),E_CMD(a5)
 		move.l	PA_EN(a5),d0
 		bne.s	.en
-		move.l	#$FF,d0
+		move.l	#$1FF,d0
 .en:		move.l	d0,E_EN(a5)
 		move.l	PA_PRES(a5),d0
 		bne.s	.pr
@@ -352,7 +377,7 @@ eff_params:
 		neg.l	d0
 		add.l	d0,d0			; not sized: SIZE (2), sized: RUN (0)
 		move.l	d0,E_CMD(a5)
-		move.l	#$FF,E_EN(a5)
+		move.l	#$1FF,E_EN(a5)
 		move.l	V_PRES(a5),E_PRES(a5)
 		lea	.tab(pc),a2
 .dfl:		move.w	(a2)+,d1
@@ -384,6 +409,10 @@ eff_params:
 		dc.l	1024
 		dc.w	PA_CIA,E_CIA
 		dc.l	32
+		dc.w	PA_ZZN,E_ZZN
+		dc.l	16
+		dc.w	PA_ZZB,E_ZZB
+		dc.l	0
 		dc.w	0
 
 ; ---------------------------------------------------------------------------------------
@@ -452,16 +481,18 @@ park:
 		bra	loop
 
 zero_counters:
-		lea	MB_REC(a5),a0
-		moveq	#NPATH-1,d0
-.z:		clr.l	REC_ERR(a0)
-		clr.l	REC_OPS(a0)
-		clr.l	REC_BERR(a0)
-		clr.l	REC_FA(a0)
-		clr.l	REC_FX(a0)
-		clr.l	REC_LAST(a0)
-		lea	32(a0),a0
-		dbra	d0,.z
+		moveq	#0,d6
+.z:		bsr	recp
+		clr.l	REC_ERR(a6)
+		clr.l	REC_OPS(a6)
+		clr.l	REC_BERR(a6)
+		clr.l	REC_FA(a6)
+		clr.l	REC_FX(a6)
+		clr.l	REC_LAST(a6)
+		clr.l	REC_EXP(a6)
+		addq.l	#1,d6
+		cmp.l	#NPATH,d6
+		blt.s	.z
 		clr.l	MB_XCNT(a5)
 		rts
 
@@ -512,9 +543,7 @@ run_paths:
 		move.l	V_CUR(a5),d6
 		cmp.l	#NPATH,d6
 		bge	.end
-		move.l	d6,d0
-		lsl.l	#5,d0
-		lea	MB_REC(a5,d0.l),a6
+		bsr	recp
 		; status of this path
 		moveq	#2,d1
 		tst.l	V_MODE(a5)
@@ -560,6 +589,18 @@ ptab:		bra.w	path_chip
 		bra.w	path_cia
 		bra.w	path_acfg
 		bra.w	path_self
+		bra.w	path_zz
+
+; recp: d6 path index (0-based) -> a6 its record; records 1-8 at MB_REC, 9 at MB_REC9
+recp:
+		cmp.l	#8,d6
+		blt.s	.lo
+		lea	MB_REC9(a5),a6
+		rts
+.lo:		move.l	d6,d0
+		lsl.l	#5,d0
+		lea	MB_REC(a5,d0.l),a6
+		rts
 
 ; ---------------------------------------------------------------------------------------
 ; error bookkeeping: d0 read, d1 expected, a1 address, a6 record
@@ -568,6 +609,7 @@ bad:
 		tst.l	REC_FA(a6)
 		bne.s	.fa
 		move.l	a1,REC_FA(a6)
+		move.l	d1,REC_EXP(a6)
 .fa:		move.l	d0,REC_LAST(a6)
 		eor.l	d0,d1
 		or.l	d1,REC_FX(a6)
@@ -1061,6 +1103,184 @@ path_self:
 		move.l	d4,V_OFF+28(a5)
 		rts
 
+; path 9, the RTG board's register zone. Card RAM and the framebuffer are PL-local; a register cycle is held by the
+; PL until core0's handler (rtg.c) has served it. Per pass: N reads of three constants and of an unhandled register,
+; the ADF_TXT tail written and read back (walking bit, its inverse, address, inverted address, then 0), and N reads
+; of VBLANK_STATUS, which the PL answers itself (bits 31:1 are 0). Never ethernet, USB, audio, blitter, soft3d, P2C,
+; video or INT_STATUS: their handlers have side effects.
+path_zz:
+		bsr	zz_base
+		beq	.r
+		movea.l	d0,a2
+		bsr	zz_expect		; d2 version, d3 beta, d4 alfa; d7 0 when there are none
+		move.l	E_ZZN(a5),d5
+		move.l	d5,d6
+		subq.l	#1,d6
+.k:		tst.l	d7
+		beq.s	.k3
+		lea	ZZ_FWV(a2),a1
+		move.l	(a1),d0
+		move.l	d2,d1
+		cmp.l	d1,d0
+		beq.s	.k1
+		bsr	bad
+.k1:		lea	ZZ_FWBE(a2),a1
+		move.l	(a1),d0
+		move.l	d3,d1
+		cmp.l	d1,d0
+		beq.s	.k2
+		bsr	bad
+.k2:		lea	ZZ_FWAL(a2),a1
+		move.l	(a1),d0
+		move.l	d4,d1
+		cmp.l	d1,d0
+		beq.s	.k3
+		bsr	bad
+.k3:		lea	ZZ_NONE(a2),a1
+		move.l	(a1),d0
+		moveq	#-1,d1
+		cmp.l	d1,d0
+		beq.s	.k4
+		bsr	bad
+.k4:		subq.l	#1,d6
+		bpl.s	.k
+		move.l	d5,d0
+		tst.l	d7
+		beq.s	.ko
+		lsl.l	#2,d0			; four registers read, or only the unhandled one
+.ko:		add.l	d0,REC_OPS(a6)
+		; read-back: five rounds over the five longs, the last one restores 0
+		lea	MB,a5
+		move.l	MB_HB(a5),d2
+		moveq	#1,d0
+		rol.l	d2,d0
+		move.l	d0,d2			; walking bit of this pass
+		moveq	#0,d4			; round
+.rd:		moveq	#0,d5
+.wr:		bsr	zz_slot			; a1, d1
+		move.l	d1,(a1)
+		addq.l	#1,d5
+		cmp.l	#5,d5
+		blt.s	.wr
+		moveq	#0,d5
+.rb:		bsr	zz_slot
+		move.l	(a1),d0
+		cmp.l	d1,d0
+		beq.s	.rb1
+		bsr	bad
+.rb1:		addq.l	#1,d5
+		cmp.l	#5,d5
+		blt.s	.rb
+		addq.l	#1,d4
+		cmp.l	#5,d4
+		blt.s	.rd
+		add.l	#50,REC_OPS(a6)
+		; VBLANK_STATUS: the PL-direct control
+		move.l	E_ZZN(a5),d5
+		move.l	d5,d6
+		subq.l	#1,d6
+		lea	ZZ_VBLANK(a2),a1
+.v:		move.l	(a1),d0
+		moveq	#1,d1
+		and.l	d0,d1
+		cmp.l	d1,d0
+		beq.s	.v1
+		bsr	bad
+.v1:		subq.l	#1,d6
+		bpl.s	.v
+		add.l	d5,REC_OPS(a6)
+.r:		rts
+
+; zz_slot: a2 base, d4 round, d5 slot, d2 walking bit -> a1 the slot's address, d1 its pattern
+zz_slot:
+		move.l	d5,d1
+		lsl.l	#2,d1
+		lea	ZZ_TXT(a2),a1
+		adda.l	d1,a1
+		move.l	d2,d1
+		rol.l	d5,d1			; the slots carry the bit in different lanes
+		cmp.l	#1,d4
+		bne.s	.n1
+		not.l	d1
+.n1:		cmp.l	#2,d4
+		blt.s	.r
+		move.l	a1,d1
+		cmp.l	#3,d4
+		bne.s	.n3
+		not.l	d1
+.n3:		cmp.l	#4,d4
+		bne.s	.r
+		moveq	#0,d1
+.r:		rts
+
+; zz_base: d0 = the register zone base, 0 (Z set) when there is no RTG board
+zz_base:
+		lea	MB,a5
+		move.l	E_ZZB(a5),d0
+		bne.s	.r
+		move.l	V_ZZR(a5),d0
+.r:		rts
+
+; zz_expect: d2/d3/d4 = the expected constants, the host's frozen ones when it sent them ('ZZK1'), else those sizing
+; read since this start; d7 = 0 when neither exists (a RUN on a frozen mask from a host without 'ZZK1')
+zz_expect:
+		move.l	V_ZZV(a5),d2
+		move.l	V_ZZBE(a5),d3
+		move.l	V_ZZAL(a5),d4
+		move.l	V_ZZOK(a5),d7
+		tst.l	V_CLEAN(a5)
+		beq.s	.r
+		cmp.l	#'ZZK1',PA_ZZK(a5)
+		bne.s	.r
+		move.l	PA_ZZV(a5),d2
+		move.l	PA_ZZBE(a5),d3
+		move.l	PA_ZZAL(a5),d4
+		moveq	#1,d7
+.r:		rts
+
+; size_zz (real 060): present (d7 bit 8) when the board is configured, the unhandled register reads $FFFFFFFF and
+; the ADF_TXT tail reads back a pattern and its complement; the three constants go to V_ZZ* and MB_ZZ. A cycle the
+; ARM never serves hangs here, and MB_WHERE names step 9.
+size_zz:
+		clr.l	V_ZZV(a5)
+		clr.l	V_ZZBE(a5)
+		clr.l	V_ZZAL(a5)
+		clr.l	MB_ZZ(a5)
+		clr.l	MB_ZZ+4(a5)
+		clr.l	MB_ZZ+8(a5)
+		clr.l	V_ZZOK(a5)
+		bsr	zz_base
+		beq	.r
+		movea.l	d0,a2
+		TRY	.f
+		cmp.l	#-1,ZZ_NONE(a2)
+		bne	.f
+		lea	ZZ_TXT(a2),a1
+		move.l	#$A5C3F00F,(a1)
+		move.l	#$5A3C0FF0,4(a1)
+		move.l	(a1),d0
+		move.l	4(a1),d1
+		clr.l	(a1)
+		clr.l	4(a1)
+		cmp.l	#$A5C3F00F,d0
+		bne	.f
+		cmp.l	#$5A3C0FF0,d1
+		bne	.f
+		lea	MB,a5
+		move.l	ZZ_FWV(a2),d0
+		move.l	d0,V_ZZV(a5)
+		move.l	d0,MB_ZZ(a5)
+		move.l	ZZ_FWBE(a2),d0
+		move.l	d0,V_ZZBE(a5)
+		move.l	d0,MB_ZZ+4(a5)
+		move.l	ZZ_FWAL(a2),d0
+		move.l	d0,V_ZZAL(a5)
+		move.l	d0,MB_ZZ+8(a5)
+		move.l	#1,V_ZZOK(a5)
+		bset	#8,d7
+.f:		lea	MB,a5
+.r:		rts
+
 ; ---------------------------------------------------------------------------------------
 ; acfg_card: configure the Z3660's own Z3 boards (manufacturer $144B) so the motherboard
 ; chain becomes visible at $FF000000. RAM board at E_Z3B, RTG 256 MB above it.
@@ -1105,6 +1325,7 @@ acfg_card:
 		bne.s	.ram
 		add.l	#$10000000,d0
 		move.l	d0,Z3CFG+$044
+		move.l	d0,V_ZZR(a5)
 		bset	#1,V_Z3OK+3(a5)
 		bset	#ST_RTG,MB_STAT+3(a5)
 		bra.s	.nx
@@ -1194,6 +1415,9 @@ sizing:
 		move.l	d0,(a3)+
 		dbra	d5,.ss
 		bset	#7,d7
+		; 9 the RTG register zone
+		move.l	#W_SIZE+9,MB+MB_WHERE
+		bsr	size_zz
 		bra.s	.fin
 .emu:		move.l	#W_SIZE+6,MB+MB_WHERE
 		bset	#5,d7			; CIA reaches the bus under the emulator
@@ -1211,9 +1435,9 @@ sizing:
 		move.l	#1,V_SIZED(a5)
 		bset	#ST_SIZED,MB_STAT+3(a5)
 		; records show what was found
-		lea	MB_REC(a5),a6
 		moveq	#0,d6
-.pr:		moveq	#0,d1
+.pr:		bsr	recp
+		moveq	#0,d1
 		btst	d6,d7
 		beq.s	.pn
 		moveq	#1,d1
@@ -1224,7 +1448,6 @@ sizing:
 		beq.s	.pw
 		moveq	#2,d1
 .pw:		move.l	d1,REC_PRES(a6)
-		lea	32(a6),a6
 		addq.l	#1,d6
 		cmp.l	#NPATH,d6
 		blt.s	.pr

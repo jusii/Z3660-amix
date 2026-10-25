@@ -49,12 +49,15 @@ import time
 
 MB = 0x0FFF0000
 PA = MB + 0x200
-PATHS = ('chip', 'mobo', 'card', 'z3', 'rom', 'cia', 'acfg', 'self')
-CARD_LOCAL = (2, 3, 7)          # 0-based: card, z3, self (PHASES.md section 1)
+PATHS = ('chip', 'mobo', 'card', 'z3', 'rom', 'cia', 'acfg', 'self', 'zzreg')
+CARD_LOCAL = (2, 3, 7, 8)       # 0-based: card, z3, self, zzreg (PHASES.md section 1; zzreg is PL-decoded)
+NX_EMU = (2, 3, 4, 6, 7, 8)     # 0-based: the paths that do not reach the bus when emulated
+ZZK = 0x5A5A4B31                # 'ZZK1': the path 9 constants in the parameter block are the frozen ones
 CMD_RUN, CMD_PARK, CMD_SIZE = 0, 1, 2
 OFF = dict(magic=0x00, epoch=0x04, cmd=0x08, en=0x0C, pres=0x10, mode=0x14, chlo=0x18, chhi=0x1C,
            mobo=0x20, clo=0x24, chi=0x28, z3b=0x2C, z3o=0x30, z3l=0x34, romb=0x38, acfg=0x40,
-           chunk=0x44, cacr=0x48, cia=0x4C, flags=0x50, bprobe=0x54)
+           chunk=0x44, cacr=0x48, cia=0x4C, flags=0x50, bprobe=0x54, zzk=0x58, zzv=0x5C, zzbe=0x60, zzal=0x64,
+           zzn=0x68)
 
 
 def norm360(p):
@@ -88,16 +91,21 @@ class Reply:
 
 
 def parse_tmb(r):
-    """ZT TMB crc=... lwhere=... hb=... p1=err/ops/berr/fa/fx/pres ... sz=a/b/c/d/e"""
+    """ZT TMB crc=... lwhere=... hb=... p1=err/ops/berr/fa/fx/pres ... [p9=.../exp/last] sz=a/b/c/d/e [zz=v/b/a]
+
+    p9 and zz come from a scanner firmware >= 1e7ab3c running ztest BUILD >= 5. Without them path 9 reads as
+    not present (an older ztest, or an older firmware that prints only the eight records)."""
     k = r.kv
     out = dict(crc=k.get('crc', 'bad'), lwhere=int(k.get('lwhere', '0'), 16), hb=int(k.get('hb', 0)),
                where=int(k.get('where', '0'), 16), epoch=int(k.get('epoch', 0)), st=int(k.get('st', '0'), 16),
                rs=int(k.get('rs', 0)), id=int(k.get('id', '0'), 16), paths=[])
-    for i in range(8):
+    for i in range(len(PATHS)):
         f = k.get('p%d' % (i + 1), '0/0/0/0/0/0').split('/')
         out['paths'].append(dict(err=int(f[0]), ops=int(f[1]), berr=int(f[2]), fa=int(f[3], 16),
-                                 fx=int(f[4], 16), pres=int(f[5])))
+                                 fx=int(f[4], 16), pres=int(f[5]),
+                                 exp=int(f[6], 16) if len(f) > 6 else None, last=int(f[7], 16) if len(f) > 7 else None))
     out['sz'] = [int(x, 16) for x in k.get('sz', '0/0/0/0/0').split('/')]
+    out['zz'] = [int(x, 16) for x in k['zz'].split('/')] if 'zz' in k else None
     out['temp'] = int(k['temp10']) / 10.0 if 'temp10' in k else None     # die temperature (newer firmware)
     out['up'] = int(k['up']) if 'up' in k else None
     return out
@@ -292,7 +300,8 @@ class FakeCard:
         self.contam = False
         self.w = 70 + self.rnd.uniform(-10, 10)
         self.pwin = (-90, 15)
-        self.pres = 0xF7 if mode == 'cpu' else 0x23     # no Z3 board; emulated: chip, mobo, cia
+        self.pres = 0x1F7 if mode == 'cpu' else 0x23    # no Z3 RAM board, RTG zone; emulated: chip, mobo, cia
+        self.old_tmb = False                               # True: an older firmware/ztest, eight records only
         self.params = {}
         self.boot()
 
@@ -308,7 +317,7 @@ class FakeCard:
         self.epoch = 0
         self.parked = False
         self.sized = False
-        self.cnt = [[0, 0, 0] for _ in range(8)]
+        self.cnt = [[0, 0, 0] for _ in range(len(PATHS))]
         self.last_t = self.t
         self.params = {}
         self.contam = False
@@ -355,8 +364,8 @@ class FakeCard:
         self.hb += n
         pres = self.params.get('pres') or self.pres
         mhz, ph = self.applied
-        for p in range(8):
-            if not (pres >> p) & 1 or (self.mode == 'emu' and p in (2, 3, 4, 6, 7)):
+        for p in range(len(PATHS)):
+            if not (pres >> p) & 1 or (self.mode == 'emu' and p in NX_EMU):
                 continue
             ops = n * 6000
             self.cnt[p][1] += ops
@@ -443,23 +452,29 @@ class FakeCard:
                 cmd = self.params.get('cmd', CMD_RUN)
                 if self.params.get('epoch', 0) != self.epoch and cmd != CMD_PARK:
                     self.epoch = self.params.get('epoch', 0)
-                    self.cnt = [[0, 0, 0] for _ in range(8)]
+                    self.cnt = [[0, 0, 0] for _ in range(len(PATHS))]
                 self.parked = cmd == CMD_PARK
             return 'ZT WM ok n=%d' % (len(w) - 2)
         if v == 'TMB':
             where = 0xFFFF0000 if self.parked else 0x00070000
             ps = []
             pres = self.params.get('pres') or self.pres
-            for p in range(8):
+            np = 8 if self.old_tmb else len(PATHS)
+            for p in range(np):
                 pr = 1 if (pres >> p) & 1 else 0
-                if self.mode == 'emu' and p in (2, 3, 4, 6, 7):
+                if self.mode == 'emu' and p in NX_EMU:
                     pr = 2
                 ps.append('p%d=%d/%d/%d/00000000/%08X/%d' % (p + 1, self.cnt[p][0], self.cnt[p][1], 0,
                                                             0x80 if self.cnt[p][0] else 0, pr))
+                if p == 8:      # path 9 carries the first failure's expected value and the last wrong read
+                    ps[-1] = ps[-1].replace('/00000000/', '/%08X/' % (0x500001A0 if self.cnt[p][0] else 0), 1)
+                    ps[-1] += '/%08X/%08X' % ((0x103, 0x183) if self.cnt[p][0] else (0, 0))
             pcr = 0x04310402 if self.mode == 'cpu' else 0
-            return ('ZT TMB crc=%s lwhere=%08X hb=%d where=%08X epoch=%d st=%08X rs=%d id=%08X %s sz=%08X/%08X/FFFFFFFF/0000A48B/DD9D6123'
+            sz0 = self.pres & 0xFF if self.old_tmb else self.pres
+            zz = '' if self.old_tmb else ' zz=00000103/00000015/00000000'
+            return ('ZT TMB crc=%s lwhere=%08X hb=%d where=%08X epoch=%d st=%08X rs=%d id=%08X %s sz=%08X/%08X/FFFFFFFF/0000A48B/DD9D6123%s'
                     % ('mirror' if self.rnd.random() > 0.1 else 'ok', where, self.hb, where, self.epoch,
-                       0x75 if self.mode == 'cpu' else 0x4004D, self.rs, pcr, ' '.join(ps), self.pres, 0xFF00)
+                       0x75 if self.mode == 'cpu' else 0x4004D, self.rs, pcr, ' '.join(ps), sz0, 0xFF00, zz)
                     + ' temp10=%d up=%d' % (450 + min(200, int(self.t / 30)), int(self.t)))
         if v == 'TSTAT':
             r = self.rows[self.cur]
@@ -548,6 +563,7 @@ class Scanner:
                                    'first_counts_fx', 'temp_c'])
             self.flaky_fh.flush()
         self.acfg = 0
+        self.zz = None          # path 9's constants from the baseline sizing
         rp = os.path.join(out, 'resets-%s.csv' % a.card)
         new = not os.path.exists(rp)
         self.resets_fh = open(rp, 'a', newline='')
@@ -685,13 +701,24 @@ class Scanner:
             return None
         self.pres = mb['sz'][0]
         self.acfg = mb['sz'][4]
+        if not mb['zz']:
+            self.pres &= 0xFF           # no p9 in TMB (a firmware before 1e7ab3c): path 9 cannot be read, so off
+        self.zz = mb['zz'] if (self.pres >> 8) & 1 else None
         self.cpu = cpu_ident(mb, self.a.mode)
         self.epoch += 1
-        self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=self.acfg)
+        self.wm(epoch=self.epoch, cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **self.zzfreeze())
         self.adopted(self.epoch, 20)
         res = self.measure(self.a.dwell)
-        self.log('baseline: present=%02X cpu=%s rev=%s %s' % (self.pres, self.cpu[0], self.cpu[1], res['summary']))
+        self.log('baseline: present=%03X cpu=%s rev=%s%s %s' % (
+            self.pres, self.cpu[0], self.cpu[1],
+            ' zz=%s' % '/'.join('%08X' % x for x in self.zz) if self.zz else '', res['summary']))
         return res
+
+    def zzfreeze(self):
+        """path 9's constants as sizing read them, frozen like the present mask (ztest compares against these)"""
+        if not self.zz:
+            return {}
+        return dict(zzk=ZZK, zzv=self.zz[0], zzbe=self.zz[1], zzal=self.zz[2])
 
     def warmup(self, secs):
         end = self.con.now() + secs
@@ -722,7 +749,7 @@ class Scanner:
         common = dict(magic=0x5A545041, epoch=self.epoch, mode=2 if self.a.mode == 'emu' else 1, en=self.a.en,
                       flags=self.a.flags)
         if self.pres:
-            self.wm(cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **common)
+            self.wm(cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **dict(common, **self.zzfreeze()))
             return
         # no baseline yet, so no frozen mask: the program has to size
         self.wm(cmd=CMD_SIZE, pres=0, **common)
@@ -838,7 +865,7 @@ class Scanner:
             v = 'refused'
             self.rawline(pas, off, ph, real, how, 1, dict(silent=False, mb=None, where=0), v)
             self.log('%s %+d: apply refused (%s)' % (pas, off, real))
-            return dict(off=off, ph=list(ph), silent=False, fails=['refused'], v=v, pathok=[False] * 8)
+            return dict(off=off, ph=list(ph), silent=False, fails=['refused'], v=v, pathok=[False] * len(PATHS))
         res = self.measure(self.a.dwell)
         tries.append(how)
         if res['silent'] and self.a.mode == 'cpu' and self.a.runaway_policy:
@@ -1086,7 +1113,7 @@ class Scanner:
     def path_ok(self, res):
         ok = []
         mb = res.get('mb')
-        for i in range(8):
+        for i in range(len(PATHS)):
             if not (self.pres >> i) & 1:
                 ok.append(None)
             elif res['silent'] or not mb:
@@ -1117,13 +1144,15 @@ class Scanner:
         for i, name in enumerate(PATHS):
             if not (self.pres >> i) & 1:
                 f.append('%s=%s' % (name, 'NX' if (mb and mb['paths'][i]['pres'] == 2) or
-                                    (a.mode == 'emu' and i in (2, 3, 4, 6, 7)) else 'NP'))
+                                    (a.mode == 'emu' and i in NX_EMU) else 'NP'))
                 continue
             if not mb or res['silent']:
                 f.append('%s=-' % name)
                 continue
             p = mb['paths'][i]
             f.append('%s=%d/%d/%d' % (name, p['err'], p['ops'], p['berr']))
+            if p['err'] and p.get('exp') is not None:      # path 9: the register, what it should read, what it read
+                f.append('%s_at=%08X/%08X/%08X' % (name, p['fa'], p['exp'], p['last']))
             berr += p['berr']
             fx |= p['fx']
         f += ['berr=%d' % berr, 'fx=%08X' % fx, 'where=%08X' % res.get('where', 0),
@@ -1218,7 +1247,7 @@ class Scanner:
         out = {'all': self.window(results, lambda r: not r['silent'] and not r['fails'])}
         for i, name in enumerate(PATHS):
             if not (self.pres >> i) & 1:
-                out[name] = 'NX' if self.a.mode == 'emu' and i in (2, 3, 4, 6, 7) else 'NP'
+                out[name] = 'NX' if self.a.mode == 'emu' and i in NX_EMU else 'NP'
                 continue
             out[name] = self.window(results, lambda r, i=i: bool(r['pathok'][i]))
         return out
@@ -1576,6 +1605,8 @@ def main():
     ap.add_argument('--fake-width', type=float, default=0, help='dry run: forwarded window width in degrees')
     ap.add_argument('--fake-pshift', default='', help="dry run: 'mhz:deg,...' rows whose PCLK window sits off their table")
     ap.add_argument('--fake-shift', default='', help="dry run: 'mhz:deg,...' rows whose window sits off their table")
+    ap.add_argument('--fake-old-tmb', action='store_true',
+                    help='dry run: a firmware before 1e7ab3c or a ztest before BUILD 5 (eight records, no p9/zz)')
     ap.add_argument('--shim', help="bench shim command ('<shim> send|serve|cycle|soft')")
     ap.add_argument('--serve', action='store_true', help="one persistent '<shim> serve' instead of a call per line")
     a = ap.parse_args()
@@ -1589,6 +1620,7 @@ def main():
         card.flaky_p = a.fake_flaky
         card.hang_p = a.fake_hang
         card.reset_fail = a.fake_reset_fail
+        card.old_tmb = a.fake_old_tmb
         if a.fake_width:
             card.w = a.fake_width
         card.pshift = dict((int(k), int(v)) for k, v in (x.split(':') for x in a.fake_pshift.split(',') if x))

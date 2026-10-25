@@ -24,7 +24,7 @@ One-line console commands (each reply is one line starting `ZT `):
 | `TAPPLY PARK` | ARM takes the bus (PS_MIO_15 grant), reprograms the clock wizard, releases. Needs the program parked. |
 | `TAPPLY RESET` | CPLD reset (an Amiga reset), reprogram, FPGA reset pulse (re-latches MAPROM), release |
 | `TAPPLY LIVE` | reprogram with nothing held (the emulated modes) |
-| `TMB` | the mailbox decoded: heartbeat, the live `where` marker, per path err/ops/berr/first-address/xor/presence |
+| `TMB` | the mailbox decoded: heartbeat, the live `where` marker, per path err/ops/berr/first-address/xor/presence; for ztest BUILD ≥ 5 also `p9=…/expected/last` and `zz=` (path 9's sizing constants) |
 | `WM <addr> <v>...` | write the parameter block ($0FFF0200–$0FFF02FC only), 68k longwords in hex |
 | `TSTAT` | reset and bus-request pins, wizard registers, the row in file units, apply counters, ARM MHz |
 | `TREST` | restore the boot row and apply it |
@@ -54,12 +54,29 @@ from the image's own vectors under the emulator.
 | 6 cia | stopped-timer latches of both 8520s, CIA-A DDRB | bus |
 | 7 acfg | the motherboard autoconfig chain behind the card's boards, hashed | not exercised |
 | 8 self | the image through the MAPROM decode, 4 KB chunk sums | not exercised |
+| 9 zzreg | the RTG board's register zone, served by the ARM through the PL handshake (below) | not exercised |
 
 The mailbox is at $0FFF0000, the parameter block at $0FFF0200, and the mirror at $0FFF0800. The primary
-record is live during a pass, so the mirror holds the last consistent publish.
+record is live during a pass, so the mirror holds the last consistent publish. Records 1–8 are at $020–$11F;
+record 9 is at $140–$15F (after the sizing report and the exception words) and path 9's sizing constants at
+$160–$16B, all inside the CRC'd $000–$1FB. A record's +$1C holds the expected value at its first failure.
+
+**Path 9 (BUILD 5)** is present only when the program's own autoconfig placed the RTG board (base
+`Z3B + $10000000`). Its first 2 MB are register cycles that the PL holds until core0's handler (`rtg.c`) has
+served them; card RAM and the framebuffer are PL-local and never wait on the ARM. Per pass:
+- N reads (parameter `$0FFF0268`, default 16) each of `REG_ZZ_FW_VERSION` (+$1A0), `FW_BETA` (+$280) and
+  `FW_ALFA` (+$284) against the values sizing read, and of the unhandled `+$31C`, which must read $FFFFFFFF;
+- the `ADF_TXT` tail +$880–$893 (five longs, which the ARM reads back from what the PL wrote) written and read
+  back with a walking bit, its inverse, the address and the inverted address, then 0;
+- N reads of `VBLANK_STATUS` (+$17C), which the PL answers itself: bits 31:1 must be 0.
+
+It never touches the ethernet, USB, audio, blitter, soft3d, P2C, video registers or `INT_STATUS`. `zscan`
+freezes the three constants with the present mask (`'ZZK1'` at $0FFF0258, the values at $25C–$264). An
+unfrozen RUN without its own sizing skips the constant compares. `$0FFF026C` moves the zone (simulator only).
 
 `ztest_sim.py` runs the image on a Musashi 68040 (`pip install machine68k`) against a model A4000 and
-checks 12 scenarios: sizing, epoch, PARK, restart, and injected faults landing on the right path and bits.
+checks sizing, epoch, PARK, restart, and injected faults landing on the right path and bits. Musashi maps only
+256 MB, so path 9 runs against a register-zone model moved low with `$0FFF026C`.
 
 ## Scan loop
 
