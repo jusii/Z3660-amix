@@ -32,7 +32,10 @@
 #define ZT_PARAM_HI    0x0FFF02FCu
 #define ZT_MB_MAGIC    0x5A544D42u   /* 'ZTMB' */
 #define ZT_WHERE_PARKED 0xFFFF0000u
-#define ZT_NPATHS      8
+#define ZT_NPATHS      8             /* the records at $020; path 9 has its own at ZT_REC9 */
+#define ZT_REC9        0x140u
+#define ZT_ZZ          0x160u
+#define ZT_BUILD_P9    5u
 
 #define ZT_VCO_MIN     600
 #define ZT_VCO_MAX     1600
@@ -387,10 +390,26 @@ static void zt_tmb(void)
              (unsigned long)zt_rd68k(r + 0x08), (unsigned long)zt_rd68k(r + 0x0C),
              (unsigned long)zt_rd68k(r + 0x10), (unsigned long)zt_rd68k(r + 0x18));
    }
-   printf(" sz=%08lX/%08lX/%08lX/%08lX/%08lX temp10=%d up=%lu\n",
+   /* ztest BUILD 5 and later: path 9 (the RTG register zone). Its record follows MB_SZ/MB_X* at $140 and adds
+    * the expected value at the first failure and the last wrong read; zz= are the constants its sizing read. */
+   int p9 = (zt_rd68k(b + 0x04) & 0xFFFFu) >= ZT_BUILD_P9;
+   if (p9)
+   {
+      uint32_t r = b + ZT_REC9;
+      printf(" p9=%lu/%lu/%lu/%08lX/%08lX/%lu/%08lX/%08lX",
+             (unsigned long)zt_rd68k(r + 0x00), (unsigned long)zt_rd68k(r + 0x04),
+             (unsigned long)zt_rd68k(r + 0x08), (unsigned long)zt_rd68k(r + 0x0C),
+             (unsigned long)zt_rd68k(r + 0x10), (unsigned long)zt_rd68k(r + 0x18),
+             (unsigned long)zt_rd68k(r + 0x1C), (unsigned long)zt_rd68k(r + 0x14));
+   }
+   printf(" sz=%08lX/%08lX/%08lX/%08lX/%08lX",
           (unsigned long)zt_rd68k(b + 0x120), (unsigned long)zt_rd68k(b + 0x124),
           (unsigned long)zt_rd68k(b + 0x128), (unsigned long)zt_rd68k(b + 0x12C),
-          (unsigned long)zt_rd68k(b + 0x130), zt_temp10(), zt_up_s());
+          (unsigned long)zt_rd68k(b + 0x130));
+   if (p9)
+      printf(" zz=%08lX/%08lX/%08lX", (unsigned long)zt_rd68k(b + ZT_ZZ), (unsigned long)zt_rd68k(b + ZT_ZZ + 4),
+             (unsigned long)zt_rd68k(b + ZT_ZZ + 8));
+   printf(" temp10=%d up=%lu\n", zt_temp10(), zt_up_s());
 }
 
 static void zt_wm(const char *s)
