@@ -590,9 +590,19 @@ class Scanner:
 
     # ---- primitives over the console ----
     def wm(self, **fields):
-        words = []
-        for k, v in sorted(fields.items(), key=lambda kvp: OFF[kvp[0]]):
-            words.append((PA + OFF[k], v))
+        return self.wm_raw(dict((OFF[k], v) for k, v in fields.items()))
+
+    def wm_block(self, **fields):
+        """the whole parameter block: magic cleared, every field $204-$27C written (zero unless given), magic last.
+        ztest trusts any nonzero field once the magic is valid, and a runaway can scribble the block (METAL-4 row 100:
+        a page-lost re-arm left path 1's chunk bounds scribbled, and its fill ran across $F9702C-$FFFFFC); so a block
+        that sets the magic never leaves an old field live"""
+        vals = dict((off, 0) for off in range(0x04, 0x80, 4))
+        vals.update((OFF[k], v) for k, v in fields.items() if k != 'magic')
+        return self.wm_raw({0x00: 0}) and self.wm_raw(vals) and self.wm_raw({0x00: 0x5A545041})
+
+    def wm_raw(self, offs):
+        words = [(PA + off, v) for off, v in sorted(offs.items())]
         # contiguous runs go in one WM line (at most 8 words, the console's 90-character line)
         lines, run = [], []
         for addr, v in words:
@@ -663,7 +673,7 @@ class Scanner:
             return
         self.log('ztest runs in the other mode (st %08X): writing mode=%d and restarting it' % (
             mb['st'], 2 if want else 1))
-        self.wm(magic=0x5A545041, mode=2 if want else 1)
+        self.wm_block(mode=2 if want else 1)
         if self.a.mode == 'cpu':
             self.apply(self.row['ph'], 'reset')
         else:
@@ -693,7 +703,7 @@ class Scanner:
     def baseline(self):
         self.epoch += 1
         mode = 2 if self.a.mode == 'emu' else 1
-        self.wm(magic=0x5A545041, epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=mode, en=self.a.en,
+        self.wm_block(epoch=self.epoch, cmd=CMD_SIZE, pres=0, mode=mode, en=self.a.en,
                 flags=self.a.flags)
         self.con.sleep(3)
         mb = self.adopted(self.epoch, 30, sized=True)     # the sizing result of THIS epoch, never a stale one
@@ -746,13 +756,12 @@ class Scanner:
         self.pagelost += 1
         self.log('page-lost restart (%s): re-arming the parameter block' % why)
         self.epoch += 1
-        common = dict(magic=0x5A545041, epoch=self.epoch, mode=2 if self.a.mode == 'emu' else 1, en=self.a.en,
-                      flags=self.a.flags)
+        common = dict(epoch=self.epoch, mode=2 if self.a.mode == 'emu' else 1, en=self.a.en, flags=self.a.flags)
         if self.pres:
-            self.wm(cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **dict(common, **self.zzfreeze()))
+            self.wm_block(cmd=CMD_RUN, pres=self.pres, acfg=self.acfg, **dict(common, **self.zzfreeze()))
             return
         # no baseline yet, so no frozen mask: the program has to size
-        self.wm(cmd=CMD_SIZE, pres=0, **common)
+        self.wm_block(cmd=CMD_SIZE, pres=0, **common)
         self.con.sleep(3)
         self.tmb()
         self.epoch += 1
