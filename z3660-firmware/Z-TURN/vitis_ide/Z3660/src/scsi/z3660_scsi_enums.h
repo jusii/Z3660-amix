@@ -57,6 +57,8 @@ enum piscsi_cmds {
    // Read-only device-type register. SINGLE SOURCE OF TRUTH for the peripheral
    // device type: 0x00 = direct-access disk, 0x05 = read-only CD-ROM.
    PISCSI_CMD_PDT          = 0xA0,
+   // 0xBC stays UNDEFINED, for reads and writes alike: amix-z3660scsi (ZS-05) reads it as P_UDMA_ARM, the covering
+   // read before a USED_DMA write ($BC & $9C == $9C), so the FPGA's (previous & current) address capture lands right.
 
    PISCSI_DBG_MSG          = 0x100,
    PISCSI_DBG_VAL1         = 0x110,
