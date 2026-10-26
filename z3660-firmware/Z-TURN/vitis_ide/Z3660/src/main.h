@@ -289,4 +289,5 @@ FRESULT f_umount(const TCHAR* path);
 void xc3_usleep(unsigned int usec);
 void set_cpu_freq_for_usleep(int cpufreq);
 
+#include "zz_tripwire.h"
 #endif /* SRC_MAIN_H_ */

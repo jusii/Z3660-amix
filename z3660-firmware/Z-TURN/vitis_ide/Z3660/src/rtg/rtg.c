@@ -579,7 +579,7 @@ int rtg_thread(struct pt *pt)
    while(1)
    {
 
-      PT_WAIT_UNTIL(pt,((gpio=read_reg_s01(REG1))&0xC0000000)!=0); EP_T(ep_td); EP_DECL(int,ep_reg,ep_reg_idx(gpio));
+      PT_WAIT_UNTIL(pt,((gpio=read_reg_s01(REG1))&0xC0000000)!=0); ZZT_EVENT(gpio); EP_T(ep_td); EP_DECL(int,ep_reg,ep_reg_idx(gpio));
       if((gpio&0x80000000)!=0) //write
       {
          if((gpio&0xF80000)==0xF80000)
@@ -1151,7 +1151,7 @@ void write_rtg_register(uint32_t zaddr,uint32_t zdata)
          }
          else
          {
-            printf("[RTG] Error mode: %d\n", mode);
+            printf("[RTG] Error mode: %d\n", mode); ZZT("MODE out of range", zaddr, zdata);
          }
          break;
       }
@@ -1245,7 +1245,7 @@ void write_rtg_register(uint32_t zaddr,uint32_t zdata)
 
          // Generic acceleration ops
       case REG_ZZ_ACC_OP: {
-         handle_acc_op(zdata);
+         if ((uint16_t)zdata >= ACC_OP_NUM) { ZZT("ACC_OP out of range", zaddr, zdata); } handle_acc_op(zdata);
          break;
       }
       // DMA RTG rendering
@@ -2438,7 +2438,7 @@ debug_printf("framebuffer %lX\n",(uint32_t)video_state->framebuffer);
             printf("[RTG OVERLAY] HEIGHT write: 0x%x\n", overlay_h);
          break;
       }
-      default:
+      default: ZZT("unknown or read-only ZZ register", zaddr, zdata);
          if(debug_console.debug_rtg)
             printf("Write to unknown %08x RTG register\n", (unsigned int)address);
          break;
@@ -2451,3 +2451,23 @@ void audio_reset(void)
    audio_silence();
    audio_init_i2s();
 }
+
+/* ZZ_TRIPWIRE counter and print (zz_tripwire.h); compiled only with the flag. Prints the first 256 events, then
+ * every 1024th: the reason, the register offset acted on, the value read from the DDR mirror, this event's and
+ * the previous event's REG1 words, and "sub" = 1 when this address has no bit the previous one lacks. */
+#if ZZ_TRIPWIRE
+#include <stdio.h>
+
+uint32_t zzt_prev_gpio, zzt_cur_gpio;
+static uint32_t zzt_count;
+
+void zz_tripwire(const char *what, uint32_t zaddr, uint32_t zdata)
+{
+   uint32_t cur = zzt_cur_gpio & 0x1FFFFF, prev = zzt_prev_gpio & 0x1FFFFF;
+
+   zzt_count++;
+   if (zzt_count <= 256 || (zzt_count & 1023) == 0)
+      printf("[ZZTRIP] #%lu %s: reg %05lX data %08lX gpio %08lX prev %08lX sub %d\n", zzt_count, what, zaddr, zdata,
+             zzt_cur_gpio, zzt_prev_gpio, (cur & ~prev) == 0);
+}
+#endif

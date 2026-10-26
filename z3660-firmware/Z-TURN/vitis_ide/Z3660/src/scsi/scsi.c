@@ -2021,7 +2021,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
    case PISCSI_CMD_BLOCKS:
       printf("[!!!PISCSI] WARN: Write to read only register PISCSI_CMD_BLOCKS (%.8lX: %ld)\n", addr, val);
       break;
-   default:
+   default: ZZT("piscsi offset unhandled", addr, val);
       //            DEBUG("[!!!PISCSI] WARN: Unhandled %s register write to %.8lX: %ld\n", op_type_names[type], addr, val);
       printf("[!!!PISCSI] WARN: Unhandled register write to %.8lX: %ld\n", addr, val);
       break;
