@@ -145,7 +145,7 @@ static volatile uint32_t FramesRx = 0;
 static volatile uint16_t frame_serial = 0;
 static volatile uint32_t frames_received = 0;
 static volatile uint16_t frames_backlog = 0;
-int frames_received_from_backlog = 0;
+static volatile int frames_received_from_backlog = 0; // shared with the RX ISR
 
 #if ETH_PROF
 static void ep_release(int slot);
@@ -728,6 +728,11 @@ int ethernet_receive_frame() {
    }
    printf("\n==========================================\n");
     */
+   // The GEM RX ISR appends to the backlog in IRQ context. Unmasked, it could land a frame in slot 0 between the
+   // catch-up reset and the fake-serial write below: that frame's serial was overwritten with the consumed one, so
+   // the Amiga saw "no new frame" at slot 0 for good while the backlog filled (S3-46, 2026-10-26).
+   u32 cpsr = mfcpsr();
+   Xil_ExceptionDisableMask(XIL_EXCEPTION_IRQ);
    if (frames_backlog>0) {
       EP_DO(ep_release(frames_received_from_backlog));
       frames_received_from_backlog++;
@@ -755,7 +760,10 @@ int ethernet_receive_frame() {
       DEBUG_ETHERNET("EMAC: ethernet_receive_frame() called but backlog is empty\n");
       frames_received_from_backlog=0;
    }
-   return(frames_received_from_backlog);
+   int fetched = frames_received_from_backlog;
+   if (!(cpsr & XIL_EXCEPTION_IRQ))
+      Xil_ExceptionEnableMask(XIL_EXCEPTION_IRQ);
+   return(fetched);
 }
 
 uint32_t get_frames_received() {
