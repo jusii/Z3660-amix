@@ -70,6 +70,9 @@ enum zz_reg_offsets {
    REG_ZZ_SET_SPLIT_POS  = 0x188,
    REG_ZZ_ORIG_RES       = 0x18C,
 
+   // Reads of $190 ETH_TX, $198/$19C ETH_MAC_HI/LO, $1A4 ETH_RX_ADDRESS and $1A8 INT_STATUS must stay free of side
+   // effects: amix-z3660net (ZS-05) issues them as covering reads to arm the next write against the FPGA's
+   // (previous & current) address capture.
    REG_ZZ_ETH_TX         = 0x190,
    REG_ZZ_ETH_RX         = 0x194,
    REG_ZZ_ETH_MAC_HI     = 0x198,
