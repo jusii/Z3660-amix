@@ -11,7 +11,10 @@
 #   make profile    -> PROFILING core1 + BOOT-prof.BIN, side by side with the other two
 #   make q2probe    -> WARP M0 Q2 unwind-probe core1 + BOOT-q2probe.BIN (experiment only)
 #   make version    -> run make_version_alfa.py packaging script
-#   make clean      -> clean app builds (FSBL/app dirs), all FOUR core1 build variants
+#   make clean      -> clean app builds (FSBL/app dirs), all FOUR core1 build variants;
+#                      keeps the tracked FSBL ELFs and the BSP lib/ dirs
+#   make bsp        -> REBUILD the core0 + core1 BSP libraries (explicit only; overwrites tracked archives)
+#   make fsbl_bsp   -> REBUILD the FSBL's BSP library (explicit only)
 #
 # FOUR FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3 + C1, WARP M0):
 #   BOOT.BIN       default -- the run-loop diagnostics are compiled in and switchable at
@@ -232,21 +235,40 @@ z3660_emu_abl%: bsp_cortexa9_1
 
 
 # Build BSP libraries for both processors
+# THE BSP LIBRARIES ARE INPUTS TOO, like the FSBL. Their lib/ directories hold the six TRACKED
+# archives (libxil.a, liblwip4.a, libxilffs.a) and the untracked xil-crt0.o both links name
+# directly. They used to be rebuilt whenever libxil.a was missing -- which `make clean` arranged
+# by deleting all six -- with whatever gcc was on PATH. The build now only checks they are
+# there; rebuilding them is `make bsp` (core0 + core1) or `make fsbl_bsp`, explicitly.
+BSP0_DIR     := design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp
+BSP1_DIR     := design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp
+FSBL_BSP_DIR := $(FSBL_DIR)/zynq_fsbl_bsp
+BSP_LIB_DIRS := $(BSP0_DIR)/ps7_cortexa9_0/lib $(BSP1_DIR)/ps7_cortexa9_1/lib $(FSBL_BSP_DIR)/ps7_cortexa9_0/lib
+
+# need_bsp <lib dir> -- fail with the explicit target's name instead of rebuilding behind the build's back.
+define need_bsp
+@for f in $(1)/libxil.a $(1)/xil-crt0.o; do test -f $$f || { echo "ERROR: $$f is missing -- BSP libraries are never rebuilt implicitly; 'make bsp' rebuilds them"; exit 1; }; done
+endef
+
 bsp_cortexa9_0:
-	@if [ ! -f design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp/ps7_cortexa9_0/lib/libxil.a ]; then \
-		$(MAKE) -C design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp; \
-	fi
+	$(call need_bsp,$(BSP0_DIR)/ps7_cortexa9_0/lib)
 
 bsp_cortexa9_1:
-	@if [ ! -f design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp/ps7_cortexa9_1/lib/libxil.a ]; then \
-		$(MAKE) -C design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp; \
-	fi
+	$(call need_bsp,$(BSP1_DIR)/ps7_cortexa9_1/lib)
 
 zynq_fsbl_bsp:
 	@if [ ! -f design_1_wrapper/zynq_fsbl/fsbl.elf ]; then \
 		$(MAKE) -C design_1_wrapper/zynq_fsbl; \
 	fi
-bsp: bsp_cortexa9_0 bsp_cortexa9_1
+
+# Explicit BSP rebuilds -- these overwrite the tracked archives.
+.PHONY: bsp fsbl_bsp
+bsp:
+	$(MAKE) -C $(BSP0_DIR)
+	$(MAKE) -C $(BSP1_DIR)
+
+fsbl_bsp:
+	$(MAKE) -C $(FSBL_BSP_DIR)
 
 # Prepare for bootbin generation by ensuring fsbl.elf has correct DDR speed
 bootbin_prepare: build
@@ -320,23 +342,17 @@ version:
 clean:
 	# Cleaning FSBL objects (fsbl.elf and fsbl_ddr533.elf are TRACKED inputs and stay)
 	-@cd $(FSBL_DIR) && rm -rf *.o *.d fsbl_ddr667.elf fsbl_ddr800.elf
-	-@cd $(FSBL_DIR)/zynq_fsbl_bsp/ps7_cortexa9_0/lib && rm -f *.o *.a *.d
 	# Clean Z3660
 	-@cd $(Z3660_DIR) && rm -rf build *.o *.d
 	# Clean Z3660_emu (all four build variants)
 	-@cd $(Z3660_EMU_DIR) && rm -rf build build-lean build-prof build-q2probe *.o *.d
-	# Clean BSP libraries
-	-@cd design_1_wrapper/ps7_cortexa9_0/standalone_domain/bsp && rm -rf *.o *.a
-	-@cd design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/bsp && rm -rf *.o *.a
 	# Clean additional Xilinx compiled libraries
 	-@rm -rf design_1_wrapper/ps7_cortexa9_0/freertos10_xilinx_ps7_cortexa9_0/*.o
 	-@rm -rf design_1_wrapper/ps7_cortexa9_0/freertos10_xilinx_ps7_cortexa9_0/*.a
 	-@rm -rf design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/*.o
 	-@rm -rf design_1_wrapper/ps7_cortexa9_1/standalone_ps7_cortexa9_1/*.a
-	# Clean Xilinx BSP objects and archives recursively
-	-@find design_1_wrapper -name "*.o" -delete
-	-@find design_1_wrapper -name "*.d" -delete
-	-@find design_1_wrapper -name "*.a" -delete
+	# Clean Xilinx BSP intermediates recursively -- NOT the BSP lib/ dirs (archives + xil-crt0.o), see need_bsp
+	-@find design_1_wrapper $(foreach d,$(BSP_LIB_DIRS),-path $(d) -prune -o) \( -name "*.o" -o -name "*.d" \) -exec rm -f {} +
 	-@find design_1_wrapper -name "build" -type d -exec rm -rf {} + 2>/dev/null || true
 	# Clean complete
 
