@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-29 — build: `make clean` keeps the BSP libraries; rebuilding them is `make bsp` / `make fsbl_bsp` only (4b4a5fd)
+
+The three BSP lib/ dirs (the six tracked archives and xil-crt0.o) survive `make clean`; the build only checks they are
+present and stops with a hint otherwise. `make clean` plus the normal build reproduces E751375E byte-for-byte.
+
 ## 2026-10-29 — build: the tracked FSBL is packed, never rebuilt; core1 independent of the checkout path (a0906c4, 8321632)
 
 `make bootbin` and the variants pack the tracked FSBL (rebuild = `make fsbl` only) and `make clean` keeps it (a0906c4).
