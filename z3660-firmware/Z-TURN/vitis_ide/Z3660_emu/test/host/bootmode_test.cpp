@@ -108,8 +108,16 @@ int main(void)
          "core0_stats is followed by prof_hz\n");
    CHECK(CONFITEM_PROF_HZ         + 1 == CONFITEM_PROF_BUCKETS,
          "prof_hz is followed by prof_buckets\n");
-   CHECK(CONFITEM_PROF_BUCKETS    + 1 == CONFITEM_NUM,
-         "prof_buckets is the LAST item -- append new keys after it, never before\n");
+   CHECK(CONFITEM_PROF_BUCKETS    + 1 == CONFITEM_ETH_RERAISE,     "prof_buckets -> eth_reraise\n");
+   CHECK(CONFITEM_ETH_RERAISE     + 1 == CONFITEM_ETH_RXKICK,      "eth_reraise -> eth_rxkick\n");
+   CHECK(CONFITEM_ETH_RXKICK      + 1 == CONFITEM_ETH_TAILDROP,    "eth_rxkick -> eth_taildrop\n");
+   CHECK(CONFITEM_ETH_TAILDROP    + 1 == CONFITEM_ETH_TX_POLL,     "eth_taildrop -> eth_tx_poll\n");
+   CHECK(CONFITEM_ETH_TX_POLL     + 1 == CONFITEM_ETH_ADV1000,     "eth_tx_poll -> eth_adv1000\n");
+   /* A bound, not an equality: a key appended after the chain is legal and must not fail
+    * this test (fec86e0 did exactly that). The chain above still catches any insert into
+    * or reorder of this fork's keys; extend it when you append. */
+   CHECK(CONFITEM_ETH_ADV1000     <  CONFITEM_NUM,
+         "eth_adv1000 is inside the enum -- append new keys after it, never before\n");
 
    /* 5. The overhead switches resolve the way the whole feature promises they do.
     *
