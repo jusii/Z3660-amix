@@ -97,8 +97,13 @@ CFLAGS  := -mcpu=cortex-a9 -mfpu=neon-vfpv3 -mfloat-abi=hard -Os -std=c++11 -MMD
            -ffunction-sections -fdata-sections \
            -ffast-math -ftree-vectorize -mvectorize-with-neon-quad \
            -D__ARM_ARCH=7 -DARM_ASSEMBLY -DARMV6T2 -DARMV6_ASSEMBLY \
+           -ffile-prefix-map=$(abspath $(ROOT)/..)=z3660-firmware/Z-TURN/vitis_ide \
            $(VARIANT_DEFS)
 #-Wall -Wextra -marm
+# -ffile-prefix-map: every source here is compiled by ABSOLUTE path, so the asserts' __FILE__
+# strings carried the checkout's location into .rodata, and moving the tree (Amix -> Amigaux,
+# 2026-10-29) changed 14,412 bytes of a core1 whose source had not changed. Mapped to the
+# repo-relative path, core1 is the same bytes wherever it is built.
 
 # Additional C++ flags
 CXXFLAGS := $(CFLAGS)
