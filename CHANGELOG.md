@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-29 — build: the tracked FSBL is packed, never rebuilt; core1 independent of the checkout path (a0906c4, 8321632)
+
+`make bootbin` and the variants pack the tracked FSBL (rebuild = `make fsbl` only) and `make clean` keeps it (a0906c4).
+core1 is built with -ffile-prefix-map, so it is the same bytes at any checkout path (8321632). New core1 reference
+c26ec847 / image E751375E: against 1.0's core1 only the 4 assert path strings change (43 B shorter each) and the
+layout shifts by 176 B; no code byte changed.
+
 ## 2026-10-29 — eth-rxring: RX catch-up with IRQs masked, side-effect-free ZZ reads, the tripwire, bench passed (21d992f..5b33bfc)
 
 receive_frame masks IRQs around the RX backlog catch-up (3ce1a2c); the ETH and INT_STATUS register reads have no side
