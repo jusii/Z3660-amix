@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-29 — eth-rxring: RX catch-up with IRQs masked, side-effect-free ZZ reads, the tripwire, bench passed (21d992f..5b33bfc)
+
+receive_frame masks IRQs around the RX backlog catch-up (3ce1a2c); the ETH and INT_STATUS register reads have no side
+effects (be41441); ZZ_TRIPWIRE counts stray 68k writes in rtg/piscsi (dd9d179, compiled out of the plain image); scsi
+enums keep $BC undefined (a29dff0); zscan parameter blocks write every field (21d992f); bootmode_test pins the eth_*
+CONFITEM keys (5b33bfc). Plain image differs from the release cut 66660DDB only in core0 (3ce1a2c + 2cf0c41).
+Bench 2026-10-29: 5B28CB67 on the A4000T, same-day A/B with 9994961A on 68060-261021-72: push median 337.8 vs
+339.1 KB/s, GEM rx errors 0, every transfer byte-exact, piscsi cmp OK. Golden 9994961A left on the card.
+
 ## 2026-10-25 — eth-rxring: Z3660Net.device 1.5, bench goldens, the timing scanner and ztest BUILD 5 (01a7df3..7289136)
 
 Ethernet: an RX descriptor ring (ETH_RXRING, 16 descriptors default) with a capped backlog, INT6 re-raise/kick options,
