@@ -1,9 +1,9 @@
 # Top-level Makefile for Z3660 project on macOS
 #
 # Targets:
-#   make all        -> z3660 + z3660_emu + bootbin + version (fsbl only if needed)
+#   make all        -> z3660 + z3660_emu + bootbin + version (the tracked FSBL, never rebuilt)
 #   make build      -> z3660 + z3660_emu
-#   make fsbl       -> build FSBL (only if not exists)
+#   make fsbl       -> REBUILD the FSBL for DDR_SPEED (explicit only; overwrites the tracked ELFs)
 #   make z3660      -> build main firmware
 #   make z3660_emu  -> build emulator firmware (core1)
 #   make bootbin    -> generate BOOT.BIN
@@ -135,26 +135,37 @@ all: bootbin version
 
 build: bsp_cortexa9_0 bsp_cortexa9_1 z3660 z3660_emu
 
-# DDR speed targets for FSBL
-fsbl_ddr533: $(FSBL_DIR)/fsbl_ddr533.elf
+# THE FSBL IS A TRACKED INPUT, NOT A BUILD PRODUCT. fsbl.elf and fsbl_ddr533.elf are committed
+# (the FSBL every release image carries), and bootbin and every variant pack them as they are.
+# Until 2026-10-29 the packing targets named the FSBL ELF as a FILE target behind the phony
+# zynq_fsbl_bsp, so a checkout without FSBL objects recompiled it with whatever gcc was on PATH
+# and overwrote both tracked ELFs: that day's eth-rxring build came out 81,920 B short
+# (4F2AAE1C) with a different bootloader in it. Rebuilding is now these phony targets only.
+.PHONY: fsbl fsbl_ddr533 fsbl_ddr667 fsbl_ddr800
 
-$(FSBL_DIR)/fsbl_ddr533.elf: zynq_fsbl_bsp
+# DDR_SPEED variable can be set to 533, 667, or 800. Defined before its first use: a
+# prerequisite list expands as it is read, so a later default left `fsbl` depending on `fsbl_ddr`.
+DDR_SPEED ?= 533
+
+fsbl: fsbl_ddr$(DDR_SPEED)
+
+fsbl_ddr533: zynq_fsbl_bsp
 	@$(MAKE) -C $(FSBL_DIR) DDR_SPEED=533 -j 4
 
-fsbl_ddr667: $(FSBL_DIR)/fsbl_ddr667.elf
-
-$(FSBL_DIR)/fsbl_ddr667.elf: zynq_fsbl_bsp
+fsbl_ddr667: zynq_fsbl_bsp
 	@$(MAKE) -C $(FSBL_DIR) DDR_SPEED=667 ddr667 -j 4
 
-fsbl_ddr800: $(FSBL_DIR)/fsbl_ddr800.elf
-
-$(FSBL_DIR)/fsbl_ddr800.elf: zynq_fsbl_bsp
+fsbl_ddr800: zynq_fsbl_bsp
 	@$(MAKE) -C $(FSBL_DIR) DDR_SPEED=800 ddr800 -j 4
 
-fsbl: $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-
-$(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf: zynq_fsbl_bsp
-	@$(MAKE) -C $(FSBL_DIR) DDR_SPEED=$(DDR_SPEED) -j 4
+# use_fsbl -- point the bifs' fsbl.elf at the DDR_SPEED image without building anything. For the
+# default 533 the two tracked files are identical and nothing is written; another speed needs
+# `make fsbl DDR_SPEED=<n>` first, and then (and only then) changes the tracked fsbl.elf.
+FSBL_ELF := $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
+define use_fsbl
+@test -f $(FSBL_ELF) || { echo "ERROR: $(FSBL_ELF) is missing -- the FSBL is never rebuilt implicitly; 'make fsbl DDR_SPEED=$(DDR_SPEED)' builds one"; exit 1; }
+@cmp -s $(FSBL_ELF) $(FSBL_DIR)/fsbl.elf || { echo "fsbl.elf <- $(FSBL_ELF) (DDR $(DDR_SPEED))"; cp $(FSBL_ELF) $(FSBL_DIR)/fsbl.elf; }
+endef
 
 # THE WARP RUN-LOOP GATE, ON EVERY CORE1 BUILD (docs/WARP-ENGINE.md 0.17.3 G-R6.12).
 # tools/warp-gate.sh reads both run loops off the freshly linked ELF and FAILS the build if
@@ -219,8 +230,6 @@ z3660_emu_abl%: bsp_cortexa9_1
 	@$(MAKE) -C $(Z3660_EMU_DIR) Z3660_WARP_ABLATE=$* -j 4
 	$(call warp_gate,$(Z3660_EMU_DIR)/build-abl$*/Z3660_emu.elf)
 
-# DDR_SPEED variable can be set to 533, 667, or 800
-DDR_SPEED ?= 533
 
 # Build BSP libraries for both processors
 bsp_cortexa9_0:
@@ -240,8 +249,8 @@ zynq_fsbl_bsp:
 bsp: bsp_cortexa9_0 bsp_cortexa9_1
 
 # Prepare for bootbin generation by ensuring fsbl.elf has correct DDR speed
-bootbin_prepare: build $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+bootbin_prepare: build
+	$(use_fsbl)
 
 bootbin: bootbin_prepare
 	@mkdir -p $(dir $(BOOTBIN))
@@ -252,8 +261,8 @@ bootbin: bootbin_prepare
 
 # `make lean` -> sd_card/BOOT-lean.BIN, the production image. Core0 and the FSBL are the
 # same binaries the default image uses; only core1 differs. Does NOT touch BOOT.BIN.
-lean_prepare: bsp_cortexa9_0 z3660 z3660_emu_lean $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+lean_prepare: bsp_cortexa9_0 z3660 z3660_emu_lean
+	$(use_fsbl)
 
 lean: lean_prepare
 	@mkdir -p $(dir $(LEAN_BOOTBIN))
@@ -264,8 +273,8 @@ lean: lean_prepare
 
 # `make profile` -> sd_card/BOOT-prof.BIN. Core0 and the FSBL are the same binaries the
 # other two images use; only core1 differs. Does NOT touch BOOT.BIN or BOOT-lean.BIN.
-profile_prepare: bsp_cortexa9_0 z3660 z3660_emu_prof $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+profile_prepare: bsp_cortexa9_0 z3660 z3660_emu_prof
+	$(use_fsbl)
 
 profile: profile_prepare
 	@mkdir -p $(dir $(PROF_BOOTBIN))
@@ -276,8 +285,8 @@ profile: profile_prepare
 
 # `make q2probe` -> sd_card/BOOT-q2probe.BIN. Core0 and the FSBL are the same binaries the
 # other three images use. Does NOT touch BOOT.BIN, BOOT-lean.BIN or BOOT-prof.BIN.
-q2probe_prepare: bsp_cortexa9_0 z3660 z3660_emu_q2probe $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-	cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+q2probe_prepare: bsp_cortexa9_0 z3660 z3660_emu_q2probe
+	$(use_fsbl)
 
 q2probe: q2probe_prepare
 	@mkdir -p $(dir $(Q2PROBE_BOOTBIN))
@@ -292,8 +301,8 @@ q2probe: q2probe_prepare
 # core0 for it would be noise AND would move a variable the kit is trying to hold still.
 ABL_LEVELS := 1 2 3 4 5
 
-abl%: bsp_cortexa9_0 z3660 z3660_emu_abl% $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf
-	@cp $(FSBL_DIR)/fsbl_ddr$(DDR_SPEED).elf $(FSBL_DIR)/fsbl.elf
+abl%: bsp_cortexa9_0 z3660 z3660_emu_abl%
+	$(use_fsbl)
 	@mkdir -p $(dir $(BOOTBIN))
 	@echo "Generating BOOT-abl$*.BIN (DDR $(DDR_SPEED)MHz, WARP ablation level $*)"
 	$(BOOTGEN_EXE_HOST) Z3660_system/Alfa/system_cli_abl$*.bif \
@@ -309,8 +318,8 @@ version:
 
 # Clean targets
 clean:
-	# Cleaning FSBL
-	-@cd $(FSBL_DIR) && rm -rf *.o *.d fsbl.elf fsbl_ddr*.elf
+	# Cleaning FSBL objects (fsbl.elf and fsbl_ddr533.elf are TRACKED inputs and stay)
+	-@cd $(FSBL_DIR) && rm -rf *.o *.d fsbl_ddr667.elf fsbl_ddr800.elf
 	-@cd $(FSBL_DIR)/zynq_fsbl_bsp/ps7_cortexa9_0/lib && rm -f *.o *.a *.d
 	# Clean Z3660
 	-@cd $(Z3660_DIR) && rm -rf build *.o *.d
