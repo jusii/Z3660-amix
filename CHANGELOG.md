@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-31 — docs and comments state facts without internal ids or process wording (fcf303c)
+
+Internal ids, run labels and codenames restated as technical facts; local tool ignores moved to .git/info/exclude.
+Firmware bytes unchanged: the same-day BOOT.BIN is 78ba165e before and after.
+
 ## 2026-10-31 — emu: real Zorro III boards hidden from the guest in amix_mode (4b1213d)
 
 In amix_mode the emulated Kickstart no longer sees real Zorro III boards. On the A4000D the 68030 mode stalled on the
