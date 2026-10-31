@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-31 — emu: real Zorro III boards hidden from the guest in amix_mode (4b1213d)
+
+In amix_mode the emulated Kickstart no longer sees real Zorro III boards. On the A4000D the 68030 mode stalled on the
+bus and reset-looped in early Kickstart once the guest configured the real A4092 and the Prometheus Firebird PCI
+bridge (S5-20). k30 now boots there, 3 cold boots; the A4000T 030 boot is unchanged (M54). The firmware's own boards
+(its Z3 RAM, the RTG/combo board, all Zorro II) stay visible. Image BF365A40 (13 417 484 B, sha256 03116257…a228).
+
 ## 2026-10-29 — build: `make clean` keeps the BSP libraries; rebuilding them is `make bsp` / `make fsbl_bsp` only (4b4a5fd)
 
 The three BSP lib/ dirs (the six tracked archives and xil-crt0.o) survive `make clean`; the build only checks they are
