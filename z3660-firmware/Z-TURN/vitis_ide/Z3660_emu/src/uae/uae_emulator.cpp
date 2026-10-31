@@ -361,6 +361,13 @@ unsigned int auto_read_8_z2(uaecptr address)
    return(ps_read_8(address));
 #endif
 }
+// amix_mode: once our own Zorro III boards are configured, the emulated Kickstart sees no
+// further board, so a real Zorro III card (an A4092) stays unconfigured on the real bus.
+// Reads return 0: er_Type 0 is no valid board type and the inverted er_Reserved03 is non-zero.
+// With the A4092 passed through, the A4000D's 030 mode stalled on the bus within seconds of
+// Kickstart configuring it and reset-looped; the mode cannot use such a card anyway (its
+// memory is not reachable by a bus master).
+static int real_z3_hidden=0;
 unsigned int auto_read_32_z3(uaecptr address)
 {
 //   z3660_printf("[Core1] Autoconfig Z3 BANK: Read32 LONG 0x%08lX\n",address);
@@ -368,7 +375,7 @@ unsigned int auto_read_32_z3(uaecptr address)
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       return(read_autoconfig_z3(address));
    else
-      return(ps_read_32(address));
+      return(real_z3_hidden?0:ps_read_32(address));
 #else
    return(ps_read_32(address));
 #endif
@@ -380,7 +387,7 @@ unsigned int auto_read_16_z3(uaecptr address)
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       return(read_autoconfig_z3(address)>>16);
    else
-      return(ps_read_16(address));
+      return(real_z3_hidden?0:ps_read_16(address));
 #else
    return(ps_read_16(address));
 #endif
@@ -392,7 +399,7 @@ unsigned int auto_read_8_z3(uaecptr address)
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       return(read_autoconfig_z3(address)>>24);
    else
-      return(ps_read_8(address));
+      return(real_z3_hidden?0:ps_read_8(address));
 #else
    return(ps_read_8(address));
 #endif
@@ -441,7 +448,7 @@ void auto_write_32_z3(uaecptr address, unsigned int data)
 #ifdef AUTOCONFIG_ENABLED
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       write_autoconfig_z3(address,data);
-   else
+   else if(!real_z3_hidden)
       ps_write_32(address,data);
 #else
    ps_write_32(address,data);
@@ -453,7 +460,7 @@ void auto_write_16_z3(uaecptr address, unsigned int data)
 #ifdef AUTOCONFIG_ENABLED
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       write_autoconfig_z3(address,data<<16);
-   else
+   else if(!real_z3_hidden)
       ps_write_16(address,data);
 #else
    ps_write_16(address,data);
@@ -465,7 +472,7 @@ void auto_write_8_z3(uaecptr address, unsigned int data)
    z3660_printf("[Core1] Autoconfig Z3 BANK: Write8 0x%08X 0x%08X\n",address,data);
    if(((configured_z3|shutup_z3)&local.z3_enabled)!=local.z3_enabled)
       write_autoconfig_z3(address,data<<24);
-   else
+   else if(!real_z3_hidden)
       ps_write_8(address,data);
 #else
    ps_write_8(address,data);
@@ -1034,6 +1041,9 @@ extern "C" void make_dummy_address_bank(uint32_t address)
 void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
 {
    z3660_printf("[Core1] Starting UAE%s_%s%s%s emulator\n",enable_jit?"JIT":"",cpu_model==68030?"030":"040",enable_mmu?"_MMU":"",amix_mode?"_AMIX":"");
+   real_z3_hidden=amix_mode!=0;
+   if(real_z3_hidden)
+      z3660_printf("[Core1] amix_mode: real Zorro III boards hidden from the guest\n");
    currprefs.cpu_model              = changed_prefs.cpu_model=cpu_model;
    currprefs.fpu_model              = changed_prefs.fpu_model=cpu_model==68030?68882:68040;
    // UAE_030_MMU: real 68030 PMMU. enable_mmu and JIT are mutually exclusive (the
