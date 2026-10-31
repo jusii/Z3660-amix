@@ -6,7 +6,7 @@
 #include "uae/types.h"
 
 #include "mmu_common.h"
-#include "z3660_prof.h"   /* CYBERSTORM C1: stage buckets (expands to nothing off-profile) */
+#include "z3660_prof.h"   /* Profiler: stage buckets (expands to nothing off-profile) */
 
 #define MMU_DPAGECACHE030 1
 #define MMU_IPAGECACHE030 1
@@ -115,7 +115,7 @@ static ALWAYS_INLINE uae_u32 uae_mmu030_get_fc_data(void)
 }
 
 /* ==========================================================================
- * CYBERSTORM C1 -- the 68030 half of the stage buckets, at the same layer and for the
+ * Interpreter profiler -- the 68030 half of the stage buckets, at the same layer and for the
  * same reason as the 040's (see the long note above uae_mmu040_get_iword in cpummu.h):
  * ALWAYS_INLINE is bare `__inline` in this tree, so gcc emits one out-of-line copy per
  * translation unit and a probe here is a handful of code sites, not the ~2900 call sites
@@ -125,7 +125,7 @@ static ALWAYS_INLINE uae_u32 uae_mmu030_get_fc_data(void)
  * hit counters: the 030 caches live inside the mmu030_get_ and mmu030_put_ family in
  * cpummu030.cpp with no upstream scaffolding to switch on, so those twelve branch edits
  * would be new code in a fork of someone else's emulator, on the path that is NOT the
- * CYBERSTORM target. The ATC and table-walk tiers are still visible on the 030 (see
+ * speed-up target. The ATC and table-walk tiers are still visible on the 030 (see
  * mmu030_logical_is_in_atc and mmu030_table_search); the tier-0 hit rate is the one
  * number a 030 profile does without, and this note is here so a reader finds that out
  * from the source rather than from a suspiciously absent row in a dump.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zscan.py -- host loop of the Z3660 timing scanner (P-27; PRIMITIVES.md section 3).
+"""zscan.py -- host loop of the Z3660 timing scanner (the scan loop of the timing-scanner design).
 
 Drives a card running a ZT_SCAN firmware and ztest.rom through its debug console, one CPU
 mode per run, over one or more timings rows (--rows): the rows are reached by a live frequency
@@ -128,7 +128,7 @@ class RowClosed(Exception):
 
 
 class StopRule(Exception):
-    """a core0 abort or an unexpected boot banner in a reply window (METAL stop rule)"""
+    """a core0 abort or an unexpected boot banner in a reply window (a stop condition)"""
 
 
 class ShimConsole:
@@ -294,7 +294,7 @@ class FakeCard:
         self.pagelost_p = 0.0                              # chance a RESET comes back cold, page lost
         self.flaky_p = 0.0                                 # chance an apply gives a one-off chip error
         self.hang_p = 0.0                                  # chance a RESET after a runaway leaves ztest hung
-        self.reset_fail = 0.01                             # chance any RESET fails to restart (METAL-2 D: 0/12)
+        self.reset_fail = 0.01                             # chance any RESET fails to restart (on the A4000D: 0/12)
         self.flaky_now = False
         self.need_magic = False
         self.contam = False
@@ -594,7 +594,7 @@ class Scanner:
 
     def wm_block(self, **fields):
         """the whole parameter block: magic cleared, every field $204-$27C written (zero unless given), magic last.
-        ztest trusts any nonzero field once the magic is valid, and a runaway can scribble the block (METAL-4 row 100:
+        ztest trusts any nonzero field once the magic is valid, and a runaway can scribble the block (seen at row 100:
         a page-lost re-arm left path 1's chunk bounds scribbled, and its fill ran across $F9702C-$FFFFFC); so a block
         that sets the magic never leaves an old field live"""
         vals = dict((off, 0) for off in range(0x04, 0x80, 4))
@@ -663,7 +663,7 @@ class Scanner:
 
     def ensure_mode(self):
         """ztest takes its CPU mode at start, from the parameter block when that is valid, and card RAM keeps the
-        block over a soft reboot (METAL-2: mode=2 left by an emulated session started ztest emulated on the 060).
+        block over a soft reboot (seen on metal: mode=2 left by an emulated session started ztest emulated on the 060).
         A running program in the other mode gets the mode written and a restart."""
         mb = self.tmb()
         if not mb:
@@ -786,7 +786,7 @@ class Scanner:
         res['summary'] = 'silent' if silent else ('pass' if not fails else 'fail-err:' + ','.join(fails))
         return res
 
-    # ---- apply a phase set and measure, with the D7/D13 retry rule ----
+    # ---- apply a phase set and measure, with the silent-step retry rule ----
     def tph(self, ph):
         """TPH values as 0..359: the console's line input drops '-' (debug_console.c:345)"""
         return 'TPH %s' % ' '.join(str(norm360(x)) for x in ph)
@@ -796,7 +796,7 @@ class Scanner:
         send the -360 form (its line input drops '-': debug_console.c:345), so those values cannot be applied"""
         if self.a.mode != 'emu' or not self.row:
             return False
-        # a sum of exactly 360 is valid for the firmware but fails on the board (METAL-2c row 70: whole-word mobo
+        # a sum of exactly 360 is valid for the firmware but fails on the board (row 70: whole-word mobo
         # errors at CLK90 360.00, repeated in two runs) and cannot be folded to 0 without a '-': not applied either
         return any(norm360(ph[i]) + self.row['xp'] >= 360 for i in (3, 4))
 
@@ -878,7 +878,7 @@ class Scanner:
         res = self.measure(self.a.dwell)
         tries.append(how)
         if res['silent'] and self.a.mode == 'cpu' and self.a.runaway_policy:
-            # owner/Amix 10-22 (METAL-2c): a CPLD reset after a runaway is not reliable (D 6/7, tower 1/2), so a
+            # measured 2026-10-22: a CPLD reset after a runaway is not reliable (D 6/7, tower 1/2), so a
             # silent step is the edge of its direction: no same-value retry, recovery by RESET at the start values
             self.runaways += 1
             self.row_runaways += 1
@@ -890,7 +890,7 @@ class Scanner:
             self.rawline(pas, off, ph, real, '+'.join(tries), len(tries), res, v)
             return dict(off=off, ph=list(ph), silent=True, fails=[], v=v, pathok=self.path_ok(res))
         if res['silent'] and self.a.mode == 'cpu':
-            # D13: one RESET first
+            # a silent step: one RESET first
             self.timed_reset('d13-same', pas, ph)
             res = self.measure(self.a.dwell)
             tries.append('reset')
@@ -927,7 +927,7 @@ class Scanner:
 
     def clean_check(self, pas, r):
         """after a step that failed with errors: back at the pass start values the program must run clean.
-        A failing step can leave the board faulty until an Amiga reset (METAL-2: motherboard RAM erring at the
+        A failing step can leave the board faulty until an Amiga reset (seen on metal: motherboard RAM erring at the
         boot row's own values after row 90's table step; clean again after a reset), and every later step would
         be measured on that board. Not clean: reset (060: TAPPLY RESET, emulated: soft reboot), re-check."""
         if not self.a.clean_check or not r['fails'] or r['silent'] or not self.safe or 'refused' in r['fails']:
@@ -944,7 +944,7 @@ class Scanner:
             self.log('%s: CONTAMINATED -- the start values fail (%s) after a failing step: reset' % (
                 pas, 'silent' if back['silent'] else ','.join(back['fails'])))
         else:
-            # METAL-2: a board faulted by a failing step can still pass at the start values while failing at
+            # seen on metal: a board faulted by a failing step can still pass at the start values while failing at
             # weaker phases, so the check cannot see it: reset after every failing step
             back = dict(silent=False, fails=[])
         if self.a.mode == 'cpu':
@@ -1012,7 +1012,7 @@ class Scanner:
         if not back['silent']:
             tries.append('reset-ok')
             return
-        self.con.sleep(20)                      # the METAL-1 rule allows the heartbeat 30 s
+        self.con.sleep(20)                      # a healthy run beats within 30 s (measured 2026-10-22)
         back = self.measure(self.a.dwell)
         if not back['silent']:
             tries.append('reset-ok-late')
@@ -1046,7 +1046,7 @@ class Scanner:
                 raise SystemExit('STOP RULE: TREST (RESET at the boot row) did not bring the program back (silent)')
             if res['fails']:
                 # running but erring at the boot row: a board a runaway faulted beyond what a CPLD reset clears
-                # (METAL-2c 2b: the autoconfig chain hash changed and path 7 erred until a power cycle)
+                # (seen on metal: the autoconfig chain hash changed and path 7 erred until a power cycle)
                 self.log('the board runs but fails at the boot row after TREST (%s): a power cycle' % res['summary'])
                 self.restart_at_baseline()
         else:
@@ -1083,10 +1083,10 @@ class Scanner:
         return t_hb
 
     def reset_safe(self, pas, off, ph, real, tries, res, kind='safe'):
-        """RESET at the pass start values; a silent one (30 s) is the METAL stop rule"""
+        """RESET at the pass start values; a silent one (30 s) is a stop condition"""
         self.timed_reset(kind, pas, self.safe)
         back = self.measure(self.a.dwell)
-        if back['silent']:                      # the METAL-1 rule allows the heartbeat 30 s
+        if back['silent']:                      # a healthy run beats within 30 s (measured 2026-10-22)
             self.con.sleep(20)
             back = self.measure(self.a.dwell)
         tries.append('reset-safe:' + ('ok' if not back['silent'] else 'silent'))
@@ -1291,7 +1291,7 @@ def keep_form(v):
         v -= 360
     while v < -360:
         v += 360
-    if v in (360, -360):        # the wizard's 360 is not its 0 (METAL-2c row 70): fold it
+    if v in (360, -360):        # the wizard's 360 is not its 0 (row 70): fold it
         v = 0
     return v
 
@@ -1308,7 +1308,7 @@ def summary_row(a, sc, start, final, wins, var_bases):
               'pclk phase': keep_form(final[0]), 'clken phase': keep_form(final[1]), 'bclk phase': keep_form(final[2]),
               'cpuclk phase': keep_form(final[3]), 'clk90 phase': keep_form(final[4]),
               'emu extra': row['xp'] if a.mode == 'emu' else '',
-              'Remarks': 'measured window, P-27 scanner (centre of the all-paths window; edges per path)',
+              'Remarks': 'measured window, timing scanner (centre of the all-paths window; edges per path)',
               'card': a.card, 'cpu_rev': sc.cpu[1], 'arm_mhz': row['armmhz'],
               'pclk_div': row['div'][0], 'clken_div': row['div'][1], 'bclk_div': row['div'][2],
               'cpuclk_div': row['div'][3], 'clk90_div': row['div'][4], 'bus_mhz': '%.2f' % busmhz,
@@ -1374,7 +1374,7 @@ def write_row(a, sc, base, centre, wins, var_bases, remark=None):
     tp = os.path.join(a.out, 'timings-%s-%d-%s.txt' % (a.card, row['mhz'], a.mode))
     if wins:
         with open(tp, 'w') as fh:
-            fh.write('# Z3660 timings row measured by the P-27 scanner -- not for a card until the OS campaign passes (D11)\n')
+            fh.write('# Z3660 timings row measured by the timing scanner -- not for a card until it passes the OS stress test\n')
             fh.write('# card %s box %s cpu %s rev %s ARM %d MHz mode %s; BCLK-CPUCLK at the centre %s deg = %s ns\n' % (
                 a.card, a.box, sc.cpu[0], sc.cpu[1], row['armmhz'], a.mode, d['dbc_centre'], d['dbc_centre_ns']))
             for q in wins:
@@ -1383,7 +1383,7 @@ def write_row(a, sc, base, centre, wins, var_bases, remark=None):
                 for p in PATHS:
                     fh.write('#    %-5s %s..%s\n' % (p, d['%s_%s_lo' % (q, p)], d['%s_%s_hi' % (q, p)]))
             fh.write('# rule: phase (+ emu_extra_phase on cpuclk/clk90 when emulated) never equals 360 -- the wizard\'s\n'
-                     '# 360 is not its 0 (METAL-2c: CLK90 at 360.00 fails whole-word on motherboard RAM, repeatably)\n')
+                     '# 360 is not its 0 (CLK90 at 360.00 fails whole-word on motherboard RAM, repeatably)\n')
             xp = row['xp'] if a.mode == 'emu' else 0
             sums = [keep_form(centre[0]), keep_form(centre[1]), keep_form(centre[2]),
                     norm360(centre[3]) + xp, norm360(centre[4]) + xp]
@@ -1422,7 +1422,7 @@ def scan_row(a, sc, mhz):
         sc.safe = None
         found = None
         dead = set()                        # a side that went silent: further out only hangs harder
-        # only the card-local paths failing = the PCLK/CLKEN pair's business (D16), else BCLK's
+        # only the card-local paths failing = the PCLK/CLKEN pair's business, else BCLK's
         fp = [p for p in r0['fails'] if p in PATHS]
         local = bool(fp) and all(PATHS.index(p) in CARD_LOCAL for p in fp)
         axis = 'pclk' if local else 'bclk'
@@ -1457,13 +1457,13 @@ def scan_row(a, sc, mhz):
             r0 = dict(r0, silent=False, fails=[])
             base = found
             if axis == 'pclk' and 'pclk' not in passes:
-                passes.append('pclk')       # D16: a pclk pass where the card-local paths fail first
+                passes.append('pclk')       # a pclk pass where the card-local paths fail first
         else:
             start_remark = None
     else:
         start_remark = None
     if r0['silent'] or r0['fails']:
-        write_row(a, sc, base, base, {}, {}, remark='P-27 scanner: the table values fail at this row (%s)%s; no sweep' % (
+        write_row(a, sc, base, base, {}, {}, remark='timing scanner: the table values fail at this row (%s)%s; no sweep' % (
             r0['v'], ' and no BCLK step from -170 to +180 passes' if a.find_start else ''))
         if a.reset_after_fail and not r0['silent']:
             sc.reset_board()
@@ -1499,7 +1499,7 @@ def scan_row(a, sc, mhz):
             c = int(round(win['all']['centre']))
             centre = vary(centre, c)
             sc.log('%s centre: offset %+d -> phases %s' % (pas, c, [norm360(x) for x in centre]))
-        # D16: the PCLK/CLKEN pass is only worth it where the card-RAM paths fail first
+        # the PCLK/CLKEN pass is only worth it where the card-RAM paths fail first
         if pas in ('cpuclk', 'bclk') and isinstance(win['all'], dict):
             for edge in ('lo_fail', 'hi_fail'):
                 o = win['all'][edge]
@@ -1510,17 +1510,17 @@ def scan_row(a, sc, mhz):
                     continue
                 local = [p for p in r_edge['fails'] if p in PATHS and PATHS.index(p) in CARD_LOCAL]
                 if local:
-                    sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here (D16)'
+                    sc.log('note: %s fails first at %+d on card-local path(s) %s: a pclk pass applies here'
                            % (pas, o, local))
     write_row(a, sc, base, centre, wins, var_bases,
-              remark=('measured window, P-27 scanner; ' + start_remark) if start_remark else None)
+              remark=('measured window, timing scanner; ' + start_remark) if start_remark else None)
     # leave the row's table values staged (a later TREST or revisit starts from the table)
     sc.con.send(sc.tph(row['ph']))
     return True
 
 
 def run_switch(a, sc):
-    """owner item 5: a live frequency change between two rows, each at its own table values"""
+    """A live frequency change between two rows, each at its own table values"""
     ra, rb = [int(x) for x in a.switch.split(',')]
     sp = os.path.join(a.out, 'switch-%s.csv' % a.card)
     new = not os.path.exists(sp)
@@ -1562,7 +1562,7 @@ def main():
                          'cycle, a second one is the stop rule')
     ap.add_argument('--runaway-cap', type=int, default=2, help='runaways per row before the row is closed')
     ap.add_argument('--max-hangs', type=int, default=1,
-                    help='reset-hangs a session absorbs with a power cycle each; one more is the stop rule (ruled: 1)')
+                    help='reset-hangs a session absorbs with a power cycle each; one more is the stop rule (default 1)')
     ap.add_argument('--confirm-fail', action='store_true',
                     help='a step failing with errors is measured once more after its reset; failed only if it fails '
                          'again, else logged as flaky (flaky-<card>.csv)')
@@ -1596,7 +1596,7 @@ def main():
                     help='a silent step that RESET does not cure gets a soft reboot (RARM) before a power cycle')
     ap.add_argument('--reset-to-safe', action='store_true',
                     help='real 060: a step silent after its RESET retry gets a RESET at the pass start values and one '
-                         'more try; silent again = the step fails, no reboot (Amix ruling on D13, 2026-10-22)')
+                         'more try; silent again = the step fails, no reboot (2026-10-22)')
     ap.add_argument('--two-silent', action='store_true',
                     help='keep stepping outward after a silent step (default: a silent step ends that side)')
     ap.add_argument('--max-cycles', type=int, help='power cycles this run may spend; past it the run stops')
@@ -1687,7 +1687,7 @@ def main():
                     except RowClosed as e:
                         sc.log('row %d CLOSED: %s -- a marginal row; the scan goes on' % (mhz, e))
                         write_row(a, sc, sc.row['ph'], sc.row['ph'], {}, {},
-                                  remark='P-27 scanner: row closed, %s (a marginal row at its table values)' % e)
+                                  remark='timing scanner: row closed, %s (a marginal row at its table values)' % e)
                         sc.reset_board()
                         ok = True
                     if ok is None:
@@ -1698,7 +1698,7 @@ def main():
         r = con.send('TREST')[0]
         sc.log('TREST: %s' % r.line)
         if a.mode == 'emu' and a.reset_after_fail and sc.last_bad:
-            # METAL-2c: 1b3 ended on row 120's silent start and the next run's warm-up found mobo faulted
+            # seen on metal: one run ended on row 120's silent start and the next run's warm-up found mobo faulted
             # (50240 whole-word errors); an emulated TREST is a LIVE apply and clears nothing
             sc.log('the last step failed: a soft reboot so the next run starts on a clean board')
             sc.softs += 1

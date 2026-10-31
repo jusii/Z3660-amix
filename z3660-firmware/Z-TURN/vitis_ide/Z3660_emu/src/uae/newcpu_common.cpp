@@ -72,7 +72,7 @@ int m68k_move2c (int regno, uae_u32 *regp)
 					cacr_mask = 0x80008000;
 				regs.cacr = *regp & cacr_mask;
 				set_cpu_caches (false);
-				/* CYBERSTORM C2 rung 1. CACR is the register that enables and disables
+				/* Interpreter speed-up rung 1. CACR is the register that enables and disables
 				 * the very caches the decoded-op cache is standing in for -- on the
 				 * 68040 it carries the instruction- and data-cache enables, and
 				 * uae_mmu040_getc_iword() consults bit 15 directly. A guest that turns
@@ -193,7 +193,7 @@ int m68k_move2c (int regno, uae_u32 *regp)
 		// real the contract holds, and this site is correct as it stands. Re-examined and left
 		// unchanged on purpose -- do not "fix" it without evidence that AMIX omits a PFLUSH
 		// the 68040 UM requires.
-		/* CYBERSTORM C2 rung 1 rides along, and it is important that it does NOT change
+		/* Interpreter speed-up rung 1 rides along, and it is important that it does NOT change
 		 * the paragraph above. The ATC's silicon-faithful "no implicit flush" contract
 		 * stands untouched. The decoded-op cache is an emulator-internal structure with
 		 * no silicon counterpart and therefore no such contract to keep, and it is tagged

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* CYBERSTORM C3 -- run-loop overhead switches: the single copy of the resolution rule.
+/* Run-loop overhead switches: the single copy of the resolution rule.
  *
  * WHAT THESE ARE
  *

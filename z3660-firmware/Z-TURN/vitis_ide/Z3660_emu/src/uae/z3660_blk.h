@@ -1,4 +1,4 @@
-/* CYBERSTORM C2 -- the block-idiom fast path: the switch rule, in one testable place.
+/* Interpreter speed-up -- the block-idiom fast path: the switch rule, in one testable place.
  *
  * WHAT THE FAST PATH IS. The C2 map measured a family of tight kernel block loops --
  * `bzero`, `mcpy`, the 68040 `CPUSHL` cache-flush loop and their relatives -- at 33.6 % of

@@ -415,7 +415,7 @@ command away from wedging the box.
 ## Two related findings that are not stalls
 
 Both were found while chasing the above. Neither can produce a multi-second core0 block, and
-neither is in scope for the fix wave, but they should not be lost.
+neither is in scope for the fix, but they should not be lost.
 
 1. **`scsi.c` :2060-2061 — a whole-boot-ROM double cache flush on every boot-ROM read.**
 

@@ -33,7 +33,7 @@
 #define MMU_IPAGECACHE 1
 #define MMU_DPAGECACHE 1
 
-/* CYBERSTORM C1. Upstream already carries the hit/miss branch scaffolding for the two
+/* Profiler. Upstream already carries the hit/miss branch scaffolding for the two
  * page caches -- correctly placed on every hit and every miss arm below -- and only
  * switches it off. The profiling build switches it on; the default and lean builds get
  * the literal 0 they have always had, so their generated code is unchanged.
@@ -44,11 +44,11 @@
  * 2.0 % of guest throughput. Adding it back to the shipping loop would undo the thing
  * C3b just finished proving. */
 #include "z3660_prof.h"
-/* CYBERSTORM C2 rung 1: the decoded-op cache publishes its one extension-word window
+/* Interpreter speed-up rung 1: the decoded-op cache publishes its one extension-word window
  * here, so the single out-of-line copy of uae_mmu040_get_iword() below can answer from
  * it. Nothing else in this header depends on it. */
 #include "z3660_dopc.h"
-/* CYBERSTORM C2 rung 2: the data accessors' fast path. Read that header first -- it is
+/* Interpreter speed-up rung 2: the data accessors' fast path. Read that header first -- it is
  * where the design, the measurement that motivates it, and the coherence argument live. */
 #include "z3660_dfast.h"
 #if Z3660_EMU_PROF
@@ -720,7 +720,7 @@ static ALWAYS_INLINE uae_u16 uae_mmu040_getc_iword(uaecptr addr)
 #endif
 
 /* ==========================================================================
- * CYBERSTORM C2 rung 2 -- THE DATA-ACCESSOR FAST PATH, RESOLVED IN ONE PLACE.
+ * Interpreter speed-up rung 2 -- THE DATA-ACCESSOR FAST PATH, RESOLVED IN ONE PLACE.
  *
  * z3660_dfast.h carries the design and the measurement. What is here is the resolver
  * these two functions are: given a guest address that the caller has ALREADY proved
@@ -842,7 +842,7 @@ Z3660_DFAST_INLINE int z3660_dfast_write(uaecptr addr, uaecptr *pa, uae_u8 *cs)
 }
 
 /* ==========================================================================
- * CYBERSTORM C1 -- where the interpreter's stage buckets are actually charged.
+ * Interpreter profiler -- where the interpreter's stage buckets are actually charged.
  *
  * This is the choke layer, and picking it was the whole design decision. The named
  * accessors above it (get_long_mmu040 and friends) are STATIC_INLINE = always_inline and
@@ -864,7 +864,7 @@ Z3660_DFAST_INLINE int z3660_dfast_write(uaecptr addr, uaecptr *pa, uae_u8 *cs)
  * ========================================================================== */
 static ALWAYS_INLINE uae_u16 uae_mmu040_get_iword(uaecptr addr)
 {
-	/* CYBERSTORM C2 rung 1 -- the decoded-op cache's extension-word window.
+	/* Interpreter speed-up rung 1 -- the decoded-op cache's extension-word window.
 	 *
 	 * This is the ONLY place a handler's extension-word fetch can be intercepted. The
 	 * generated handlers call get_iword_mmu040(N) directly (cpuemu_31 does so about 920

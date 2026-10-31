@@ -1,4 +1,4 @@
-# The `f` measurement — CYBERSTORM C2 §38.6, and it is a removal
+# The `f` measurement — C2-ATTACK-MAP §38.6, and it is a removal
 
 > **PRE-REGISTRATION. Committed before the implementation commit, and the git timestamps are
 > the evidence.** Nothing below may be edited once a metal row exists — corrections go in a
@@ -398,7 +398,7 @@ this document named in advance as equally suspicious.
 The §30.3 step-3 prediction is **checked, not assumed**: the disarm penalty was priced in
 advance at < 0.01 % of wall clock and measured −0.147 %, inside the ±0.5 % band — so the
 same-boot B/A number is usable directly and no fallback to reporting B against R was needed.
-R lands on **8185 exactly**, so this session's live reference and the pre-registered 8308
+R lands on **8185 exactly**, so the live reference and the pre-registered 8308
 gate line coincide. The return leg reproduces arm A to +0.012 %, so the disarm did invalidate
 and step 6's "the whole session is suspect" condition did not fire.
 

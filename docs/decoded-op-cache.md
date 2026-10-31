@@ -1,4 +1,4 @@
-# The decoded-op cache (CYBERSTORM C2, rungs 1, 1b and 1c)
+# The decoded-op cache (interpreter speed-up, rungs 1, 1b and 1c)
 
 What it is, what it costs on the path that matters, how it stays coherent on a board where
 the *other* CPU writes guest memory, and the pre-registered numbers the metal session is

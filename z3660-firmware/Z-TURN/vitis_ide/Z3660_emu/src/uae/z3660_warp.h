@@ -82,7 +82,7 @@
  * value is inverted: unset means the SHIPPED behaviour, and an engine that is not shipped
  * behaviour until the M5 gate has a shipped behaviour of OFF.
  *
- * It is a deliberate inversion of the house rule and it expires on the user's word at M5,
+ * It is a deliberate inversion of the house rule and it expires at the M5 ship gate,
  * not silently and not by a later reading of this comment.
  *
  * ARMING TAKES AN EXACT MAGIC, not `1` and not "anything non-zero" -- the withdrawn IVSUP

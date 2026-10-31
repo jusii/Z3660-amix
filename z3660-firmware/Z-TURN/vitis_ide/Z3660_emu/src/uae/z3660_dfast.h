@@ -1,4 +1,4 @@
-/* z3660_dfast.h -- CYBERSTORM C2 rung 2: the data-accessor fast path.
+/* z3660_dfast.h -- Interpreter speed-up rung 2: the data-accessor fast path.
  *
  * ==========================================================================
  * WHAT THIS REMOVES, AND WHY IT IS NOT TRANSLATION

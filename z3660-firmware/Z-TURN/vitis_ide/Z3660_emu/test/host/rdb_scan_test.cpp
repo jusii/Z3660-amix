@@ -149,7 +149,7 @@ int main(void)
    }
 
    /* 3. The blocker itself. An AMIX root is RDSK at sector 2 with sector 0 all zeroes --
-    *    the layout measured on all 24 AMIX images in this workspace. */
+    *    the layout measured on 24 AMIX disk images. */
    printf("[test] an AMIX root (empty sector 0, RDSK at sector 2) is found\n");
    {
       FakeDisk d; d.put_rdb(2);

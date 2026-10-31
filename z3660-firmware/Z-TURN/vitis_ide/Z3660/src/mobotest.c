@@ -1300,7 +1300,7 @@ void mobo_change_jumpers(int reg6)
  * Only specific, reversible writes: DMACON/INTENA set-then-clear of one inert bit each, SERPER, and
  * one character into SERDAT (which also puts a real byte on the DB25 for a serial-path check).
  * Nothing random goes into register space; the exhaustive RAM test never touches $DFF000.
- * Requested by the A4000T bring-up on 2026-09-12 to separate "Gary/Alice/Bridgette answer" from
+ * Added for the A4000T bring-up on 2026-09-12 to separate "Gary/Alice/Bridgette answer" from
  * "the GAL/DRAM segment answers" on a board whose chip RAM reads a driven 0x00000000. */
 static void reg_line(const char *m)
 {

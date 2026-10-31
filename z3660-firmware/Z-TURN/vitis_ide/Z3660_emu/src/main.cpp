@@ -32,7 +32,7 @@
 #include "newcpu.h"
 #include "custom.h"
 #include "defines.h"
-#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: the DMA arm of the decoded-op cache's invalidation */
+#include "z3660_dopc.h"   /* Interpreter speed-up rung 1: the DMA arm of the decoded-op cache's invalidation */
 
 SHARED *shared;
 extern LOCAL local;
@@ -346,7 +346,7 @@ extern "C" void write_scsi_register(uint16_t zaddr,uint32_t zdata,int type)
       && piscsi_addr_stash!=0 && piscsi_len_stash!=0)
    {
       Xil_L1DCacheInvalidateRange(piscsi_addr_stash,piscsi_len_stash);
-      /* CYBERSTORM C2 rung 1. The two lines are the same problem one level apart, and
+      /* Interpreter speed-up rung 1. The two lines are the same problem one level apart, and
        * the second one is new. The ARM's L1 above holds stale COPIES of guest DRAM; the
        * decoded-op cache holds stale DECODES of it. core0 has just written instruction
        * bytes into guest memory that the interpreter never saw go past -- an AMIX text
@@ -478,7 +478,7 @@ extern "C" void write_floppy_register(uint16_t zaddr,uint32_t zdata,int type)
 
    while(shared->write_floppy==1){NOP;}
 
-   /* CYBERSTORM C2 rung 1 -- the same DMA argument as write_scsi_register()'s, and this
+   /* Interpreter speed-up rung 1 -- the same DMA argument as write_scsi_register()'s, and this
     * arm is the one that matters for an AmigaOS boot: a floppy READ lands sectors in
     * guest DRAM that the bootblock is about to execute. The address/length descriptor is
     * not stashed on this path (core0 holds it), so the range is passed as unknown --

@@ -63,7 +63,7 @@ static uint32_t c0_block_n, c0_block_lines;
 
 static int      c0_armed;             /* c0stat_init() has run                  */
 int             core0_stats_report = 1;
-/* CYBERSTORM C3 runtime gate on the MEASUREMENT itself (not just the printing).
+/* Overhead-switch runtime gate on the MEASUREMENT itself (not just the printing).
  * 1 = the historical behaviour. Read straight from the C0_* macros, so an off
  * state never even reaches this translation unit. See core0_stats.h. */
 int             core0_stats_enabled = 1;

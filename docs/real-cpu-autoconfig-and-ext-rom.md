@@ -455,7 +455,7 @@ This is the class of defect upstream documents at `CHANGES.md:41`:
 - **F0 is evidence the current timing worked**: the extended ROM executed, so MAPROMEXT
   *was* latched — by the Amiga's reset, just in time.
 - It is a change to the real-CPU boot path of a card that reached first light hours ago,
-  and **no metal proof is available this session** (nothing is being flashed, and the
+  and **no metal proof is available yet** (nothing is being flashed, and the
   thermal kill clause has parked long real-CPU runs until cooling is fitted).
 
 ### 6.2 The pre-registered change, for whoever picks it up

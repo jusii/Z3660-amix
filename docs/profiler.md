@@ -1217,7 +1217,7 @@ its split-cost line (rung 1d)**, the `[PROF] s` per-bucket span block, `[PROF] c
 
 ## What the symbolizer has to do
 
-Symbolization is the port lane's business; the firmware emits raw records only. The
+Symbolization is done on the host; the firmware emits raw records only. The
 minimum correct implementation:
 
 1. **Check `magic` and `version`.** Refuse anything else. `Z3P2` / `2` today.

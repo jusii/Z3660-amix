@@ -58,12 +58,12 @@
  *   PSTATC  dump core0 per-task cumulative totals -- non-destructive
  *   PSTATZ  zero the core0 cumulative totals and the worst-ever latch
  *   PSTATR  (pre-existing) dump piscsi cumulative totals and reset them
- *   CSTAT   toggle the MEASUREMENT ITSELF on/off at runtime (CYBERSTORM C3)
+ *   CSTAT   toggle the MEASUREMENT ITSELF on/off at runtime (the overhead switches)
  *
  * Set CORE0_STATS to 0 to compile every span, counter and report out.
  *
  * ---------------------------------------------------------------------------
- * CYBERSTORM C3: the instrument is itself overhead, so it has a runtime switch.
+ * Overhead switches: the instrument is itself overhead, so it has a runtime switch.
  *
  * `core0_stats_report` has always gated only the PRINTING. The stamping never
  * stopped: a loop iteration takes ~8 XTime_GetTime() reads of the SCU global

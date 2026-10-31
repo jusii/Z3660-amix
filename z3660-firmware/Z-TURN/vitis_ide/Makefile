@@ -16,7 +16,7 @@
 #   make bsp        -> REBUILD the core0 + core1 BSP libraries (explicit only; overwrites tracked archives)
 #   make fsbl_bsp   -> REBUILD the FSBL's BSP library (explicit only)
 #
-# FOUR FIRMWARE VARIANTS, ONE TREE (CYBERSTORM C3 + C1, WARP M0):
+# FOUR FIRMWARE VARIANTS, ONE TREE (overhead switches + profiler, WARP M0):
 #   BOOT.BIN       default -- the run-loop diagnostics are compiled in and switchable at
 #                  runtime (PROBES / PERFS / CSTAT). Flash this when something needs
 #                  looking at.
@@ -73,7 +73,7 @@ BOOTBIN       := Z3660_system/Alfa/sd_card/BOOT.BIN
 LEAN_BIF      := Z3660_system/Alfa/system_cli_lean.bif
 LEAN_BOOTBIN  := Z3660_system/Alfa/sd_card/BOOT-lean.BIN
 
-# PROFILING variant (CYBERSTORM C1). Same shape again: its own bif, its own output file,
+# PROFILING variant (the interpreter profiler). Same shape again: its own bif, its own output file,
 # so all three images exist side by side and a metal session can re-flash between them
 # without a rebuild.
 PROF_BIF      := Z3660_system/Alfa/system_cli_prof.bif

@@ -4,7 +4,7 @@
 
 In amix_mode the emulated Kickstart no longer sees real Zorro III boards. On the A4000D the 68030 mode stalled on the
 bus and reset-looped in early Kickstart once the guest configured the real A4092 and the Prometheus Firebird PCI
-bridge (S5-20). k30 now boots there, 3 cold boots; the A4000T 030 boot is unchanged (M54). The firmware's own boards
+bridge. k30 now boots there, 3 cold boots; the A4000T 030 boot is unchanged. The firmware's own boards
 (its Z3 RAM, the RTG/combo board, all Zorro II) stay visible. Image BF365A40 (13 417 484 B, sha256 03116257…a228).
 
 ## 2026-10-29 — build: `make clean` keeps the BSP libraries; rebuilding them is `make bsp` / `make fsbl_bsp` only (4b4a5fd)
@@ -41,11 +41,11 @@ runaway policy, page-lost re-arm, circular sweeps, 360 rule, resets CSV). ztest 
 ARM-served RTG register zone (constants, ADF_TXT read-back, VBLANK control); zscan parses 8 or 9 paths; the scanner TMB
 prints the 9th record (scanner image FB078756, not deployed).
 
-## 2026-10-04 — firmware 1.0 (release-1.0-fw); deferred R-16 KNOWN_ISSUES line (9ea9a4d..ff9e8fb)
+## 2026-10-04 — firmware 1.0 (release-1.0-fw); deferred KNOWN_ISSUES line (9ea9a4d..ff9e8fb)
 
 Firmware 1.0: MAPROM/MAPROMEXT decided before the final FPGA reset pulse (kickstart 0 works again on a real CPU)
 and the piscsi register value re-read until two reads agree; release MANIFEST and README with the card layout and
-rollback. Deferred R-16 line: KNOWN_ISSUES fork notes (A4000T ROM paths, the 710 left in SYNC by the A4000T ROM,
+rollback. Deferred line: KNOWN_ISSUES fork notes (A4000T ROM paths, the 710 left in SYNC by the A4000T ROM,
 stale-REG5 ARM reads, the core0 abort sightings).
 
 ## 2026-09-29 — KNOWN_ISSUES
@@ -163,7 +163,7 @@ Backfilled at the 2026-09-26 consolidation review.
   sample points in their old order. `piscsi_parse_rdb()` keeps no scan loop of its own on the
   image-file path, and `_Static_assert`s pin the header's constants to `PISCSI_MAX_BLOCK_SIZE`,
   `RDB_BLOCK_LIMIT` and `RDB_IDENTIFIER`. **Compatibility measured, not argued:** both policies
-  replayed against all 41 disk images in the workspace — **15 identical, 26 differ, and every
+  replayed against all 41 disk images on hand — **15 identical, 26 differ, and every
   differing row is an AMIX root**; nine AmigaOS RDB disks, both `conectix` hybrids, three
   blanks and an ADF are unchanged. Host harness `rdb_scan_test.cpp`, **32 checks**, in a suite
   of **3587**. **Scored on metal the same day:** the lean image `9CE3F6A6` printed
@@ -503,7 +503,7 @@ and missed its gate by 41 (see below); the card's standing image remains `F294E7
   **The card's standing image remains the clean interpreter lineage `F294E75A`** (fourth
   consecutive rollback, on-card CRC verified); `WARPTEST` PASS 17/17 on everything flown.
 
-- **M1 CLOSED — PARKED at generation-one scope, by user decision.** Final scorecard: armed trend
+- **M1 CLOSED — PARKED at generation-one scope.** Final scorecard: armed trend
   over four rounds **5 301 → 7 185 → 7 536 → 7 563** dhrystones (round 2's 5 301 is the
   null-block row — the entry sequence's arrival in full, with no code generated), ending at
   **0.92401×** of its own session's reference — rising, and never crossing 1.0×. Coverage
@@ -1193,7 +1193,7 @@ port ISSUE-48, confirmed ×4) + the panic-path guard (ISSUE-46) metal-proven.
 Harness 90 → **182**. Box parked OFF, selector restored to golden.
 ## 2026-08-21 — 040: bitfield ops used the 68030 accessors (ISSUE-49) (6e8e33a)
 
-The port lane isolated `bfins %d0,%a2@{2:1}` (d0=0) failing to write against table-walked
+The 040/060 port isolated `bfins %d0,%a2@{2:1}` (d0=0) failing to write against table-walked
 kernel VAs while neighbouring byte ops landed — 149/149 page structs reading `0x22`.
 
 - **Cause:** `cpuemu_32`'s bitfield fix (call `x_get_bitfield`/`x_put_bitfield` instead of
@@ -1261,7 +1261,7 @@ park core1.
 
 ## 2026-08-21 — 040: guest reset now clears the MMU state (27664e2, 87310e9)
 
-**ISSUE-48 resolution recorded:** the port lane confirmed the page database was
+**ISSUE-48 resolution recorded:** the 040/060 port confirmed the page database was
 unzeroed DRAM (`calls=1 npages=3688 dirty=3620 held=150`); `page_free` is gone
 (`syncg calls=0`) and the kernel runs for minutes. That vindicates §9.6/§9.7 — the
 geometry was correctly derived and never the problem — and explains the byte-for-byte
@@ -1328,7 +1328,7 @@ inverted.
   A sync() NULL guard, B the real page_free condition, C memory geometry). Firmware
   cleared; memory-contract change proposed, not implemented.
 
-## 2026-08-20 — 040: fault named, case handed to the port lane (37cb2aa)
+## 2026-08-20 — 040: fault named, case handed to the 040/060 port (37cb2aa)
 
 `F87F6FA7` returned outcome 2: **zero interrupts** (storm dead, IPL7 edge question moot)
 and `a7=080f49e8` **at MMU-on** — `pstack` already 6936/8000 deep before the MMU was
@@ -1343,7 +1343,7 @@ panic was the cascade.
   observed `0x08001378`) and every entry relocates to a kernel symbol — no ROM address.
   Control was transferred through a pointer.
 - Emulator exonerated: one exception, correct frame, kernel's own handler, no storm, no
-  stale ATC. **Kernel/handover question → port lane.**
+  stale ATC. **Kernel/handover question → the 040/060 port.**
 - Corrections: the TC write sits after `pstart` (nearest label `Lkroot`), and the
   missing `[SERMIRROR]` is expected — `btrace_mark` gates on `btrace_on` (DBG-only).
 - Ships `[ROMENT]` (one compare/instruction, AMIX-040, 4 hits max) naming the source pc,
@@ -1839,7 +1839,7 @@ ordered by when a booting 040 OS would hit them: #1 the format-$7 bus-error stac
 (the parked 3.4; its frame *builder* is host-assertable ahead of a kernel, its *integration*
 is not), #2 no cache model (CINV/CPUSH/MOVE16, cache-inhibit coherency), then PFLUSH/PTEST,
 indirect descriptors, page-crossing faults, ATC eviction. **3.4 stays parked pending an
-external 68040 kernel** (user decision); the lane is otherwise as far advanced as build-ahead
+external 68040 kernel**; the lane is otherwise as far advanced as build-ahead
 allows.
 
 ## 2026-08-06 — new carrier revision: bring-up findings and the 060 rule
@@ -1880,7 +1880,7 @@ allows.
   arrives as `application/json` and parses. Post-flash gates all green: `BETA 21`,
   `Emulation mode 4`, `68030 MMU enabled`, A3000 SCSI initialised, Amix to multiuser on the LAN,
   and `validate-metal.sh --cycles 5` PASS on the CD stack.
-- **`docs/http-vs-tftp-upload.md` (new)** — measurements behind the workspace's move off TFTP,
+- **`docs/http-vs-tftp-upload.md` (new)** — measurements behind the move off TFTP,
   including the correction that HTTP uploads do *not* run while the guest does.
 - **Defect catalogue in `docs/AMIX.md` now lists seven beta-21 defects**, none reported upstream:
   the L1-only cache maintenance, the `else`-after-`else`, the `machdep/m68k.h` include guard, the

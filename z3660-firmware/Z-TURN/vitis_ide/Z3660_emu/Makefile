@@ -12,7 +12,7 @@ ROOT    := $(abspath .)
 SRCDIR  := $(ROOT)/src
 LDSCRIPT:= $(SRCDIR)/lscript.ld
 
-# ---- Build variant (CYBERSTORM C3) -----------------------------------------
+# ---- Build variant (the overhead switches) -----------------------------------------
 # Z3660_LEAN=1 builds the LEAN (production) core1: the run-loop diagnostics are
 # compiled OUT rather than merely switched off at runtime, so the hot path carries
 # neither the instruments nor the predicates that gate them. See
@@ -24,7 +24,7 @@ LDSCRIPT:= $(SRCDIR)/lscript.ld
 # would happily succeed. Separate dirs make that impossible instead of merely
 # unlikely, and let both BOOT.BINs exist at once for an A/B re-flash pair.
 #
-# Z3660_PROF=1 (CYBERSTORM C1) is the THIRD variant: the lean flags PLUS
+# Z3660_PROF=1 (the interpreter profiler) is the THIRD variant: the lean flags PLUS
 # -DZ3660_EMU_PROF=1, into build-prof. It is built on top of LEAN and not on top of the
 # default on purpose -- a profile of the diagnostic loop would be a map of a binary nobody
 # runs, and the C3 calibration priced the difference between the two loops at 9.1 % of
@@ -88,7 +88,7 @@ INCLUDES:= -I$(SRCDIR) \
            -I$(BSP_CORE1_INC) \
            -I$(BSP_CORE1_EXPORT_INC)
 
-# -MMD -MP: track HEADER dependencies. Until CYBERSTORM C1 nothing here did, so a header
+# -MMD -MP: track HEADER dependencies. Until the profiler work nothing here did, so a header
 # edit left stale objects in every build dir and the link succeeded regardless -- the
 # reason `rm -rf build*` has been the standing advice. It generates .d files only and
 # cannot change a single byte of output. (-D flags remain untracked; that is what the
@@ -151,7 +151,7 @@ OBJS += $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(S_SRCS))
 
 # THE OTHER HALF OF -MMD, AND WITHOUT IT THE FIRST HALF IS DECORATION.
 #
-# CFLAGS has carried -MMD -MP since CYBERSTORM C1 and the .d files have been written ever
+# CFLAGS has carried -MMD -MP since the profiler work and the .d files have been written ever
 # since -- correctly, listing every header each object really reads. Nothing ever READ them.
 # So a header edit still left every object stale and the link still succeeded, which is the
 # exact hazard the -MMD comment above says was fixed.
@@ -176,7 +176,7 @@ BIN := $(BUILDDIR)/Z3660_emu.bin
 # The parent Makefile invokes this one with no goal ($(MAKE) -C Z3660_emu -j 4), so the
 # consequence was that `make bootbin` stopped rebuilding core1 entirely: bootgen happily
 # packed a MONTHS-OLD Z3660_emu.elf into a fresh-looking BOOT.BIN, with a green build log
-# and no warning anywhere. Found during CYBERSTORM C2 by disassembling the shipped lean
+# and no warning anywhere. Found during the interpreter speed-up work by disassembling the shipped lean
 # image and noticing z3660_knobs_sync() did not read a mailbox word that had just been
 # added to it.
 #

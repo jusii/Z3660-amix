@@ -1,4 +1,4 @@
-# The block-idiom fast path (CYBERSTORM C2, rung 0)
+# The block-idiom fast path (interpreter speed-up, rung 0)
 
 What it is, what it is deliberately not, how to switch it, and the pre-registered numbers
 the metal session is supposed to judge it against — written down *before* the measurement,

@@ -1231,7 +1231,7 @@ static void desc_get_quad(uaecptr addr, uae_u32 *descr)
  * for PTEST (levels 1 to 7). Using level 0 creates an ATC entry. */
 
 static uae_u32 mmu030_table_search(uaecptr addr, uae_u32 fc, bool write, int level) {
-    /* CYBERSTORM C1: this IS the 030 descriptor table walk -- the tier-2 miss. The bucket
+    /* Profiler: this IS the 030 descriptor table walk -- the tier-2 miss. The bucket
      * is not closed on the bus-error exits below because those THROW; the run loop's
      * CATCH recovers the span into FAULT, which is where a walk that faulted belongs. */
     Z3660_PROF_CNT(Z3660_PROF_C_ATC_MISS);
@@ -2087,7 +2087,7 @@ static uae_u32 mmu030_get_atc_generic(uaecptr addr, int l, uae_u32 fc, int flags
  * by comparing the logical address and function code to the values
  * stored in the ATC entries. If a matching entry is found it sets
  * the history bit and returns the cache index of the entry. */
-/* CYBERSTORM C1. On the 030 this is the tier-1 ATC search, and -- like mmu_translate on
+/* Profiler. On the 030 this is the tier-1 ATC search, and -- like mmu_translate on
  * the 040 -- reaching it at all means the tier-0 page cache missed. So one probe here
  * yields both numbers: XLATE counts page-cache misses, and the bucket span covers the ATC
  * search proper. The table walk it does not cover is charged separately in

@@ -110,7 +110,7 @@ struct uae_prefs currprefs,changed_prefs;
 #include "fpp.h"
 #include "../main.h"
 #include "newcpu.h"
-#include "z3660_prof.h"   /* CYBERSTORM C1: profiling variant bring-up (inert elsewhere) */
+#include "z3660_prof.h"   /* Profiler: profiling variant bring-up (inert elsewhere) */
 
 void fill_prefetch_quick(void);
 void m68k_reset_newcpu(bool hardreset);
@@ -1290,7 +1290,7 @@ void uae_emulator(int enable_jit, int cpu_model, int enable_mmu, int amix_mode)
    init_m68k();
    build_cpufunctbl();
 #if Z3660_EMU_PROF
-   /* CYBERSTORM C1. Bring the PMU up and calibrate the ARM clock here rather than lazily
+   /* Profiler. Bring the PMU up and calibrate the ARM clock here rather than lazily
     * from the first command, so the calibration's ~10 ms busy-wait happens while the
     * guest is not yet running instead of in the middle of the window being measured.
     * Then take any command core0 already left in the mailbox -- which is how a config

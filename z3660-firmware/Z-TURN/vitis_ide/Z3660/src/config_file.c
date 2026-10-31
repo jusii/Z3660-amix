@@ -13,7 +13,7 @@
 #include "config_file.h"
 #include "amix_ram.h"
 #include "overhead_switches.h"   /* the single copy of the perf_stats/emu_probes/core0_stats rule */
-#include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (CYBERSTORM C1) */
+#include "prof_config.h"         /* the single copy of the prof_hz/prof_buckets rule (the interpreter profiler) */
 /* WARP ENGINE: the OFF sentinel this file publishes unconditionally on every boot. Included
  * directly rather than mirrored, for debug_console.c's reason -- a mirrored copy is only a
  * second place for the sentinel to drift away from the one core1 tests against. */
@@ -245,7 +245,7 @@ void print_line(FIL *fil, char* line_in, ...)
  * The resolved value is always published to the mailbox (so core1 can never read a
  * stale one), but it only MEANS anything under amix_mode -- core1 consults it solely
  * inside its amix_mode arm, so every non-AMIX config is bit-for-bit unaffected. */
-/* CYBERSTORM C3: resolve and publish the three run-loop overhead switches.
+/* Overhead switches: resolve and publish the three run-loop overhead switches.
  *
  * Called from BOTH config paths (no-preset and preset) once the whole file is parsed,
  * exactly like resolve_amix_ram(), so the values are settled before core1 is dispatched.
@@ -284,7 +284,7 @@ static void resolve_overhead_switches(int verbose)
              yesno_names[config.core0_stats]);
 }
 
-/* CYBERSTORM C1: resolve the profiler keys and publish them to the cross-core mailbox.
+/* Profiler: resolve the profiler keys and publish them to the cross-core mailbox.
  *
  * Published UNCONDITIONALLY, exactly like perf_stats/emu_probes above and for the same
  * reason: the mailbox is DDR that survives a warm reset, so a boot that leaves prof_ctl
@@ -406,10 +406,10 @@ void load_default_config(void)
    config.amix_mode=-1;
    config.amix_ram=-1;
    config.service_cadence=-1;
-   config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
+   config.perf_stats=Z3660_OVH_UNSET;    /* Overhead switches: unset -> YES (historical behaviour) */
    config.emu_probes=Z3660_OVH_UNSET;
    config.core0_stats=Z3660_OVH_UNSET;
-   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* Profiler: unset -> OFF (no profiler before there was one) */
    config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.eth_reraise=CFG_ETH_DEFAULT_reraise;   /* ethernet keys (config_file.h) */
    config.eth_rxkick=CFG_ETH_DEFAULT_rxkick;
@@ -865,10 +865,10 @@ retry:
    config.amix_mode=-1;
    config.amix_ram=-1;
    config.service_cadence=-1;
-   config.perf_stats=Z3660_OVH_UNSET;    /* CYBERSTORM C3: unset -> YES (historical behaviour) */
+   config.perf_stats=Z3660_OVH_UNSET;    /* Overhead switches: unset -> YES (historical behaviour) */
    config.emu_probes=Z3660_OVH_UNSET;
    config.core0_stats=Z3660_OVH_UNSET;
-   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* CYBERSTORM C1: unset -> OFF (no profiler before there was one) */
+   config.prof_hz=Z3660_PROF_CFG_UNSET;      /* Profiler: unset -> OFF (no profiler before there was one) */
    config.prof_buckets=Z3660_PROF_CFG_UNSET;
    config.eth_reraise=CFG_ETH_DEFAULT_reraise;   /* ethernet keys (config_file.h) */
    config.eth_rxkick=CFG_ETH_DEFAULT_rxkick;
@@ -1093,7 +1093,7 @@ retry:
          if(verbose) printf("[CFG] service_cadence %d\n", config.service_cadence);
          break;
 
-      /* CYBERSTORM C3 run-loop overhead switches. All three default to YES = what the
+      /* Run-loop overhead switches. All three default to YES = what the
        * firmware has always done, so a config file without these lines is unchanged.
        * They exist so a metal calibration session can subtract one overhead at a time
        * and measure what the guest actually gains. See docs/AMIX.md. */
@@ -1115,7 +1115,7 @@ retry:
          if(verbose) printf("[CFG] core0_stats %s.\n", yesno_names[config.core0_stats]);
          break;
 
-      /* CYBERSTORM C1 profiler arming. Both default to OFF -- see prof_config.h for why
+      /* Interpreter profiler arming. Both default to OFF -- see prof_config.h for why
        * that is the SAME "an absent key changes nothing" rule as the C3 switches above
        * and not its opposite. These exist for the one profile the serial console cannot
        * take: the boot itself. Config file only, not per preset. */
@@ -1383,7 +1383,7 @@ load_successful:;
    if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
    shared->service_cadence=config.service_cadence;
    resolve_overhead_switches(verbose);      /* perf_stats / emu_probes / core0_stats */
-   resolve_prof_config(verbose);            /* CYBERSTORM C1: prof_hz / prof_buckets */
+   resolve_prof_config(verbose);            /* Profiler: prof_hz / prof_buckets */
    publish_warp_default();                  /* WARP ENGINE: never armed at boot */
 
    memcpy(&temp_config,&config,sizeof(CONFIG));
@@ -1669,7 +1669,7 @@ retry:
                   if(preset==preset_selected)
                      if(verbose) printf("\e[30m\e[103m[ENV] service_cadence %d\e[0m\n", env_file_vars_temp[preset].service_cadence);
                   break;
-               /* CYBERSTORM C3 overhead switches, per preset. Absent -> the -1 inherited
+               /* Overhead switches, per preset. Absent -> the -1 inherited
                 * from default_config -> YES in resolve_overhead_switches(). */
                case CONFITEM_PERF_STATS:
                   get_next_string(parse_line, cur_cmd, &str_pos, ' ');
@@ -1825,7 +1825,7 @@ retry:
       if(config.service_cadence<1) config.service_cadence=1;   /* default/clamp: 1 = poll every instruction */
       shared->service_cadence=config.service_cadence;
       resolve_overhead_switches(verbose);   /* perf_stats / emu_probes / core0_stats */
-      resolve_prof_config(verbose);         /* CYBERSTORM C1: prof_hz / prof_buckets */
+      resolve_prof_config(verbose);         /* Profiler: prof_hz / prof_buckets */
       publish_warp_default();               /* WARP ENGINE: never armed at boot */
       memcpy(&temp_config,&config,sizeof(CONFIG));
    }

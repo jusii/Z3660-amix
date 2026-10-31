@@ -1,4 +1,4 @@
-; ztest.s -- Z3660 timing-scanner bus test program (P-27 D8/D9).
+; ztest.s -- Z3660 timing-scanner bus test program.
 ;
 ; A 512 KB image for a z3660cfg kickstart slot. The firmware maps it at $F80000 (MAPROM on the
 ; real 68060, the emulator's ROM bank under UAE 040 JIT). No Kickstart, interrupts masked,
@@ -153,7 +153,7 @@ Z3CFG		equ	$FF000000
 Z2CFG		equ	$00E80000
 Z3660_MFR	equ	$144B
 GARY_TO		equ	$DE0000			; Gary: bit 7 set = a cycle nobody answers ends in BERR
-GARY_TOEN	equ	$DE0001			; Gary TOENB: bit 7 = the bus timeout enable (METAL-2: $DE0000 alone did nothing on the D)
+GARY_TOEN	equ	$DE0001			; Gary TOENB: bit 7 = the bus timeout enable ($DE0000 alone did nothing on the A4000D)
 BPROBE_DEF	equ	$00F00000		; empty on the A4000D: Gary's timeout ends the cycle
 ; path 9: the RTG board's register zone (its first 2 MB), served by the ARM through the PL handshake
 ZZ_VBLANK	equ	$17C			; REG_ZZ_VBLANK_STATUS: answered by the PL itself, bit 0 only
@@ -451,7 +451,7 @@ loop:
 		bra	loop
 
 ; flags bit 3 (real 060): Gary in BERR mode (TIMEOUT + TOENB) for the whole run, so a motherboard cycle nobody
-; ends becomes a caught bus error on its path instead of a hang (METAL-2c: the first chip-RAM read after a runaway
+; ends becomes a caught bus error on its path instead of a hang (seen on metal: the first chip-RAM read after a runaway
 ; and a CPLD reset never ended). Off again: both registers cleared once.
 gary_mode:
 		tst.l	V_MODE(a5)

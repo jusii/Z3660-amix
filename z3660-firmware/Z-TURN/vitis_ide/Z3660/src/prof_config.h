@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* CYBERSTORM C1 -- profiler config keys: the single copy of the resolution rule.
+/* Interpreter profiler config keys: the single copy of the resolution rule.
  *
  * WHAT THESE ARE
  *

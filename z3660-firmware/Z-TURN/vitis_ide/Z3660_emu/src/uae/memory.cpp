@@ -23,7 +23,7 @@
 //#include "custom.h"
 #include "events.h"
 #include "newcpu.h"
-#include "z3660_dopc.h"   /* CYBERSTORM C2 rung 1: map_banks() invalidates the decoded-op cache */
+#include "z3660_dopc.h"   /* Interpreter speed-up rung 1: map_banks() invalidates the decoded-op cache */
 //#include "autoconf.h"
 //#include "savestate.h"
 //#include "ar.h"
@@ -3193,7 +3193,7 @@ static void map_banks2 (addrbank *bank, int start, int size, int realsize, int q
 		old = debug_bankchange (-1);
 #endif
 	flush_icache(3); /* Sure don't want to keep any old mappings around! */
-	/* CYBERSTORM C2 rung 1: and the decoded-op cache is exactly "an old mapping" in the
+	/* Interpreter speed-up rung 1: and the decoded-op cache is exactly "an old mapping" in the
 	 * sense this line means -- its entries hold opcode words read through the bank map
 	 * that is being replaced on the next line. flush_icache() is a no-op macro without
 	 * the JIT, so upstream's own sentence has had nothing to act on until now. */
@@ -3780,7 +3780,7 @@ uae_u32 memory_get_wordi(uaecptr addr)
 		return swap16(*((uae_u16*)m));
 	}
 }
-/* CYBERSTORM C2 rung 2: the direct arms now call the direct_get_ / direct_put_ inlines
+/* Interpreter speed-up rung 2: the direct arms now call the direct_get_ / direct_put_ inlines
  * in memory.h instead of open-coding `m = (uae_u8*)addr; swap32(*(uae_u32*)m)`. The
  * accessor fast path performs the same access on its hit path, and one copy of the
  * fork's identity-mapping assumption is the whole point -- upstream's commented-out

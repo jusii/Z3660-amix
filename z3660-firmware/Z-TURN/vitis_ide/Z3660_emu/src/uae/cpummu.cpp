@@ -94,7 +94,7 @@ struct mmufastcache atc_data_cache_write[MMUFASTCACHE_ENTRIES];
 #endif
 
 /* ==========================================================================
- * CYBERSTORM C2 rung 2 -- the data accessors' fast-path verdict tables.
+ * Interpreter speed-up rung 2 -- the data accessors' fast-path verdict tables.
  *
  * The design, the measurement and the coherence argument are in z3660_dfast.h. What is
  * here is the build, and the build is the whole correctness claim: for every (super,
@@ -208,7 +208,7 @@ unsigned long long z3660_dfast_served(void)
 #endif
 }
 
-/* CYBERSTORM C1: in a profiling build these six names are macros for slots in
+/* Profiler: in a profiling build these six names are macros for slots in
  * z3660_prof_cnt[] (cpummu.h), so there is nothing to define here -- and defining them
  * would expand to `int z3660_prof_cnt[5], ...`, which is why the guard is explicit
  * rather than relying on CACHE_HIT_COUNT alone. */
@@ -265,7 +265,7 @@ void mmu_tt_modified (void)
 	mmu_ttr_enabled_ins = ((regs.itt0 | regs.itt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled_data = ((regs.dtt0 | regs.dtt1) & MMU_TTR_BIT_ENABLED) != 0;
 	mmu_ttr_enabled = mmu_ttr_enabled_ins || mmu_ttr_enabled_data;
-	/* CYBERSTORM C2 rung 2. The fast path's verdict tables are derived from the SAME four
+	/* Interpreter speed-up rung 2. The fast path's verdict tables are derived from the SAME four
 	 * registers as the three flags above, so they are rebuilt in the same breath and
 	 * cannot be stale in any way those flags are not. This is the only reason the tables
 	 * need no invalidation protocol of their own. */
@@ -978,7 +978,7 @@ static void mmu_add_cache(uaecptr addr, uaecptr phys, bool super, bool data, boo
 	}
 }
 
-/* CYBERSTORM C1 probe note. Reaching this function AT ALL is a miss in the tier-0 page
+/* Profiler probe note. Reaching this function AT ALL is a miss in the tier-0 page
  * caches (MMU_IPAGECACHE / MMU_DPAGECACHE, in cpummu.h's inlines), so XLATE counts
  * tier-0 misses; ATC_MISS below counts the ones that also missed the 4-way ATC and had
  * to walk the descriptor tables. Three tiers, three numbers, one out-of-line function
@@ -1612,7 +1612,7 @@ void REGPARAM2 mmu_op_real(uae_u32 opcode, uae_u16 extra)
 	}
 }
 
-/* CYBERSTORM C2 rung 1b: the upstream half of mmu_flush_cache(), which the two ATC
+/* Interpreter speed-up rung 1b: the upstream half of mmu_flush_cache(), which the two ATC
  * flushes below keep while attaching their own decoded-op-cache policy. Defined with
  * mmu_flush_cache() further down, where it belongs; declared here because the callers
  * come first in this file. */
@@ -1641,7 +1641,7 @@ void REGPARAM2 mmu_flush_atc(uaecptr addr, bool super, bool global)
 	}	
 	flush_shortcut_cache(addr, super);
 	mmu_flush_icache_only();
-	/* CYBERSTORM C2 rung 1b -- PFLUSH KEEPS ITS OWN CAUSE ID, and rung 1c is why the whole
+	/* Interpreter speed-up rung 1b -- PFLUSH KEEPS ITS OWN CAUSE ID, and rung 1c is why the whole
 	 * cache still goes.
 	 *
 	 * PFLUSH is the only invalidation cause that names a guest LOGICAL page, which is the
@@ -1676,7 +1676,7 @@ void REGPARAM2 mmu_flush_atc_all(bool global)
 	}
 	flush_shortcut_cache(0xffffffff, 0);
 	mmu_flush_icache_only();
-	/* CYBERSTORM C2 rung 1b. PFLUSHA names no page, so there is nothing to narrow by --
+	/* Interpreter speed-up rung 1b. PFLUSHA names no page, so there is nothing to narrow by --
 	 * whole cache, exactly as before. It gets its own cause id only so the attribution can
 	 * separate it from the per-page form, which is the row that decides whether the
 	 * narrowing above was worth making. mmu_set_tc() and mmu_reset() arrive here too, and
@@ -1765,7 +1765,7 @@ uae_u16 REGPARAM2 mmu_set_tc(uae_u16 tc)
 	}
 
 	mmu_flush_atc_all(true);
-	/* CYBERSTORM C2 rung 2. This function is the ONLY writer of regs.mmu_enabled and of
+	/* Interpreter speed-up rung 2. This function is the ONLY writer of regs.mmu_enabled and of
 	 * the page geometry the fast path's index arithmetic uses, so it is the second and
 	 * last rebuild site. (mmu_flush_atc_all above has already emptied both page caches,
 	 * so the PAGE arm cannot serve a translation made under the old geometry.) */
@@ -1812,7 +1812,7 @@ void REGPARAM2 mmu_set_super(bool super)
 	mmu_is_super = super ? 0x80000000 : 0;
 }
 
-/* CYBERSTORM C2 rung 1b. The upstream half of mmu_flush_cache(), factored out so the
+/* Interpreter speed-up rung 1b. The upstream half of mmu_flush_cache(), factored out so the
  * three callers below can keep it while attaching DIFFERENT decoded-op-cache policies --
  * PFLUSH names a logical page and is narrowable, CPUSHL and PFLUSHA are not. Upstream's
  * body is reproduced here verbatim rather than restructured, so an upstream resync
@@ -1828,7 +1828,7 @@ static void mmu_flush_icache_only(void)
 void REGPARAM2 mmu_flush_cache(void)
 {
 	mmu_flush_icache_only();
-	/* CYBERSTORM C2 rung 1. THIS is the 68040 core's instruction-cache flush point, and
+	/* Interpreter speed-up rung 1. THIS is the 68040 core's instruction-cache flush point, and
 	 * it always was -- upstream clears its own (compiled-out) icache right here. So the
 	 * decoded-op cache joins it, and by doing so it inherits the architecture's own
 	 * coherence contract instead of inventing one:

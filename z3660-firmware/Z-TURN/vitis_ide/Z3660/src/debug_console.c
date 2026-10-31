@@ -29,16 +29,16 @@ void piscsi_stats_dump(void);
 int  piscsi_stats_reporting(void);
 #include "eth_prof.h"   /* the ethernet frame-path profile (ESTAT); next: core0 cooperative-loop per-task duration accounting */
 #include "core0_stats.h"
-/* CYBERSTORM C1: the profiler command word core0 writes into SHARED.prof_ctl. */
+/* Profiler: the profiler command word core0 writes into SHARED.prof_ctl. */
 #include "prof_config.h"
-/* CYBERSTORM C2 rung 0. Included DIRECTLY rather than mirrored into a core0 copy the way
+/* Interpreter speed-up rung 0. Included DIRECTLY rather than mirrored into a core0 copy the way
  * prof_config.h mirrors z3660_prof.h -- z3660_prof.h drags in the emulator's headers and
  * core0 cannot compile it, but z3660_blk.h is #defines and one static inline over
  * `unsigned` and nothing else. A mirrored copy would only be a second place for the OFF
  * sentinel to drift away from the one core1 tests against. */
 #include "../../Z3660_emu/src/uae/z3660_blk.h"
 #include "../../Z3660_emu/src/uae/z3660_dopc.h"
-/* CYBERSTORM C2 rung 2: same reasoning again -- z3660_dfast.h is deliberately
+/* Interpreter speed-up rung 2: same reasoning again -- z3660_dfast.h is deliberately
  * self-contained (plain types, no emulator headers) so the ONE rule that turns a mailbox
  * word into a state lives in one file that both cores compile. */
 #include "../../Z3660_emu/src/uae/z3660_dfast.h"
@@ -97,18 +97,18 @@ typedef enum {
    PERFS,   PERF_STATS,
    PROBES,  EMU_PROBES,
    CSTAT,   CORE0_LOOP_STATS,
-   /* CYBERSTORM C1 profiler. APPEND-ONLY: command_names[] is indexed by this enum. */
+   /* Interpreter profiler. APPEND-ONLY: command_names[] is indexed by this enum. */
    PROF,    PROF_ARM,
    PROFB,   PROF_BUCKETS,
    PROFD,   PROF_DUMP,
    PROFR,   PROF_RING,
    PROFZ,   PROF_ZERO,
    PROFO,   PROF_OFF,      /* C2-prep: the lossless stop. See the case below. */
-   /* CYBERSTORM C2 rung 0: the block-idiom fast path. APPEND-ONLY, like everything above. */
+   /* Interpreter speed-up rung 0: the block-idiom fast path. APPEND-ONLY, like everything above. */
    BLK,     BLOCK_IDIOM,
-   /* CYBERSTORM C2 rung 1: the decoded-op cache. APPEND-ONLY, like everything above. */
+   /* Interpreter speed-up rung 1: the decoded-op cache. APPEND-ONLY, like everything above. */
    DOPC,    DECODED_OP_CACHE,
-   /* CYBERSTORM C2 rung 2: the data-accessor fast path. APPEND-ONLY. */
+   /* Interpreter speed-up rung 2: the data-accessor fast path. APPEND-ONLY. */
    DFAST,   ACCESSOR_FAST_PATH,
    /* WARP ENGINE: the 68040 MMU block engine. DEFAULT OFF. APPEND-ONLY. */
    WARP,    WARP_ENGINE,
@@ -230,7 +230,7 @@ void debug_console_init(void)
    debug_console.reset_cpld=0;
    debug_console.reset_fpga=0;
    debug_console.overlay_enabled=0;
-   debug_console.prof_buckets=0;   /* CYBERSTORM C1: nothing armed at power-on */
+   debug_console.prof_buckets=0;   /* Profiler: nothing armed at power-on */
 }
 uint32_t hextoi(char *str)
 {
@@ -485,7 +485,7 @@ int debug_thread(struct pt *pt)
                      xil_printf("DEBUG EMU %s\r\n", shared->debug_emu?"ON":"OFF");
                      debug_console.subcmd=0;
                      break;
-                  /* CYBERSTORM C3 overhead switches. These toggle DIAGNOSTIC COST only --
+                  /* Overhead switches. These toggle DIAGNOSTIC COST only --
                    * no emulation behaviour changes either way -- so they are safe to
                    * flip live under a running guest during a calibration sweep. */
                   case PERFS:
@@ -550,7 +550,7 @@ int debug_thread(struct pt *pt)
                      core0_stats_zero();         // zero core0 cumulative totals + worst-ever latch
                      debug_console.subcmd=0;
                      break; EP_COMMAND_CASES
-                  /* CYBERSTORM C1 profiler (core1). Every one of these is a WRITE to the
+                  /* Interpreter profiler (core1). Every one of these is a WRITE to the
                    * cross-core command word; core1 consumes it in do_specialties(), so it
                    * costs nothing per emulated instruction and arrives within an
                    * interrupt period.
@@ -648,7 +648,7 @@ int debug_thread(struct pt *pt)
                      break;
                   case BLK:
                   case BLOCK_IDIOM:
-                     {  /* CYBERSTORM C2 rung 0. Cycle the chunk cap OFF -> 64 -> 256 -> 1024 -> OFF.
+                     {  /* Interpreter speed-up rung 0. Cycle the chunk cap OFF -> 64 -> 256 -> 1024 -> OFF.
                         * A cap, not a toggle, because the cap is what bounds interrupt latency
                         * (the run loop's poll runs once per chunk) -- so the one knob answers
                         * both "is it on" and "how long a stall will this guest tolerate", and a
@@ -672,7 +672,7 @@ int debug_thread(struct pt *pt)
                      break;
                   case DOPC:
                   case DECODED_OP_CACHE:
-                     {  /* CYBERSTORM C2 rung 1. Toggle the decoded-op cache ON <-> OFF.
+                     {  /* Interpreter speed-up rung 1. Toggle the decoded-op cache ON <-> OFF.
                         * A toggle and not a size, unlike BLK: the geometry is fixed by
                         * the map's measured PC distribution (4096 entries, 4-way) and a
                         * runtime way-count knob would put a variable bound on the hit
@@ -692,7 +692,7 @@ int debug_thread(struct pt *pt)
                      break;
                   case DFAST:
                   case ACCESSOR_FAST_PATH:
-                     {  /* CYBERSTORM C2 rung 2. Toggle the data accessors' fast path.
+                     {  /* Interpreter speed-up rung 2. Toggle the data accessors' fast path.
                         * OFF is the REFERENCE MACHINE -- every access takes the original
                         * out-of-line accessor -- so this is what makes a PROFZ-fenced
                         * same-boot A/B of the rung possible without a second flash, which

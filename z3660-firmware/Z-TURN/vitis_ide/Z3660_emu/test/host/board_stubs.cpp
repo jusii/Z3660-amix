@@ -232,7 +232,7 @@ extern "C" void test_write_32(unsigned int a, unsigned int v){ hram_poke32(a, v)
  * ===================================================================== */
 extern "C" int  intlev(void){ return -1; }            /* no pending interrupt */
 /* The run loop's interrupt poll passes through here, so counting it is how the harness
- * measures YIELD GRANULARITY -- how often the block-idiom fast path (CYBERSTORM C2) hands
+ * measures YIELD GRANULARITY -- how often the block-idiom fast path (the interpreter speed-up work) hands
  * control back to the tail. A claim like "the poll still runs at its normal cadence" is
  * otherwise unfalsifiable; this makes it a number. */
 unsigned long harness_ipl_polls = 0;

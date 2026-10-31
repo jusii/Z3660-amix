@@ -16,7 +16,7 @@
 > [../../../../z3660-drivers/amix/AMIX_ethernet_driver_plan.md](../../../../z3660-drivers/amix/AMIX_ethernet_driver_plan.md).
 > Musashi's PMMU path was explicitly rejected; this plan covers the UAE path only.
 
-## Resolved decisions (grilling pass, 2026-05-30)
+## Resolved decisions (2026-05-30)
 
 These supersede any conflicting wording further down; the older sections are kept
 for context but read these first.
@@ -485,7 +485,7 @@ directly; login `guest` (no password), or root with the image's root password.
 - The host harness tests **translation logic**, not bus timing / cache coherency /
   real-IPL — those remain hardware-only (below).
 
-### Iteration ladder (recommended order — revised per grilling)
+### Iteration ladder (recommended order, revised)
 0. **On-target unwind gate (Phase 0.5, hardware):** flash the trivial
    `TRY{THROW(7);}CATCH` test under `-O3 -flto`; confirm it catches on the Z-Turn.
    If it doesn't unwind, switch TRY/CATCH/THROW to `setjmp`/`longjmp` before any

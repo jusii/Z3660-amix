@@ -1,4 +1,4 @@
-/* CYBERSTORM C1 -- the interpreter profiler: contract, wire format, and hot-path probes.
+/* The interpreter profiler: contract, wire format, and hot-path probes.
  *
  * WHAT THIS IS FOR
  *
@@ -197,7 +197,7 @@
  * WIRE FORMAT -- the symbolizer's contract (see docs/profiler.md)
  * ==========================================================================
  *
- * The firmware emits raw records; symbolization is the port lane's business. Both the
+ * The firmware emits raw records; symbolization is done on the host. Both the
  * binary layout below and the ASCII serial rendering are versioned by Z3660_PROF_VERSION
  * and pinned by the host harness, so a symbolizer written against this header does not
  * have to re-read the firmware to stay correct.
@@ -603,7 +603,7 @@ enum {
    Z3660_PROF_C_DOPC_MISS   = 25, /* ... consulted and not found (the fetch still ran) */
    Z3660_PROF_C_DOPC_EXT    = 26, /* ... extension words served from the entry's slot  */
    Z3660_PROF_C_DOPC_INVAL  = 27, /* ... whole-cache invalidations that ACTUALLY ran    */
-   /* CYBERSTORM C2 rung 1b -- invalidation attribution. One counter per cause, in
+   /* Interpreter speed-up rung 1b -- invalidation attribution. One counter per cause, in
     * Z3660_DOPC_INV_* order. They count the requests that REACH z3660_dopc_invalidate(),
     * which with the cache on is every request that performs one:
     *
@@ -642,7 +642,7 @@ enum {
    Z3660_PROF_C_DOPC_IV_PFLUSH  = 35, /* PFLUSH of one page -- the narrowed cause      */
    Z3660_PROF_C_DOPC_IV_PFLUSHA = 36, /* PFLUSHA / TC write / MMU reset                */
    Z3660_PROF_C_DOPC_IV_CACR    = 37, /* MOVEC to CACR                                 */
-   /* CYBERSTORM C2 rung 1c -- OUTSIDE the cause block, and deliberately.
+   /* Interpreter speed-up rung 1c -- OUTSIDE the cause block, and deliberately.
     *
     * The one narrowing the 2026-08-23 verdict kept decides at its CALL SITE (MOVEC to
     * CACR that changes no retained bit, newcpu_common.cpp), so it never reaches
@@ -656,7 +656,7 @@ enum {
     * second call-site narrowing gets a second counter for the same reason -- one shared
     * "skipped" counter could not attribute either of them. */
    Z3660_PROF_C_DOPC_IV_CACR_SKIP = 38, /* MOVEC to CACR proved INERT at the call site  */
-   /* CYBERSTORM C2 v3.1 SS25.2 -- THE WAY HISTOGRAM. A COUNTER CHANGE, NOT A RUNG.
+   /* THE WAY HISTOGRAM. A COUNTER CHANGE, NOT A RUNG.
     *
     * v3.1 made DOPCFIND the largest NAMED thing in the dispatch loop (11.45-11.65 % of
     * the interpreter, paid on every dispatch) and then declined to attack it, because
@@ -689,7 +689,7 @@ enum {
    Z3660_PROF_C_DOPC_WAY1       = 40,
    Z3660_PROF_C_DOPC_WAY2       = 41,
    Z3660_PROF_C_DOPC_WAY3       = 42,
-   /* CYBERSTORM C2 rung 2 -- THE MISALIGNED-READ DENOMINATOR, SPLIT.
+   /* Interpreter speed-up rung 2 -- THE MISALIGNED-READ DENOMINATOR, SPLIT.
     *
     * v3.1 SS25.1 reported "one guest read in five is misaligned (20.71 %) against one
     * write in 800 (0.12 %)" and called the asymmetry the bucket's own unexplained
@@ -715,7 +715,7 @@ enum {
     * advance of any capture: MISALIGN_I is the overwhelming majority of the 8 231 131,
     * and the remainder is the same order as MISALIGN_W's 0.12 %. */
    Z3660_PROF_C_MISALIGN_I      = 43, /* ... of MISALIGN_R, the instruction-stream half */
-   /* CYBERSTORM C2 rung 2 -- what the accessor fast path actually served.
+   /* Interpreter speed-up rung 2 -- what the accessor fast path actually served.
     *
     * DFAST_HIT is coverage: the fast path's share of (READ + WRITE) is the fraction of
     * the bucket the rung can possibly have moved, and a rung that measures a wall-clock
@@ -1094,7 +1094,7 @@ extern uint8_t  z3660_prof_stack[Z3660_PROF_STACK_DEPTH];
 extern uint64_t z3660_prof_acc[Z3660_PROF_B_COUNT];
 extern uint64_t z3660_prof_cnt[Z3660_PROF_C_COUNT];
 
-/* CYBERSTORM C2 rung 1b -- PER-BUCKET TRANSITION SPANS, the successor to IFETCH_CALLS.
+/* Interpreter speed-up rung 1b -- PER-BUCKET TRANSITION SPANS, the successor to IFETCH_CALLS.
  *
  * The dump has always reported the probe's total weight and then told the reader to
  * "subtract per bucket by its share of transitions" -- while reporting no per-bucket

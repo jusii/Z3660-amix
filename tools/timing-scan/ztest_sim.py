@@ -9,7 +9,7 @@ detects "emulated" unless the parameter block forces the real-CPU paths).
 The model: chip RAM 2 MB with the Gary overlay (CIA-A PRA bit 0), motherboard RAM blocks 0-3
 at $07000000 (blocks 4-15 float), card RAM $08000000-$0FFFFFFF, the image at $F80000, both
 8520s (timers, DDRs, PRA; a stopped timer's counter loads one CIA access after the TxHI write, as
-measured on the A4000D in METAL-1), Gary's timeout register at $DE0000 (bit 7 set: a read of an empty
+measured on the A4000D, 2026-10-22), Gary's timeout register at $DE0000 (bit 7 set: a read of an empty
 address faults; the fault is injected as a 68060 format-4 access-fault frame from the instruction
 hook), custom chips as a write sink. machine68k maps only the low 256 MB,
 so the Zorro III spaces ($FF000000, $40000000) read as empty: path 4 is NP, path 7 hashes a

@@ -19,7 +19,7 @@ UAE      := $(SRC)/uae
 # Z3660_LEAN_EXPECTED tells the harness which variant it is SUPPOSED to be, so a
 # stale/mixed build is a test failure rather than a quietly relabelled pass.
 #
-# Z3660_PROF=1 (CYBERSTORM C1) is the third variant and mirrors `make profile`: the
+# Z3660_PROF=1 (the interpreter profiler) is the third variant and mirrors `make profile`: the
 # LEAN flags PLUS -DZ3660_EMU_PROF=1. The profiling firmware is built on top of lean
 # on purpose -- a profile of the default loop would describe a binary nobody runs --
 # so the harness variant does the same rather than inventing a fourth combination.
@@ -43,7 +43,7 @@ INCLUDES := -Istubs -I$(UAE)/include -I$(UAE)/include/uae -I$(UAE)/jit -I$(SRC) 
 # -O0 -g for fast iteration + gdb. -fno-strict-aliasing matches WinUAE assumptions.
 # SDL_strcasecmp macro (sysconfig.h) -> libc strcasecmp. Exceptions ON (TRY/CATCH).
 # -MMD -MP: track HEADER dependencies. Not a nicety -- without them, editing a header
-# left every object stale and the link succeeded anyway, which during CYBERSTORM C1 made a
+# left every object stale and the link succeeded anyway, which during the profiler work made a
 # deliberately-broken probe macro pass its own mutation test. A build system that cannot
 # fail is not evidence. (-D flags are STILL untracked, which is why the variants keep
 # separate build directories; the two mechanisms cover different halves of the hazard.)
@@ -95,7 +95,7 @@ BIN := $(BUILD)/mmu_harness
 # The parent Makefile invokes this one with no goal ($(MAKE) -C Z3660_emu -j 4), so the
 # consequence was that `make bootbin` stopped rebuilding core1 entirely: bootgen happily
 # packed a MONTHS-OLD Z3660_emu.elf into a fresh-looking BOOT.BIN, with a green build log
-# and no warning anywhere. Found during CYBERSTORM C2 by disassembling the shipped lean
+# and no warning anywhere. Found during the interpreter speed-up work by disassembling the shipped lean
 # image and noticing z3660_knobs_sync() did not read a mailbox word that had just been
 # added to it.
 #
@@ -202,7 +202,7 @@ run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(R
 run-lean:
 	@$(MAKE) Z3660_LEAN=1 run
 
-# The profiling firmware's core1 (CYBERSTORM C1). Runs the whole MMU suite through the
+# The profiling firmware's core1 (the interpreter profiler). Runs the whole MMU suite through the
 # instrumented accessors -- which is the point: the probes sit inside the read/write/fetch
 # path, so "the emulator still computes the same answers with the profiler compiled in" is
 # a claim that has to be tested, not assumed. Adds the profiler's own suite on top.

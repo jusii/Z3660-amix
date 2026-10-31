@@ -1,5 +1,5 @@
 /*
- * zz_tripwire.h -- fork-only diagnostic for the register-capture phantoms (S3-46, 2026-10-26).
+ * zz_tripwire.h -- fork-only diagnostic for the register-capture phantoms (2026-10-26).
  *
  * Build flag ZZ_TRIPWIRE (default 0): with it off both macros are empty and the image is the release build. With it
  * on, every REG1 event's raw word is kept (ZZT_EVENT) and every write the 68k cannot have meant -- an unknown or

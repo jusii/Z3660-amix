@@ -1,4 +1,4 @@
-# The instruction-fetch fast path — CYBERSTORM C2 rung 3
+# The instruction-fetch fast path — Interpreter speed-up rung 3
 
 > ## STATUS — BUILT, MEASURED, **REVERTED** (2026-08-23)
 >
@@ -483,7 +483,7 @@ tables — predicts a further rise. At the same pinned price 57: rung 2's 2 KB o
 **70.26**, rung 3's 3 KB read **70.53**, **+0.39 %**. A mechanism that allegedly charged
 15.5 % for the first 2 KB charged nothing for the third. **Candidate (b) is DEMOTED.** F6
 stays open with neither candidate confirmed — and the cross-session pinned price is itself not
-like-for-like, which is the other correction this session sent to `profiler.md`.
+like-for-like, which is the other correction made to `profiler.md`.
 
 ### One instrument warning this rung paid for
 

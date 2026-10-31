@@ -1,4 +1,4 @@
-# The HANDLER discriminator — CYBERSTORM C2 §30.3, on one handler family
+# The HANDLER discriminator — C2-ATTACK-MAP §30.3, on one handler family
 
 > ## STATUS — PRE-REGISTERED. Not built when this section was written, not measured.
 >

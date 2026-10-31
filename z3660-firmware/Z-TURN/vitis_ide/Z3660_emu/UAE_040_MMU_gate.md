@@ -1122,7 +1122,7 @@ Everything the firmware is responsible for behaved correctly at the moment of fa
 
 The failing act is a control transfer into an AmigaOS ROM service whose backing structures
 AMIX has already destroyed. That is a kernel/handover question, and per the standing rule it
-belongs to the port lane rather than to this repo.
+belongs to the 040/060 port rather than to this repo.
 
 **The single fact that finishes it** is the *source* of that transfer — which kernel pointer
 still held an AmigaOS-era value ~296 stack-bytes after the TC write. That is a runtime fact
@@ -1158,7 +1158,7 @@ That single line names the caller and closes the attribution question in one 3-m
 **Self-contained.** Everything needed to pick this up is in this section; nothing else in
 this document is required reading. Written for `amix-040-060-port`.
 
-**Bottom line: the ROM/ExecBase chain everyone (including me) chased is the DOUBLE PANIC —
+**Bottom line: the ROM/ExecBase chain that was chased is the DOUBLE PANIC —
 the kernel's own panic path failing on the way out. The primary bug is whatever makes
 `page_free` panic, and it is not visible to any emulator-side exception trace because it is
 a software panic, not a CPU exception.** The kernel said so on the screen all along:
@@ -1263,7 +1263,7 @@ init reach a `page_free` panic?* The standing candidate is the memory geometry �
 
 ### 9.3 What the firmware has been cleared of
 
-Stated so the port lane does not re-litigate it. At the moment of failure, on image
+Stated so the 040/060 port does not re-litigate it. At the moment of failure, on image
 `8C51370A`, all of the following were verified correct, several of them fixed during this
 investigation and each covered by a host-harness guard:
 
@@ -1300,7 +1300,7 @@ printer supplies both.
 firmware presents was shaped for the **68030** kernel: exactly one <=16 MB Fast-RAM window at
 `$08000000`, plus a vestigial `a3000mem` window at `$07000000`. The 040 kernel's
 `MAINSTORE`/`VSIZOFMEM` expectations may differ, and a page-allocator panic during VM init is
-consistent with a geometry the kernel did not expect. The port lane can check this without
+consistent with a geometry the kernel did not expect. The 040/060 port can check this without
 the card: compare the 040 kernel's memory probe and `MAINSTORE`/`VSIZOFMEM` derivation against
 what the bench (Amiberry) presents versus the contract in §8.
 
@@ -1309,14 +1309,14 @@ what the bench (Amiberry) presents versus the contract in §8.
 > map). It is deliberately not done, because that single window is the most load-bearing
 > thing the metal-proven 030 boot depends on — the 030 kernel panics `vatosde()` if it sees a
 > region outside SCN1, and two adjacent banks coalescing is equally fatal. It must not move
-> without an explicit decision and a 030 regression plan. If the port lane's analysis shows
+> without an explicit decision and a 030 regression plan. If the 040/060 port's analysis shows
 > the 040 kernel needs a different geometry, say what it needs and it can be built and
 > A/B'd against the 030 golden.
 
 ### 9.6 Candidate C (memory geometry): EXONERATED, with a latent landmine found
 
 Checked statically, three ways. **C is not the cause** — but the pass turned up a real
-hazard that the port lane should fix anyway, and it narrowed `page_free` to three named
+hazard that the 040/060 port should fix anyway, and it narrowed `page_free` to three named
 assertions.
 
 #### The three memory maps
@@ -1400,7 +1400,7 @@ page database for `[0, 0x08000000)` — which **excludes every byte of the card'
 `0x08000000`+**, and would make exactly the `pages`/`epages` assertion below fail on the
 first free. It is not what is happening today (the fixpoint succeeds, so the fallback is
 skipped), but it is a live trap: **any boot where `bootinfo.memory[]` arrives empty or
-unusable on this card fails in precisely the observed way.** Worth fixing in the port lane
+unusable on this card fails in precisely the observed way.** Worth fixing in the 040/060 port
 independently — the mask and the `0x08000000` terminus both need to come from the memlist
 rather than from a 1991 assumption.
 
@@ -1421,7 +1421,7 @@ the three fired is not determinable from the panic text**, and that is the remai
 
 ### 9.7 What candidate B needs that statics cannot supply
 
-With C exonerated, the case rests entirely on the port lane, and the missing facts are all
+With C exonerated, the case rests entirely on the 040/060 port, and the missing facts are all
 runtime:
 
 1. **Which assertion fired** — line 622, 623 or 624 (`assfail` prints file and line, so the
@@ -1438,7 +1438,7 @@ to get it.
 
 **No firmware change is proposed.** The contract variant floated in §9.4C is withdrawn as a
 fix for this panic — the geometry is correct on both sides — and should not be built. If the
-port lane later wants the card's RAM at `0x07000000` to match the bench bit-for-bit (which
+040/060 port later wants the card's RAM at `0x07000000` to match the bench bit-for-bit (which
 would also sidestep the landmine above), that is a separate, deliberate decision with a 030
 regression plan, not a fix for `page_free`.
 
@@ -1459,7 +1459,7 @@ Kept because the wrong turns are informative:
 
 ### 9.8 RESOLVED: `page_free` was ISSUE-48 (unzeroed page database) — kernel-side, confirmed
 
-**The §9 case is closed and the diagnosis held.** The port lane's fix build confirmed
+**The §9 case is closed and the diagnosis held.** The 040/060 port's fix build confirmed
 **ISSUE-48 — the page database was unzeroed DRAM** — on metal, with live counters:
 `calls=1 npages=3688 dirty=3620 **held=150**`. The `page_free` panic is **gone**
 (`syncg calls=0`), and the kernel now runs for **minutes** rather than seconds.
@@ -1679,7 +1679,7 @@ suspected trigger to reproduce.
 
 ### 10.6 ISSUE-49: bitfield ops on the 040 MMU path used the 68030 accessors
 
-The port lane's five instrumented boots plus a flag histogram over the kernel's page array
+The 040/060 port's five instrumented boots plus a flag histogram over the kernel's page array
 isolated it to a single instruction: **`bfins %d0,%a2@{2:1}` with `d0 = 0` against a
 table-walked kernel VA does not write**, while `andi.b`/`ori.b`/`move.w` to the same byte
 nine instructions later land correctly — 149 of 149 allocated page structs read
@@ -1727,7 +1727,7 @@ path's *translation*, not its decode. Harness 167 → **182**.
 fix the `bfins` clear lands, so `byte0` goes `0x20 → 0x00` and the following `ori.b #2` gives
 **`0x02`, not `0x22`** — the harness asserts exactly that transition. No stale `p_free` bit
 means `segmap_unlock` has nothing to trip on, so the boot should proceed past the 22 s wall.
-**The port lane's kernel needs no change; ISSUE-49 becomes a symptom record.** The caveat is
+**The 040/060 port's kernel needs no change; ISSUE-49 becomes a symptom record.** The caveat is
 the honest one: this closes *this* mechanism, and whether the boot then runs depends on
 nothing else lurking further in.
 

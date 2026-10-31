@@ -57,7 +57,7 @@ same binary as every prior WARP row.
 | **A0 armed** | `7A5EC595` | 5 | **7 563** | **0.92401× = −7.599 %** |
 | A0 disarmed again, same boot | `7A5EC595` | 3 | 7 897 | 0.96482× — the switch is repeatable in-boot |
 
-`R` = 8 185 exactly, so this session's kill threshold `R × (1 + s)` with `s` = 0.70 % is **8 242**
+`R` = 8 185 exactly, so the kill threshold `R × (1 + s)` with `s` = 0.70 % is **8 242**
 — numerically identical to §0.5.2's user-agreed absolute floor. Both are quoted; neither was
 approached from above.
 
@@ -810,7 +810,7 @@ n = 7, spread 0.42 %); §0.5.2's absolute floor **8 242**; the disarmed blessing
 
 *Five options. One row each. No recommendation — that is carried outside this document.*
 
-**Ruled 2026-08-24: PARK + TAX FIX** (user decision; carried in `WARP-ENGINE.md` §0.19, the
+**Decided 2026-08-24: PARK + TAX FIX** (carried in `WARP-ENGINE.md` §0.19, the
 fix built in round 6). The table below is kept as priced, for the day the fork reopens.
 
 | option | dhry band vs `R` = 8 185 | cost | risk grade | what it forecloses |

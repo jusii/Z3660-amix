@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zosswitch.py -- METAL-3: live CPU-frequency switches under a running AmigaOS on the real 060 (ZT_SCAN firmware).
+"""zosswitch.py -- live CPU-frequency switches under a running AmigaOS on the real 060 (ZT_SCAN firmware).
 
 Each switch is TROW <mhz> then TAPPLY GRANT: the ARM takes the bus from the running 060, re-locks the clock wizard at
 the other row's table values and gives the bus back (~1 ms). After it: TSTAT (the wizard registers and the row),

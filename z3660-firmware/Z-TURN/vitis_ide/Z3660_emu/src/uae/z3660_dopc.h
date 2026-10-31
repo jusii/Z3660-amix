@@ -1,4 +1,4 @@
-/* CYBERSTORM C2 rung 1 -- the decoded-op cache: the geometry, the switch rule, and the
+/* Interpreter speed-up rung 1 -- the decoded-op cache: the geometry, the switch rule, and the
  * one window the instruction-word accessor is allowed to answer from.
  *
  * WHAT THE CACHE IS. The C2 map measured the interpreter's instruction fetch at

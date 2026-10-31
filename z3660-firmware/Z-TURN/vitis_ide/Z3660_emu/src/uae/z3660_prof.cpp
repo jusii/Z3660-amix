@@ -1,4 +1,4 @@
-/* CYBERSTORM C1 -- the interpreter profiler engine.
+/* The interpreter profiler engine.
  *
  * The contract, the wire format and the hot-path probes live in z3660_prof.h; this file
  * is the machinery behind them: PMU bring-up, ARM-clock calibration, the sample ring, the
@@ -82,7 +82,7 @@ typedef char z3660_prof_bucket_names_complete[
 typedef char z3660_prof_counter_names_complete[
    (sizeof(z3660_prof_counter_names)/sizeof(z3660_prof_counter_names[0]) == Z3660_PROF_C_COUNT) ? 1 : -1];
 
-/* CYBERSTORM C2 rung 1b. The invalidation attribution block is indexed BY CAUSE --
+/* Interpreter speed-up rung 1b. The invalidation attribution block is indexed BY CAUSE --
  * z3660_dopc_count_cause() computes Z3660_PROF_C_DOPC_IV_BASE + cause -- so the two
  * enumerations have to stay the same length and the same order. Nothing would fail
  * otherwise: a new cause would simply increment whatever counter happens to sit at the
@@ -827,7 +827,7 @@ extern "C" void z3660_prof_dump_stats(void)
                    z3660_prof_u64(tail), ip, fp);
    }
 
-   /* CYBERSTORM C2 rung 1d -- the LOOP split, rolled back up and PRICED.
+   /* Interpreter speed-up rung 1d -- the LOOP split, rolled back up and PRICED.
     *
     * Three lines, and each answers a question the `b` rows on their own cannot:
     *
@@ -938,7 +938,7 @@ extern "C" void z3660_prof_dump_stats(void)
                       "The calibration or the transition count is wrong; do not subtract.\r\n");
    }
 
-   /* CYBERSTORM C2 rung 1b -- the per-bucket subtraction the line above has always asked
+   /* Interpreter speed-up rung 1b -- the per-bucket subtraction the line above has always asked
     * the reader to do and never gave them the numbers for. `s` lines carry each bucket's
     * OWN span count, so its corrected cycles are acc - spans x price exactly, and a
     * bucket's corrected share stops being an interval. The 2026-08-23 verdict had to
@@ -1059,7 +1059,7 @@ extern "C" void z3660_prof_dump_stats(void)
                    ip, fp, z3660_prof_u64(in));
    }
 
-   /* CYBERSTORM C2 rung 1b -- the decoded-op cache's own derived rows, computed here for
+   /* Interpreter speed-up rung 1b -- the decoded-op cache's own derived rows, computed here for
     * the same reason as the ones above: the 2026-08-23 verdict had to work all of these
     * out by hand from a dump, and one of them it got structurally wrong because the doc
     * named the wrong test. The right quantity is MISSES PER INVALIDATION against the

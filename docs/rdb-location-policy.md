@@ -23,7 +23,7 @@ score this page against itself.
    is a property of the disk. §4.
 
 4. **No AmigaOS disk changes behaviour.** Measured, not argued: both policies replayed against
-   all 41 disk images in the workspace. 26 rows differ and **every one of them is an AMIX
+   all 41 disk images on hand. 26 rows differ and **every one of them is an AMIX
    root**; the other 15 — nine AmigaOS RDB disks, two hybrids, three blanks and an ADF — are
    identical. §5.
 
@@ -83,7 +83,7 @@ So the gate's intent has to survive. It just cannot be keyed on a flag that also
 
 ## 3. The census
 
-Every disk image in the workspace, first 16 sectors (`11-sector-census.txt`, produced by
+Every disk image on hand, first 16 sectors (`11-sector-census.txt`, produced by
 `rdbscan.py`):
 
 | class | n | sector 0 | RDSK at | stock finds |

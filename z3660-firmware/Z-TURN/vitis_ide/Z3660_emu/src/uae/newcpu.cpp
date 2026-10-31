@@ -34,7 +34,7 @@
 #include "../main.h"
 #include "cpummu.h"
 #include "cpummu030.h"
-#include "z3660_prof.h"   // CYBERSTORM C1: profiling variant -- sampler + interpreter stage buckets
+#include "z3660_prof.h"   // Profiler: profiling variant -- sampler + interpreter stage buckets
 #include "cputbl.h"
 #include "cpu_prefetch.h"
 #include "uae/uaestring.h"
@@ -1114,7 +1114,7 @@ void build_cpufunctbl (void)
    }
    write_log(_T("\n"));
 
-   /* CYBERSTORM C2 rung 1. Every decoded-op cache entry holds a RESOLVED cpufunctbl[]
+   /* Interpreter speed-up rung 1. Every decoded-op cache entry holds a RESOLVED cpufunctbl[]
     * pointer, and the loop above has just rebuilt that table -- so a surviving entry
     * would dispatch the previous mode's implementation of its opcode. That is a wrong
     * instruction rather than a stale word, and it is reachable from any mode change. */
@@ -3498,7 +3498,7 @@ void doint(void)
       set_special (SPCFLAG_DOINT);
 }
 
-/* CYBERSTORM C3: run-loop knob resync (defined with the perf block further down).
+/* Overhead switches: run-loop knob resync (defined with the perf block further down).
  * Called from do_specialties() only -- i.e. only when regs.spcflags != 0 -- so it is
  * free on the per-instruction path. See the comment on z3660_knobs_poll(). */
 static void z3660_knobs_poll(void);
@@ -3507,7 +3507,7 @@ static int do_specialties (int cycles)
 {
    z3660_knobs_poll();   /* SERV / PERFS / PROBES reach the run loops from here */
 #if Z3660_EMU_PROF
-   /* CYBERSTORM C1: and so do the profiler commands, for exactly the same reason -- this
+   /* Profiler: and so do the profiler commands, for exactly the same reason -- this
     * function runs only when regs.spcflags != 0, so a serial PROFDUMP costs nothing per
     * emulated instruction and still arrives within an interrupt period. */
    z3660_prof_poll_cmd();
@@ -4583,7 +4583,7 @@ static void amix_dump_wild(uae_u32 wildpc)
 #include "xtime_l.h"   // ARM global timer (XTime / COUNTS_PER_SECOND); same header a3000_scsi.cpp uses
 #include "runloop_build.h"   // Z3660_EMU_PROBES / Z3660_EMU_PERF: which instruments this binary carries
 
-/* CYBERSTORM C1: the per-instruction sample tick, spelled once so the two run loops
+/* Profiler: the per-instruction sample tick, spelled once so the two run loops
  * cannot drift in what they record.
  *
  * Placed at the TAIL and not before the fetch, deliberately. At the tail the instruction
@@ -4594,7 +4594,7 @@ static void amix_dump_wild(uae_u32 wildpc)
  *
  * Expands to NOTHING outside the profiling build: no tick, and so no predicate either,
  * which is the same rule runloop_build.h established for the other two instruments. */
-/* CYBERSTORM C2-prep: the tail is now SUB-BUCKETED, and these three macros are where.
+/* Profiler groundwork: the tail is now SUB-BUCKETED, and these three macros are where.
  *
  * The C2 map measured the run-loop tail at 20.01 % of guest time and 110.8 ARM cycles
  * per instruction -- for what ought to be a PC advance and a cheap event test -- and had
@@ -4684,7 +4684,7 @@ static int     z3660_serv_ctr_040    = 0;
 static uae_u64 z3660_perf_count      = 0; // instructions retired in m68k_run_mmu030 (benchmark accumulator)
 #endif
 
-/* ===== CYBERSTORM C3: run-loop overhead knobs =========================================
+/* ===== run-loop overhead knobs =========================================
  *
  * WHY. C0STAT on the 040 AMIX metal runs reports ~64% of the CORE0 cooperative loop
  * going to things that are not the mailbox service, and core1 hard-spins inside every
@@ -4732,7 +4732,7 @@ static int z3660_perf_on   = 1;   // mirrors shared->perf_stats (1 = historical 
 static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical behaviour)
 #endif
 
-/* CYBERSTORM C2 rung 0: iterations of a recognised block idiom per run-loop pass.
+/* Interpreter speed-up rung 0: iterations of a recognised block idiom per run-loop pass.
  * 0 == the recognizer never fires (pure passthrough). Compiled into EVERY variant, unlike
  * the two instruments above: this is an optimisation, not a diagnostic, and the lean
  * production image is the one that most wants it. The knob exists so a metal session can
@@ -4741,7 +4741,7 @@ static int z3660_probes_on = 1;   // mirrors shared->emu_probes (1 = historical 
 #include "z3660_blk.h"
 static unsigned z3660_blk_chunk = Z3660_BLK_DEFAULT;
 
-/* CYBERSTORM C2 rung 1: the decoded-op cache. Same shape of switch as rung 0 and for the
+/* Interpreter speed-up rung 1: the decoded-op cache. Same shape of switch as rung 0 and for the
  * same reasons -- compiled into EVERY variant because it is an optimisation and not a
  * diagnostic, and switchable at runtime so a metal session can A/B it on a live guest
  * without reflashing, and so the host harness has an off state to compare against.
@@ -4838,7 +4838,7 @@ extern "C" void z3660_knobs_sync(void)
       if (d != z3660_dopc_on) { z3660_dopc_on = d; z3660_dopc_invalidate(Z3660_DOPC_INV_KNOB); }
    }
    {                                                                                   // DFAST
-      /* CYBERSTORM C2 rung 2. Only on a CHANGE, because arming rebuilds two 1 KB tables
+      /* Interpreter speed-up rung 2. Only on a CHANGE, because arming rebuilds two 1 KB tables
        * and this runs at every resync point. Unlike DOPC there is nothing to invalidate:
        * the fast path holds no state of its own -- disarming just makes every verdict
        * SLOW, and the original accessor is what runs. */
@@ -5063,7 +5063,7 @@ static void z3660_perf_tick(void)         // called ~every 1M instructions from 
    } while(0)
 
 /* ====================================================================================
- * CYBERSTORM C2 RUNG 0 -- THE BLOCK-IDIOM FAST PATH
+ * INTERPRETER SPEED-UP RUNG 0 -- THE BLOCK-IDIOM FAST PATH
  *
  * WHAT THE MEASUREMENT SAID. The C2 map (amix-040-060-port/docs/C2-ATTACK-MAP.md §9.7)
  * put a family of tight kernel block loops at 33.63 % of an AMIX boot, 25.11 % of a raw
@@ -5545,7 +5545,7 @@ static __attribute__((always_inline)) inline int z3660_blk_run(uae_u16 op, int *
    }
 }
 
-/* CYBERSTORM C2 rung 1d: the recognizer's own bucket, spelled as a wrapper rather than as
+/* Interpreter speed-up rung 1d: the recognizer's own bucket, spelled as a wrapper rather than as
  * an ENTER/EXIT pair around the call site, because the call site is the right operand of
  * an `&&`. Restructuring that into an `if` to make room for two statements would change
  * the LEAN source -- and the whole macro idiom in z3660_prof.h exists so the non-profiling
@@ -5573,7 +5573,7 @@ static __inline__ int z3660_prof_blk_run(uae_u16 op, int *cycp, int *shapep)
 #endif
 
 /* ====================================================================================
- * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
+ * INTERPRETER SPEED-UP RUNG 1 -- THE DECODED-OP CACHE
  *
  * WHAT IT REPLACES. Every pass of the run loop currently pays, before it has executed
  * anything: an indirect call through `x_prefetch`, a TTR predicate, a one-entry
@@ -6080,7 +6080,7 @@ insretry:
             // wip-030-mmu-buserror: about to fetch from a wild USER pc (user mode + PC below the AMIX
             // user base 0x80000000 = jumped into the kernel/low region). Dump the corruptor once,
             // BEFORE the fetch faults, so the retired-insn ring still holds the instruction that did it.
-            // CYBERSTORM C3: one gate for the whole detector pair, including the volatile
+            // Overhead switches: one gate for the whole detector pair, including the volatile
             // amix_wild_rte_pending clear (a store on every instruction). With PROBES off the
             // flag simply stays set until the next re-arm; it drives nothing else.
             if (z3660_probes_on) {
@@ -6150,7 +6150,7 @@ insretry:
             // wip-030-mmu-buserror: record this just-retired instruction (start pc, opcode, and the
             // PC it left behind = branch target for control transfers) so the wild-PC detector above
             // can show what corrupted the user PC. AMIX-gated; mmu030_opcode still holds the opcode here.
-            // CYBERSTORM C3: this is the 030 loop's heaviest per-instruction probe -- five stores
+            // Overhead switches: this is the 030 loop's heaviest per-instruction probe -- five stores
             // and a getpc() on EVERY instruction of an AMIX-030 boot -- so it gets the probe gate.
 #if Z3660_EMU_PROBES
             if (z3660_probes_on && amix_mmu_on) {
@@ -6542,7 +6542,7 @@ uae_u8 *restore_cpu (uae_u8 *src)
       regs.tcr = restore_u32 ();
       regs.urp = restore_u32 ();
       regs.srp = restore_u32 ();
-      /* CYBERSTORM C2 rung 2 found this hole rather than made it: every OTHER writer of
+      /* Interpreter speed-up rung 2 found this hole rather than made it: every OTHER writer of
        * the four TT registers calls mmu_tt_modified() to recompute mmu_ttr_enabled /
        * _ins / _data from them, and this one never did -- so a restore left the three
        * flags describing the PREVIOUS machine's TTRs. That is a pre-existing defect of

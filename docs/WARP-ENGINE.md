@@ -4,7 +4,7 @@
 card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 185 dhrystones
 (2.14×) and closed with one row left on the board. This is the plan for that row.*
 
-> ## **STATUS: `M1 CLOSED — PARKED AT GENERATION-ONE SCOPE`, by user decision 2026-08-24.**
+> ## **STATUS: `M1 CLOSED — PARKED AT GENERATION-ONE SCOPE`, 2026-08-24.**
 >
 > Six rounds, five metal sessions, **zero correctness failures**, and **no verdict in either
 > direction** — the kill line's 60 % coverage precondition was never met, so §0.2's kill line
@@ -19,7 +19,7 @@ card sits in. The interpreter campaign took the emulated 68040 from 3 818 to 8 1
 > the card's standing image is unchanged.** §0.19 is the park: what it preserves, and what
 > reopening would require — **an `E`-round before any new families**.
 
-**Status:** `M0 DONE`, **`M1 round 1 DONE`** — the grill ran on **2026-08-23** and every question
+**Status:** `M0 DONE`, **`M1 round 1 DONE`** — the design review ran on **2026-08-23** and every question
 in §7 is answered; the metal half ran the same day and **Q2 came back `TERMINATED`** (§0.4.1) with
 the §1.5 base re-taken at **48.68 – 49.91 %** (§0.4.2); **§0.5 is the committed M1
 pre-registration**, the last of M0's seven items. **M1's first round shipped on 2026-08-24**: the
@@ -37,7 +37,7 @@ correction marked.
 **`docs/warp-gen2-prospectus.md`** prices the M1 fork — park generation one, or fund a generation
 two — as scenarios against the R5 metal rows, now scored in full at **§0.16**. It is a paper
 instrument, it carries no recommendation, and it scores nothing here: no number in this document
-is moved by it. **The fork itself was with the user, and it was ruled on 2026-08-24: `PARK + TAX
+is moved by it. **The fork itself was decided on 2026-08-24: `PARK + TAX
 FIX`** — the prospectus's §8 row 2. Round 6 landed the fix and §0.19 is the park. The prospectus
 still decides nothing and still scores nothing; it priced the options and the choice was made
 outside it, which is what its §9 says must happen.
@@ -76,14 +76,14 @@ Everything in this plan traces to these. Where a claim traces to none of them, i
 | `docs/warp-objdiff.py` | the function-granularity object diff §0.7's disarmed-equivalence number is read from |
 | `docs/core0-loop-blocking-audit.md`, `docs/piscsi-service-path.md` | core0's cooperative loop, its blocking paths, and the latency budget |
 | `CHANGES.md` + `0a4c064`, `e37bb43`, `8be8949` | the AMP coherence history and the JIT's own I-cache lesson |
-| the 68040 port lane's `docs/C2-ATTACK-MAP.md` §§30–47 | the pricing law, the ladder, and **row J** |
+| the 040/060 port's `docs/C2-ATTACK-MAP.md` §§30–47 | the pricing law, the ladder, and **row J** |
 | `Z3660_emu/src/uae/` (`newcpu.cpp`, `cpummu.cpp`, `z3660_dopc.h`, `z3660_dfast.h`, `jit/`) | what exists today |
 
 ---
 
 # 0. Grill decisions — design freeze (2026-08-23)
 
-The grill ran on **2026-08-23** against §7's thirteen questions. All thirteen are answered.
+The design review ran on **2026-08-23** against §7's thirteen questions. All thirteen are answered.
 Each §7 entry now carries a `RESOLVED` line pointing here, with its original recommendation
 and cheapest-experiment text left **byte-untouched** beside it — a recommendation rewritten
 to match its own outcome is not a recommendation, and §3.4 makes that a rule rather than a
@@ -109,7 +109,7 @@ only where a family survives the bail contract** — never wholesale.
 > allocator gets redesigned toward Route B's shape **only if the numbers say that is the
 > ceiling** — not because a redesign looks tidier from the outside.
 
-The census that motivated the choice is §0.3(a). The grill recorded its finding as *"the memory
+The census that motivated the choice is §0.3(a). The design review recorded its finding as *"the memory
 model is confined to the `jnf_MEM_*` layer, all emitting via `R_MEMSTART`"*, and that
 confinement is what makes "replace the layer" a route rather than a wish — inheriting a
 per-opcode compiler means inheriting whatever memory model it emits, and the whole bet is that
@@ -181,7 +181,7 @@ PCs.** Revisit at M4 with its own gate, and read the campaign's rule out loud fi
 
 A deliberate inversion of the house rule, and the reason is recorded: the house rule exists so a
 zeroed `SHARED` struct from an older core0 still runs *shipped behaviour*, and an unshipped
-engine's shipped behaviour is "off". **Flip to unset = ON only at M5, on the user's word.**
+engine's shipped behaviour is "off". **Flip to unset = ON only at M5, by an explicit decision.**
 **Arm attestation rides every capture** — arm state is read from a counter, never from a banner.
 
 ### Q10 — the cadence contract: **blocks feed the counter with retired guest instructions** `FROZEN`
@@ -206,7 +206,7 @@ not expire at M5.
 
 ### Schedule
 
-**M0 now, and WARP runs solo** — no parallel projects until the user says otherwise.
+**M0 now, and WARP runs solo** — no parallel projects alongside it.
 
 ## 0.2 The kill line — agreed, binding, and written before any code
 
@@ -271,7 +271,7 @@ with **3 054** compiler bodies defined in `compemu_arm.cpp` (1 527 × 2). **(mea
 
 > **Q1's own cheapest experiment, answered: "nearly all of them" is 79.44 %.** The plan said
 > that if it were nearly all of them, *"Route A is a rewrite wearing a retrofit's clothes and
-> the grill should say so out loud"*. It is, and the grill did. **Four fifths of the existing
+> the design review should say so out loud"*. It is, and the review did. **Four fifths of the existing
 > per-opcode compilers cannot be inherited without the new memory model underneath them.**
 
 **By mnemonic family** — 69 families across the 1 527 compilers, split three ways:
@@ -486,7 +486,7 @@ this census puts a number on rather than leaving to discovery. **(measured)**
 | 3. the family census (Q7), zero build | `DONE` | §0.3(a), read against the dhrystone window per Q11 |
 | 4. the block-length census, zero build | `DONE` | §0.3(a) — faultable-site density; block length is predicted, not read out, in §2a |
 | 5. the §1.5 base re-take (optional) | `DONE` | **base = 48.68 – 49.91 % on one capture**; the stitched ~50 % survives — §0.4.2 |
-| 6. the state-discipline census | `DONE` | §0.3(b) — added at the grill as Q1's contract input |
+| 6. the state-discipline census | `DONE` | §0.3(b) — added at the design review as Q1's contract input |
 | 7. the M1 pre-registration commit | `DONE` | §0.5 — scope, kill line, band, cost measurement, gates, counters, sessions. **Committed before any engine code exists.** |
 
 > ### M0 is `DONE`. All seven items are closed; M1 opens.
@@ -613,7 +613,7 @@ It has now earned it.**
 
 **Free in the same capture, and carried into M1's cost side:** `TAILADV` reads **10.22 % at price
 40 and 5.58 % at price 51** — it nearly halves inside one capture. That is §1.4's price artefact
-reproducing on this session's own window. It is excluded from the base on purpose and it stays
+reproducing in the measurement's own window. It is excluded from the base on purpose and it stays
 excluded.
 
 **The rows that ride beside every verdict, per Q11**, from the same boot:
@@ -805,7 +805,7 @@ comparison this campaign has repeatedly found untrustworthy:
    KILL if   engine-on median  <=  R x (1 + s)
 ```
 
-With this session's numbers (`R` = 8 151, measured spread 0.43 %, so `s` = 0.70 %) that threshold
+With these numbers (`R` = 8 151, measured spread 0.43 %, so `s` = 0.70 %) that threshold
 is **8 208**. The user-agreed absolute floor **8 242** is quoted beside every M1 row and is never
 removed — **both are stated; the same-session row governs.** A row that clears one and not the
 other is reported as exactly that, and the session that produces it is repeated before anything is
@@ -1552,7 +1552,7 @@ Every number below is from the metal cost session of 2026-08-24 (evidence
 > verdict, none of them is admissible against §0.2, and the M1 kill line fires for the first
 > time only at the verdict session that takes its rows. **`kill-R` is the CLEAN INTERPRETER
 > LINEAGE row** — the engine-off cross-build reference on the then-current interpreter lean,
-> not a WARP image disarmed — per the ruling of 2026-08-24. A disarmed WARP image already
+> not a WARP image disarmed — per the decision of 2026-08-24. A disarmed WARP image already
 > carries the switch's own shipped cost and using it as `R` would grade the engine against a
 > baseline it had already slowed down.
 
@@ -1962,7 +1962,7 @@ same arithmetic, at the same measured IPC 0.46 (2.17 cycles per ARM instruction)
 **The reading rules are §0.6.5's, unchanged.** This is a cost and a static count, not a
 verdict; **round 2 takes no metal row at all**, so the M1 kill line cannot fire on it, and
 `kill-R` remains the CLEAN INTERPRETER LINEAGE row rather than a disarmed WARP image (the
-ruling of 2026-08-24). What the re-derivation says is that **the entry cost is still the
+decision of 2026-08-24). What the re-derivation says is that **the entry cost is still the
 dominant term and the amortisation is not yet paying for it** — at L = 8 the same arithmetic
 gives 1.14×, so the lever with the most left in it is block length, which generation one's
 own exclusions (`MOVEQ`, `(An)+`/`-(An)`, `BSR`, every memory-destination ALU shape) are what
@@ -2055,7 +2055,7 @@ wrong is marked `MISSED` beside the measurement with the prediction left **byte-
 
 **Round 3 takes no metal row either.** Every number below is a static count, a host-harness
 count, an arithmetic derivation, or a protocol for a session that has not happened. The kill
-line cannot fire on it and `kill-R` remains the clean interpreter lineage row (the ruling of
+line cannot fire on it and `kill-R` remains the clean interpreter lineage row (the decision of
 2026-08-24).
 
 ### 0.10.1 THE ROOT CAUSE — the publish sequence does not cover the block it publishes
@@ -2155,7 +2155,7 @@ and §0.9.5 restated it. The gap is one line of the harness:
    ```
 
 **So the harness proves the words and never the PUBLICATION of the words.** Stated as the
-four questions the round-2 dispatch asked, answered honestly:
+four questions round 2 asked, answered honestly:
 
 | question | round-2 answer |
 |---|---|
@@ -3089,7 +3089,7 @@ unit. `make lean` recompiled `z3660_warp.cpp` **alone**, and the resulting image
 a run loop reading the OLD gate — provably, because the literal in `m68k_run_mmu040`'s constant
 pool still pointed at `z3660_warp_gate` rather than into `regs`.
 
-**The cause: `-MMD -MP` has been in `CFLAGS` since CYBERSTORM C1 and the `.d` files have been
+**The cause: `-MMD -MP` has been in `CFLAGS` since the profiler work and the `.d` files have been
 written correctly ever since — and nothing ever `-include`d them.** The dependency data was
 generated and thrown away. `newcpu.d` lists `include/newcpu.h` four times; make never read the
 file. The comment above `CFLAGS` claims the hazard was fixed; only half of it was.
@@ -4088,7 +4088,7 @@ commit precedes the implementation commits, provably, by commit timestamp in thi
 and a pre-registration that gets rewritten is not one, so every number below is left
 byte-untouched and scored beside itself.
 
-**Round 6 is NOT routed by §0.5.2's decision table.** It is routed by the user's ruling on the
+**Round 6 is NOT routed by §0.5.2's decision table.** It is routed by the decision on the
 M1 fork, taken on **2026-08-24** against `docs/warp-gen2-prospectus.md` §8's five options:
 **PARK + TAX FIX**. Generation one freezes at its measured scope and the prospectus's §6 is
 landed, so that an engine which ships dormant also ships **free**. **No family is added, no
@@ -4375,7 +4375,7 @@ measured 8 140.** Three real instruction differences survive the fix:
    `L-HOOK`'s 1.967 pp, which this round **removed without explaining**.
 
 
-## 0.19 M1 CLOSED — **PARKED AT GENERATION-ONE SCOPE**, by user decision 2026-08-24
+## 0.19 M1 CLOSED — **PARKED AT GENERATION-ONE SCOPE**, 2026-08-24
 
 **The kill line never became entitled to fire, and that is the outcome rather than a gap.**
 §0.2 bound this plan to a pre-registered kill condition — *armed throughput at or below
@@ -4521,7 +4521,7 @@ consequence for scope is large and it changes the shape of the project: **the re
 the flag machinery, the block/`blockinfo`/`cache_tags` structures, the code-cache allocator, the
 I-cache maintenance primitives and an ARM FPU compiler are all present, built for this exact
 silicon.** The question is not "write a JIT". It is "which of these do we keep, and what replaces
-the memory model". That fork is **Q1** and it is the first thing the grill has to settle.
+the memory model". That fork is **Q1** and it is the first thing the design review has to settle.
 
 > **Settled 2026-08-23 — §0.1 Q1: Route C.** The plumbing is kept, the `jnf_MEM_*` layer is
 > replaced, and the per-opcode compilers are inherited family by family only where a family
@@ -4550,7 +4550,7 @@ the memory model". That fork is **Q1** and it is the first thing the grill has t
 - **Not cycle-exact.** The engine keeps the existing `do_cycles`/`adjust_cycles` accounting
   faithful enough that the service cadence and the A3000-SCSI pump keep their timebase (§2g),
   and no more.
-- **Not default-on.** Whether a shipped image runs the JIT by default is the user's decision at
+- **Not default-on.** Whether a shipped image runs the JIT by default is decided at
   M5, not this plan's.
 
 ## 1.4 The bound, quoted correctly
@@ -5486,7 +5486,7 @@ set is pre-registered at M0 and grows with each milestone.
 
 ## 3.4 Pre-registration discipline
 
-The port lane's `ACCEPTANCE.md` is the model and the campaign has been running it: platform classes,
+The 040/060 port's `ACCEPTANCE.md` is the model and the campaign has been running it: platform classes,
 identity before numbers, exact per-test pass lines, expectations registered **before** the run, and
 a "what this does not establish" section. Two mechanical rules ride with it:
 
@@ -5526,8 +5526,8 @@ single rule both cores compile — exactly like `BLK`, `DOPC` and `DFAST`. **(me
 that must run the shipped behaviour rather than silently disarming the rung."* The engine is not
 shipped behaviour until M5.
 
-> **Decision: `unset = OFF` until the M5 ship gate, then the user decides whether to flip it.**
-> (**Q9** — this is a deliberate inversion and the grill should challenge it.)
+> **Decision: `unset = OFF` until the M5 ship gate, which decides whether to flip it.**
+> (**Q9** — this is a deliberate inversion and the design review should challenge it.)
 
 **The disarm costs real time, and the verdict number is never the switch.** Measured, three times:
 
@@ -5565,7 +5565,7 @@ that is why its numbers are trustworthy. Session counts are **assumed**.
 
 | # | milestone | what it proves | measurement | **kill criterion** | est. |
 |---|---|---|---|---|---|
-| **M0** | **Design freeze** (post-grill) | the route is chosen, the unwind question is answered, the contracts are written and pre-registered | 1 static audit + 2 zero-build censuses off banked data + **1 target boot** (the unwind probe) + optionally 1 profiling boot (the §1.5 base re-take) | **Q2 says a throw cannot be contained AND bail-before-fault cannot cover the access classes** ⇒ stop here, for the price of one boot | 2–3 |
+| **M0** | **Design freeze** (after the design review) | the route is chosen, the unwind question is answered, the contracts are written and pre-registered | 1 static audit + 2 zero-build censuses off banked data + **1 target boot** (the unwind probe) + optionally 1 profiling boot (the §1.5 base re-take) | **Q2 says a throw cannot be contained AND bail-before-fault cannot cover the access classes** ⇒ stop here, for the price of one boot | 2–3 |
 | **M1** | **Straight-line user-mode blocks** — dhrystone runs jitted | codegen, block cache, chaining, the poll and bail contracts | host corpus green + metal cross-build dhry + coverage counter + per-block lockstep | **cross-build dhry ≤ 8 185 with coverage in band and no named implementation defect** ⇒ the mechanism does not pay on this machine; revert, as rung 3 did the same day | 6–10 |
 | **M2** | **Faults and demand paging survive** — miniroot boot | the bail contract on the path `f` explicitly did not test | miniroot boots to the installer prompt with the engine on; `FAULTS`/`INSNS` identities; full boot-message analysis | **a divergence class that cannot be reduced to a bail rule** ⇒ the fault contract is wrong, back to M0 | 4–8 |
 | **M3** | **Full multiuser boot on metal** | the whole contract in the shipping posture | installed 040 system, piscsi/card-1 root, 128 MiB, cadence 4: multiuser + login + `zen0` 0 % loss + clean `/etc/haltsys`; dhry, boot time and raw-device read all same-boot A/B | **any correctness event at all** | 3–6 |
@@ -5574,11 +5574,11 @@ that is why its numbers are trustworthy. Session counts are **assumed**.
 
 ### M0 — Design freeze `DONE`
 
-**State on 2026-08-23: the grill has run, §0 is the freeze, the metal half has run, and the M1
+**State on 2026-08-23: the design review has run, §0 is the freeze, the metal half has run, and the M1
 pre-registration is committed. All seven items are `DONE`** — the unwind probe answered
 `TERMINATED` on one boot (§0.4.1), the optional §1.5 base re-take was taken and the base survived
 (§0.4.2), the four zero-build censuses are §0.3, and **§0.5 is the pre-registration, committed
-before the first line of engine code.** The per-item ledger is §0.4. One census was added at the grill and is not in the list of five: the state-discipline
+before the first line of engine code.** The per-item ledger is §0.4. One census was added at the design review and is not in the list of five: the state-discipline
 census (§0.3(b)), which is the input to Q1's pre-registered state-sync measurement.
 
 Five cheap things, all before any codegen. Only the first needs the card.
@@ -5588,7 +5588,7 @@ Five cheap things, all before any codegen. Only the first needs the card.
    answer here ends the project for the price of that boot.
 2. **The route audit (Q1), zero build.** Count how many of `compemu_arm.cpp`'s per-opcode compilers
    reach `readmem_real` / `writemem_real` / `get_n_addr_real`. If it is nearly all of them, Route A
-   is a rewrite wearing a retrofit's clothes, and the grill should know that before choosing.
+   is a rewrite wearing a retrofit's clothes, and the design review should know that before choosing.
    *(Corrected at M0: those three are `STATIC_INLINE` and a per-opcode compiler never names them.
    The symbols to count are the ten public accessors they sit behind —
    `readbyte`/`readword`/`readlong`, `writebyte`/`writeword`/`writelong`, the two `_clobber`
@@ -5709,7 +5709,7 @@ never-optimised path.
 > built as a retrofit of this tree's `compemu_*`, it is ours alone. That is a licensing- and
 > collaboration-shaped consequence of a technical choice, and it should be made deliberately.
 
-## 6.2 The 68040 port lane and the silicon collaboration
+## 6.2 The 040/060 port and the silicon collaboration
 
 **The JIT is our emulator's lane only. No guest kernel changes, no ISSUE numbers on the shared
 branch, no acceptance rows on his repo.** The kernels that boot today boot unchanged.
@@ -5749,12 +5749,12 @@ GPL-3.0, full credit to sHaNsHe.
 
 ---
 
-# 7. Open questions for the grill  —  ALL RESOLVED 2026-08-23
+# 7. Open questions for the design review  —  ALL RESOLVED 2026-08-23
 
 Each has a recommendation and the cheapest experiment that would settle it. Nothing below is
 decided.
 
-> **All thirteen were resolved by the grill of 2026-08-23. Each carries a `RESOLVED` line
+> **All thirteen were resolved by the design review of 2026-08-23. Each carries a `RESOLVED` line
 > pointing at the decision in §0.1, and the recommendation and cheapest-experiment text below it
 > is left byte-untouched — including where the outcome differed from the recommendation, and
 > including where a stated fact turned out wrong.** §3.4's rule is that a pre-registration which
@@ -5765,7 +5765,7 @@ decided.
 
 > **RESOLVED 2026-08-23 → §0.1 Q1: Route C, as recommended.** The cheapest experiment was run
 > as census (a) (§0.3(a)) and answered **79.44 %** — nearly all of them, so Route A is a rewrite
-> wearing a retrofit's clothes and the grill said so. The route carries one explicit
+> wearing a retrofit's clothes and the review said so. The route carries one explicit
 > pre-registration: the **state-sync overhead per faultable access is an M1 measurement**, and
 > the allocator is redesigned toward Route B's shape only if that number says it is the ceiling.
 > *One factual correction below: the memory model is `r10 = memstart`, not `r11` — §2c.*
@@ -5777,7 +5777,7 @@ compilers, whose entire memory model is `r11 = memstart` plus a bswap.
 
 **Cheapest experiment:** count how many of `compemu_arm.cpp`'s per-opcode compilers reach
 `readmem_real` / `writemem_real` / `get_n_addr_real`. One grep and one script, zero build. If it is
-nearly all of them, Route A is a rewrite wearing a retrofit's clothes and the grill should say so
+nearly all of them, Route A is a rewrite wearing a retrofit's clothes and the design review should say so
 out loud.
 
 ### Q2 — Can a C++ `throw` cross a frame of generated code on this toolchain, or does it terminate?
@@ -5891,13 +5891,13 @@ the shipping firmware pays.*
 
 > **RESOLVED 2026-08-23 → §0.1 Q9: as recommended — `unset = OFF` through M4**, a deliberate
 > inversion of the house rule with the reason recorded. The flip to `unset = ON` happens at M5
-> on the user's word and not before. **Arm attestation rides every capture.**
+> on an explicit decision and not before. **Arm attestation rides every capture.**
 
 **Recommendation: `unset = OFF` until M5**, deliberately inverting the house rule, then flip at the
-ship gate if the user says so. The house rule exists so a zeroed `SHARED` struct from an older
+ship gate if it is decided so. The house rule exists so a zeroed `SHARED` struct from an older
 core0 still runs *shipped behaviour*; an unshipped engine's shipped behaviour is "off".
 
-**Cheapest experiment:** none — this is a judgement call, and it is here because the grill should
+**Cheapest experiment:** none — this is a judgement call, and it is here because the design review should
 push on it rather than inherit it.
 
 ### Q10 — Does a block feed the cadence counter with its retired instruction count, or does the cadence contract change?

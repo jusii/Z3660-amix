@@ -1337,7 +1337,7 @@ int main()
    }
 
    shared->arm_freq_code=config.arm_frequency;
-   /* CYBERSTORM C2-prep: publish the rate the global timer ACTUALLY runs at, next to the
+   /* Profiler groundwork: publish the rate the global timer ACTUALLY runs at, next to the
     * code that selected it. core1's profiler cannot work this out for itself -- the
     * CPU:global-timer ratio is a fixed 2:1 in silicon, so measuring it tells you nothing
     * about the PLL -- and the BSP's COUNTS_PER_SECOND is a compile-time constant frozen

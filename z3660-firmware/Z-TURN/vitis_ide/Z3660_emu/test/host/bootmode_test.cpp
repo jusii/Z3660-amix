@@ -26,7 +26,7 @@ extern "C" {
 #include "../../../Z3660/src/overhead_switches.h"
 #include "../../../Z3660/src/prof_config.h"
 }
-/* CYBERSTORM C1. This is the ONLY place in the tree where core0's prof_config.h and
+/* Profiler. This is the ONLY place in the tree where core0's prof_config.h and
  * core1's z3660_prof.h are compiled side by side. They MUST agree -- core0 writes the
  * command word, core1 decodes it -- and they cannot share a header, because one is core0
  * C and the other lives inside the UAE C++ include tree. Two hand-maintained copies that
@@ -91,7 +91,7 @@ int main(void)
    CHECK(BOOTMODE_NUM == 9, "BOOTMODE_NUM == 9 -- if this fires, a mode was appended: put it\n"
                             "        in the right bucket above and update every replica\n");
 
-   /* 4. CYBERSTORM C3 config keys: the CONFITEM enum is APPEND-ONLY.
+   /* 4. Overhead-switch config keys: the CONFITEM enum is APPEND-ONLY.
     *    config_item_names[] is indexed by this enum, so an entry inserted in the middle
     *    shifts every name after it and the parser silently writes the WRONG config field
     *    for the rest of the file -- no error, no diagnostic, just a config that means
@@ -143,7 +143,7 @@ int main(void)
    CHECK(Z3660_OVH_UNSET   == -1, "the unset sentinel is -1 (what both config paths write)\n");
    CHECK(Z3660_OVH_DEFAULT ==  1, "the default is ON\n");
 
-   /* 6. CYBERSTORM C1: the profiler config keys.
+   /* 6. Profiler: the profiler config keys.
     *
     *    Same negative guarantee as the switches above, landing on the opposite value and
     *    for the same reason. The C3 switches default ON because ON is what this firmware
@@ -191,7 +191,7 @@ int main(void)
    CHECK((unsigned)Z3660_PROF_CFG_RING_ENTRIES == (unsigned)Z3660_PROF_RING_ENTRIES,
          "RING_ENTRIES agrees -- core0 prints the wrap-free window when arming\n");
 
-   /* CYBERSTORM C2-prep: the `PROF` ladder, and the rule that a rate off the ladder means
+   /* Profiler groundwork: the `PROF` ladder, and the rule that a rate off the ladder means
     * STOP rather than step-up.
     *
     * Every rung ARMS, and arming ZEROES the ring, the buckets and the counters. The C1

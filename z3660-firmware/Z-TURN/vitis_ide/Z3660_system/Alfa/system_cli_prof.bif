@@ -1,4 +1,4 @@
-/* Z3660 command-line boot image -- PROFILING variant (CYBERSTORM C1).
+/* Z3660 command-line boot image -- PROFILING variant (the interpreter profiler).
  *
  * Identical to system_cli.bif except for the core1 ELF: Z3660_emu/build-prof/ instead of
  * Z3660_emu/build/. Core0 (Z3660.elf), the FSBL and the bitstream are shared -- the

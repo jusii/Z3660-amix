@@ -1,4 +1,4 @@
-# The accessor fast path — CYBERSTORM C2 rung 2
+# The accessor fast path — Interpreter speed-up rung 2
 
 **What it is.** The 68040 data accessors (`uae_mmu040_get_long` and its five siblings) resolve
 a guest data access to a host address inline, with no calls at all, and perform the access

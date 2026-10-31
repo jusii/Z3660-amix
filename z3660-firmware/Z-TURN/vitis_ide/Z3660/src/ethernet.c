@@ -730,7 +730,7 @@ int ethernet_receive_frame() {
     */
    // The GEM RX ISR appends to the backlog in IRQ context. Unmasked, it could land a frame in slot 0 between the
    // catch-up reset and the fake-serial write below: that frame's serial was overwritten with the consumed one, so
-   // the Amiga saw "no new frame" at slot 0 for good while the backlog filled (S3-46, 2026-10-26).
+   // the Amiga saw "no new frame" at slot 0 for good while the backlog filled (2026-10-26).
    u32 cpsr = mfcpsr();
    Xil_ExceptionDisableMask(XIL_EXCEPTION_IRQ);
    if (frames_backlog>0) {

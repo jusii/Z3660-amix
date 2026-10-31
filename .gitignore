@@ -47,10 +47,6 @@ docker/xilinx/
 /hdf/
 /adf/
 
-# AI-agent / assistant config — kept local, never published
-/.claude/
-/CLAUDE.md
-
 # Local AMIX debug-session investigations — kept local, never published
 /docs/investigations/
 

@@ -63,7 +63,7 @@ __attribute__((noinline, noclone)) void Z3660_RUNLOOP_NAME(void)
 
 #if Z3660_EMU_PROBES
             // ROM-ENTRY PROBE (diagnostic, AMIX-040 only, first few hits then silent).
-            // Gated by z3660_probes_on (CYBERSTORM C3). gcc evaluates the volatile
+            // Gated by z3660_probes_on (the overhead switches). gcc evaluates the volatile
             // amix_mmu_on arm first, so a non-AMIX boot pays nothing at all and an
             // AMIX boot pays 4 instructions to skip 44. It matters more than it looks
             // -- the amix_mmu_on arm below is TRUE for every instruction of an AMIX-040
@@ -159,7 +159,7 @@ __attribute__((noinline, noclone)) void Z3660_RUNLOOP_NAME(void)
             } else {
 #endif
             mmu_opcode = -1;
-            /* CYBERSTORM C2 rung 1. The decoded-op cache is consulted HERE, before
+            /* Interpreter speed-up rung 1. The decoded-op cache is consulted HERE, before
              * x_prefetch, because this is the last moment at which the loop still has a
              * choice about paying for the fetch. A hit supplies the opcode word, the
              * resolved handler, rung 0's idiom verdict and one extension word; a miss is
@@ -224,7 +224,7 @@ __attribute__((noinline, noclone)) void Z3660_RUNLOOP_NAME(void)
 #endif
 
 #if Z3660_EMU_PROBES
-            /* CYBERSTORM C3: the three post-fetch ISSUE-52 probes collapsed behind ONE
+            /* Overhead switches: the three post-fetch ISSUE-52 probes collapsed behind ONE
              * gate -- 3 ARM instructions for the whole group instead of a per-probe
              * compare chain, and the branch is perfectly predicted. [USTEP]
              * is the reason this is worth doing: its first term is `!regs.s`, which is
@@ -336,7 +336,7 @@ __attribute__((noinline, noclone)) void Z3660_RUNLOOP_NAME(void)
             }
             }   /* if (z3660_probes_on) -- post-fetch probe group */
 #endif /* Z3660_EMU_PROBES */
-            /* CYBERSTORM C2 rung 0. The block-idiom recognizer sits exactly here -- after
+            /* Interpreter speed-up rung 0. The block-idiom recognizer sits exactly here -- after
              * the opcode is in hand, before the dispatch -- because that is the only place
              * that knows both what the instruction is and that the run loop has not yet
              * committed to executing one of it.

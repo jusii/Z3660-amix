@@ -17,7 +17,7 @@
 #include "newcpu.h"
 #include "cpummu030.h"
 #include "cpummu.h"        /* 68040 MMU: mmu_translate, mmu_set_tc, mmu_match_ttr, TTR/descriptor defines */
-#include "z3660_prof.h"    /* CYBERSTORM C1: the profiler's wire format + phase machine */
+#include "z3660_prof.h"    /* Profiler: the profiler's wire format + phase machine */
 #define Z3660_WARP_ENGINE 1   /* the harness drives the engine, not just its switch */
 #include "z3660_warp.h"    /* WARP ENGINE: the block engine's switch rule, key and geometry */
 #include "z3660_blk.h"     /* the neighbouring knobs' vocabulary, for the arm-magic sweep   */
@@ -2494,7 +2494,7 @@ static void test_mmu030_multifault_continuation(void)
 
 /* ================================================================== */
 /* ==================================================================
- * CYBERSTORM C3: the run-loop overhead switches.
+ * The run-loop overhead switches.
  *
  * What has to be true, and what a metal calibration session is entitled to assume:
  *
@@ -2738,7 +2738,7 @@ static void test_perf_line_clock(void)
 }
 
 /* ==================================================================
- * Build-variant contract (CYBERSTORM C3 follow-up).
+ * Build-variant contract (overhead switches).
  *
  * runloop_build.h is the single copy of "which instruments is this binary carrying",
  * and it is read by the run loop, by this harness, and (as -D flags) by the Makefile.
@@ -2837,7 +2837,7 @@ static void test_shared_mailbox_offsets(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C1 -- the interpreter profiler.
+ * The interpreter profiler.
  *
  * Four things are worth testing here and they are not the same thing:
  *
@@ -3347,7 +3347,7 @@ static void test_prof_bucket_arithmetic(void)
 	CHECK_EQ32((uae_u32)z3660_prof_cnt[Z3660_PROF_C_TRANSITIONS], 6,
 	           "every transition is counted, so probe overhead is subtractable");
 
-	/* CYBERSTORM C2 rung 1b -- PER-BUCKET TRANSITION SPANS.
+	/* Interpreter speed-up rung 1b -- PER-BUCKET TRANSITION SPANS.
 	 *
 	 * The aggregate above makes the probe subtractable from the TOTAL; it has never been
 	 * subtractable per bucket, and the 2026-08-23 verdict paid for that by having to
@@ -3497,7 +3497,7 @@ static void test_prof_ret_macro_ordering(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2-prep -- the probe calibration reports a PER-TRANSITION cost.
+ * Profiler groundwork -- the probe calibration reports a PER-TRANSITION cost.
  *
  * This is the defect that inverted the top of the C2 attack map, and it is worth being
  * precise about why no existing test could see it. v1 timed a batch of N enter/exit
@@ -3614,7 +3614,7 @@ static void test_prof_probe_calibration(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2 v3.1 riding item -- THE PRICE BRACKET'S CEILING.
+ * THE PRICE BRACKET'S CEILING.
  *
  * The map's §26.3 item 3, and the second time the same arithmetic has bitten: a capture's
  * corrected cycles are acc[b] - spans[b] x price, so a price above min_b(acc[b]/spans[b])
@@ -3703,7 +3703,7 @@ static void test_prof_price_ceiling(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2-prep -- the tail split.
+ * Profiler groundwork -- the tail split.
  *
  * The map's single highest-value instrument ask: TAIL was 20 % of guest time with no
  * internal breakdown. What has to hold is what holds for every other nested stage --
@@ -3762,7 +3762,7 @@ static void test_prof_tail_split(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2-prep -- ATC_HIT counts ATC hits.
+ * Profiler groundwork -- ATC_HIT counts ATC hits.
  *
  * The v1 counter sat on mmu_translate()'s success return, which is reached BOTH by an
  * ATC tag match and by `goto atc_retry` after a table walk -- so it counted successful
@@ -3899,7 +3899,7 @@ static void test_prof_ifetch_calls(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2-prep -- where the absolute ARM clock comes from.
+ * Profiler groundwork -- where the absolute ARM clock comes from.
  *
  * The measurable part (the PMCCNTR : global-timer RATIO) is fixed at 2:1 in silicon and
  * so says nothing about the PLL; the absolute rate has to be taken from the running
@@ -4072,7 +4072,7 @@ static void test_prof_under_execution(void)
 #endif /* Z3660_EMU_PROF */
 
 /* ==================================================================
- * CYBERSTORM C2 RUNG 0 -- THE BLOCK-IDIOM FAST PATH, BY STATE EQUIVALENCE
+ * INTERPRETER SPEED-UP RUNG 0 -- THE BLOCK-IDIOM FAST PATH, BY STATE EQUIVALENCE
  *
  * The map's instruction for this test is precise and it is not "spot checks": for a
  * corpus of start states, run the idiom once through the recognizer and once with the
@@ -4461,7 +4461,7 @@ static void blk_case(const struct blk_desc *c, unsigned cap, int engage,
 }
 
 /* ==================================================================
- * CYBERSTORM C2 RUNG 2 -- THE VERDICT TABLE, REPLAYED EXHAUSTIVELY
+ * INTERPRETER SPEED-UP RUNG 2 -- THE VERDICT TABLE, REPLAYED EXHAUSTIVELY
  *
  * The fast path replaces an out-of-line call to mmu_match_ttr() with one load out of a
  * 2 x 256 table. The table's build (cpummu.cpp, z3660_dfast_rebuild) is written as a
@@ -4594,7 +4594,7 @@ static void test_dfast_verdict_table(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2 RUNG 2 -- THE ACCESSOR FAST PATH, BY STATE EQUIVALENCE
+ * INTERPRETER SPEED-UP RUNG 2 -- THE ACCESSOR FAST PATH, BY STATE EQUIVALENCE
  *
  * The map's instruction, quoted: "state equivalence, not spot checks -- for a corpus of
  * start states, run each access inlined and out-of-line and assert register file,
@@ -5410,7 +5410,7 @@ static void test_blk_state_equivalence(void)
 
 
 /* ==================================================================
- * CYBERSTORM C2 RUNG 1 -- THE DECODED-OP CACHE
+ * INTERPRETER SPEED-UP RUNG 1 -- THE DECODED-OP CACHE
  *
  * Two claims have to be established and they are not the same claim, so they get two
  * suites:
@@ -6481,7 +6481,7 @@ static void test_dopc_counters(void)
 }
 
 /* ==================================================================
- * CYBERSTORM C2 RUNG 1d -- THE `LOOP` SPLIT
+ * INTERPRETER SPEED-UP RUNG 1d -- THE `LOOP` SPLIT
  *
  * The C2 map's v3 ranked `LOOP` FIRST at 26.38-26.54 % of the interpreter and then
  * REFUSED to give it a reclaim estimate, because nothing had ever enumerated what is in

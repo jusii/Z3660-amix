@@ -45,7 +45,7 @@ typedef struct {
    uint8_t reset_cpld;
    uint8_t reset_fpga;
    uint8_t overlay_enabled;
-   /* CYBERSTORM C1: core0's memory of what it last asked core1's stage buckets to do.
+   /* Profiler: core0's memory of what it last asked core1's stage buckets to do.
     * It is core0's own toggle state, NOT a readback -- core1 owns the buckets and there
     * is no path back. If the two ever disagree, core1's [PROF] reply is the truth. */
    uint8_t prof_buckets;

@@ -510,7 +510,7 @@ extern addrbank *get_mem_bank_real(uaecptr);
 #endif
 
 /* ==========================================================================
- * CYBERSTORM C2 rung 2 -- THE DIRECT-BANK ACCESS, WRITTEN ONCE.
+ * Interpreter speed-up rung 2 -- THE DIRECT-BANK ACCESS, WRITTEN ONCE.
  *
  * `baseaddr_direct_r` / `_w` non-NULL means "this bank is plain memory the emulator may
  * touch without going through the bank's function pointers". In THIS FORK the guest's

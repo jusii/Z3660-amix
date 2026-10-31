@@ -1,4 +1,4 @@
-/* CYBERSTORM C3 -- which run-loop instruments this BINARY was compiled with.
+/* Run-loop overhead switches -- which run-loop instruments this BINARY was compiled with.
  *
  * The single copy of the build-variant rule, in a self-contained header for the same
  * reason as amix_ram.h and overhead_switches.h: the contract that matters is "a build

@@ -136,7 +136,7 @@ Beta 21 has **no `Z3660_emu/test/` directory and no `UAE_030_MMU_plan.md` / `AMI
 | `349b026` | MMU030 tests 3–5 (fault/restart, LRMW, PFLUSH) 46/46 | RE-PORT (additive) | `test/host/{board_stubs.cpp,harness_main.cpp,stubs/sleep.h}` |
 | `5247b0a` | stub A3000-SCSI seams so harness links | RE-PORT (additive) | `test/host/board_stubs.cpp` |
 | `26072ee` | stub `shared` + `z3660_dbg_emu` for harness | RE-PORT (additive) | `test/host/board_stubs.cpp` — must track the beta-21 `SHARED` layout, see §5 |
-| `38cca35` | UAE_030_MMU plan: grilling decisions | DROP | Historical planning doc; superseded by `5887703` and by this ledger |
+| `38cca35` | UAE_030_MMU plan: design decisions | DROP | Historical planning doc; superseded by `5887703` and by this ledger |
 | `90da035` | plan: gencpu Phase-0 baseline result | DROP | ditto |
 | `770e5be` | plan: progress log | DROP | ditto |
 | `5887703` | plan: mark UAE_030_MMU implemented | RE-PORT (additive) | Keep the final `UAE_030_MMU_plan.md` state only — one file, not the four-commit history |
@@ -509,7 +509,7 @@ So the piscsi mailbox contract has **not drifted at all** across this resync. `N
 
 ### 7.2 amiberry's Z3660 native-device emulation
 
-The bench emulator (amiberry, workspace fork of BlitterStudio/amiberry) models the Z3660 board so an Amix guest can run without hardware. Its emulation lives on a dedicated branch in `src/z3660_scsi.cpp` (+ `src/include/z3660_scsi.h`, `expansion.cpp`, `rommgr.h`), and its header states the register map was transcribed from **this repository's** `Z3660/src/scsi/scsi.c` + `z3660_scsi_enums.h`.
+The bench emulator (amiberry, our fork of BlitterStudio/amiberry) models the Z3660 board so an Amix guest can run without hardware. Its emulation lives on a dedicated branch in `src/z3660_scsi.cpp` (+ `src/include/z3660_scsi.h`, `expansion.cpp`, `rommgr.h`), and its header states the register map was transcribed from **this repository's** `Z3660/src/scsi/scsi.c` + `z3660_scsi_enums.h`.
 
 **Version pin: there is no version pin.** The emulation carries no `PISCSI_DRIVER_VERSION`, no version register read, no magic/ident value, and no comment citing a firmware version, beta number, or date. The only version artefact anywhere in that tree is the boot ROM it serves at `board+0x6000` (an untracked test-data file whose strings read `Z3660 SCSI v1.4` / `Z3660SCSI 1.4 (16 Oct 2024)`) — and the emulation derives no behaviour from it. So the practical pin is *the reference sources as of the branch's commit date (2026-07-11)*, i.e. **this fork's `amix-main` at the T2.P3 firmware state**, which §7.1 has just shown is register-identical to beta 21.
 
