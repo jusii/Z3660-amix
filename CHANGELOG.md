@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-01 — rtg: SMUSH codec buffers clear of the emulator image (0555d59)
+
+In the emulated boot modes the SMUSH codec buffers no longer overwrite the CPU emulator: their base is 0x37000000 there, and 0x30000000 with a real 68060, as before. The core-1 emulator link asserts _end <= 0x37000000 (_end 0x36CF29C0; its ELF unchanged, e07f38ff). Image D054CE1F.
+
 ## 2026-10-31 — docs and comments state facts without internal ids or process wording (fcf303c)
 
 Internal ids, run labels and codenames restated as technical facts; local tool ignores moved to .git/info/exclude.
