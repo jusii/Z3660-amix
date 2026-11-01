@@ -1,6 +1,7 @@
 // Adapted from ScummVM SMUSH codec37 class
 #include <string.h>
 #include "codec37.h"
+#include "smush_buffers.h"
 
 void bompDecodeLine(uint8_t *dst, const uint8_t *src, int len);
 
@@ -16,7 +17,7 @@ void Codec37Decoder_Init(int idx, int width, int height)
 	dc->_height = height;
 	dc->_frameSize = width * height;
 	dc->_deltaSize = dc->_frameSize * 3 + 0x13600;
-	dc->_deltaBuf = (byte *)0x30000000 + num_decoders * 0x1000000;
+	dc->_deltaBuf = smush_buffer_base() + num_decoders * 0x1000000;
 	dc->_deltaBufs[0] = dc->_deltaBuf + 0x4D80;
 	dc->_deltaBufs[1] = dc->_deltaBuf + 0xE880 + dc->_frameSize;
 	dc->_curtable = 0;

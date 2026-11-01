@@ -25,6 +25,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "smush_buffers.h"
 
 #define inline
 
@@ -554,8 +555,8 @@ void Codec47Decoder_Init(int idx, int width, int height) {
 	dc->_lastTableWidth = -1;
 	dc->_width = width;
 	dc->_height = height;
-	dc->_tableBig = (byte *)0x30000000 + num_decoders * 0x1000000;
-	dc->_tableSmall = (byte *)0x30800000 + num_decoders * 0x1000000;
+	dc->_tableBig = smush_buffer_base() + num_decoders * 0x1000000;
+	dc->_tableSmall = smush_buffer_base() + 0x800000 + num_decoders * 0x1000000;
 	if ((dc->_tableBig != NULL) && (dc->_tableSmall != NULL)) {
         printf("c47: Making interpolation tables.\n");
 		c47_makeTablesInterpolation(idx, 4);
@@ -564,7 +565,7 @@ void Codec47Decoder_Init(int idx, int width, int height) {
 
 	dc->_frameSize = dc->_width * dc->_height;
 	dc->_deltaSize = dc->_frameSize * 3;
-	dc->_deltaBuf = (byte *)0x31000000 + num_decoders * 0x1000000;
+	dc->_deltaBuf = smush_buffer_base() + 0x1000000 + num_decoders * 0x1000000;
 	dc->_deltaBufs[0] = dc->_deltaBuf;
 	dc->_deltaBufs[1] = dc->_deltaBuf + dc->_frameSize;
 	dc->_curBuf = dc->_deltaBuf + dc->_frameSize * 2;

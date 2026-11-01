@@ -293,3 +293,6 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
 _end = .;
 }
 
+/* Core 0 places the SMUSH codec buffers at 0x37000000 in the emulated boot modes
+   (Z3660/src/rtg/smush_buffers.h, SMUSH_BUFFER_BASE_EMU): the image, heap and stack end below. */
+ASSERT(_end <= 0x37000000, "core 1 image reaches the SMUSH codec buffers at 0x37000000")

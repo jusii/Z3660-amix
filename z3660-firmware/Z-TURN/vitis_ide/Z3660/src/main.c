@@ -78,6 +78,7 @@ int reset_thread(struct pt *pt);
 int measures_thread(struct pt *pt);
 int emulator_thread(struct pt *pt);
 int emulator_reset_thread(struct pt *pt);
+int smush_emulated=0; // rtg/smush_buffers.h
 int interrupt_thread(struct pt *pt);
 // Core0's Amiga-bus byte accessors live in mobotest.c and take a timeout counter, which they set
 // and count down. The core1 emulator has its own two-argument versions in a separate ELF; declaring
@@ -1457,6 +1458,7 @@ int main()
       emu=1; // -> 060 not used -> PCLK/2
    else
       emu=0; // CPU: the real 68060 on the card drives the bus
+   smush_emulated = (emu==1); // the SMUSH codec buffers keep clear of the emulator's image
    write_reg_s01(REG2,INT_TON); // 100 us aprox
    write_reg_s01(REG3,INT_TOFF); // 10 ms
 
