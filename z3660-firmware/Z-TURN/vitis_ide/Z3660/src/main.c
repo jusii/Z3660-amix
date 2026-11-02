@@ -56,6 +56,7 @@ extern ENV_FILE_VARS env_file_vars_temp[9]; // really size 8
 #include "ethernet.h"
 #include <xtime_l.h>
 #include "core0_stats.h"
+#include "l2guard.h"
 
 #include "usb_proxy.h"
 
@@ -544,6 +545,7 @@ void DataAbortHandler(void *data)
    (void) data;
    uint32_t FaultStatus;
    unsigned int FaultAddress;
+   z3660_abort_capture(L2G_KIND_DATA, DataAbortAddr);
    FaultAddress = mfcp(XREG_CP15_DATA_FAULT_ADDRESS);
    FaultStatus = mfcp(XREG_CP15_DATA_FAULT_STATUS);
    xc3_usleep(100000); // let other printf to finish
@@ -556,6 +558,7 @@ void DataAbortHandler(void *data)
    else
       printf("Read Fault from 0x%08X\n",FaultAddress);
    printf("Instruction 0x%08lX\n",*((uint32_t *)(uint32_t)DataAbortAddr));
+   z3660_abort_print();
    xc3_usleep(10000);
    hard_reboot();
    while(1);
@@ -564,10 +567,12 @@ void PrefetchAbortHandler(void *CallBackRef){
    (void) CallBackRef;
    u32 FaultStatus;
 
+   z3660_abort_capture(L2G_KIND_PREFETCH, PrefetchAbortAddr);
    FaultStatus = mfcp(XREG_CP15_INST_FAULT_STATUS);
 
    printf("Prefetch abort with Instruction Fault Status Register  0x%08lx\n",FaultStatus);
    printf("Address of Instruction causing Prefetch abort 0x%08lx\n",PrefetchAbortAddr);
+   z3660_abort_print();
    xc3_usleep(10000);
    hard_reboot();
    while(1);
@@ -1203,6 +1208,7 @@ int main()
    printf("  /  /___   ____| | | |__| | | |__| | | |__| |\n");
    printf(" /_______| |______| |______| |______| |______|\n");
    printf("\n");
+   z3660_abort_report();
    printf("FPGA version number 0x%08lX\n",read_reg_s01(REG2));
    printf("ARM IDCODE 0x%08lX\n",*(uint32_t*)0xF8000530);
    unsigned long si_ver = ps7GetSiliconVersion ();
@@ -1800,7 +1806,7 @@ int main()
    pifloppy_init();
 #endif
    Xil_L1DCacheFlush();
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_MAIN_INIT);
 
    if(data3d==NULL)
    {
@@ -1974,6 +1980,7 @@ int main()
          ethernet_thread(&pt_ethernet);
          usb_thread(&pt_usb);
          other_tasks();
+         z3660_l2_stress();
          task_counter++;
          break;
       }

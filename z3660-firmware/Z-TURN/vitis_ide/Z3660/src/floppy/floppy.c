@@ -23,6 +23,7 @@
 #include "../config_file.h"
 #include "../debug_console.h"
 #include "../scsi/scsi.h"
+#include "../l2guard.h"
 
 extern CONFIG config;
 extern DEBUG_CONSOLE debug_console;
@@ -223,7 +224,7 @@ int pifloppy_init(void)
     }
 
     Xil_L1DCacheFlush();
-    Xil_L2CacheFlush();
+    z3660_l2_flush(L2G_FLOPPY_INIT);
 
     return 1;
 }
@@ -575,7 +576,7 @@ void handle_pifloppy_reg_write(uint32_t addr, uint32_t val, uint8_t type)
           sprintf((char *)dst_data + data_addr, "z3660_floppy.device");
 
           Xil_L1DCacheFlush();
-          Xil_L2CacheFlush();
+          z3660_l2_flush(L2G_FLOPPY_REG);
 
        }
        else

@@ -32,6 +32,7 @@
 #include <ff.h>
 #include "mpg/pl_mpeg_player.h"
 #include "debug_console.h"
+#include "l2guard.h"
 
 #define VDMA_VID_DEVICE_ID   XPAR_AXIVDMA_0_DEVICE_ID
 #define VDMA_OVL_DEVICE_ID   XPAR_AXIVDMA_1_DEVICE_ID
@@ -173,7 +174,7 @@ void handle_cache_flush(uint32_t address,uint32_t size)
    EP_T(ep_c2);
 #ifndef NO_L2_CACHE_FLUSH
 #ifdef L2_CACHE_ENABLED
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_VIDEO_FLUSH);
 #endif
 #endif
    EP_END(EP_V_FLUSH_L2,ep_c2);
@@ -458,7 +459,7 @@ void play_init(int bm)
    f_read(&fil, ENCODED + RTG_BASE, filesize, &NumBytesRead);
 
    Xil_L1DCacheFlush();
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_VIDEO_PLAY);
    f_close(&fil);
 //   f_umount(Path);
    write_rtg_register(REG_ZZ_AUDIO_PARAM, 0);

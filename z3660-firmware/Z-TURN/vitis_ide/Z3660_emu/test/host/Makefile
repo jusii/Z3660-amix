@@ -139,10 +139,15 @@ CORE0_ROM_WINDOW_H := $(ROOT)/../Z3660/src/rom_window.h
 # hybrid-disk protection the amix_mode gate used to provide.
 RDB_SCAN_BIN := $(BUILD)/rdb_scan_test
 CORE0_RDB_SCAN_H := $(ROOT)/../Z3660/src/scsi/rdb_scan.h
+L2GUARD_BIN := $(BUILD)/l2guard_test
+CORE0_L2GUARD_H := $(ROOT)/../Z3660/src/l2guard.h
+# absolute, so the source scan does not depend on the cwd
+CORE0_SRC := $(abspath $(ROOT)/../Z3660/src)
 
 .PHONY: all clean clean-all objs run run-lean run-prof run-scsi run-bootmode run-amix-ram \
-        run-rom-window run-rdb-scan
-all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN)
+        run-rom-window run-rdb-scan run-l2guard
+all: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN) \
+     $(L2GUARD_BIN)
 
 $(BIN): $(OBJS)
 	@echo "  LINK  $@"
@@ -167,7 +172,7 @@ $(BUILD)/host/%.o: %.cpp
 	@$(CXX) $(CXXFLAGS) -c $< -o $@
 
 -include $(BUILD)/bootmode_test.d $(BUILD)/amix_ram_test.d $(BUILD)/scsi_cd_test.d \
-         $(BUILD)/rom_window_test.d $(BUILD)/rdb_scan_test.d
+         $(BUILD)/rom_window_test.d $(BUILD)/rdb_scan_test.d $(BUILD)/l2guard_test.d
 
 $(BOOTMODE_BIN): bootmode_test.cpp $(CORE0_CONFIG_H)
 	@mkdir -p $(BUILD)
@@ -188,14 +193,20 @@ $(RDB_SCAN_BIN): rdb_scan_test.cpp $(CORE0_RDB_SCAN_H)
 	@mkdir -p $(BUILD)
 	@echo "  CXX+LINK  rdb_scan_test.cpp"
 	@$(CXX) $(CXXFLAGS) rdb_scan_test.cpp -o $@
+$(L2GUARD_BIN): l2guard_test.cpp $(CORE0_L2GUARD_H)
+	@mkdir -p $(BUILD)
+	@echo "  CXX+LINK  l2guard_test.cpp"
+	@$(CXX) $(CXXFLAGS) -DZ3660_CORE0_SRC_PATH='"$(CORE0_SRC)"' l2guard_test.cpp -o $@
 
-run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN)
+run: $(BIN) $(SCSI_CD_BIN) $(BOOTMODE_BIN) $(AMIX_RAM_BIN) $(ROM_WINDOW_BIN) $(RDB_SCAN_BIN) \
+     $(L2GUARD_BIN)
 	@$(BIN)
 	@$(SCSI_CD_BIN)
 	@$(BOOTMODE_BIN)
 	@$(AMIX_RAM_BIN)
 	@$(ROM_WINDOW_BIN)
 	@$(RDB_SCAN_BIN)
+	@$(L2GUARD_BIN)
 
 # The lean (production) firmware's core1, through the same suites. scsi_cd/bootmode/
 # amix_ram do not touch the run loop, so the variant that matters is the MMU harness.
@@ -223,6 +234,8 @@ run-rom-window: $(ROM_WINDOW_BIN)
 
 run-rdb-scan: $(RDB_SCAN_BIN)
 	@$(RDB_SCAN_BIN)
+run-l2guard: $(L2GUARD_BIN)
+	@$(L2GUARD_BIN)
 
 clean:
 	rm -rf $(BUILD)

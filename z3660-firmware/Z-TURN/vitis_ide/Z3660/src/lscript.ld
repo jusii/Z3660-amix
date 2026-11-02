@@ -241,6 +241,16 @@ SECTIONS
    __bss_end = .;
 } > ps7_ddr_0_memory_0
 
+/* Neither loaded nor cleared: the abort record survives the handler's reboot (l2guard.c) */
+.noinit (NOLOAD) : {
+   . = ALIGN(32);
+   __noinit_start = .;
+   *(.noinit)
+   *(.noinit.*)
+   . = ALIGN(32);
+   __noinit_end = .;
+} > ps7_ddr_0_memory_0
+
 _SDA_BASE_ = __sdata_start + ((__sbss_end - __sdata_start) / 2 );
 
 _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );

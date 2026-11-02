@@ -8,6 +8,7 @@
  */
 
 #include <stdio.h>
+#include "l2guard.h"
 #include <stdlib.h>
 #include <string.h>
 #include "main.h"
@@ -141,7 +142,7 @@ int load_rom(void)
       return(2);
    }
    Xil_L1DCacheFlush();
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_LOAD_ROM);
    f_umount(Path);
    //   while(1);
 #endif
@@ -288,7 +289,7 @@ int load_romext(void)
       printf("File read OK\n");
    }
    Xil_L1DCacheFlush();
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_LOAD_ROMEXT);
    f_umount(Path);
 //   while(1);
 #endif

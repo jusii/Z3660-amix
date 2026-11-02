@@ -27,6 +27,8 @@ INCLUDES:= -I$(SRCDIR) -I$(BSP_INC) -I$(LWIP_INC) -I$(SRCDIR)/mbedtls/include -I
 CFLAGS  := -mcpu=cortex-a9 -marm -mfpu=neon -mfloat-abi=hard -O3 -std=gnu99 -ftree-vectorize -mvectorize-with-neon-quad -ffast-math \
            -Wall -Wextra \
            -MMD -MP -D__ARM_NEON__ # Automatic dependency generation
+# Test-only switches for the L2 flush guard (l2guard.h); empty in every shipped build
+CFLAGS  += $(L2G_DIAG)
 #           -fno-builtin \
 
 ASFLAGS := $(CFLAGS)

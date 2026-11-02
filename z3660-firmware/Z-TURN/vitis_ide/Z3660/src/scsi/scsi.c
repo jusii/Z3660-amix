@@ -9,6 +9,7 @@
 #include <ff.h>
 #include <diskio.h>
 #include "../main.h"
+#include "../l2guard.h"
 
 #include <xparameters.h>
 #include "../memorymap.h"
@@ -472,7 +473,7 @@ int piscsi_init() {
       }
    }
    Xil_L1DCacheFlush();
-   Xil_L2CacheFlush();
+   z3660_l2_flush(L2G_SCSI_INIT);
 
    ACTIVITY_LED_OFF; // OFF
    return(1); // Boot ROM loaded
@@ -883,7 +884,7 @@ void piscsi_find_filesystems(PISCSI_DEV *d) {
       }
       fhb = (struct FileSysHeaderBlock *)fhb_block;
       Xil_L1DCacheFlush();
-      Xil_L2CacheFlush();
+      z3660_l2_flush(L2G_SCSI_FSHD);
    }
 
    if (!fs_found) {
@@ -1818,7 +1819,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
             skip_disk:;
          }
          Xil_L1DCacheFlush();
-         Xil_L2CacheFlush();
+         z3660_l2_flush(L2G_SCSI_DRIVER);
       }
       else
       {
@@ -1884,7 +1885,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          node->dn_SegList = 0;
          printf("[!!!PISCSI] Found no handler for file system %c%c%c/%d\n", dosID[0], dosID[1], dosID[2], dosID[3]);
          Xil_L1DCacheFlush();
-         Xil_L2CacheFlush();
+         z3660_l2_flush(L2G_SCSI_SETFSH_NONE);
          break;
          fs_found:;
          DEBUG("[FS-HANDLER] Next: %ld Type: %.8lX\n", BE(node->dn_Next), BE(node->dn_Type));
@@ -1894,7 +1895,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          DEBUG("[FS-HANDLER] SegList: %.8lX GlobalVec: %ld\n", BE((uint32_t)node->dn_SegList), BE(node->dn_GlobalVec));
          DEBUG("[PISCSI] Handler for partition %.8lX set to %.8lX (%.8lX).\n", BE((uint32_t)node->dn_Name), filesystems[i].FS_ID, filesystems[i].handler);
          Xil_L1DCacheFlush();
-         Xil_L2CacheFlush();
+         z3660_l2_flush(L2G_SCSI_SETFSH);
       }
       else
       {
@@ -1931,7 +1932,7 @@ void handle_piscsi_reg_write(uint32_t addr, uint32_t val, uint8_t type) {
          printf("[PISCSI] LOADFS Address 0x%08lX not mapped in FPGA RAM...\n",val);
       }
       Xil_L1DCacheFlush();
-      Xil_L2CacheFlush();
+      z3660_l2_flush(L2G_SCSI_LOADFS);
    break;
    }
    case PISCSI_DBG_VAL1:

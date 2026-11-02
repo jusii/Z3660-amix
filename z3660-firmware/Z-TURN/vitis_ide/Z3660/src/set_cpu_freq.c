@@ -3,6 +3,7 @@
 #include "xil_cache.h"
 #include "xil_cache_l.h"
 #include "xil_misc_psreset_api.h"
+#include "l2guard.h"
 
 // SLCR registers for Zynq-7020
 #define XSLCR_PLL_STATUS      (XSLCR_BASEADDR + 0x164)
@@ -149,7 +150,7 @@ int set_cpu_frequency(uint32_t target_freq_mhz) {
     
     // IMPORTANT: Flush caches after changing frequency
     Xil_L1DCacheFlush();
-    Xil_L2CacheFlush();
+    z3660_l2_flush(L2G_CPU_FREQ);
     Xil_DCacheFlush(); 
     Xil_ICacheInvalidate();
     
