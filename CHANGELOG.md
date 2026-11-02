@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-02 — core0: every whole-L2 flush runs with IRQ/FIQ masked (61e89f3)
+
+The vblank interrupt's own whole-L2 flush running inside a foreground one caused the intermittent core-0 abort (DFSR 0x1C06) seen in real-CPU boots; reproduced with a stress build, gone with the mask (50 cold boots on an A4000T, no abort). Data and prefetch aborts now leave a record that the next boot prints after the banner. Image 3E3D7907.
+
 ## 2026-11-01 — rtg: SMUSH codec buffers clear of the emulator image (0555d59)
 
 In the emulated boot modes the SMUSH codec buffers no longer overwrite the CPU emulator: their base is 0x37000000 there, and 0x30000000 with a real 68060, as before. The core-1 emulator link asserts _end <= 0x37000000 (_end 0x36CF29C0; its ELF unchanged, e07f38ff). Image D054CE1F.
