@@ -17,3 +17,4 @@ ethernet   as 9994961A; z3660cfg.txt keys, all optional (absent = default):
 AmigaOS    Z3660Net.device 1.5Beta (crc32 ABCE15E9), z3660-drivers/eth and 0_Z3660.adf.
 
 Not deployed yet: both boxes take it once, at the release acceptance.
+Superseded on 2026-11-02 by 3E3D7907 (MANIFEST-golden-2026-11-02.txt), which carries this change.

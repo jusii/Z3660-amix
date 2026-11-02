@@ -1,0 +1,31 @@
+Z3660 fork firmware: bench golden 2026-11-02 and the 1.1 firmware image, successor of 9994961A
+
+fat/Z3660.bin    golden          13417484 B  crc32 3E3D7907
+                 sha256 16f1a6014dc2998c6240c88706187994c8136792ac206ded02a2f0aaaaff326d
+shelf            9994961A (MANIFEST-golden-2026-10-21.txt), the rollback; C96EAD03 (MANIFEST-1.0.txt) behind it
+
+source     branch eth-rxring, commit 61e89f3 (the commits after it up to bb1eefd are documentation only)
+build      plain (no -D flags, L2G_DIAG empty); core0 in the Vitis docker (gcc 12.2), core1 with the host
+           arm-none-eabi-gcc 14.2.1 (Z3660_emu.elf sha256 e07f38ff..., path-independent), FSBL and bitstream
+           the tracked ones; core0 ELF sha256 07068f29e12511275f1da261a7f3e8cd1a3a9ccd3dedf2e2174d9efd7f34dec4.
+           A clean rebuild reproduces the image byte for byte.
+
+since 9994961A (10c7501), in the default build
+  core0      every whole-L2 cache flush runs with IRQ/FIQ masked (z3660_l2_flush): the vblank interrupt's own
+             flush nested in a foreground one caused the intermittent core-0 abort (DFSR 0x1C06) of real-CPU
+             boots; data/prefetch aborts leave a record that the next boot prints after the banner (61e89f3)
+  ethernet   eth_adv1000 defaults to YES (fef1e02); IRQs masked around the RX backlog catch-up (3ce1a2c)
+  registers  the ETH and INT_STATUS reads have no side effects (be41441)
+  emulation  real Zorro III boards are hidden from the guest in amix_mode, so 030 mode boots on a box with
+             one (4b1213d); SMUSH codec buffers no longer overwrite the emulator image (0555d59)
+  console    TSTAT/TMB carry die temperature and uptime, DMS dumps byte-swapped again (b55e840, 2cf0c41)
+  The timing-scanner and tripwire additions (a6aa408, 4623cdb, 1e7ab3c, dd9d179) are behind build flags.
+
+ethernet   as 66660DDB: z3660cfg.txt keys, all optional (absent = default):
+             eth_reraise YES   eth_rxkick YES   eth_taildrop YES   eth_tx_poll YES   eth_adv1000 YES
+AmigaOS    Z3660Net.device 1.5Beta (crc32 ABCE15E9), z3660-drivers/eth and 0_Z3660.adf.
+
+Measured   A4000T, CPU mode, the 1.1 060 disk plus a second hdf: 50 cold boots, no abort, no hang
+           (9994961A on the same box the same day: 1 abort in 5). KNOWN_ISSUES.md, "Cause shown and fixed".
+
+CPLD (z3660.jed), z3660_scsi.rom and FAILSAFE.bin are unchanged by this cut.
