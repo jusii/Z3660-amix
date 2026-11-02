@@ -204,6 +204,21 @@ last on 9994961A.
 - Soak of 3E3D7907 on the A4000T in the conditions of the 2026-11-02 abort (CPU mode, two hdfs): 50 cold boots,
   no abort, no hang, one banner each. Golden 9994961A gave 1 abort in 5 cold boots on the same box that day.
 
+### Fork note (2026-11-02): on the real 68060, a reset from the Amiga side leaves the 060 stopped
+
+**Current behaviour:**
+- In real-CPU mode (`bootmode CPU`), the 68060 does not start again after a reset that the card itself drives or
+  passes on. That covers the CPU's own `RESET` instruction (an Amix `reboot` or `uadmin 2 1`, the automatic reboot
+  after `fsck` repairs the root file system, Kickstart's `ColdReboot`) and the firmware's `RAMIGA`.
+- The firmware logs `Reset active (DOWN)` and `Reset inactive (UP)` and re-initialises its side. After that there is
+  no bus activity, and the screen keeps its last colour.
+- A keyboard reset (Ctrl-Amiga-Amiga on the real keyboard) restarted it in 20 of 21 recorded cases (2026-10-04, the
+  A4000T); a power cycle always does.
+- Seen on the A4000T with stock 1.03 beta 21 and this fork alike.
+
+**Until fixed:** shut Amix down with `shutdown -y -g0 -i0` and power-cycle, or press Ctrl-Amiga-Amiga on the
+keyboard. Expect the first boot after an unclean shutdown to run `fsck` and reboot: that is the case to power-cycle.
+
 ### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
 
 **Setup:** A4000T, Z3660 card 2, 68LC060 @80; the onboard 53C710 SCSI with board termination built; a ZuluSCSI at
