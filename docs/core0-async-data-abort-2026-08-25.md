@@ -11,6 +11,27 @@ sighting to be a measurement rather than another five lines.
 `cpufreq 50` → clock index 0, `autoconfig_rtg NO`, `cpu_ram YES`, RTG up at 800x600x16 60 Hz.
 **Fork-local, additive.** Nothing here modifies an upstream file.
 
+**Update 2026-11-02: reproduced, cause shown, fixed.** Candidate A (§5) is the mechanism.
+- Seen five times in all: the A4000D on 2026-08-25 (this document), the A4000T on 2026-09-28,
+  2026-10-03 (twice) and 2026-11-02 (golden 9994961A).
+- Firmware 61e89f3 routes every whole-L2 flush through `z3660_l2_flush()`. It masks IRQ+FIQ for the
+  duration and records the site, mode, depth and a nesting count. The abort handlers keep a record
+  across the reboot (§8 items 1, 2, 4 and 7).
+- With that record, a test build that runs the whole-L2 flush on every main-loop pass for 120 s after
+  the 060 starts:
+  - **with interrupts not masked** (image 8D122C20) aborted 8 times in one power cycle on the
+    A4000T. Every record read `FSR 00001C06 … PC Xil_L2CacheFlush+0x18 (or its bne) from sys` and
+    `depth 1 site stress/sys last video-flush/irq … nested >= 1; PL310 RIS 000 … dbg 4`;
+  - **with interrupts masked** (1E037CE7) ran 5 boots of about 100 s each with no abort.
+- What the record shows: the vblank ISR's own whole-L2 flush ran inside the foreground's by-way
+  operation. The asynchronous abort was taken in the foreground's poll once the ISR returned.
+  - The PL310 latched no error on its master port (RIS 0), so the error came back on a core-issued
+    access, the register writes of the nested operation, not on an L2 write-back (candidate B).
+  - Debug control read DCL = DWB = 0: the inner flush had cleared the write-back inhibit under the
+    outer one.
+- The first abort came at the first nesting. Later boots took up to 45 nestings before one aborted.
+- The original sighting below is unchanged.
+
 ---
 
 ## 1. Bottom line

@@ -189,6 +189,19 @@ lines are not required.
 **Bench consequence:** the re-init prints fresh `[PISCSI] Map` lines. A boot-activity check must therefore treat a
 Data Abort, or a second banner in one power cycle, as a failed boot.
 
+**Cause shown and fixed (2026-11-02).** Seen on both boxes: the A4000D once (2026-08-25), the A4000T four times, the
+last on 9994961A.
+- Cause: the vblank interrupt's whole-L2 flush (`video.c` `handle_cache_flush()`, real-CPU modes) running inside a
+  foreground whole-L2 flush. `Xil_L2CacheFlush()` masks no interrupts.
+- Reproduced on the A4000T with a test build that runs the whole-L2 flush on every main-loop pass for 120 s after the
+  060 starts, interrupts not masked (8D122C20): 8 aborts in one power cycle. Each record showed the field signature,
+  DFSR 0x1C06 at `Xil_L2CacheFlush+0x18` (or its `bne`). Each was taken in the outer flush right after a nested one
+  (nested >= 1, the first at the first nesting), with PL310 RIS 0.
+- The same stress with IRQ+FIQ masked (1E037CE7): 5 boots of about 100 s each, no abort.
+- Fix, 61e89f3 (image 3E3D7907): every whole-L2 flush goes through `z3660_l2_flush()`, which masks IRQ+FIQ.
+- A data or prefetch abort now leaves a record (fault and auxiliary status, SPSR, flush site, depth and nesting
+  count, PL310 status) that the next boot prints after the banner.
+
 ### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
 
 **Setup:** A4000T, Z3660 card 2, 68LC060 @80; the onboard 53C710 SCSI with board termination built; a ZuluSCSI at
