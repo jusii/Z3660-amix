@@ -473,7 +473,33 @@ but only if a recurrence rate exists to compare against, which today it does not
 
 ---
 
-## 10. Reproducing the identification
+## 9a. Related observation, 2026-11-02: a silent stall in the same boot phase (no abort)
+
+**Seen once, A4000T, golden 9994961A** (CRC read back from `0:/Z3660.bin` just before), CPU mode,
+060 at 80 MHz, the A4000T 47.115 Kickstart MAPROMed, scsiboot YES, two hdfs (SCSI5 200 MB and SCSI6
+640 MB, both with an RDB of UNIX_Root/Swap/Boot). The serial printed the two `[PISCSI] Map` blocks and
+the SD card's own MBR lines (`Partition 0: type 0x0C …`, `Partition 1: type 0x07 …`, from the SD scan
+at the end of `piscsi_init()`), then nothing at all for four minutes until a power cycle. The next
+cold boot of the same configuration was normal.
+
+Where it stopped: after the SD MBR loop and before `pifloppy_init()`'s first output (the `Hunk ID`
+line of `process_hunks()` on `z3660_scsi.rom`). That window holds, in order: the end of
+`piscsi_init()` (`Xil_L1DCacheFlush(); Xil_L2CacheFlush();`), the ADF opens (none configured), and
+`f_open()` / `f_read()` of `z3660_scsi.rom` from the SD. The 5 s `[C0STAT]` lines come from the main
+loop, which had not started yet, so their absence says nothing more.
+
+What it is not: not this abort (no `DataAbortHandler`, no reboot), and not candidate A (§5). This is
+before the 060 starts and before the GIC is enabled (`GIC: … enabled` prints after `060 starting
+now`), so no interrupt handler, and no vblank flush, can run on core 0 in that window.
+
+Candidates, not separable from this log: a whole-L2 flush whose way-mask poll never clears (the
+same routine as the abort, but with nothing to nest into it); or an SD/FatFS read that never
+completes. The abort record of l2guard (`.noinit`) is not written by a hang, and a power cycle may
+clear DDR anyway; telling these apart needs a progress marker kept in `.noinit` and a watchdog that
+reboots the ARM without a power cycle, so that the next boot can print where the previous one
+stopped.
+
+
 
 ```bash
 cd z3660-firmware/Z-TURN/vitis_ide
