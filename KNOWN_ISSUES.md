@@ -201,6 +201,8 @@ last on 9994961A.
 - Fix, 61e89f3 (image 3E3D7907): every whole-L2 flush goes through `z3660_l2_flush()`, which masks IRQ+FIQ.
 - A data or prefetch abort now leaves a record (fault and auxiliary status, SPSR, flush site, depth and nesting
   count, PL310 status) that the next boot prints after the banner.
+- Soak of 3E3D7907 on the A4000T in the conditions of the 2026-11-02 abort (CPU mode, two hdfs): 50 cold boots,
+  no abort, no hang, one banner each. Golden 9994961A gave 1 abort in 5 cold boots on the same box that day.
 
 ### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
 
