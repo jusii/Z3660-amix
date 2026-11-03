@@ -187,5 +187,5 @@ eth_rxkick YES
 eth_taildrop YES
 # wait for a transmit by polling (bounded 1.1 ms) instead of 100 us sleeps
 eth_tx_poll YES
-# advertise 1000BASE-T at OS time (NO = 10/100 only)
-eth_adv1000 YES
+# advertise 1000BASE-T at OS time (NO = 10/100 only; at 1000 a real 060 loses frames)
+eth_adv1000 NO
