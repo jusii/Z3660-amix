@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-03 — ethernet: eth_adv1000 defaults to NO again (07c4602, c799f36)
+
+At 1000 Mbit with a real 68060 the GEM's receive FIFO overruns on trains of four or more back-to-back full-size frames, so uploads to the Amiga stalled on TCP retransmits (FTP put 30 KB/s). The OS-time link now advertises 10/100 only unless z3660cfg.txt says `eth_adv1000 YES`: FTP put 255–271 KB/s, gets and ssh unchanged. This reverses the 2026-10-21 default (YES). Image 28072E28 is the bench golden and the 1.1 image (10 cold boots); rollback 3E3D7907. It reproduces byte for byte from a clean build.
+
 ## 2026-11-02 — core0: every whole-L2 flush runs with IRQ/FIQ masked (61e89f3)
 
 The vblank interrupt's own whole-L2 flush running inside a foreground one caused the intermittent core-0 abort (DFSR 0x1C06) seen in real-CPU boots; reproduced with a stress build, gone with the mask (50 cold boots on an A4000T, no abort). Data and prefetch aborts now leave a record that the next boot prints after the banner. Image 3E3D7907.
