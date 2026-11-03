@@ -1,0 +1,35 @@
+Z3660 fork firmware: bench golden 2026-11-03 and the 1.1 firmware image, successor of 3E3D7907
+
+fat/Z3660.bin    golden          13417484 B  crc32 28072E28
+                 sha256 8791f3b5127cd20a5290269106feb2b5a4697bc62d2949f478309ff16dc3c6b7
+shelf            3E3D7907 (MANIFEST-golden-2026-11-02.txt), the rollback; 9994961A and C96EAD03 (MANIFEST-1.0.txt)
+                 behind it
+
+source     branch eth-adv1000-no, commit 07c4602 (= 3E3D7907's 61e89f3 plus documentation, plus this change)
+build      plain (no -D flags, L2G_DIAG empty); core0 in the Vitis docker (gcc 12.2), core1 with the host
+           arm-none-eabi-gcc 14.2.1 (Z3660_emu.elf sha256 e07f38ff..., unchanged), FSBL and bitstream the
+           tracked ones; core0 ELF sha256 14c322be1870db860aab188a0a3d74af6b9d9da2e6fcf2474cc3dc83dd4c8066.
+           A clean rebuild of 07c4602 (core0 and core1 build directories removed) reproduces the image and
+           both ELFs byte for byte. The core0 banner carries __DATE__ (mobotest.c), so a rebuild on a day
+           other than 2026-11-03 differs in that string.
+
+since 3E3D7907 (61e89f3), in the default build
+  ethernet   eth_adv1000 defaults to NO: the PHY advertises 10/100 only (07c4602). With a real 060 at
+             1000 Mbit the GEM's RX FIFO overruns on 4+ back-to-back full-size frames (A4000D: overruns =
+             lost frames, 67/80 echoes); at 100 Mbit 80/80 and no overrun. eth_adv1000 YES keeps gigabit.
+  The template and the SD-content z3660cfg.txt say eth_adv1000 NO.
+  Everything else as 3E3D7907 (MANIFEST-golden-2026-11-02.txt).
+
+ethernet   z3660cfg.txt keys, all optional (absent = default):
+             eth_reraise YES   eth_rxkick YES   eth_taildrop YES   eth_tx_poll YES   eth_adv1000 NO
+AmigaOS    Z3660Net.device 1.5Beta (crc32 ABCE15E9), z3660-drivers/eth and 0_Z3660.adf.
+
+Measured   A4000D, CPU mode, k46 -60: FTP put 4 / 8 MB 255 / 271 KB/s at 100 Mbit (30 / 31 KB/s at 1000 on
+           3E3D7907), get 342 / 394 KB/s (278 / 405), ssh unchanged. 28072E28 with no eth_adv1000 line: 3 cold
+           boots, link 100 (NWCFG 011F2083), 1472-byte echo trains 4/4.
+           A4000D 10/10 cold boots on 28072E28: link 100, echo trains 4/4, FTP 4 MB put 11.2-12.6 s, get
+           7.2-7.5 s, byte-identical. A4000T 1 boot after the flash, the same checks passed (the first boot
+           was lost to that box's known warm-reset fault, KNOWN_ISSUES.md).
+           3E3D7907's 50-boot A4000T soak covers the rest of the image (KNOWN_ISSUES.md, "Cause shown and fixed").
+
+CPLD (z3660.jed), z3660_scsi.rom and FAILSAFE.bin are unchanged by this cut.

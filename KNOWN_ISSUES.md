@@ -226,6 +226,14 @@ real-CPU mode:
 **On that kind of setup:** shut Amix down with `shutdown -y -g0 -i0` and power-cycle, or press Ctrl-Amiga-Amiga on the
 keyboard. The first boot after an unclean shutdown runs `fsck` and reboots; that is the case to power-cycle.
 
+### Fork note (2026-11-03, measured): Ethernet links at 100 Mbit by default; `eth_adv1000 YES` for gigabit
+
+With a real 060 (`bootmode CPU`) at 1000 Mbit the Ethernet controller's receive FIFO overflows on a train of 4 or more
+back-to-back full-size frames, and those frames are lost (A4000D: the overrun count equals the loss, 67 of 80 echoes;
+FTP put 30 KB/s). At 100 Mbit, or with an emulated CPU at 1000, nothing is lost (80 of 80; FTP put 255-271 KB/s, get
+unchanged). So the firmware advertises 10/100 only; `eth_adv1000 YES` in `z3660cfg.txt` still selects gigabit. A fix
+that keeps gigabit is planned.
+
 ### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
 
 **Setup:** A4000T, Z3660 card 2, 68LC060 @80; the onboard 53C710 SCSI with board termination built; a ZuluSCSI at

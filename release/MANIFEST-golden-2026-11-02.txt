@@ -29,3 +29,4 @@ Measured   A4000T, CPU mode, the 1.1 060 disk plus a second hdf: 50 cold boots, 
            (9994961A on the same box the same day: 1 abort in 5). KNOWN_ISSUES.md, "Cause shown and fixed".
 
 CPLD (z3660.jed), z3660_scsi.rom and FAILSAFE.bin are unchanged by this cut.
+Superseded on 2026-11-03 by 28072E28 (MANIFEST-golden-2026-11-03.txt): this image plus eth_adv1000 NO by default.
