@@ -204,20 +204,27 @@ last on 9994961A.
 - Soak of 3E3D7907 on the A4000T in the conditions of the 2026-11-02 abort (CPU mode, two hdfs): 50 cold boots,
   no abort, no hang, one banner each. Golden 9994961A gave 1 abort in 5 cold boots on the same box that day.
 
-### Fork note (2026-11-02): on the real 68060, a reset from the Amiga side leaves the 060 stopped
+### Fork note (2026-11-03, measured): on one A4000T, a reset from the Amiga side leaves the real 060 stopped
 
-**Current behaviour:**
-- In real-CPU mode (`bootmode CPU`), the 68060 does not start again after a reset that the card itself drives or
-  passes on. That covers the CPU's own `RESET` instruction (an Amix `reboot` or `uadmin 2 1`, the automatic reboot
-  after `fsck` repairs the root file system, Kickstart's `ColdReboot`) and the firmware's `RAMIGA`.
-- The firmware logs `Reset active (DOWN)` and `Reset inactive (UP)` and re-initialises its side. After that there is
+**A4000D: works.** In real-CPU mode (`bootmode CPU`, firmware 3E3D7907) the 68060 came back after every reset the
+card drives or passes on: an Amix `uadmin 2 1` (the CPU's own `RESET` instruction) 3/3, the firmware's `RAMIGA` 3/3,
+and a keyboard Ctrl-Amiga-Amiga 3/3. One of the nine showed a second reset about 10 s later, taken from a running
+Kickstart; the boot then went on normally.
+
+**The bench A4000T (a ReAmiga 4000T board with a Kickstart 3.2.3 47.115 pair in its ROM sockets): stops.** Same firmware,
+real-CPU mode:
+- After a card-driven or passed-on reset the 060 does not run again: Amix `uadmin 2 1` 0/3, AmigaOS `C:Reboot` 0/3,
+  `RAMIGA` 0/3 (also at a plain Kickstart screen), and the timing scanner's own reset with the clocks reprogrammed 0/3.
+- The firmware logs `Reset active (DOWN)` and `Reset inactive (UP)` and re-initialises its side; after that there is
   no bus activity, and the screen keeps its last colour.
-- A keyboard reset (Ctrl-Amiga-Amiga on the real keyboard) restarted it in 20 of 21 recorded cases (2026-10-04, the
-  A4000T); a power cycle always does.
-- Seen on the A4000T with stock 1.03 beta 21 and this fork alike.
+- A keyboard reset restarts it (3/3); a power cycle always does.
+- With DiagROM in the same sockets (2026-10-10) `RAMIGA` restarted it 4/4. With the 47.115 pair fitted, the same
+  scanner reset restarted it 5/5 after a test program (2026-10-22), but not after Kickstart had run.
+- So the cause lies in that board or its socket-ROM configuration together with the state Kickstart leaves behind, not
+  in the reset sequence the firmware drives.
 
-**Until fixed:** shut Amix down with `shutdown -y -g0 -i0` and power-cycle, or press Ctrl-Amiga-Amiga on the
-keyboard. Expect the first boot after an unclean shutdown to run `fsck` and reboot: that is the case to power-cycle.
+**On that kind of setup:** shut Amix down with `shutdown -y -g0 -i0` and power-cycle, or press Ctrl-Amiga-Amiga on the
+keyboard. The first boot after an unclean shutdown runs `fsck` and reboots; that is the case to power-cycle.
 
 ### Fork note (2026-10-03, measured): A4000T ROM paths on the real 060 (MAPROM vs the motherboard sockets)
 
